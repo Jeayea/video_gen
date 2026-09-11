@@ -736,12 +736,33 @@ scene_4_shot_4: 旧=另一个人 → 新=同一张脸 + 后期造型（桂冠/�
 （真实样本 `English prompt: A confident…`），`build_prompt` 现在会剥掉
 `English prompt:` / `Prompt:` / `英文提示词：` 这类前缀。
 
+### 全量重跑：整片 15/15（含「一镜多参考图」）
+
+用户确认「主角前后仍然跳脸」后，把剩下 12 个旧片段也重跑，并把双人镜头升级成
+**一镜多图**（`VideoRequest.reference_images: list[Path]`，画面里每个配了参考图的角色各带一张；
+模型 400 时两级降级：多张 → 第一张 → 不带）：
+
+```
+主角林悦（13 个镜头）：素颜便装 → 训练 → T 台 → 桂冠，全片同一张脸 ✓
+双人镜头（s1_2/s4_1/s4_3）：主角稳定，第二个角色改善有限（多图权重问题，见 README 限制 17）
+花费：整轮 $10.27（3 镜验证 $1.95 + 12 镜 $8.32）；账本 video $20.02，漏记 $0.00
+```
+
+过程中真实撞到一次**本机 DNS 抖动**（`ConnectError: nodename nor servname provided`）：
+4 个片段提交失败（重试 3 次仍失败），但**失败不计费**（片段 cost=$0）；
+`compose` 随后以 400「视频片段不完整」正确拒绝合成，补跑这 4 个（$3.12）后 15/15 才出片。
+这正是「宁可拒绝也不产缺料成片」的设计意图被真实检验了一次。
+
+另外差点超支一次：12 个镜头的 preflight 报价是 **$8.32**（不是按 5 秒粗算的 $7.80 ——
+其中两个镜头是 7 秒），而当时剩余 $7.9789，**预算门控直接拒绝**，用户把 `BUDGET_USD`
+提到 30 后才跑。这类「差 $0.34」的边界正是门控存在的意义。
+
 ### 测试
 
 新增 `tests/test_character_image.py`（23）、`tests/test_image_openrouter.py`（11）、
 `tests/test_ffmpeg_selection.py`（5），并在 `test_compose.py` 补 4 例 VTT/升级路径、
 `test_api.py` 补 5 例（plan / 单个 / 批量 / vtt / health）、`test_video.py` 补 3 例文本锚点。
-全套 **418 passed**，ruff clean。
+全套 **421 passed**，ruff clean。
 
 顺带修掉一个测试基线漏洞：`.env` 改成 `COMPOSE_SUBTITLE_MODE=burn` 后，
 `test_compose.py` 里两个默认 soft 的用例开始失败（真实行为变了）——
