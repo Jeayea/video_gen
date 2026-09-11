@@ -10,7 +10,9 @@ from typing import TypeVar
 from pydantic import BaseModel
 
 from videogen.config import get_settings
+from videogen.models.audio import AudioManifest
 from videogen.models.bible import StoryBible
+from videogen.models.compose import ComposeReport
 from videogen.models.consistency import ConsistencyReport
 from videogen.models.project import (
     LEGACY_STATUS_MAP,
@@ -184,6 +186,47 @@ class FileStore:
     def load_video_manifest(self, project_id: str) -> VideoManifest | None:
         return self._load(project_id, "video_manifest", VideoManifest)
 
+    # --- Audio（配音）---
+    def save_audio_manifest(self, project_id: str, manifest: AudioManifest) -> None:
+        self._save(project_id, "audio_manifest", manifest)
+
+    def load_audio_manifest(self, project_id: str) -> AudioManifest | None:
+        return self._load(project_id, "audio_manifest", AudioManifest)
+
+    # --- Compose（成片）---
+    def save_compose_report(self, project_id: str, report: ComposeReport) -> None:
+        self._save(project_id, "compose_report", report)
+
+    def load_compose_report(self, project_id: str) -> ComposeReport | None:
+        return self._load(project_id, "compose_report", ComposeReport)
+
+    def purge_media(
+        self,
+        project_id: str,
+        *,
+        video: bool = False,
+        audio: bool = False,
+        compose: bool = False,
+    ) -> None:
+        """上游产物变了就作废下游媒体，避免拿着过期分镜的片子去合成。
+
+        只删清单 + 媒体目录，不动 meta/剧本/分镜这些文本产物。
+        """
+        if not self.is_valid_id(project_id):
+            return
+        directory = self.project_dir(project_id)
+        if not directory.is_dir():
+            return
+        if video:
+            self.remove_artifact(project_id, "video_manifest")
+            shutil.rmtree(directory / "clips", ignore_errors=True)
+        if audio:
+            self.remove_artifact(project_id, "audio_manifest")
+            shutil.rmtree(directory / "audio", ignore_errors=True)
+        if compose:
+            self.remove_artifact(project_id, "compose_report")
+            shutil.rmtree(directory / "output", ignore_errors=True)
+
     def resolve_artifact(self, project_id: str, relative: str) -> Path | None:
         """把产物相对路径安全地解析成绝对路径（禁止越出项目目录）。"""
         if not self.is_valid_id(project_id) or not relative:
@@ -209,5 +252,11 @@ class FileStore:
 
     def output_dir(self, project_id: str) -> Path:
         d = self.ensure_project_dir(project_id) / "output"
+        d.mkdir(exist_ok=True)
+        return d
+
+    def segments_dir(self, project_id: str) -> Path:
+        """合成中间产物（每个镜头一段），失败可复用已渲染好的段。"""
+        d = self.output_dir(project_id) / "segments"
         d.mkdir(exist_ok=True)
         return d

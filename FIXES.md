@@ -104,3 +104,46 @@ pytest -q              → 71 passed
 2. **后台任务化**：生成接口仍是同步长请求，需要 job 队列 + `GET /jobs/{id}` 进度（也为视频轮询铺路）
 3. **成本统计**：目前只在日志里打印 token 数
 4. **多进程锁**：当前锁是单进程内的，多 worker 部署需换文件锁或数据库
+
+
+---
+
+## v0.4 — Phase A：配音 + BGM + 成片合成
+
+补齐「主题 → 成片」的最后一段：`TTSProvider` 抽象（Edge-TTS 真实配音 / Mock 离线占位）、
+本地 BGM 曲库按情绪选曲、FFmpeg 分段拼接 + 混音 + 字幕，以及音画时长对齐。
+
+### 新增能力
+
+| 能力 | 说明 |
+|------|------|
+| 配音 | `EdgeTTSProvider`：中文音色、按角色性别分配音色、换音色只重跑该角色 |
+| 音画对齐 | 配音比镜头长就**拉长镜头**（`AUDIO_GAP_SEC` 留白），合成时 `tpad` 冻结末帧补足 |
+| BGM | `BGM_DIR` + `bgm.json` 元数据，按镜头 `mood` 打分匹配；曲库为空就出无声底成片 |
+| 合成 | 每镜分段（统一分辨率/帧率/采样率）→ concat 流拷贝 → BGM 混音 → 字幕 |
+| 字幕 | `soft`（mov_text 内嵌）/ `burn`（libass 烧录）/ `none`；无论哪种都导出 `.srt` |
+| 状态机 | 新增 `AUDIO_GENERATING → AUDIO_READY → COMPOSING → DONE`，同为后台任务（进度/取消/互斥） |
+
+### 开发中发现并修掉的问题
+
+| # | 问题 | 表现 | 修复 |
+|---|------|------|------|
+| A1 | 中文语音只返回 `SentenceBoundary` | 只认 `WordBoundary` 时时长恒为 0，音画对齐失效 | 两种边界都认，末位 + 尾巴补偿；有 `ffprobe` 时以真实时长为准，再退化为按 48kbps 码率估算 |
+| A2 | 竖屏字幕溢出画面 | `force_style` 的字号是 **384x288 参考系**单位，直接写像素会让 1080x1920 上字幕大到出框 | 按「min(宽,高) × 5% 像素」算目标字号，再换算回参考系单位（1080 宽 → `FontSize=8`）；抽帧人工确认 |
+| A3 | `-map` 被当成输入选项 | 软字幕那条命令报 `Option map ... cannot be applied to input url subtitles.srt` | ffmpeg 的所有 `-i` 必须写在输出选项之前 |
+| A4 | 把 mp4 当 concat 列表读 | 收尾阶段报 `Invalid data found when processing input` | 拼接产物是普通 mp4，只有 concat **列表文件**才用 `-f concat` |
+| A5 | `woman` 里的 `man` | 女主被判成男声（中英关键词都用了子串匹配） | 英文关键词改成整词匹配，中文仍用包含匹配 |
+| A6 | 系统 ffmpeg 没有 libass | 请求烧字幕会直接失败 | 启动时探测 `-filters`/`-encoders` 能力并缓存，`burn` 不可用就降级 `soft`，`mov_text` 也没有就只导出 srt，并在报告里告警 |
+| A7 | 上游改了、下游还在 | 分镜重生成后旧 `video_manifest.json` 还在，会跳过重新生成而沿用过期片段 | 文本/分镜一变就清掉下游媒体；补跑镜头作废成片但保留配音 |
+| A8 | 取消一个还没被调度的任务 | 项目永远停在 `AUDIO_GENERATING`/`COMPOSING` | `cancel()` 同步落定状态，`recover_interrupted_jobs()` 按「产物是否真的存在」回收 |
+
+### 验证
+
+- `ruff check src tests` 全绿；`pytest -q` **180 passed**（新增 audio / compose / API / 状态机用例）
+- 真实链路（不花 LLM 的钱）：手工分镜 → mock 视频 → **真实 edge-tts**（`zh-CN-XiaoxiaoNeural`）
+  → 音画对齐（1s 镜头因 3.41s 配音拉长到 4s）→ 合成
+  - 成片 `h264 1080x1920 24fps + aac 44100Hz 立体声`，时长 12.00s（与分镜一致）
+  - 烧字幕模式：抽帧确认中文正常渲染且不出框（见 A2）
+  - 软字幕模式（系统 ffmpeg）：额外得到 `Stream #0:2 (zho): Subtitle: mov_text`
+  - BGM 命中 `tense_01（暗涌）`（分镜 mood = 紧张）
+- UI：用真实 API 载荷在 stub DOM 上跑渲染冒烟（18 项检查全通过）

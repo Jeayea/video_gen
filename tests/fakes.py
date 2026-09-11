@@ -8,15 +8,24 @@ from typing import Any
 
 from pydantic import BaseModel
 
+from videogen.models.audio import BgmTrack
 from videogen.models.video import MediaKind
+from videogen.providers.bgm.base import BgmLibrary
 from videogen.providers.llm.base import LLMError, LLMMessage, LLMProvider
 from videogen.providers.llm.openrouter import OpenRouterProvider
+from videogen.providers.tts.base import (
+    GeneratedAudio,
+    TTSProvider,
+    TTSProviderError,
+    TTSRequest,
+)
 from videogen.providers.video.base import (
     GeneratedClip,
     VideoProvider,
     VideoProviderError,
     VideoRequest,
 )
+from videogen.utils.text import clean_spoken_text
 
 SCENE_ID_RE = re.compile(r"场次(?:\s*ID)?[:：]\s*(\S+)")
 
@@ -276,3 +285,90 @@ class AlwaysFailVideoProvider(FakeVideoProvider):
     async def generate(self, request: VideoRequest) -> GeneratedClip:
         self.calls.append(request.shot_id)
         raise VideoProviderError("全量失败")
+
+
+class FakeTTSProvider(TTSProvider):
+    """离线假配音 provider：写一个小文件代替真实音频。
+
+    时长按字数算，方便断言「音画对齐」的结果；可配置失败与延时。
+    """
+
+    name = "fake"
+    offline = True
+
+    def __init__(
+        self,
+        *,
+        fail_clips: set[str] | None = None,
+        fail_times: int = 0,
+        delay: float = 0.0,
+        sec_per_char: float = 0.2,
+        media_kind: MediaKind = MediaKind.AUDIO,
+    ):
+        self.fail_clips = set(fail_clips or ())
+        self.fail_times = fail_times
+        self.delay = delay
+        self.sec_per_char = sec_per_char
+        self.media_kind = media_kind
+        self.calls: list[str] = []
+        self.voices: dict[str, str] = {}
+        self.active = 0
+        self.max_active = 0
+        self.closed = 0
+
+    def attempts_for(self, clip_id: str) -> int:
+        return self.calls.count(clip_id)
+
+    async def synthesize(self, request: TTSRequest) -> GeneratedAudio:
+        self.calls.append(request.clip_id)
+        self.voices[request.clip_id] = request.voice
+        self.active += 1
+        self.max_active = max(self.max_active, self.active)
+        try:
+            if self.delay:
+                await asyncio.sleep(self.delay)
+            should_fail = (
+                request.clip_id in self.fail_clips
+                and self.attempts_for(request.clip_id) <= self.fail_times
+            )
+            if should_fail:
+                raise TTSProviderError(f"fake 配音失败 clip={request.clip_id}")
+            target = Path(request.output_path)
+            if self.media_kind == MediaKind.PLACEHOLDER:
+                target = target.with_suffix(".placeholder.json")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(b"fake-audio")
+            duration = round(len(clean_spoken_text(request.text)) * self.sec_per_char, 3)
+            return GeneratedAudio(
+                path=target,
+                media_kind=self.media_kind,
+                duration_sec=max(0.6, duration),
+                voice=request.voice,
+            )
+        finally:
+            self.active -= 1
+
+    async def aclose(self) -> None:
+        self.closed += 1
+
+
+class AlwaysFailTTSProvider(FakeTTSProvider):
+    """所有条目都失败，用来验证「零可用配音」时的收尾。"""
+
+    async def synthesize(self, request: TTSRequest) -> GeneratedAudio:
+        self.calls.append(request.clip_id)
+        raise TTSProviderError("全量配音失败")
+
+
+class FakeBgmLibrary(BgmLibrary):
+    """固定返回一首（可指定路径）的假曲库。"""
+
+    name = "fake"
+
+    def __init__(self, *, path: str = "/nonexistent/fake_bgm.mp3", moods=("紧张", "压抑")):
+        self._tracks = [
+            BgmTrack(id="fake_bgm", title="假BGM", path=path, moods=list(moods), duration_sec=30)
+        ]
+
+    def tracks(self) -> list[BgmTrack]:
+        return list(self._tracks)

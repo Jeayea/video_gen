@@ -5,9 +5,12 @@ import time
 import pytest
 from fastapi.testclient import TestClient
 
-from tests.fakes import FakeLLM, FakeVideoProvider
+from tests.factories import small_project
+from tests.fakes import FakeBgmLibrary, FakeLLM, FakeTTSProvider, FakeVideoProvider
 from videogen import main
 from videogen.orchestrator.pipeline import Pipeline
+from videogen.providers.tts.mock import MockTTSProvider
+from videogen.providers.video.mock import MockVideoProvider
 from videogen.utils.file_store import FileStore
 
 
@@ -16,7 +19,13 @@ def client(tmp_path, monkeypatch):
     store = FileStore(tmp_path / "projects")
     llm = FakeLLM()
     video = FakeVideoProvider()
-    pipeline = Pipeline(store, llm_factory=lambda: llm, video_factory=lambda: video)
+    pipeline = Pipeline(
+        store,
+        llm_factory=lambda: llm,
+        video_factory=lambda: video,
+        tts_factory=lambda: FakeTTSProvider(),
+        bgm_factory=lambda: FakeBgmLibrary(),
+    )
     # 端点运行时从模块全局取 store/pipeline，这里替换成临时目录的实例
     monkeypatch.setattr(main, "store", store)
     monkeypatch.setattr(main, "pipeline", pipeline)
@@ -25,6 +34,25 @@ def client(tmp_path, monkeypatch):
         test_client.videogen_store = store
         test_client.videogen_pipeline = pipeline
         test_client.videogen_video = video
+        yield test_client
+
+
+@pytest.fixture
+def media_client(tmp_path, monkeypatch):
+    """产出**真实**媒体文件的客户端（mock 视频 + mock 配音），合成用例用它。"""
+    store = FileStore(tmp_path / "projects")
+    pipeline = Pipeline(
+        store,
+        llm_factory=lambda: FakeLLM(),
+        video_factory=lambda: MockVideoProvider(),
+        tts_factory=lambda: MockTTSProvider(),
+        bgm_factory=lambda: FakeBgmLibrary(),
+    )
+    monkeypatch.setattr(main, "store", store)
+    monkeypatch.setattr(main, "pipeline", pipeline)
+    with TestClient(main.app) as test_client:
+        test_client.videogen_store = store
+        test_client.videogen_pipeline = pipeline
         yield test_client
 
 
@@ -68,7 +96,17 @@ def test_health(client):
     resp = client.get("/api/health")
     assert resp.status_code == 200
     data = resp.json()
-    assert data["stages_implemented"] == ["bible", "script", "storyboard", "video"]
+    assert data["stages_implemented"] == [
+        "bible",
+        "script",
+        "storyboard",
+        "video",
+        "audio",
+        "compose",
+    ]
+    assert data["stages_pending"] == []
+    assert data["tts_provider"] == "edge"
+    assert data["subtitle_mode"] in {"soft", "burn", "none"}
     assert "llm_key_configured" in data
     # 绝不能把密钥暴露给前端
     assert "key" not in {k for k in data if "configured" not in k}
@@ -316,6 +354,127 @@ def test_clip_endpoint_404_when_no_manifest(client):
 def test_health_reports_video_stage(client):
     data = client.get("/api/health").json()
     assert "video" in data["stages_implemented"]
-    assert data["stages_pending"] == ["audio", "compose"]
+    assert "audio" in data["stages_implemented"]
+    assert data["stages_pending"] == []
     assert data["video_provider"] == "mock"
     assert "ffmpeg_available" in data
+    assert "ffprobe_available" in data
+    assert "bgm_enabled" in data
+
+
+# ── 配音 / 合成 API ───────────────────────────────────
+
+
+def wait_audio_job(client: TestClient, project_id: str, timeout: float = 15.0) -> dict:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        status = client.get(f"/api/projects/{project_id}/audio/status").json()
+        job = status.get("job")
+        if job and not job["is_active"]:
+            return status
+        time.sleep(0.02)
+    raise AssertionError("配音任务没有在超时前结束")
+
+
+def wait_compose_job(client: TestClient, project_id: str, timeout: float = 60.0) -> dict:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        status = client.get(f"/api/projects/{project_id}/compose/status").json()
+        job = status.get("job")
+        if job and not job["is_active"]:
+            return status
+        time.sleep(0.05)
+    raise AssertionError("合成任务没有在超时前结束")
+
+
+def test_audio_endpoints_full_flow(client):
+    pid = prepare_confirmed_storyboard(client)
+    assert client.post(f"/api/projects/{pid}/video/generate").status_code == 202
+    wait_video_job(client, pid)
+
+    assert client.get(f"/api/projects/{pid}/audio/manifest").status_code == 404
+    resp = client.post(f"/api/projects/{pid}/audio/generate", json={"voices": {}})
+    assert resp.status_code == 202
+    assert resp.json()["job"]["kind"] == "audio"
+
+    status = wait_audio_job(client, pid)
+    assert status["job"]["status"] == "succeeded"
+    assert status["summary"]["usable"] is True
+    assert status["manifest"]["clips"]
+    assert status["voice_map"]
+
+    manifest = client.get(f"/api/projects/{pid}/audio/manifest").json()
+    clip_id = manifest["clips"][0]["id"]
+    audio_resp = client.get(f"/api/projects/{pid}/audio/{clip_id}")
+    assert audio_resp.status_code == 200
+    assert len(audio_resp.content) > 0
+
+    assert client.get(f"/api/projects/{pid}/audio/不存在的条目").status_code == 404
+
+
+def test_audio_generate_requires_video(client):
+    pid = prepare_confirmed_storyboard(client)
+    resp = client.post(f"/api/projects/{pid}/audio/generate")
+    assert resp.status_code == 400
+    assert "视频" in resp.json()["detail"]
+
+
+def test_audio_unknown_project(client):
+    assert client.get("/api/projects/nope/audio/status").status_code == 404
+    assert client.post("/api/projects/nope/audio/generate").status_code == 404
+    assert client.get("/api/projects/nope/audio/manifest").status_code == 404
+
+
+def test_compose_endpoints_full_flow(media_client):
+    client = media_client
+    if not client.get("/api/health").json()["ffmpeg_available"]:
+        pytest.skip("环境里没有 ffmpeg，跳过真实合成 API 用例")
+
+    # 用手工小项目，避免走 LLM 生成 10 个镜头（合成会很慢）
+    pid = small_project(client.videogen_store, shots=2).id
+    assert client.post(f"/api/projects/{pid}/video/generate").status_code == 202
+    wait_video_job(client, pid)
+    assert client.post(f"/api/projects/{pid}/audio/generate").status_code == 202
+    wait_audio_job(client, pid)
+
+    resp = client.post(f"/api/projects/{pid}/compose", json={"subtitle_mode": "soft"})
+    assert resp.status_code == 202
+    assert resp.json()["job"]["kind"] == "compose"
+
+    status = wait_compose_job(client, pid)
+    assert status["job"]["status"] == "succeeded", status["job"]["error"]
+    assert status["summary"]["segments"] > 0
+    assert client.get(f"/api/projects/{pid}").json()["status"] == "done"
+
+    final = client.get(f"/api/projects/{pid}/final")
+    assert final.status_code == 200
+    assert final.headers["content-type"] == "video/mp4"
+    assert len(final.content) > 1000
+
+    subs = client.get(f"/api/projects/{pid}/subtitles")
+    assert subs.status_code == 200
+    assert "林晚" in subs.text or "-->" in subs.text
+
+
+def test_compose_requires_audio(client):
+    pid = prepare_confirmed_storyboard(client)
+    assert client.post(f"/api/projects/{pid}/video/generate").status_code == 202
+    wait_video_job(client, pid)
+
+    resp = client.post(f"/api/projects/{pid}/compose")
+    assert resp.status_code == 400
+    assert "配音" in resp.json()["detail"]
+
+
+def test_compose_endpoints_404_without_artifacts(client):
+    pid = prepare_confirmed_storyboard(client)
+    assert client.get(f"/api/projects/{pid}/final").status_code == 404
+    assert client.get(f"/api/projects/{pid}/subtitles").status_code == 404
+    assert client.get("/api/projects/nope/compose/status").status_code == 404
+    assert client.post("/api/projects/nope/compose").status_code == 404
+
+
+def test_compose_rejects_invalid_subtitle_mode(client):
+    pid = prepare_confirmed_storyboard(client)
+    resp = client.post(f"/api/projects/{pid}/compose", json={"subtitle_mode": "乱填"})
+    assert resp.status_code == 422

@@ -21,6 +21,7 @@ class MediaKind(str, Enum):
     """
 
     VIDEO = "video"
+    AUDIO = "audio"
     PLACEHOLDER = "placeholder"
 
 
@@ -73,9 +74,7 @@ class VideoManifest(BaseModel):
 
     @property
     def pending_clips(self) -> list[VideoClip]:
-        return [
-            c for c in self.clips if c.status in {ClipStatus.PENDING, ClipStatus.GENERATING}
-        ]
+        return [c for c in self.clips if c.status in {ClipStatus.PENDING, ClipStatus.GENERATING}]
 
     @property
     def total_duration_sec(self) -> int:

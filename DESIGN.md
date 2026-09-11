@@ -562,7 +562,7 @@ FFMPEG_PATH=ffmpeg
 
 ---
 
-## 10. 实现状态（v0.3，2026-09-11 更新）
+## 10. 实现状态（v0.4，2026-09-11 更新）
 
 ### 已落地
 
@@ -575,11 +575,21 @@ FFMPEG_PATH=ffmpeg
 - LLM 输出强制过 Pydantic schema，失败回灌错误重试；脏字段（`7.5` / `"约10秒"` / `null`）容错兜底
 - 生成失败可续跑：逐场/逐镜落盘 + `outline.json` + `video_manifest.json`，重试只补缺失部分
 
-### 尚未实现（Phase 3-4）
+- **Phase A（配音 + 合成）已完成（v0.4）**：`TTSProvider`（Edge-TTS 真实配音 / Mock 离线占位）、
+  按角色分配音色并可单独换音色、音画时长对齐（拉长镜头 + 合成时冻结末帧）、本地 BGM 曲库按情绪匹配、
+  FFmpeg 分段渲染 → concat → 混音 → 字幕（soft 内嵌 / burn 烧录 / none 只导 srt）、
+  UI 第 5/6 阶段（试听、进度、成片播放与下载）
+- 状态机补全：`VIDEO_GENERATING → VIDEO_READY → AUDIO_GENERATING → AUDIO_READY → COMPOSING → DONE`，
+  配音与合成同样是带进度/取消/互斥的后台任务；上游文本一变就作废下游媒体
 
-- `audio_service` / `compose_service`、`TTSProvider`（Edge-TTS）、BGM 曲库、FFmpeg 拼接与字幕烧录
-- 任务状态目前只在进程内存里（项目状态已落盘，重启会自动回收）
-- 成本统计与额度控制
+### 尚未实现（Phase B 打磨）
+
+- 成本估算与额度控制（token / 秒数 / 字符 → USD 账本，超预算拒绝开工）
+- 批量生产模式（一次提交多个主题，自动跑完整条链路）
+- 多模型对比切换（同一阶段换模型重跑并留档对比）
+- 角色一致性：reference image / seed 的端到端接入（`VideoRequest.reference_image` 与
+  `VideoProvider.supports_reference_image` 已预留）
+- 任务状态只在进程内存里（项目状态已落盘，重启会自动回收）
 
 > §2.3 的目录结构是目标形态，当前实际结构见 [README.md](README.md#代码结构)；
 > 问题审计与修复记录见 [REVIEW.md](REVIEW.md) 与 [FIXES.md](FIXES.md)。

@@ -313,3 +313,89 @@ def test_atomic_write_leaves_no_tmp_files(store):
     leftovers = [p.name for p in store.project_dir(project.id).iterdir() if p.suffix == ".tmp"]
     assert leftovers == []
     assert store.load_world_state(project.id).current_scene == "scene_1"
+
+
+# ── 媒体阶段门控（配音 / 合成 / 回退）─────────────────
+
+
+def force_status(store: FileStore, project_id: str, value: str) -> None:
+    """直接改 meta.json 的状态，用来构造「已经出片」这类终态。"""
+    path = store.project_dir(project_id) / "meta.json"
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    raw["status"] = value
+    path.write_text(json.dumps(raw), encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_audio_needs_video_and_compose_needs_audio(store, media_pipeline, ready_project):
+    with pytest.raises(PipelineError):
+        await media_pipeline.start_audio_generation(ready_project.id)
+    with pytest.raises(PipelineError):
+        await media_pipeline.start_compose(ready_project.id)
+
+
+@pytest.mark.asyncio
+async def test_reopen_storyboard_from_video_ready(store, media_pipeline, video_ready_project):
+    # 已经生成过视频也要能退回分镜重做（否则只能删项目重来）
+    await media_pipeline.reopen_storyboard(video_ready_project.id)
+    assert store.load_project(video_ready_project.id).status == ProjectStatus.SCRIPT_CONFIRMED
+    # 只是回退状态，产物要等「重新生成」才作废
+    assert store.load_video_manifest(video_ready_project.id) is not None
+
+
+@pytest.mark.asyncio
+async def test_reopen_script_from_audio_ready(store, media_pipeline, audio_ready_project):
+    await media_pipeline.reopen_script(audio_ready_project.id)
+    assert store.load_project(audio_ready_project.id).status == ProjectStatus.DRAFT
+
+
+@pytest.mark.asyncio
+async def test_reopen_from_done(store, media_pipeline, video_ready_project):
+    force_status(store, video_ready_project.id, ProjectStatus.DONE.value)
+
+    await media_pipeline.reopen_storyboard(video_ready_project.id)
+    assert store.load_project(video_ready_project.id).status == ProjectStatus.SCRIPT_CONFIRMED
+
+    force_status(store, video_ready_project.id, ProjectStatus.DONE.value)
+    await media_pipeline.reopen_script(video_ready_project.id)
+    assert store.load_project(video_ready_project.id).status == ProjectStatus.DRAFT
+
+
+@pytest.mark.asyncio
+async def test_video_rerun_after_audio_ready_keeps_audio(
+    store, media_pipeline, audio_ready_project
+):
+    job = await media_pipeline.start_video_generation(audio_ready_project.id)  # 允许补跑镜头
+    assert store.load_project(audio_ready_project.id).status == ProjectStatus.VIDEO_GENERATING
+
+    from tests.conftest import wait_for_job
+
+    finished = await wait_for_job(media_pipeline, job.id)
+    assert finished.status.value == "succeeded"
+    # 配音与文本无关，补跑镜头不该把配音清掉
+    assert store.load_audio_manifest(audio_ready_project.id) is not None
+    assert store.load_project(audio_ready_project.id).status == ProjectStatus.AUDIO_READY
+
+
+@pytest.mark.asyncio
+async def test_regenerating_bible_after_reopen_invalidates_media(
+    store, media_pipeline, audio_ready_project
+):
+    await media_pipeline.reopen_script(audio_ready_project.id)
+    await media_pipeline.generate_bible(audio_ready_project.id)
+
+    assert store.load_video_manifest(audio_ready_project.id) is None
+    assert store.load_audio_manifest(audio_ready_project.id) is None
+    assert not (store.project_dir(audio_ready_project.id) / "clips").exists()
+    assert not (store.project_dir(audio_ready_project.id) / "audio").exists()
+
+
+@pytest.mark.asyncio
+async def test_editing_storyboard_invalidates_media(store, media_pipeline, video_ready_project):
+    await media_pipeline.reopen_storyboard(video_ready_project.id)
+    storyboard = store.load_storyboard(video_ready_project.id)
+    data = storyboard.model_dump()
+    data["shots"][0]["video_prompt"] = "close up, a different shot"
+
+    await media_pipeline.update_storyboard(video_ready_project.id, data)
+    assert store.load_video_manifest(video_ready_project.id) is None

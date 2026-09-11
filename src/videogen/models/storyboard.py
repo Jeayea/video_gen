@@ -61,6 +61,8 @@ class Shot(BaseModel):
 class Storyboard(BaseModel):
     shots: list[Shot] = Field(default_factory=list)
     duration_normalized: bool = False
+    #: 是否已按配音时长对齐过（对齐只会拉长镜头，不会裁掉配音）
+    audio_aligned: bool = False
 
     @property
     def total_duration_sec(self) -> int:

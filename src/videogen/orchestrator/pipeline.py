@@ -5,7 +5,9 @@ import logging
 from collections.abc import Callable
 
 from videogen.config import get_settings
+from videogen.models.audio import AudioManifest
 from videogen.models.bible import StoryBible
+from videogen.models.compose import ComposeReport
 from videogen.models.consistency import ConsistencyReport
 from videogen.models.project import Project, ProjectStatus
 from videogen.models.script import Script, ScriptOutline
@@ -13,17 +15,24 @@ from videogen.models.storyboard import Storyboard
 from videogen.models.video import VideoManifest
 from videogen.models.world_state import WorldState
 from videogen.orchestrator.jobs import Job, JobContext, JobManager
+from videogen.providers import bgm as bgm_providers
 from videogen.providers import llm as llm_providers
+from videogen.providers import tts as tts_providers
 from videogen.providers import video as video_providers
+from videogen.providers.bgm.base import BgmLibrary
 from videogen.providers.llm.base import LLMProvider
+from videogen.providers.tts.base import TTSProvider
 from videogen.providers.video.base import VideoProvider
 from videogen.services import (
+    audio_service,
     bible_service,
+    compose_service,
     consistency_service,
     script_service,
     storyboard_service,
     video_service,
 )
+from videogen.utils.ffmpeg import ffmpeg_available
 from videogen.utils.file_store import FileStore
 
 logger = logging.getLogger(__name__)
@@ -50,6 +59,10 @@ REOPEN_SCRIPT_STATUSES = {
     ProjectStatus.SCRIPT_CONFIRMED,
     ProjectStatus.STORYBOARD_REVIEW,
     ProjectStatus.STORYBOARD_CONFIRMED,
+    # 已经出片的项目也要能退回改剧本（改文本时才作废媒体）
+    ProjectStatus.VIDEO_READY,
+    ProjectStatus.AUDIO_READY,
+    ProjectStatus.DONE,
 }
 GENERATE_STORYBOARD_STATUSES = {
     ProjectStatus.SCRIPT_CONFIRMED,
@@ -57,7 +70,12 @@ GENERATE_STORYBOARD_STATUSES = {
     ProjectStatus.FAILED,
 }
 CONFIRM_STORYBOARD_STATUSES = {ProjectStatus.STORYBOARD_REVIEW}
-REOPEN_STORYBOARD_STATUSES = {ProjectStatus.STORYBOARD_CONFIRMED}
+REOPEN_STORYBOARD_STATUSES = {
+    ProjectStatus.STORYBOARD_CONFIRMED,
+    ProjectStatus.VIDEO_READY,
+    ProjectStatus.AUDIO_READY,
+    ProjectStatus.DONE,
+}
 
 EDIT_BIBLE_STATUSES = {ProjectStatus.DRAFT, ProjectStatus.FAILED, ProjectStatus.SCRIPT_REVIEW}
 EDIT_SCRIPT_STATUSES = {ProjectStatus.DRAFT, ProjectStatus.FAILED, ProjectStatus.SCRIPT_REVIEW}
@@ -69,6 +87,10 @@ GENERATE_VIDEO_STATUSES = {
     ProjectStatus.STORYBOARD_CONFIRMED,
     ProjectStatus.VIDEO_READY,
     ProjectStatus.VIDEO_GENERATING,
+    # 配音/合成之后也允许补跑镜头（配音与文本无关，不会被作废）
+    ProjectStatus.AUDIO_READY,
+    ProjectStatus.COMPOSING,
+    ProjectStatus.DONE,
 }
 
 #: 进程重启后需要收尾的「进行中」状态
@@ -78,7 +100,23 @@ TRANSIENT_STATUSES = {
     ProjectStatus.COMPOSING,
 }
 
+#: 配音入口：视频就绪后开跑；AUDIO_READY 下允许补跑失败条目
+GENERATE_AUDIO_STATUSES = {
+    ProjectStatus.VIDEO_READY,
+    ProjectStatus.AUDIO_READY,
+    ProjectStatus.AUDIO_GENERATING,
+}
+
+#: 合成入口：配音就绪后合成；DONE 下允许重新合成（换 BGM / 换字幕模式）
+COMPOSE_STATUSES = {
+    ProjectStatus.AUDIO_READY,
+    ProjectStatus.COMPOSING,
+    ProjectStatus.DONE,
+}
+
 VIDEO_JOB_KIND = "video"
+AUDIO_JOB_KIND = "audio"
+COMPOSE_JOB_KIND = "compose"
 
 
 class Pipeline:
@@ -95,11 +133,15 @@ class Pipeline:
         store: FileStore | None = None,
         llm_factory: Callable[[], LLMProvider] | None = None,
         video_factory: Callable[[], VideoProvider] | None = None,
+        tts_factory: Callable[[], TTSProvider] | None = None,
+        bgm_factory: Callable[[], BgmLibrary] | None = None,
         jobs: JobManager | None = None,
     ):
         self.store = store or FileStore()
         self._llm_factory = llm_factory or (lambda: llm_providers.get_llm())
         self._video_factory = video_factory or (lambda: video_providers.get_video_provider())
+        self._tts_factory = tts_factory or (lambda: tts_providers.get_tts_provider())
+        self._bgm_factory = bgm_factory or (lambda: bgm_providers.get_bgm_library())
         self.jobs = jobs or JobManager()
         self._locks: dict[str, asyncio.Lock] = {}
 
@@ -117,6 +159,16 @@ class Pipeline:
 
     def _video(self) -> VideoProvider:
         return self._video_factory()
+
+    def _tts(self) -> TTSProvider:
+        return self._tts_factory()
+
+    def _bgm(self) -> BgmLibrary:
+        return self._bgm_factory()
+
+    def _invalidate_media(self, project_id: str) -> None:
+        """文本产物变了，下游媒体全部作废（避免用旧分镜去合成）。"""
+        self.store.purge_media(project_id, video=True, audio=True, compose=True)
 
     def get_project(self, project_id: str) -> Project:
         project = self.store.load_project(project_id)
@@ -169,8 +221,9 @@ class Pipeline:
                 raise PipelineError(f"故事圣经生成失败：{exc}") from exc
 
             self.store.save_bible(project_id, bible)
-            # 圣经变了，旧的一致性报告作废
+            # 圣经变了，旧的一致性报告和下游媒体全部作废
             self.store.remove_artifact(project_id, "consistency_report")
+            self._invalidate_media(project_id)
             return bible
 
     async def update_bible(self, project_id: str, data: dict) -> StoryBible:
@@ -182,6 +235,7 @@ class Pipeline:
             except Exception as exc:
                 raise PipelineError(f"圣经更新失败：{exc}") from exc
             self.store.save_bible(project_id, bible)
+            self._invalidate_media(project_id)
             self._revalidate(project, bible, self.store.load_script(project_id))
             return bible
 
@@ -233,8 +287,9 @@ class Pipeline:
             self.store.save_outline(project_id, outline)
             script = Script(title=bible.style.genre or project.title, logline="")
             world_state = WorldState()
-            # 重新生成剧本会让旧分镜失效
+            # 重新生成剧本会让旧分镜和所有下游媒体失效
             self.store.remove_artifact(project_id, "storyboard")
+            self._invalidate_media(project_id)
             self.store.save_script(project_id, script)
             self.store.save_world_state(project_id, world_state)
         else:
@@ -300,6 +355,7 @@ class Pipeline:
             except Exception as exc:
                 raise PipelineError(f"剧本更新失败：{exc}") from exc
             self.store.save_script(project_id, script)
+            self._invalidate_media(project_id)
             self._revalidate(project, self.store.load_bible(project_id), script)
             return script
 
@@ -323,6 +379,7 @@ class Pipeline:
                     f"剧本不完整（{len(script.scenes)}/{len(outline.scenes)} 场），请先生成完整剧本"
                 )
 
+            self._invalidate_media(project_id)
             llm = self._llm()
             try:
                 storyboard = await self._run_storyboard_generation(project, script, bible, llm)
@@ -406,6 +463,7 @@ class Pipeline:
             except Exception as exc:
                 raise PipelineError(f"分镜更新失败：{exc}") from exc
             self.store.save_storyboard(project_id, storyboard)
+            self._invalidate_media(project_id)
             self._revalidate(
                 project, self.store.load_bible(project_id), self.store.load_script(project_id)
             )
@@ -438,9 +496,13 @@ class Pipeline:
         )
 
     def _reject_if_video_running(self, project_id: str) -> None:
-        running = self.jobs.active_for(project_id, VIDEO_JOB_KIND)
+        self._reject_if_running(project_id, VIDEO_JOB_KIND, "视频生成")
+
+    def _reject_if_running(self, project_id: str, kind: str, label: str) -> None:
+        """同一项目同类型任务只允许一个在跑（在拿项目锁之前调用，避免阻塞）。"""
+        running = self.jobs.active_for(project_id, kind)
         if running:
-            raise PipelineError(f"该项目已有视频生成任务在运行（job={running.id}）")
+            raise PipelineError(f"该项目已有{label}任务在运行（job={running.id}）")
 
     async def _run_video_job(self, ctx: JobContext, project_id: str) -> None:
         async with self._lock(project_id):
@@ -476,19 +538,27 @@ class Pipeline:
                 )
             except asyncio.CancelledError:
                 # 取消：保留已生成片段，状态退回可重试的位置
-                self._settle_video_status(project, self.store.load_video_manifest(project_id))
+                self.store.purge_media(project_id, compose=True)
+                self._settle_video_status(
+                    project,
+                    self.store.load_video_manifest(project_id),
+                    self.store.load_audio_manifest(project_id),
+                )
                 raise
             finally:
                 await provider.aclose()
 
             self.store.save_video_manifest(project_id, manifest)
-            self._settle_video_status(project, manifest)
+            # 片段变了，旧的成片一定过期
+            self.store.purge_media(project_id, compose=True)
+            self._settle_video_status(
+                project, manifest, self.store.load_audio_manifest(project_id)
+            )
             ctx.set_progress(
                 done=len(manifest.clips),
                 total=len(manifest.clips),
                 message=(
-                    f"完成：成功 {len(manifest.ready_clips)}，"
-                    f"失败 {len(manifest.failed_clips)}"
+                    f"完成：成功 {len(manifest.ready_clips)}，失败 {len(manifest.failed_clips)}"
                 ),
             )
             if not manifest.ready_clips:
@@ -496,13 +566,19 @@ class Pipeline:
                     f"全部 {len(manifest.clips)} 个片段生成失败，请检查 provider 配置 / ffmpeg"
                 )
 
-    def _settle_video_status(self, project: Project, manifest: VideoManifest | None) -> None:
-        """有可用片段就进 VIDEO_READY，否则退回 STORYBOARD_CONFIRMED（可重试）。"""
-        project.status = (
-            ProjectStatus.VIDEO_READY
-            if manifest and manifest.ready_clips
-            else ProjectStatus.STORYBOARD_CONFIRMED
-        )
+    def _settle_video_status(
+        self,
+        project: Project,
+        manifest: VideoManifest | None,
+        audio: AudioManifest | None = None,
+    ) -> None:
+        """有可用片段就进 VIDEO_READY（配音仍在则保持 AUDIO_READY），否则退回分镜确认态。"""
+        if not manifest or not manifest.ready_clips:
+            project.status = ProjectStatus.STORYBOARD_CONFIRMED
+        elif audio is not None and audio.is_usable and audio.ready_clips:
+            project.status = ProjectStatus.AUDIO_READY
+        else:
+            project.status = ProjectStatus.VIDEO_READY
         self.store.save_project(project)
 
     def get_video_manifest(self, project_id: str) -> VideoManifest | None:
@@ -527,7 +603,302 @@ class Pipeline:
         if cancelled:
             async with self._lock(project_id):
                 project = self.get_project(project_id)
-                self._settle_video_status(project, self.store.load_video_manifest(project_id))
+                self._settle_video_status(
+                    project,
+                    self.store.load_video_manifest(project_id),
+                    self.store.load_audio_manifest(project_id),
+                )
+        return cancelled
+
+    # ── 配音阶段 ──────────────────────────────────────────
+
+    async def start_audio_generation(
+        self, project_id: str, voice_overrides: dict[str, str] | None = None
+    ) -> Job:
+        """提交配音后台任务（进度用 audio_status 查）。
+
+        `voice_overrides` 可以按角色换音色；换了音色的条目会重新合成（其余续跑）。
+        """
+        self._reject_if_running(project_id, AUDIO_JOB_KIND, "配音")
+
+        async with self._lock(project_id):
+            project = self.get_project(project_id)
+            self._reject_if_running(project_id, AUDIO_JOB_KIND, "配音")
+            self._require(project, GENERATE_AUDIO_STATUSES, "生成配音（需先有视频片段）")
+
+            storyboard = self.store.load_storyboard(project_id)
+            if not storyboard or not storyboard.shots:
+                raise PipelineError("分镜不存在或为空，无法生成配音")
+            video = self.store.load_video_manifest(project_id)
+            if not video or not video.ready_clips:
+                raise PipelineError("没有可用的视频片段，请先生成视频")
+
+            project.status = ProjectStatus.AUDIO_GENERATING
+            self.store.save_project(project)
+
+        return self.jobs.submit(
+            project_id,
+            AUDIO_JOB_KIND,
+            lambda ctx: self._run_audio_job(ctx, project_id, voice_overrides),
+        )
+
+    async def _run_audio_job(
+        self, ctx: JobContext, project_id: str, voice_overrides: dict[str, str] | None = None
+    ) -> None:
+        async with self._lock(project_id):
+            project = self.get_project(project_id)
+            storyboard = self.store.load_storyboard(project_id) or Storyboard()
+            bible = self.store.load_bible(project_id)
+            provider = self._tts()
+            project_dir = self.store.ensure_project_dir(project_id)
+            audio_dir = self.store.audio_dir(project_id)
+            settings = get_settings()
+
+            def on_progress(manifest: AudioManifest) -> None:
+                self.store.save_audio_manifest(project_id, manifest)
+                done = len(manifest.ready_clips) + len(manifest.failed_clips)
+                ctx.set_progress(
+                    done=done,
+                    total=len(manifest.clips),
+                    message=(
+                        f"配音 {done}/{len(manifest.clips)}（成功 {len(manifest.ready_clips)}，"
+                        f"失败 {len(manifest.failed_clips)}）"
+                    ),
+                )
+
+            try:
+                manifest = await audio_service.synthesize_all(
+                    project,
+                    storyboard,
+                    bible,
+                    provider,
+                    audio_dir,
+                    project_dir,
+                    settings=settings,
+                    concurrency=settings.tts_concurrency,
+                    max_retries=settings.tts_max_retries,
+                    retry_backoff_sec=settings.tts_retry_backoff_sec,
+                    existing=self.store.load_audio_manifest(project_id),
+                    voice_overrides=voice_overrides,
+                    on_progress=on_progress,
+                )
+            except asyncio.CancelledError:
+                self._settle_audio_status(
+                    project,
+                    self.store.load_audio_manifest(project_id),
+                    self.store.load_video_manifest(project_id),
+                )
+                raise
+            finally:
+                await provider.aclose()
+
+            if manifest.ready_clips:
+                manifest.bgm = audio_service.pick_bgm(
+                    storyboard, self._bgm(), preferred_id=settings.bgm_id
+                )
+            audio_service.align_storyboard(
+                storyboard,
+                manifest,
+                gap_sec=settings.audio_gap_sec,
+                max_ratio=settings.audio_align_max_ratio,
+            )
+            self.store.save_storyboard(project_id, storyboard)
+            self.store.save_audio_manifest(project_id, manifest)
+            # 镜头时长可能被拉长 -> 旧成片作废
+            self.store.purge_media(project_id, compose=True)
+            self._settle_audio_status(project, manifest, self.store.load_video_manifest(project_id))
+
+            failed, ready = len(manifest.failed_clips), len(manifest.ready_clips)
+            ctx.set_progress(
+                done=len(manifest.clips),
+                total=len(manifest.clips),
+                message=f"完成：成功 {ready}，失败 {failed}",
+            )
+            if failed and not ready:
+                raise PipelineError(f"全部 {failed} 条配音生成失败，请检查 TTS 配置 / 网络")
+
+    def _settle_audio_status(
+        self,
+        project: Project,
+        audio: AudioManifest | None,
+        video: VideoManifest | None,
+    ) -> None:
+        """配音齐全（含「本来就没台词」）就进 AUDIO_READY，否则退回 VIDEO_READY。"""
+        if audio is not None and audio.is_usable and video and video.ready_clips:
+            project.status = ProjectStatus.AUDIO_READY
+        else:
+            project.status = (
+                ProjectStatus.VIDEO_READY
+                if video and video.ready_clips
+                else ProjectStatus.STORYBOARD_CONFIRMED
+            )
+        self.store.save_project(project)
+
+    def get_audio_manifest(self, project_id: str) -> AudioManifest | None:
+        return self.store.load_audio_manifest(project_id)
+
+    def audio_status(self, project_id: str) -> dict:
+        project = self.get_project(project_id)
+        manifest = self.store.load_audio_manifest(project_id)
+        active = self.jobs.active_for(project_id, AUDIO_JOB_KIND)
+        latest = self.jobs.list(project_id, limit=1)
+        job = active or (latest[0] if latest else None)
+        return {
+            "project_status": project.status.value,
+            "summary": manifest.summary() if manifest else None,
+            "manifest": manifest.model_dump() if manifest else None,
+            "voice_map": manifest.voice_map if manifest else {},
+            "job": job.to_public() if job else None,
+        }
+
+    async def cancel_audio_generation(self, project_id: str) -> int:
+        self.get_project(project_id)
+        cancelled = await self.jobs.cancel_project(project_id, AUDIO_JOB_KIND)
+        if cancelled:
+            async with self._lock(project_id):
+                project = self.get_project(project_id)
+                self._settle_audio_status(
+                    project,
+                    self.store.load_audio_manifest(project_id),
+                    self.store.load_video_manifest(project_id),
+                )
+        return cancelled
+
+    # ── 合成阶段 ──────────────────────────────────────────
+
+    async def start_compose(self, project_id: str, overrides: dict | None = None) -> Job:
+        """提交成片合成后台任务（进度用 compose_status 查）。
+
+        `overrides` 可临时覆盖设置（字幕模式 / BGM / 画质），不改全局配置。
+        """
+        self._reject_if_running(project_id, COMPOSE_JOB_KIND, "合成")
+
+        async with self._lock(project_id):
+            project = self.get_project(project_id)
+            self._reject_if_running(project_id, COMPOSE_JOB_KIND, "合成")
+            self._require(project, COMPOSE_STATUSES, "合成成片（需先生成配音）")
+
+            storyboard = self.store.load_storyboard(project_id)
+            if not storyboard or not storyboard.shots:
+                raise PipelineError("分镜不存在或为空，无法合成")
+            video = self.store.load_video_manifest(project_id)
+            if not video or not video.is_usable:
+                raise PipelineError("视频片段不完整（含失败或占位文件），请先补齐再合成")
+
+            project.status = ProjectStatus.COMPOSING
+            self.store.save_project(project)
+
+        return self.jobs.submit(
+            project_id,
+            COMPOSE_JOB_KIND,
+            lambda ctx: self._run_compose_job(ctx, project_id, overrides),
+        )
+
+    async def _run_compose_job(
+        self, ctx: JobContext, project_id: str, overrides: dict | None = None
+    ) -> None:
+        if not ffmpeg_available():
+            raise PipelineError(
+                "未找到 ffmpeg，无法合成（brew install ffmpeg 或 pip install imageio-ffmpeg）"
+            )
+
+        async with self._lock(project_id):
+            project = self.get_project(project_id)
+            storyboard = self.store.load_storyboard(project_id) or Storyboard()
+            bible = self.store.load_bible(project_id)
+            video = self.store.load_video_manifest(project_id)
+            audio = self.store.load_audio_manifest(project_id)
+            settings = get_settings()
+            if overrides:
+                allowed = {
+                    "compose_subtitle_mode",
+                    "compose_crf",
+                    "compose_preset",
+                    "compose_subtitle_font",
+                    "compose_subtitle_font_scale",
+                    "bgm_id",
+                    "bgm_gain_db",
+                    "bgm_enabled",
+                }
+                clean = {k: v for k, v in overrides.items() if k in allowed and v is not None}
+                if clean:
+                    settings = settings.model_copy(update=clean)
+                    logger.info("合成参数覆盖：%s", ", ".join(sorted(clean)))
+
+            def on_progress(done: int, total: int, message: str) -> None:
+                ctx.set_progress(done=done, total=total, message=message)
+
+            try:
+                report = await compose_service.compose(
+                    project,
+                    storyboard,
+                    video,
+                    audio,
+                    segments_dir=self.store.segments_dir(project_id),
+                    output_dir=self.store.output_dir(project_id),
+                    project_dir=self.store.ensure_project_dir(project_id),
+                    bible=bible,
+                    settings=settings,
+                    on_progress=on_progress,
+                )
+            except asyncio.CancelledError:
+                self.store.purge_media(project_id, compose=True)
+                self._settle_compose_status(project, audio, video)
+                raise
+            except Exception:
+                # 失败的半截成片一律删掉，避免被当成可用产物
+                self.store.purge_media(project_id, compose=True)
+                self._settle_compose_status(project, audio, video)
+                raise
+
+            self.store.save_compose_report(project_id, report)
+            project.status = ProjectStatus.DONE
+            self.store.save_project(project)
+            ctx.set_progress(
+                done=len(report.segments),
+                total=len(report.segments),
+                message=f"成片完成：{report.duration_sec:.1f}s",
+            )
+
+    def _settle_compose_status(
+        self, project: Project, audio: AudioManifest | None, video: VideoManifest | None
+    ) -> None:
+        if audio is not None and audio.is_usable and video and video.ready_clips:
+            project.status = ProjectStatus.AUDIO_READY
+        elif video and video.ready_clips:
+            project.status = ProjectStatus.VIDEO_READY
+        else:
+            project.status = ProjectStatus.STORYBOARD_CONFIRMED
+        self.store.save_project(project)
+
+    def get_compose_report(self, project_id: str) -> ComposeReport | None:
+        return self.store.load_compose_report(project_id)
+
+    def compose_status(self, project_id: str) -> dict:
+        project = self.get_project(project_id)
+        report = self.store.load_compose_report(project_id)
+        active = self.jobs.active_for(project_id, COMPOSE_JOB_KIND)
+        latest = self.jobs.list(project_id, limit=1)
+        job = active or (latest[0] if latest else None)
+        return {
+            "project_status": project.status.value,
+            "summary": report.summary() if report else None,
+            "report": report.model_dump() if report else None,
+            "job": job.to_public() if job else None,
+            "ffmpeg_available": ffmpeg_available(),
+        }
+
+    async def cancel_compose(self, project_id: str) -> int:
+        self.get_project(project_id)
+        cancelled = await self.jobs.cancel_project(project_id, COMPOSE_JOB_KIND)
+        if cancelled:
+            async with self._lock(project_id):
+                project = self.get_project(project_id)
+                self._settle_compose_status(
+                    project,
+                    self.store.load_audio_manifest(project_id),
+                    self.store.load_video_manifest(project_id),
+                )
         return cancelled
 
     async def recover_interrupted_jobs(self) -> list[str]:
@@ -540,14 +911,17 @@ class Pipeline:
             if project.status not in TRANSIENT_STATUSES:
                 continue
             manifest = self.store.load_video_manifest(project.id)
+            audio = self.store.load_audio_manifest(project.id)
             if project.status == ProjectStatus.VIDEO_GENERATING:
-                self._settle_video_status(project, manifest)
-            else:
-                # 配音/合成阶段未实现，回退到视频就绪
+                self._settle_video_status(project, manifest, audio)
+            elif project.status == ProjectStatus.AUDIO_GENERATING:
+                self._settle_audio_status(project, audio, manifest)
+            else:  # COMPOSING：半截成片已经在合成任务里清掉了
+                self.store.purge_media(project.id, compose=True)
                 project.status = (
-                    ProjectStatus.VIDEO_READY
-                    if manifest and manifest.ready_clips
-                    else ProjectStatus.STORYBOARD_CONFIRMED
+                    ProjectStatus.AUDIO_READY
+                    if audio and audio.is_usable and manifest and manifest.ready_clips
+                    else ProjectStatus.VIDEO_READY
                 )
                 self.store.save_project(project)
             recovered.append(project.id)

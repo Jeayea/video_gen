@@ -271,6 +271,14 @@ body {
 .clip-card .clip-error { color: var(--red); font-size: 11px; margin-top: 6px; }
 .clip-card.pending { opacity: 0.6; }
 
+.voice-map { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 10px; }
+.voice-row { display: flex; align-items: center; gap: 6px; font-size: 12px; }
+.voice-row .voice-name { color: var(--text2); }
+.voice-row select {
+  background: var(--bg); color: var(--text); border: 1px solid var(--border);
+  border-radius: 6px; padding: 4px 6px; font-size: 12px; font-family: inherit;
+}
+.clip-card audio { width: 100%; height: 32px; margin-top: 6px; }
 .progress-wrap { margin-top: 10px; }
 .progress-bar {
   height: 8px; background: var(--bg); border-radius: 99px; overflow: hidden;
@@ -287,7 +295,7 @@ body {
 
 <div class="header">
   <h1>videogen</h1>
-  <span class="badge">v0.3</span>
+  <span class="badge">v0.4</span>
   <span style="flex:1"></span>
   <span id="health" style="font-size:12px;color:var(--text2)"></span>
   <span id="global-status" style="font-size:12px;color:var(--text2)"></span>
@@ -368,7 +376,11 @@ let currentScript = null;
 let currentStoryboard = null;
 let currentProject = null;
 let currentVideo = null;
+let currentAudio = null;
+let currentCompose = null;
 let videoPollTimer = null;
+let audioPollTimer = null;
+let composePollTimer = null;
 
 const $ = id => document.getElementById(id);
 
@@ -502,6 +514,8 @@ async function renderProject(id) {
   currentScript = await safeGet(`/api/projects/${id}/script`);
   currentStoryboard = await safeGet(`/api/projects/${id}/storyboard`);
   currentVideo = await safeGet(`/api/projects/${id}/video/status`);
+  currentAudio = await safeGet(`/api/projects/${id}/audio/status`);
+  currentCompose = await safeGet(`/api/projects/${id}/compose/status`);
 
   const scriptTotal = currentScript ? currentScript.scenes.reduce((a, s) => a + s.duration_sec, 0) : null;
 
@@ -569,7 +583,7 @@ async function renderProject(id) {
         <button class="btn btn-sm btn-outline" onclick="startEdit('script')" id="btn-script-edit" style="display:none">编辑 JSON</button>
         ${inStatus(p, ['script_review'])
           ? '<button class="btn btn-sm btn-green" onclick="doConfirmScript()">确认剧本 → 进入分镜</button>' : ''}
-        ${inStatus(p, ['script_confirmed','storyboard_review','storyboard_confirmed'])
+        ${inStatus(p, ['script_confirmed','storyboard_review','storyboard_confirmed','video_ready','audio_ready','done'])
           ? '<button class="btn btn-sm btn-danger" onclick="doReopenScript()">退回重生成剧本</button>' : ''}
       </div>
     </div>
@@ -598,13 +612,13 @@ async function renderProject(id) {
         <button class="btn btn-sm btn-outline" onclick="startEdit('storyboard')" id="btn-storyboard-edit" style="display:none">编辑 JSON</button>
         ${inStatus(p, ['storyboard_review'])
           ? '<button class="btn btn-sm btn-green" onclick="doConfirmStoryboard()">确认分镜</button>' : ''}
-        ${inStatus(p, ['storyboard_confirmed'])
+        ${inStatus(p, ['storyboard_confirmed','video_ready','audio_ready','done'])
           ? '<button class="btn btn-sm btn-danger" onclick="doReopenStoryboard()">退回重生成分镜</button>' : ''}
       </div>
     </div>
   `;
 
-  // 4. 视频片段（真实可用；配音/合成仍是 Phase 3）
+  // 4. 视频片段
   html += `
     <div class="panel">
       <h3><span class="num">4</span> 视频片段
@@ -618,9 +632,41 @@ async function renderProject(id) {
         <div class="progress-text" id="video-progress-text"></div>
       </div>
       <div class="panel-actions" id="video-actions"></div>
-      <div class="hint" style="margin-top:10px">
-        配音（Edge-TTS）与 FFmpeg 合成仍是 Phase 3，尚未实现；上面生成的片段已可直接交给下游流程。
+    </div>
+  `;
+
+  // 5. 配音
+  html += `
+    <div class="panel">
+      <h3><span class="num">5</span> 配音
+        <span id="audio-tags"></span>
+      </h3>
+      <div id="audio-body">
+        <span style="color:var(--text2);font-size:12px">尚未生成</span>
       </div>
+      <div class="progress-wrap" id="audio-progress" style="display:none">
+        <div class="progress-bar"><div class="progress-fill" id="audio-progress-fill"></div></div>
+        <div class="progress-text" id="audio-progress-text"></div>
+      </div>
+      <div class="panel-actions" id="audio-actions"></div>
+    </div>
+  `;
+
+  // 6. 成片
+  html += `
+    <div class="panel">
+      <h3><span class="num">6</span> 成片合成
+        <span id="compose-tags"></span>
+      </h3>
+      <div id="compose-body">
+        <span style="color:var(--text2);font-size:12px">尚未合成</span>
+      </div>
+      <div class="progress-wrap" id="compose-progress" style="display:none">
+        <div class="progress-bar"><div class="progress-fill" id="compose-progress-fill"></div></div>
+        <div class="progress-text" id="compose-progress-text"></div>
+      </div>
+      <div id="compose-options" class="edit-form"></div>
+      <div class="panel-actions" id="compose-actions"></div>
     </div>
   `;
 
@@ -629,6 +675,8 @@ async function renderProject(id) {
   renderScript();
   renderStoryboard();
   renderVideo();
+  renderAudio();
+  renderCompose();
   await loadConsistency(id);
 }
 
@@ -641,7 +689,13 @@ function nextStep(status) {
     script_review: '检查剧本与校验报告 → 确认剧本',
     script_confirmed: '生成分镜',
     storyboard_review: '检查分镜 → 确认分镜',
-    storyboard_confirmed: '等待视频/配音/合成阶段（未实现）',
+    storyboard_confirmed: '生成视频片段',
+    video_generating: '视频片段生成中…',
+    video_ready: '生成配音（Edge-TTS）',
+    audio_generating: '配音生成中…',
+    audio_ready: '合成成片（FFmpeg）',
+    composing: '成片合成中…',
+    done: '已出片：可下载成片 / 重新合成',
   })[status] || status;
 }
 
@@ -940,7 +994,9 @@ function clipStatusLabel(status) {
 function videoHint(status) {
   if (status === 'storyboard_review') return '请先确认分镜，再生成视频片段';
   if (status === 'video_generating') return '正在生成…';
-  if (status === 'video_ready') return '片段已就绪（配音 / 合成属 Phase 3）';
+  if (status === 'video_ready') return '片段已就绪，可以生成配音';
+  if (status === 'audio_ready') return '片段已就绪，可以补跑失败镜头或直接合成';
+  if (status === 'done') return '已出片；补跑镜头会让成片作废，需要重新合成';
   return '确认分镜后可生成视频片段';
 }
 
@@ -1002,7 +1058,7 @@ function renderVideo() {
     wrap.style.display = 'none';
   }
 
-  const canStart = ['storyboard_confirmed', 'video_ready'].includes(status) && !active;
+  const canStart = ['storyboard_confirmed', 'video_ready', 'audio_ready', 'done'].includes(status) && !active;
   const buttons = [];
   if (active) {
     buttons.push('<button class="btn btn-sm btn-danger" onclick="doCancelVideo()">取消生成</button>');
@@ -1054,6 +1110,329 @@ function doGenerateVideo() {
 function doCancelVideo() {
   withBusy('取消生成...', () =>
     api(`/api/projects/${currentProjectId}/video/cancel`, { method: 'POST' }));
+}
+
+// ── 配音 ────────────────────────────────────────────────────────────
+
+const EDGE_VOICES = [
+  ['zh-CN-XiaoxiaoNeural', '晓晓 · 女声'],
+  ['zh-CN-XiaoyiNeural', '晓伊 · 女声'],
+  ['zh-CN-YunxiNeural', '云希 · 男声'],
+  ['zh-CN-YunjianNeural', '云健 · 男声（旁白）'],
+  ['zh-CN-YunyangNeural', '云扬 · 男声（播报）'],
+  ['zh-CN-YunxiaNeural', '云夏 · 少年'],
+  ['zh-CN-liaoning-XiaobeiNeural', '晓北 · 东北女声'],
+  ['zh-CN-shaanxi-XiaoniNeural', '晓妮 · 陕西女声'],
+];
+
+function stopAudioPolling() {
+  if (audioPollTimer) { clearTimeout(audioPollTimer); audioPollTimer = null; }
+}
+
+function speakerLabel(clip) {
+  if (clip.speaker_name) return clip.speaker_name;
+  if (clip.speaker === 'narrator') return '旁白';
+  return clip.speaker || '未知';
+}
+
+function audioHint(status) {
+  if (status === 'storyboard_confirmed') return '请先生成视频片段，再生成配音';
+  if (status === 'video_generating') return '视频片段生成中，稍后可生成配音';
+  if (status === 'audio_generating') return '正在合成配音…';
+  if (status === 'audio_ready') return '配音已就绪，可以合成成片';
+  if (status === 'composing') return '正在合成成片…';
+  if (status === 'done') return '已出片；换音色后需要重新合成';
+  return '视频片段就绪后可生成配音（Edge-TTS，需要联网）';
+}
+
+function currentVoiceOverrides() {
+  const overrides = {};
+  document.querySelectorAll('#audio-voices select[data-speaker]').forEach(sel => {
+    const speaker = sel.getAttribute('data-speaker');
+    const base = (currentAudio && currentAudio.voice_map) || {};
+    if (base[speaker] && base[speaker] !== sel.value) overrides[speaker] = sel.value;
+  });
+  return overrides;
+}
+
+function onVoiceChange() {
+  renderAudio();
+}
+
+function renderAudio() {
+  const body = $('audio-body');
+  const actions = $('audio-actions');
+  if (!body || !actions) return;
+
+  const a = currentAudio || {};
+  const job = a.job;
+  const summary = a.summary;
+  const active = !!(job && job.is_active);
+  const status = currentProject ? currentProject.status : '';
+  const clips = (a.manifest && a.manifest.clips) || [];
+
+  $('audio-tags').innerHTML = summary
+    ? `<span class="tag-mini">${summary.ready}/${summary.total} 条</span>` +
+      (summary.failed ? `<span class="tag-mini warn">${summary.failed} 失败</span>` : '') +
+      (summary.placeholder ? `<span class="tag-mini warn">${summary.placeholder} 占位</span>` : '') +
+      (summary.bgm ? `<span class="tag-mini ok">BGM: ${esc(summary.bgm)}</span>` : '') +
+      (summary.usable ? '<span class="tag-mini ok">可进合成</span>' : '')
+    : '';
+
+  if (!clips.length) {
+    body.innerHTML = `<span style="color:var(--text2);font-size:12px">尚未生成</span>`;
+  } else {
+    const voiceMap = a.voice_map || {};
+    const speakers = [];
+    clips.forEach(c => { if (c.speaker && !speakers.includes(c.speaker)) speakers.push(c.speaker); });
+    const voiceRows = speakers.map(sp => {
+      const sample = clips.find(c => c.speaker === sp) || {};
+      const value = voiceMap[sp] || sample.voice || '';
+      const known = EDGE_VOICES.some(v => v[0] === value);
+      const options = EDGE_VOICES
+        .map(([id, label]) => `<option value="${id}"${id === value ? ' selected' : ''}>${esc(label)}</option>`)
+        .join('') + (known || !value ? '' : `<option value="${esc(value)}" selected>${esc(value)}（当前）</option>`);
+      return `<div class="voice-row">
+        <span class="voice-name">${esc(speakerLabel(sample))}</span>
+        <select data-speaker="${esc(sp)}" onchange="onVoiceChange()">${options}</select>
+      </div>`;
+    }).join('');
+
+    body.innerHTML = `
+      <div class="voice-map" id="audio-voices">${voiceRows}</div>
+      <div class="clip-grid">${clips.map(c => {
+        const playable = c.status === 'ready' && c.media_kind === 'audio';
+        const statusClass = c.status === 'failed' ? 'warn' : c.status === 'ready' ? 'ok' : '';
+        return `
+          <div class="clip-card ${c.status === 'ready' ? '' : 'pending'}">
+            <div class="clip-head">
+              <span class="clip-no">${esc(speakerLabel(c))}</span>
+              <span class="tag-mini">${esc(c.kind === 'narration' ? '旁白' : '对白')}</span>
+              <span style="color:var(--text2)">${(c.duration_sec || 0).toFixed(2)}s</span>
+              <span class="tag-mini ${statusClass}">${esc(clipStatusLabel(c.status))}</span>
+            </div>
+            <div class="clip-prompt">${esc(c.text || '')}</div>
+            ${playable
+              ? `<audio controls preload="none" src="/api/projects/${currentProjectId}/audio/${encodeURIComponent(c.id)}"></audio>`
+              : ''}
+            ${c.error ? `<div class="clip-error">${esc(c.error)}</div>` : ''}
+          </div>`;
+      }).join('')}</div>
+      ${(a.manifest && a.manifest.warnings && a.manifest.warnings.length)
+        ? `<div class="hint" style="margin-top:8px">${a.manifest.warnings.map(esc).join('<br>')}</div>` : ''}
+      ${(a.manifest && a.manifest.adjustments && a.manifest.adjustments.length)
+        ? `<div class="hint" style="margin-top:8px">音画对齐：${a.manifest.adjustments.length} 个镜头按配音拉长（合成时冻结末帧补足，不重新生成视频）</div>` : ''}
+    `;
+  }
+
+  const wrap = $('audio-progress');
+  if (active) {
+    wrap.style.display = '';
+    $('audio-progress-fill').style.width = `${job.percent || 0}%`;
+    $('audio-progress-text').textContent =
+      `${job.message || '生成中'}（${job.percent || 0}%，任务 ${job.id}）`;
+  } else {
+    wrap.style.display = 'none';
+  }
+
+  const canStart = ['video_ready', 'audio_ready', 'done'].includes(status) && !active;
+  const changed = Object.keys(currentVoiceOverrides()).length > 0;
+  const buttons = [];
+  if (active) {
+    buttons.push('<button class="btn btn-sm btn-danger" onclick="doCancelAudio()">取消配音</button>');
+  }
+  if (canStart) {
+    const label = changed ? '应用音色并重新生成'
+      : summary && summary.failed ? `重试 ${summary.failed} 条失败配音`
+      : clips.length ? '补跑缺失配音' : '生成配音';
+    buttons.push(`<button class="btn btn-sm" onclick="doGenerateAudio()">${label}</button>`);
+  }
+  if (!buttons.length) {
+    buttons.push(`<span class="hint">${esc(audioHint(status))}</span>`);
+  }
+  actions.innerHTML = buttons.join('');
+
+  if (active) scheduleAudioPoll(); else stopAudioPolling();
+}
+
+function scheduleAudioPoll() {
+  stopAudioPolling();
+  audioPollTimer = setTimeout(refreshAudioPanel, 1500);
+}
+
+async function refreshAudioPanel() {
+  if (!currentProjectId) return;
+  const previousJobId = currentAudio && currentAudio.job ? currentAudio.job.id : null;
+  const status = await safeGet(`/api/projects/${currentProjectId}/audio/status`);
+  if (!status) return;
+  currentAudio = status;
+
+  const job = status.job;
+  const active = !!(job && job.is_active);
+  renderAudio();
+  if (!active && job && job.id === previousJobId) await refresh();
+}
+
+function doGenerateAudio() {
+  const voices = currentVoiceOverrides();
+  stopAudioPolling();
+  withBusy('提交配音任务...', () =>
+    api(`/api/projects/${currentProjectId}/audio/generate`, {
+      method: 'POST',
+      body: JSON.stringify({ voices }),
+    }));
+}
+
+function doCancelAudio() {
+  withBusy('取消配音...', () =>
+    api(`/api/projects/${currentProjectId}/audio/cancel`, { method: 'POST' }));
+}
+
+// ── 成片合成 ────────────────────────────────────────────────────────
+
+function stopComposePolling() {
+  if (composePollTimer) { clearTimeout(composePollTimer); composePollTimer = null; }
+}
+
+function composeHint(status) {
+  if (status === 'video_ready') return '请先生成配音，再合成成片';
+  if (status === 'audio_generating') return '配音生成中…';
+  if (status === 'composing') return '正在合成（分段渲染 → 拼接 → 混音 → 字幕）…';
+  if (status === 'done') return '成片已就绪；改参数后可以重新合成';
+  return '配音就绪后可合成成片（需要 ffmpeg）';
+}
+
+function renderCompose() {
+  const body = $('compose-body');
+  const actions = $('compose-actions');
+  const options = $('compose-options');
+  if (!body || !actions || !options) return;
+
+  const c = currentCompose || {};
+  const job = c.job;
+  const report = c.report;
+  const summary = c.summary;
+  const active = !!(job && job.is_active);
+  const status = currentProject ? currentProject.status : '';
+
+  $('compose-tags').innerHTML = summary
+    ? `<span class="tag-mini">${summary.segments} 段 / ${summary.duration_sec}s</span>` +
+      `<span class="tag-mini">字幕: ${esc(summary.subtitle_mode)}</span>` +
+      (summary.bgm ? `<span class="tag-mini ok">BGM: ${esc(summary.bgm)}</span>` : '') +
+      (summary.warnings ? `<span class="tag-mini warn">${summary.warnings} 条提示</span>` : '')
+    : '';
+
+  if (!report) {
+    body.innerHTML = `<span style="color:var(--text2);font-size:12px">尚未合成</span>`;
+  } else {
+    body.innerHTML = `
+      <video controls preload="metadata" style="width:100%;max-width:320px;border-radius:8px;background:#000"
+             src="/api/projects/${currentProjectId}/final"></video>
+      <div class="panel-actions">
+        <a class="btn btn-sm" href="/api/projects/${currentProjectId}/final" download>下载成片 MP4</a>
+        ${report.subtitles_path
+          ? `<a class="btn btn-sm btn-outline" href="/api/projects/${currentProjectId}/subtitles" download>下载字幕 SRT</a>` : ''}
+      </div>
+      <div class="hint" style="margin-top:8px">
+        时长 ${report.duration_sec}s · 字幕模式 ${esc(report.subtitle_mode_effective || report.subtitle_mode)}
+        ${report.bgm_id ? ` · BGM ${esc(report.bgm_id)}（${report.bgm_gain_db}dB）` : ' · 无 BGM'}
+        · 视频 ${esc(report.video_provider)} / 配音 ${esc(report.tts_provider)}
+      </div>
+      ${(report.warnings && report.warnings.length)
+        ? `<div class="hint" style="margin-top:8px">${report.warnings.map(esc).join('<br>')}</div>` : ''}
+    `;
+  }
+
+  options.innerHTML = `
+    <label>字幕模式
+      <select id="compose-subtitle-mode">
+        <option value="soft">soft · mp4 内嵌字幕轨（推荐）</option>
+        <option value="burn">burn · 烧进画面（需 libass）</option>
+        <option value="none">none · 只导出 srt</option>
+      </select>
+    </label>
+    <div class="row">
+      <label>BGM 曲目 id（留空=按情绪自动选）
+        <input id="compose-bgm-id" placeholder="tense_01" />
+      </label>
+      <label>BGM 音量 dB
+        <input id="compose-bgm-gain" type="number" min="-40" max="0" step="1" value="-20" />
+      </label>
+    </div>
+  `;
+  const modeSel = $('compose-subtitle-mode');
+  if (modeSel) modeSel.value = (report && report.subtitle_mode) || 'soft';
+  const bgmInput = $('compose-bgm-id');
+  if (bgmInput && report && report.bgm_id) bgmInput.value = report.bgm_id;
+
+  const wrap = $('compose-progress');
+  if (active) {
+    wrap.style.display = '';
+    $('compose-progress-fill').style.width = `${job.percent || 0}%`;
+    $('compose-progress-text').textContent =
+      `${job.message || '合成中'}（${job.percent || 0}%，任务 ${job.id}）`;
+  } else {
+    wrap.style.display = 'none';
+  }
+
+  const canCompose = ['audio_ready', 'done'].includes(status) && !active;
+  const buttons = [];
+  if (active) {
+    buttons.push('<button class="btn btn-sm btn-danger" onclick="doCancelCompose()">取消合成</button>');
+  }
+  if (canCompose) {
+    const ready = currentVideo && currentVideo.summary && currentVideo.summary.usable;
+    buttons.push(`<button class="btn btn-sm btn-green" onclick="doCompose()"${ready ? '' : ' disabled'}>${
+      report ? '重新合成成片' : '合成成片'}</button>`);
+    if (!ready) buttons.push('<span class="hint">视频片段不完整（含失败/占位），无法合成</span>');
+  }
+  if (!buttons.length) {
+    buttons.push(`<span class="hint">${esc(composeHint(status))}</span>`);
+  }
+  if (!c.ffmpeg_available) {
+    buttons.push('<span class="hint" style="color:var(--red)">未检测到 ffmpeg，无法合成</span>');
+  }
+  actions.innerHTML = buttons.join('');
+
+  if (active) scheduleComposePoll(); else stopComposePolling();
+}
+
+function scheduleComposePoll() {
+  stopComposePolling();
+  composePollTimer = setTimeout(refreshComposePanel, 1500);
+}
+
+async function refreshComposePanel() {
+  if (!currentProjectId) return;
+  const previousJobId = currentCompose && currentCompose.job ? currentCompose.job.id : null;
+  const status = await safeGet(`/api/projects/${currentProjectId}/compose/status`);
+  if (!status) return;
+  currentCompose = status;
+
+  const job = status.job;
+  const active = !!(job && job.is_active);
+  renderCompose();
+  if (!active && job && job.id === previousJobId) await refresh();
+}
+
+function doCompose() {
+  const mode = $('compose-subtitle-mode') ? $('compose-subtitle-mode').value : 'soft';
+  const bgmId = $('compose-bgm-id') ? $('compose-bgm-id').value.trim() : '';
+  const gainRaw = $('compose-bgm-gain') ? $('compose-bgm-gain').value : '';
+  const body = { subtitle_mode: mode };
+  if (bgmId) body.bgm_id = bgmId;
+  if (gainRaw !== '') body.bgm_gain_db = Number(gainRaw);
+  stopComposePolling();
+  withBusy('提交合成任务...', () =>
+    api(`/api/projects/${currentProjectId}/compose`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }));
+}
+
+function doCancelCompose() {
+  withBusy('取消合成...', () =>
+    api(`/api/projects/${currentProjectId}/compose/cancel`, { method: 'POST' }));
 }
 
 // ── 生成 / 确认 / 退回 ──────────────────────────────────────────────
