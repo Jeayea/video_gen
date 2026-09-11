@@ -222,6 +222,18 @@ def test_appearance_anchor_skips_descriptions_already_in_the_prompt(store, ready
     assert prompt.count(character.visual_prompt.split(",")[0][:30]) == 1
 
 
+def test_build_prompt_strips_llm_label_prefix(store, ready_project):
+    """真实样本：分镜 LLM 把 `English prompt:` 也写进了 video_prompt。"""
+    shot = store.load_storyboard(ready_project.id).shots[0]
+    shot.video_prompt = "English prompt: A woman walks into the office"
+    prompt = video_service.build_prompt(shot, ready_project)
+    assert prompt.startswith("A woman walks into the office")
+    assert "English prompt" not in prompt
+
+    shot.video_prompt = "Prompt: 英文提示词： A man turns around"
+    assert video_service.build_prompt(shot, ready_project).startswith("A man turns around")
+
+
 def test_appearance_anchor_is_empty_without_bible(store, ready_project):
     shot = store.load_storyboard(ready_project.id).shots[0]
     assert video_service.appearance_anchor(shot, None, "x") == ""

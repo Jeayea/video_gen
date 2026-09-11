@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -275,7 +276,7 @@ def build_prompt(shot: Shot, project: Project, bible: StoryBible | None = None) 
     分镜 LLM 有时把 `character.visual_prompt` 抄进 `video_prompt`、有时只写
     "a young woman" —— 抄了就跳过，没抄就补上，让同一个角色在每个镜头里的文字描述一致。
     """
-    base = (shot.video_prompt or shot.visual_description or "").strip()
+    base = _strip_prompt_label(shot.video_prompt or shot.visual_description or "")
     if not base:
         base = "cinematic shot"
     parts = [base]
@@ -288,6 +289,26 @@ def build_prompt(shot: Shot, project: Project, bible: StoryBible | None = None) 
         parts.append(anchor)
     parts.append(f"{max(1, shot.duration_sec)} seconds")
     return ", ".join(parts)
+
+
+#: 分镜 LLM 偶尔把「标签」也写进 video_prompt（真实样本：`English prompt: A confident…`）。
+#: 这种前缀对视频模型毫无意义，还会挤占注意力，生成前统一剥掉。
+_PROMPT_LABEL_RE = re.compile(
+    r"^(?:english\s+prompt|video\s+prompt|visual\s+prompt|prompt|description"
+    r"|英文提示词|英文描述|提示词|描述)\s*[:：]\s*",
+    re.IGNORECASE,
+)
+
+
+def _strip_prompt_label(text: str) -> str:
+    """剥掉 prompt 开头反复出现的标签前缀（最多三轮，防止 `Prompt: English prompt:`）。"""
+    out = str(text or "").strip()
+    for _ in range(3):
+        stripped = _PROMPT_LABEL_RE.sub("", out, count=1).strip()
+        if stripped == out:
+            break
+        out = stripped
+    return out
 
 
 #: 每个角色的外貌描述最多带这么多字符，避免 prompt 被圣经挤爆

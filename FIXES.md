@@ -715,12 +715,33 @@ prompt 里带着中文名 `林悦` 和风格 `都市复仇`，模型把「都市
 - 或者用新增的 `IMAGE_PROMPT_SUFFIX`（英文，例如 `East Asian cast, Chinese television drama`）
   统一整组基调（配置侧，一次覆盖所有角色）
 
+### 实测验证：参考图真的锁住了脸
+
+把 3 个含林悦正脸的镜头（`scene_1_shot_3` / `scene_2_shot_3` / `scene_4_shot_4`）
+重置为待生成后重跑（**唯一变量**就是这次带上了 `input_references`）：
+
+```
+scene_1_shot_3: 旧=棕色齐肩发圆脸 → 新=黑短发，与定妆照同一张脸（哭戏）
+scene_2_shot_3: 旧=黑色高马尾不同脸型 → 新=同一张脸（坚毅表情）
+scene_4_shot_4: 旧=另一个人 → 新=同一张脸 + 后期造型（桂冠/妆容），人物弧光成立
+花费：3 × 5s × $0.13 = $1.9500（preflight 预估 $1.95，完全一致）
+账本：video 阶段 $9.75 → $11.70（calls 15 → 18），总计 $12.02 / 预算 $20
+```
+
+服务日志里**没有**「带参考图提交被拒」的降级告警 → `input_references` 是被接受的；
+另外 H3 元数据里的 `reference_images` SKU（$0.04/镜头）这次**没有实际计费**
+（每镜头实收仍是 $0.65）。对比图见 `projects/<id>/consistency_before.png` / `_after.png`。
+
+顺带修掉一个 prompt 脏数据：分镜 LLM 把标签也写进了 `video_prompt`
+（真实样本 `English prompt: A confident…`），`build_prompt` 现在会剥掉
+`English prompt:` / `Prompt:` / `英文提示词：` 这类前缀。
+
 ### 测试
 
 新增 `tests/test_character_image.py`（23）、`tests/test_image_openrouter.py`（11）、
 `tests/test_ffmpeg_selection.py`（5），并在 `test_compose.py` 补 4 例 VTT/升级路径、
 `test_api.py` 补 5 例（plan / 单个 / 批量 / vtt / health）、`test_video.py` 补 3 例文本锚点。
-全套 **417 passed**，ruff clean。
+全套 **418 passed**，ruff clean。
 
 顺带修掉一个测试基线漏洞：`.env` 改成 `COMPOSE_SUBTITLE_MODE=burn` 后，
 `test_compose.py` 里两个默认 soft 的用例开始失败（真实行为变了）——
