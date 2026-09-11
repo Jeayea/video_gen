@@ -879,3 +879,20 @@ scene_4_shot_4: 旧=另一个人 → 新=同一张脸 + 后期造型（桂冠/�
 `test_voice_catalog.py` 14 例 + `test_video.py` 3 例 + `test_consistency.py` 6 例
 （含严格模式：重复场 ERROR、问句结尾只 WARNING、空场 ERROR、confirm 被拦 + force 放行）。
 全套 **444 passed**，ruff clean。
+
+### 表演规范实测（3 个镜头 A/B，$1.95）
+
+用新的表演/运镜规范重跑 `scene_1_shot_3`（哭戏）、`scene_2_shot_2`（含泪不甘）、
+`scene_2_shot_4`（训练全景），与旧版逐帧对比（`projects/<id>/expression_before_after.png`）：
+
+| 镜头 | 旧 | 新 |
+|---|---|---|
+| s1_3 哭戏 | 眉毛挤成一团、张嘴痛哭、面部肌肉扭曲（舞台剧腔） | 眼眶湿润、压抑的悲伤，姿态自然 |
+| s2_2 不甘 | 极端特写 + 眼泪 + 表情夸张 | 中景、表情平静（**情绪强度明显被压低**） |
+| s2_4 训练 | 姿态略怪、画面偏虚 | 更稳、更实 |
+
+**结论要说清楚：自然度上去了，情绪强度下来了。** 这条 `VIDEO_PERFORMANCE_DIRECTIVE`
+（subtle / restrained / avoid exaggerated）确实治住了「舞台剧式表演」，但同一句话也会
+把该有的情绪一起压平。它是**可配的**：想保住自然度同时让情绪仍然读得出来，可以改成
+`natural restrained acting with clearly readable emotion (no theatrical exaggeration)` 之类，
+再跑 2-3 个镜头对比。这是创作取向，不该由代码单方面决定。
