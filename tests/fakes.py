@@ -51,13 +51,28 @@ class FakeLLM(LLMProvider):
         self.include_stage_direction = include_stage_direction
         self.video_prompt_with_ids = video_prompt_with_ids
         self.calls: list[list[LLMMessage]] = []
+        #: 成本记账用：假装这些调用花了 token
+        self.token_estimate = 3
+        self.model = "fake-model"
+        self.models_used: list[str] = []
 
     # ── LLMProvider 接口 ──────────────────────────────
+
+    @property
+    def name(self) -> str:
+        return "fake"
+
+    def with_model(self, model: str) -> FakeLLM:
+        self.model = model or self.model
+        self.models_used.append(model)
+        return self
 
     async def chat(self, messages: list[LLMMessage], **kwargs: Any) -> str:
         self.calls.append(messages)
         self._maybe_fail("chat")
-        return "假 logline：主角绝地翻盘"
+        reply = "假 logline：主角绝地翻盘"
+        self._record(messages, reply)
+        return reply
 
     async def chat_json(
         self,
@@ -70,9 +85,17 @@ class FakeLLM(LLMProvider):
     ) -> Any:
         self.calls.append(messages)
         payload = self._respond(messages)
+        self._record(messages, json.dumps(payload, ensure_ascii=False))
         if schema is None:
             return payload
         return schema.model_validate(payload)
+
+    def _record(self, messages: list[LLMMessage], reply: str) -> None:
+        """按字符数粗算 token，让成本链路在离线测试里也有数可记。"""
+        self.record_usage(
+            input_tokens=sum(len(m.content) for m in messages) // self.token_estimate,
+            output_tokens=len(reply) // self.token_estimate + 1,
+        )
 
     # ── 内部 ──────────────────────────────────────────
 
@@ -235,7 +258,10 @@ class FakeVideoProvider(VideoProvider):
         fail_times: int = 0,
         delay: float = 0.0,
         media_kind: MediaKind = MediaKind.VIDEO,
+        supports_reference_image: bool = False,
     ):
+        self.supports_reference_image = supports_reference_image
+        self.requests: list[VideoRequest] = []
         self.fail_shots = set(fail_shots or ())
         self.fail_times = fail_times
         self.delay = delay
@@ -250,6 +276,7 @@ class FakeVideoProvider(VideoProvider):
 
     async def generate(self, request: VideoRequest) -> GeneratedClip:
         self.calls.append(request.shot_id)
+        self.requests.append(request)
         self.active += 1
         self.max_active = max(self.max_active, self.active)
         try:

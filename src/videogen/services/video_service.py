@@ -5,6 +5,7 @@ import logging
 from collections.abc import Callable
 from pathlib import Path
 
+from videogen.models.bible import StoryBible
 from videogen.models.project import Project
 from videogen.models.storyboard import Shot, Storyboard
 from videogen.models.video import ClipStatus, MediaKind, VideoClip, VideoManifest
@@ -29,6 +30,8 @@ async def generate_clips(
     concurrency: int = 3,
     max_retries: int = 2,
     existing: VideoManifest | None = None,
+    bible: StoryBible | None = None,
+    seed: int = 0,
     on_progress: ProgressCallback = None,
     retry_backoff_sec: float = DEFAULT_RETRY_BACKOFF_SEC,
 ) -> VideoManifest:
@@ -87,6 +90,8 @@ async def generate_clips(
                 clips_dir,
                 project_dir,
                 manifest,
+                bible=bible,
+                seed=seed,
                 max_retries=max_retries,
                 retry_backoff_sec=retry_backoff_sec,
                 on_progress=on_progress,
@@ -108,6 +113,8 @@ async def _generate_one(
     project_dir: Path,
     manifest: VideoManifest,
     *,
+    bible: StoryBible | None = None,
+    seed: int = 0,
     max_retries: int,
     retry_backoff_sec: float,
     on_progress: ProgressCallback,
@@ -117,6 +124,7 @@ async def _generate_one(
         return
 
     output = clips_dir / f"{shot.id}.mp4"
+    reference, shot_seed = resolve_reference(shot, bible, project_dir, provider, seed)
     request = VideoRequest(
         shot_id=shot.id,
         scene_id=shot.scene_id,
@@ -124,6 +132,8 @@ async def _generate_one(
         duration_sec=max(1, shot.duration_sec),
         aspect_ratio=project.aspect_ratio.value,
         output_path=output,
+        reference_image=reference,
+        seed=shot_seed,
     )
 
     clip.status = ClipStatus.GENERATING
@@ -166,6 +176,42 @@ async def _generate_one(
         clip.error = ""
         manifest.upsert(clip)
         return
+
+
+def resolve_reference(
+    shot: Shot,
+    bible: StoryBible | None,
+    project_dir: Path,
+    provider: VideoProvider,
+    default_seed: int = 0,
+) -> tuple[Path | None, int | None]:
+    """挑出这个镜头要用的参考图与 seed（角色一致性）。
+
+    规则：provider 支持参考图时，取「画面里第一个配了参考图、且文件还在」的角色；
+    seed 优先用角色自己的，其次用全局 `VIDEO_SEED`。没有就返回 `(None, None)`，
+    绝不因为缺参考图就跳过生成。
+    """
+    if not provider.supports_reference_image or not bible:
+        return None, (default_seed or None)
+
+    for char_id in shot.character_in_frame or []:
+        character = bible.get_character(char_id)
+        if character is None or not character.reference_image:
+            continue
+        candidate = (Path(project_dir) / character.reference_image).resolve()
+        try:  # 参考图必须留在项目目录内
+            candidate.relative_to(Path(project_dir).resolve())
+        except ValueError:
+            logger.warning(
+                "角色 %s 的参考图越出项目目录，已忽略：%s", char_id, character.reference_image
+            )
+            continue
+        if candidate.is_file():
+            seed = character.seed if character.seed is not None else (default_seed or None)
+            return candidate, seed
+        logger.warning("角色 %s 的参考图不存在，已忽略：%s", char_id, candidate)
+
+    return None, (default_seed or None)
 
 
 def build_prompt(shot: Shot, project: Project) -> str:

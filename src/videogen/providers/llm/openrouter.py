@@ -44,6 +44,7 @@ class OpenRouterProvider(LLMProvider):
     ) -> str:
         payload: dict[str, Any] = self._payload(messages, temperature, max_tokens, json_mode)
         data = await self._post_with_retry(payload, json_requested=json_mode)
+        self._record_usage(data)
         content = self._content_of(data)
         logger.debug("LLM ok model=%s chars=%d json=%s", self.model, len(content), json_mode)
         return content
@@ -181,6 +182,30 @@ class OpenRouterProvider(LLMProvider):
     @staticmethod
     async def _backoff(attempt: int) -> None:
         await asyncio.sleep(min(2**attempt, 8))
+
+    @property
+    def name(self) -> str:
+        return "openrouter"
+
+    def with_model(self, model: str) -> OpenRouterProvider:
+        """同一个 provider 配置下换模型（用于多模型对比）。"""
+        if not model or model == self.model:
+            return self
+        return OpenRouterProvider(api_key=self.api_key, model=model)
+
+    def _record_usage(self, data: dict[str, Any]) -> None:
+        raw = data.get("usage") or {}
+        if not isinstance(raw, dict):
+            return
+        try:
+            prompt = int(raw.get("prompt_tokens") or 0)
+            completion = int(raw.get("completion_tokens") or 0)
+            total = int(raw.get("total_tokens") or 0)
+        except (TypeError, ValueError):
+            return
+        if completion == 0 and total > prompt:
+            completion = total - prompt
+        self.record_usage(input_tokens=prompt, output_tokens=completion)
 
     @staticmethod
     def _content_of(data: dict[str, Any]) -> str:

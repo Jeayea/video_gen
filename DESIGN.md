@@ -562,7 +562,7 @@ FFMPEG_PATH=ffmpeg
 
 ---
 
-## 10. 实现状态（v0.4，2026-09-11 更新）
+## 10. 实现状态（v0.5，2026-09-11 更新）
 
 ### 已落地
 
@@ -582,14 +582,22 @@ FFMPEG_PATH=ffmpeg
 - 状态机补全：`VIDEO_GENERATING → VIDEO_READY → AUDIO_GENERATING → AUDIO_READY → COMPOSING → DONE`，
   配音与合成同样是带进度/取消/互斥的后台任务；上游文本一变就作废下游媒体
 
-### 尚未实现（Phase B 打磨）
+- **Phase B（打磨）已完成（v0.5）**：
+  - 成本：按阶段记 token / 秒数 / 字符 → USD 账本（`cost_report.json`），
+    `BUDGET_USD` 预算门控在开工前拦「已花 + 预估」，`/api/projects/{id}/cost` 可查
+  - 批量：`BatchManager` + `Pipeline.run_chain`，一次提交多主题跑完整链路，
+    `stop_after` 可停在 storyboard / video / audio / compose，单条失败不影响其它条目
+  - 多模型：项目级 `llm_model` 或单次请求 `{"model": ...}` 切换，候选与单价走配置，
+    账本记录每阶段实际模型
+  - 角色一致性：参考图（base64 上传 → `refs/`）与 seed 透传到 `VideoRequest`，
+    路径越界/超限会拒绝；mock provider 用参考图取色，便于验证参数真的传到了 provider
 
-- 成本估算与额度控制（token / 秒数 / 字符 → USD 账本，超预算拒绝开工）
-- 批量生产模式（一次提交多个主题，自动跑完整条链路）
-- 多模型对比切换（同一阶段换模型重跑并留档对比）
-- 角色一致性：reference image / seed 的端到端接入（`VideoRequest.reference_image` 与
-  `VideoProvider.supports_reference_image` 已预留）
-- 任务状态只在进程内存里（项目状态已落盘，重启会自动回收）
+### 尚未实现（后续可做）
+
+- 多模型**对比留档**（同一阶段两个模型的产物并排对比）：目前只支持切换与记账
+- 真实视频 provider 接入后的角色一致性验证（mock 只能证明参数透传）
+- 任务/批量状态仅在进程内存里（项目状态已落盘，重启会自动回收）
+- 一个镜头多音轨混音、配音情感/语速的逐句覆盖
 
 > §2.3 的目录结构是目标形态，当前实际结构见 [README.md](README.md#代码结构)；
 > 问题审计与修复记录见 [REVIEW.md](REVIEW.md) 与 [FIXES.md](FIXES.md)。

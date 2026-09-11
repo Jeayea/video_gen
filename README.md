@@ -20,7 +20,10 @@
 | FFmpeg 合成 + 字幕 | ✅ | 分段渲染 → concat → BGM 混音 → 字幕（soft 内嵌 / burn 烧录 / none 只导 srt） |
 | 后台任务队列 | ✅ | 提交即返回 job id，进度查询 / 取消 / 单项目互斥 / 重启恢复 |
 | 手工编辑 / 分阶段确认门控 | ✅ | Web UI + REST |
-| 成本统计 / 批量生产 | ❌ | DESIGN Phase 4（打磨），尚未实现 |
+| 成本统计与预算 | ✅ | 按阶段记 token / 秒数 / 字符 → USD 账本，超预算直接拒绝开工 |
+| 批量生产 | ✅ | 一次提交多个主题自动跑完整链路（可指定跑到哪一步停） |
+| 多模型切换 | ✅ | 项目级或单次请求指定模型，候选列表 + 单价由配置给出 |
+| 角色一致性 | ✅ 接口 | 参考图上传 + seed 透传到 `VideoRequest`；mock provider 用参考图取色以便验证 |
 
 ## 快速开始
 
@@ -118,6 +121,12 @@ VIDEO_GENERATING ─▶ VIDEO_READY ──生成配音──▶ AUDIO_GENERATING
 | GET | `/api/projects/{id}/compose/status` | 合成进度 + 成片报告 |
 | POST | `/api/projects/{id}/compose/cancel` | 取消合成任务 |
 | GET | `/api/projects/{id}/final` · `/subtitles` | 下载成片 MP4 / 字幕 SRT |
+| GET | `/api/models` | 可选模型 / 单价 / 预算（前端下拉用） |
+| GET | `/api/projects/{id}/cost` | 成本账本：按阶段的花费、token、秒数、字符 + 预估 |
+| POST/GET/DELETE | `/api/projects/{id}/characters/{cid}/reference` | 角色参考图（base64 上传 / 下载 / 删除） |
+| POST | `/api/batches` | **批量生产**（202 + batch；`stop_after` 可只跑到 storyboard/video/audio） |
+| GET | `/api/batches` · `/api/batches/{id}` · `/api/batches/stages` | 批量列表 / 详情 / 可选阶段 |
+| POST | `/api/batches/{id}/cancel` | 取消批量任务 |
 | GET | `/api/projects/{id}/jobs` · `/api/jobs/{job_id}` | 任务列表 / 单任务状态 |
 
 接口文档：`/docs`。
@@ -130,13 +139,14 @@ src/videogen/
 ├── main.py                   # FastAPI 入口（静态 UI / 可选 token 鉴权 / 错误映射）
 ├── models/                   # 数据模型（容错校验器、llm_io schema、video / audio / compose）
 ├── services/                 # bible / script / storyboard / consistency / video / audio
-│                             #   / subtitle（SRT 时间轴）/ compose（FFmpeg 合成）
+│                             #   / subtitle（SRT 时间轴）/ compose（FFmpeg 合成）/ cost（记账）
 ├── providers/llm/            # LLMProvider 抽象 + OpenRouter 实现（JSON 修复 + schema 重试）
 ├── providers/video/          # VideoProvider 抽象 + MockVideoProvider（ffmpeg 占位视频）
 ├── providers/tts/            # TTSProvider 抽象 + EdgeTTSProvider + MockTTSProvider
 ├── providers/bgm/            # 本地 BGM 曲库（元数据 + 按情绪匹配）
 ├── orchestrator/
-│   ├── pipeline.py           # 状态机、门控、锁、断点续跑、媒体失效
+│   ├── pipeline.py           # 状态机、门控、锁、断点续跑、媒体失效、成本记账
+│   ├── batch.py              # 批量生产（多主题串/并行跑完整链路）
 │   └── jobs.py               # 进程内后台任务队列（进度/取消/互斥/裁剪）
 ├── tools/demo_bgm.py         # 生成演示用免版权 BGM（ffmpeg 合成）
 └── utils/                    # file_store / coerce / duration / ffmpeg / text / redact
@@ -154,18 +164,27 @@ src/videogen/
   的项目收回到最近一个「产物确实存在」的状态
 - **配音容错**：按镜头并发（`TTS_CONCURRENCY`）、单条失败不阻塞其他条目、失败可重跑、
   已就绪的条目（含音色）不重复合成；换音色只重跑那个角色
+- **花钱前先问一句**：`BUDGET_USD` > 0 时，每个阶段开工前都会检查「已花 + 预估」；
+  视频按秒、配音按字符预估，超了直接拒绝并说明还差多少，绝不事后才发现爆预算
+- **换模型不改代码**：项目的 `llm_model` 或单次请求的 `{"model": ...}` 都能切换，
+  成本账本会记下每个阶段用的是哪个模型
+- **批量生产的边界**：批量**跳过人工确认门控**（这是它的意义），所以它复用同一套
+  `run_chain`（文本 → 视频 → 配音 → 合成），单条失败不影响其它条目，失败条目保留项目便于接管
 - **字幕时间轴与成片一致**：SRT 按分段时长累加生成，每条字幕只覆盖「说话的那几秒」，
   默认字号 = `min(宽,高) × 5%`（竖屏 1080 宽 ≈ 54px）
 
 ## 已知限制
 
-1. **成本统计与批量生产未实现**（DESIGN Phase 4）：没有 token/USD 账本，也没有一次跑多个主题的入口
-2. **一个镜头最多一条配音**：分镜同时给了对白和旁白时只念对白（旁白被跳过并记 warning），
+1. **单价要自己核对**：默认单价只是常见值，真实账单请改 `.env` 里的 `*_PRICE_*`
+2. **批量跳过人工确认**：批量链路不会停下来等人审核剧本/分镜，量产前建议先单条跑通
+3. **一个镜头最多一条配音**：分镜同时给了对白和旁白时只念对白（旁白被跳过并记 warning），
    否则两条音轨会在同一镜头里互相盖住
-3. **任务状态在内存里**：多 worker 部署时 `GET /jobs/{id}` 可能查不到（项目状态本身已落盘，重启会自动回收）
-4. **锁是单进程内的**：多 worker / 多进程部署需要换成文件锁或数据库
-5. **合成是串行 CPU 活**：分段渲染并发受 `COMPOSE_CONCURRENCY` 限制，长片会占满 CPU
-6. UI 没有鉴权登录页，`API_TOKEN` 通过 `?token=` 或 `localStorage` 传递
+4. **任务状态在内存里**：多 worker 部署时 `GET /jobs/{id}` 可能查不到（项目状态本身已落盘，重启会自动回收）
+5. **锁是单进程内的**：多 worker / 多进程部署需要换成文件锁或数据库
+6. **合成是串行 CPU 活**：分段渲染并发受 `COMPOSE_CONCURRENCY` 限制，长片会占满 CPU
+7. **角色一致性只是接口就绪**：mock provider 只是「用参考图取色」证明参数透传，
+   真正的一致性要靠接上支持 reference image / seed 的真实 provider
+8. UI 没有鉴权登录页，`API_TOKEN` 通过 `?token=` 或 `localStorage` 传递
 
 ## 安全
 

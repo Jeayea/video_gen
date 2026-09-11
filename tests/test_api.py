@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import time
 
 import pytest
@@ -12,6 +13,9 @@ from videogen.orchestrator.pipeline import Pipeline
 from videogen.providers.tts.mock import MockTTSProvider
 from videogen.providers.video.mock import MockVideoProvider
 from videogen.utils.file_store import FileStore
+
+#: 一个最小的假 PNG（base64），参考图上传用例用
+PNG_BASE64 = base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"fake-image").decode()
 
 
 @pytest.fixture
@@ -478,3 +482,149 @@ def test_compose_rejects_invalid_subtitle_mode(client):
     pid = prepare_confirmed_storyboard(client)
     resp = client.post(f"/api/projects/{pid}/compose", json={"subtitle_mode": "乱填"})
     assert resp.status_code == 422
+
+
+# ── 模型 / 成本 / 参考图 / 批量（Phase B）────────────────
+
+
+def test_models_endpoint(client):
+    data = client.get("/api/models").json()
+    assert data["default"]
+    assert data["default"] in data["candidates"]
+    assert "llm_input_per_mtok" in data["prices"]
+    assert "budget_usd" in data
+
+
+def test_cost_endpoint(client):
+    pid = create_project(client)["id"]
+    assert client.post(f"/api/projects/{pid}/bible/generate").status_code == 200
+
+    data = client.get(f"/api/projects/{pid}/cost").json()
+    assert data["summary"]["total_usd"] >= 0
+    assert data["summary"]["total_tokens"] > 0
+    assert "bible" in data["stages"]
+    assert "video_usd" in data["estimate"]
+
+    assert client.get("/api/projects/nope/cost").status_code == 404
+
+
+def test_generate_accepts_model_override(client):
+    pid = create_project(client)["id"]
+    resp = client.post(
+        f"/api/projects/{pid}/bible/generate", json={"model": "anthropic/claude-3.5-haiku"}
+    )
+    assert resp.status_code == 200
+
+    report = client.get(f"/api/projects/{pid}/cost").json()
+    assert report["summary"]["entries"] == 1
+    assert report["stages"]["bible"]["tokens"] > 0
+    assert report["budget_usd"] == 0.0
+
+
+def test_reference_image_flow(client):
+    pid = prepare_confirmed_storyboard(client)
+
+    payload = {"filename": "lin.png", "content_base64": PNG_BASE64}
+    resp = client.post(f"/api/projects/{pid}/characters/char_1/reference", json=payload)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["path"] == "refs/char_1.png"
+
+    bible = client.get(f"/api/projects/{pid}/bible").json()
+    assert bible["characters"][0]["reference_image"] == "refs/char_1.png"
+
+    image = client.get(f"/api/projects/{pid}/characters/char_1/reference")
+    assert image.status_code == 200
+    assert len(image.content) > 0
+
+    assert client.delete(f"/api/projects/{pid}/characters/char_1/reference").status_code == 200
+    assert client.get(f"/api/projects/{pid}/characters/char_1/reference").status_code == 404
+
+
+def test_reference_image_validation(client, monkeypatch):
+    pid = prepare_confirmed_storyboard(client)
+    url = f"/api/projects/{pid}/characters/char_1/reference"
+
+    bad_ext = client.post(url, json={"filename": "a.gif", "content_base64": PNG_BASE64})
+    assert bad_ext.status_code == 400
+    assert client.post(url, json={"filename": "a.png", "content_base64": "!!!"}).status_code == 400
+    assert client.post(
+        f"/api/projects/{pid}/characters/char_nope/reference",
+        json={"filename": "a.png", "content_base64": PNG_BASE64},
+    ).status_code == 404
+
+    from videogen import main
+
+    monkeypatch.setattr(main.settings, "reference_image_max_mb", 0.000001)
+    resp = client.post(url, json={"filename": "a.png", "content_base64": PNG_BASE64})
+    assert resp.status_code == 400
+    assert "太大" in resp.json()["detail"]
+
+
+def wait_batch(client: TestClient, batch_id: str, timeout: float = 20.0) -> dict:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        data = client.get(f"/api/batches/{batch_id}").json()
+        if not data["is_active"]:
+            return data
+        time.sleep(0.02)
+    raise AssertionError("批量任务没有在超时前结束")
+
+
+def test_batch_endpoints(client):
+    assert client.get("/api/batches/stages").json()["stop_after"][0] == "storyboard"
+
+    resp = client.post(
+        "/api/batches",
+        json={
+            "items": [{"input_text": "逆袭故事", "title": "批量A"}, {"input_text": "复仇故事"}],
+            "target_duration_sec": 30,
+            "stop_after": "storyboard",
+        },
+    )
+    assert resp.status_code == 202, resp.text
+    batch = resp.json()
+    assert batch["summary"]["total"] == 2
+
+    done = wait_batch(client, batch["id"])
+    assert done["status"] == "succeeded"
+    assert done["percent"] == 100
+    assert done["summary"]["succeeded"] == 2
+    for item in done["items"]:
+        assert item["project_id"]
+        assert client.get(f"/api/projects/{item['project_id']}").json()["status"] == (
+            "storyboard_confirmed"
+        )
+
+    assert len(client.get("/api/batches").json()) >= 1
+    assert client.get("/api/batches/nope").status_code == 404
+    assert client.post("/api/batches/nope/cancel").json()["cancelled"] is False
+
+
+def test_batch_endpoint_validation(client):
+    assert client.post("/api/batches", json={"items": []}).status_code == 422
+    resp = client.post(
+        "/api/batches",
+        json={"items": [{"input_text": "x"}], "stop_after": "乱填"},
+    )
+    assert resp.status_code == 400
+    assert "stop_after" in resp.json()["detail"]
+
+
+def test_health_reports_budget_and_batch(client):
+    data = client.get("/api/health").json()
+    assert "budget_usd" in data
+    assert "active_batches" in data
+    assert data["llm_model_candidates"]
+
+
+def test_budget_exceeded_returns_400(client, monkeypatch):
+    """超预算要被拒绝且返回可读原因（不是 500）。"""
+    from videogen import main
+
+    pid = prepare_confirmed_storyboard(client)
+    monkeypatch.setattr(main.settings, "budget_usd", 0.0000001)
+
+    resp = client.post(f"/api/projects/{pid}/video/generate")
+    assert resp.status_code == 400
+    assert "预算不足" in resp.json()["detail"]
+    assert client.get(f"/api/projects/{pid}").json()["status"] == "storyboard_confirmed"

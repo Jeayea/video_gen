@@ -28,7 +28,9 @@ class VideoRequest(BaseModel):
     duration_sec: int
     aspect_ratio: str = "9:16"
     output_path: Path
+    #: 角色一致性：参考图 + 固定 seed（provider 不支持时为空）
     reference_image: Path | None = None
+    seed: int | None = None
 
     model_config = {"arbitrary_types_allowed": True}
 

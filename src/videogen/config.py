@@ -69,6 +69,29 @@ class Settings(BaseSettings):
     #: 保留中间分段文件（排查用）
     compose_keep_segments: bool = False
 
+    # 成本与预算（单价都可配，第三方价格会变）
+    #: 0 = 不限制；单位 USD
+    budget_usd: float = 0.0
+    budget_warn_ratio: float = 0.8
+    llm_input_price_per_mtok: float = 0.30
+    llm_output_price_per_mtok: float = 2.50
+    #: 真实视频 API 按秒计费（mock = 0），例如可灵约 0.05/秒
+    video_price_per_second: float = 0.0
+    #: 真实 TTS 按字符计费（edge-tts 免费 = 0）
+    tts_price_per_mchar: float = 0.0
+    #: 可切换的模型候选（逗号分隔），用于前端下拉
+    llm_model_candidates: str = (
+        "google/gemini-2.5-flash,google/gemini-2.5-pro,anthropic/claude-3.5-haiku"
+    )
+
+    # 角色一致性
+    #: 固定 seed（0 = 不指定），真实 provider 用来稳定人物外观
+    video_seed: int = 0
+    reference_image_max_mb: float = 8.0
+
+    # 批量生产
+    batch_max_items: int = 20
+
     # Paths
     projects_dir: Path = Path("./projects")
     static_dir: Path | None = None
@@ -97,6 +120,17 @@ class Settings(BaseSettings):
     @property
     def bgm_path(self) -> Path:
         return self.bgm_dir.expanduser().resolve()
+
+    @property
+    def candidate_models(self) -> list[str]:
+        models = [m.strip() for m in (self.llm_model_candidates or "").split(",")]
+        seen: list[str] = []
+        for model in models:
+            if model and model not in seen:
+                seen.append(model)
+        if self.openrouter_model and self.openrouter_model not in seen:
+            seen.insert(0, self.openrouter_model)
+        return seen
 
     @property
     def subtitle_mode(self) -> str:

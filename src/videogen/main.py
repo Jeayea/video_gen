@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import secrets
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
@@ -11,11 +12,14 @@ from pydantic import BaseModel, Field
 
 from videogen import __version__
 from videogen.config import get_settings
+from videogen.models.bible import Character, StoryBible
 from videogen.models.project import AspectRatio, InputMode, Project
+from videogen.orchestrator.batch import STOP_AFTER_STAGES, BatchManager
 from videogen.orchestrator.pipeline import Pipeline, PipelineError, PipelineNotFound
 from videogen.providers.llm.base import LLMError
 from videogen.providers.tts.base import TTSProviderError
 from videogen.providers.video.base import VideoProviderError
+from videogen.services.cost_service import BudgetExceeded, PriceTable
 from videogen.utils.ffmpeg import (
     ffmpeg_available,
     ffmpeg_capabilities,
@@ -65,6 +69,7 @@ async def lifespan(app: FastAPI):
 
     yield
 
+    await batches.shutdown()
     await pipeline.jobs.shutdown()
     logger.info("videogen shutting down")
 
@@ -73,6 +78,7 @@ app = FastAPI(title="videogen", version=__version__, lifespan=lifespan)
 
 store = FileStore()
 pipeline = Pipeline(store)
+batches = BatchManager()
 
 if settings.static_path.is_dir():
     app.mount("/static", StaticFiles(directory=settings.static_path), name="static")
@@ -116,6 +122,12 @@ async def _video_error_handler(request: Request, exc: VideoProviderError):
     return JSONResponse({"detail": str(exc)}, status_code=502)
 
 
+@app.exception_handler(BudgetExceeded)
+async def _budget_handler(request: Request, exc: BudgetExceeded):
+    # 超预算是业务拒绝，不是服务端故障：用 400 让前端直接把原因展示给用户
+    return JSONResponse({"detail": str(exc)}, status_code=400)
+
+
 @app.exception_handler(TTSProviderError)
 async def _tts_error_handler(request: Request, exc: TTSProviderError):
     return JSONResponse({"detail": str(exc)}, status_code=502)
@@ -137,6 +149,37 @@ class UpdateProjectRequest(BaseModel):
     input_text: str | None = None
     aspect_ratio: AspectRatio | None = None
     target_duration_sec: int | None = Field(default=None, ge=5, le=600)
+    #: 为空表示不改；给空字符串表示恢复默认模型
+    llm_model: str | None = None
+
+
+class GenerateRequest(BaseModel):
+    """生成类接口的通用参数：可临时指定 LLM 模型。"""
+
+    model: str | None = None
+
+
+class ReferenceImageRequest(BaseModel):
+    """角色参考图（角色一致性）：base64 上传，避免额外依赖 multipart。"""
+
+    filename: str = "reference.png"
+    content_base64: str = Field(min_length=1)
+
+
+class BatchItemRequest(BaseModel):
+    title: str = ""
+    input_text: str = Field(min_length=1)
+
+
+class BatchRequest(BaseModel):
+    items: list[BatchItemRequest] = Field(min_length=1)
+    target_duration_sec: int = Field(default=45, ge=5, le=600)
+    aspect_ratio: AspectRatio = AspectRatio.VERTICAL
+    input_mode: InputMode = InputMode.THEME
+    #: 批量跑到哪一步就停：storyboard（只要剧本+分镜）/ video / audio / compose（默认全流程）
+    stop_after: str = "compose"
+    model: str = ""
+    concurrency: int = Field(default=1, ge=1, le=4)
 
 
 class AudioGenerateRequest(BaseModel):
@@ -153,6 +196,33 @@ class ComposeRequest(BaseModel):
     bgm_gain_db: float | None = Field(default=None, ge=-60, le=0)
     crf: int | None = Field(default=None, ge=0, le=51)
     subtitle_font_scale: float | None = Field(default=None, gt=0, le=0.2)
+
+
+def _model_of(project_id: str, req: GenerateRequest | None) -> str:
+    """请求里显式给的模型优先，否则用项目上保存的模型（空 = 用 .env 默认）。"""
+    if req and req.model is not None:
+        return req.model.strip()
+    try:
+        return pipeline.get_project(project_id).llm_model
+    except PipelineError:
+        return ""
+
+
+# ── 模型 ────────────────────────────────────────────────────
+
+
+@app.get("/api/models")
+async def list_models():
+    """可选模型 + 单价（前端下拉用）。"""
+    prices = PriceTable.from_settings()
+    return {
+        "default": settings.openrouter_model,
+        "candidates": settings.candidate_models,
+        "prices": prices.model_dump(),
+        "budget_usd": settings.budget_usd,
+        "batch_max_items": settings.batch_max_items,
+        "seed": settings.video_seed,
+    }
 
 
 # ── Health ──────────────────────────────────────────────────
@@ -184,6 +254,9 @@ async def health():
         "stages_implemented": ["bible", "script", "storyboard", "video", "audio", "compose"],
         "stages_pending": [],
         "active_jobs": pipeline.jobs.active_count,
+        "active_batches": batches.active_count,
+        "budget_usd": settings.budget_usd,
+        "llm_model_candidates": settings.candidate_models,
     }
 
 
@@ -230,8 +303,8 @@ async def delete_project(project_id: str):
 
 
 @app.post("/api/projects/{project_id}/bible/generate")
-async def generate_bible(project_id: str):
-    bible = await pipeline.generate_bible(project_id)
+async def generate_bible(project_id: str, req: GenerateRequest | None = None):
+    bible = await pipeline.generate_bible(project_id, model=_model_of(project_id, req))
     return bible.model_dump()
 
 
@@ -254,8 +327,8 @@ async def update_bible(project_id: str, data: dict):
 
 
 @app.post("/api/projects/{project_id}/script/generate")
-async def generate_script(project_id: str):
-    script = await pipeline.generate_script(project_id)
+async def generate_script(project_id: str, req: GenerateRequest | None = None):
+    script = await pipeline.generate_script(project_id, model=_model_of(project_id, req))
     return script.model_dump()
 
 
@@ -291,8 +364,8 @@ async def reopen_script(project_id: str):
 
 
 @app.post("/api/projects/{project_id}/storyboard/generate")
-async def generate_storyboard(project_id: str):
-    storyboard = await pipeline.generate_storyboard(project_id)
+async def generate_storyboard(project_id: str, req: GenerateRequest | None = None):
+    storyboard = await pipeline.generate_storyboard(project_id, model=_model_of(project_id, req))
     return storyboard.model_dump()
 
 
@@ -504,6 +577,143 @@ async def get_subtitles(project_id: str):
     if not path:
         raise HTTPException(404, "字幕文件不存在（可能已被清理）")
     return FileResponse(path, media_type="application/x-subrip", filename=path.name)
+
+
+# ── 角色一致性（参考图）────────────────────────────────────
+
+
+def _load_character(project_id: str, char_id: str) -> tuple[StoryBible, Character]:
+    bible = pipeline.get_bible(project_id)
+    if not bible:
+        raise HTTPException(404, "故事圣经不存在")
+    character = bible.get_character(char_id)
+    if character is None:
+        raise HTTPException(404, f"角色不存在: {char_id}")
+    return bible, character
+
+
+@app.post("/api/projects/{project_id}/characters/{char_id}/reference")
+async def upload_reference(project_id: str, char_id: str, req: ReferenceImageRequest):
+    """上传角色参考图（base64）。真实视频 provider 会用它保持角色外观一致。"""
+    import base64
+    import binascii
+
+    _load_character(project_id, char_id)  # 项目/角色不存在就直接 404
+
+    suffix = Path(req.filename).suffix.lower()
+    if suffix not in {".png", ".jpg", ".jpeg", ".webp"}:
+        raise HTTPException(400, "只支持 png / jpg / jpeg / webp")
+    try:
+        raw = base64.b64decode(req.content_base64, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise HTTPException(400, f"base64 解码失败：{exc}") from exc
+
+    limit = int(settings.reference_image_max_mb * 1024 * 1024)
+    if len(raw) > limit:
+        raise HTTPException(400, f"参考图太大（{len(raw)} 字节 > {limit} 字节）")
+    if not raw:
+        raise HTTPException(400, "参考图内容为空")
+
+    target = store.refs_dir(project_id) / f"{char_id}{suffix}"
+    for stale in store.refs_dir(project_id).glob(f"{char_id}.*"):
+        if stale != target:
+            stale.unlink(missing_ok=True)
+    target.write_bytes(raw)
+
+    bible = pipeline.get_bible(project_id)
+    assert bible is not None  # _load_character 已经确认过
+    for index, item in enumerate(bible.characters):
+        if item.id == char_id:
+            bible.characters[index] = item.model_copy(
+                update={"reference_image": f"refs/{target.name}"}
+            )
+            break
+    store.save_bible(project_id, bible)
+    return {
+        "status": "ok",
+        "character_id": char_id,
+        "path": f"refs/{target.name}",
+        "bytes": len(raw),
+    }
+
+
+@app.get("/api/projects/{project_id}/characters/{char_id}/reference")
+async def get_reference(project_id: str, char_id: str):
+    character = _load_character(project_id, char_id)[1]
+    if not character.reference_image:
+        raise HTTPException(404, "该角色还没有参考图")
+    path = store.resolve_artifact(project_id, character.reference_image)
+    if not path:
+        raise HTTPException(404, "参考图文件不存在")
+    return FileResponse(path)
+
+
+@app.delete("/api/projects/{project_id}/characters/{char_id}/reference")
+async def delete_reference(project_id: str, char_id: str):
+    bible, character = _load_character(project_id, char_id)
+    for index, item in enumerate(bible.characters):
+        if item.id == char_id:
+            bible.characters[index] = item.model_copy(update={"reference_image": ""})
+            break
+    store.save_bible(project_id, bible)
+    for stale in store.refs_dir(project_id).glob(f"{char_id}.*"):
+        stale.unlink(missing_ok=True)
+    return {"status": "ok", "removed": bool(character.reference_image)}
+
+
+# ── 成本 ────────────────────────────────────────────────────
+
+
+@app.get("/api/projects/{project_id}/cost")
+async def project_cost(project_id: str):
+    """成本账本：按阶段的花费 / token / 秒数 / 字符 + 预算与预估。"""
+    return pipeline.cost_status(project_id)
+
+
+# ── 批量生产 ────────────────────────────────────────────────
+
+
+@app.post("/api/batches", status_code=202)
+async def create_batch(req: BatchRequest):
+    """一次提交多个主题，自动跑完整条链路（跳过人工确认门控）。"""
+    try:
+        batch = batches.submit(
+            pipeline,
+            [item.model_dump() for item in req.items],
+            target_duration_sec=req.target_duration_sec,
+            aspect_ratio=req.aspect_ratio,
+            input_mode=req.input_mode,
+            stop_after=req.stop_after,
+            model=req.model,
+            concurrency=req.concurrency,
+            max_items=settings.batch_max_items,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return batch.to_public()
+
+
+@app.get("/api/batches")
+async def list_batches(limit: int = 20):
+    return [batch.to_public() for batch in batches.list(limit=limit)]
+
+
+@app.get("/api/batches/stages")
+async def batch_stages():
+    return {"stop_after": list(STOP_AFTER_STAGES), "max_items": settings.batch_max_items}
+
+
+@app.get("/api/batches/{batch_id}")
+async def get_batch(batch_id: str):
+    batch = batches.get(batch_id)
+    if not batch:
+        raise HTTPException(404, "批量任务不存在")
+    return batch.to_public()
+
+
+@app.post("/api/batches/{batch_id}/cancel")
+async def cancel_batch(batch_id: str):
+    return {"cancelled": await batches.cancel(batch_id)}
 
 
 @app.get("/api/projects/{project_id}/jobs")

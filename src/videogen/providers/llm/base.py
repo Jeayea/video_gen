@@ -6,6 +6,23 @@ from typing import Any
 from pydantic import BaseModel
 
 
+class TokenUsage(BaseModel):
+    """一次（或一段）调用的 token 统计，用于成本记账。"""
+
+    calls: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+
+    @property
+    def total_tokens(self) -> int:
+        return self.input_tokens + self.output_tokens
+
+    def merge(self, other: TokenUsage) -> None:
+        self.calls += other.calls
+        self.input_tokens += other.input_tokens
+        self.output_tokens += other.output_tokens
+
+
 class LLMError(RuntimeError):
     """LLM 调用失败的统一异常。
 
@@ -23,6 +40,42 @@ class LLMMessage(BaseModel):
 
 
 class LLMProvider(ABC):
+    #: 累计使用量（由实现方在每次请求后调用 record_usage 累加）
+    usage: TokenUsage
+
+    # ── 使用量记账 ────────────────────────────────────
+
+    def _usage_ref(self) -> TokenUsage:
+        current = getattr(self, "usage", None)
+        if not isinstance(current, TokenUsage):
+            current = TokenUsage()
+            self.usage = current
+        return current
+
+    def record_usage(
+        self, *, input_tokens: int = 0, output_tokens: int = 0, calls: int = 1
+    ) -> None:
+        usage = self._usage_ref()
+        usage.calls += max(0, calls)
+        usage.input_tokens += max(0, input_tokens)
+        usage.output_tokens += max(0, output_tokens)
+
+    def take_usage(self) -> TokenUsage:
+        """取走并清零累计量：按阶段记账用。"""
+        usage = self._usage_ref()
+        snapshot = usage.model_copy()
+        self.usage = TokenUsage()
+        return snapshot
+
+    #: provider 写进成本账本的标识
+    @property
+    def name(self) -> str:
+        return type(self).__name__
+
+    def with_model(self, model: str) -> LLMProvider:
+        """换模型（不支持切换的实现原样返回）。"""
+        return self
+
     @abstractmethod
     async def chat(
         self,

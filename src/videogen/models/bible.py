@@ -20,6 +20,9 @@ class Character(BaseModel):
     description: str = ""
     visual_prompt: str = ""
     voice_id: str = ""
+    #: 角色一致性：参考图（相对项目目录，如 "refs/char_1.png"）+ 固定 seed
+    reference_image: str = ""
+    seed: int | None = None
     personality: StrList = Field(default_factory=list)
     relationships: list[Relationship] = Field(default_factory=list)
 

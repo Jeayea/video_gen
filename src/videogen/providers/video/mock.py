@@ -47,6 +47,8 @@ class MockVideoProvider(VideoProvider):
 
     name = "mock"
     requires_ffmpeg = False  # 没有 ffmpeg 也能降级工作
+    #: 支持参考图：mock 用参考图取色，方便肉眼确认「参考图真的传到了 provider」
+    supports_reference_image = True
 
     def __init__(self, fps: int = 24, crf: int = 30) -> None:
         self.fps = fps
@@ -57,7 +59,13 @@ class MockVideoProvider(VideoProvider):
         output.parent.mkdir(parents=True, exist_ok=True)
         width, height = _RESOLUTIONS.get(request.aspect_ratio, _RESOLUTIONS["9:16"])
         duration = max(1, int(request.duration_sec))
-        color = _PALETTE[_stable_index(request.shot_id, len(_PALETTE))]
+        key = request.shot_id
+        reference_used = ""
+        if request.reference_image and Path(request.reference_image).is_file():
+            # 用参考图内容决定配色：换了参考图，画面颜色一定变
+            key = f"{request.shot_id}:{Path(request.reference_image).read_bytes()!r}"
+            reference_used = str(request.reference_image)
+        color = _PALETTE[_stable_index(key, len(_PALETTE))]
 
         if not ffmpeg_available():
             return self._write_placeholder(request, output, width, height, color)
@@ -100,7 +108,15 @@ class MockVideoProvider(VideoProvider):
         if not output.exists() or output.stat().st_size == 0:
             raise VideoProviderError(f"ffmpeg 未产出有效文件（shot={request.shot_id}）")
 
-        logger.info("mock clip ok shot=%s %dx%d %ds", request.shot_id, width, height, duration)
+        logger.info(
+            "mock clip ok shot=%s %dx%d %ds seed=%s reference=%s",
+            request.shot_id,
+            width,
+            height,
+            duration,
+            request.seed or "-",
+            reference_used or "-",
+        )
         return GeneratedClip(
             path=output,
             media_kind=MediaKind.VIDEO,
@@ -123,6 +139,8 @@ class MockVideoProvider(VideoProvider):
                 {
                     "kind": "videogen.placeholder",
                     "shot_id": request.shot_id,
+                    "reference_image": str(request.reference_image or ""),
+                    "seed": request.seed,
                     "scene_id": request.scene_id,
                     "prompt": request.prompt,
                     "duration_sec": request.duration_sec,

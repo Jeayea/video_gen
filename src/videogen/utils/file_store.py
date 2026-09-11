@@ -14,6 +14,7 @@ from videogen.models.audio import AudioManifest
 from videogen.models.bible import StoryBible
 from videogen.models.compose import ComposeReport
 from videogen.models.consistency import ConsistencyReport
+from videogen.models.cost import CostReport
 from videogen.models.project import (
     LEGACY_STATUS_MAP,
     LEGACY_VIDEO_READY,
@@ -193,6 +194,13 @@ class FileStore:
     def load_audio_manifest(self, project_id: str) -> AudioManifest | None:
         return self._load(project_id, "audio_manifest", AudioManifest)
 
+    # --- Cost（成本账本）---
+    def save_cost_report(self, project_id: str, report: CostReport) -> None:
+        self._save(project_id, "cost_report", report)
+
+    def load_cost_report(self, project_id: str) -> CostReport | None:
+        return self._load(project_id, "cost_report", CostReport)
+
     # --- Compose（成片）---
     def save_compose_report(self, project_id: str, report: ComposeReport) -> None:
         self._save(project_id, "compose_report", report)
@@ -252,6 +260,12 @@ class FileStore:
 
     def output_dir(self, project_id: str) -> Path:
         d = self.ensure_project_dir(project_id) / "output"
+        d.mkdir(exist_ok=True)
+        return d
+
+    def refs_dir(self, project_id: str) -> Path:
+        """角色参考图目录（角色一致性用）。"""
+        d = self.ensure_project_dir(project_id) / "refs"
         d.mkdir(exist_ok=True)
         return d
 

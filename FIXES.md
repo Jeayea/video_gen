@@ -147,3 +147,39 @@ pytest -q              → 71 passed
   - 软字幕模式（系统 ffmpeg）：额外得到 `Stream #0:2 (zho): Subtitle: mov_text`
   - BGM 命中 `tense_01（暗涌）`（分镜 mood = 紧张）
 - UI：用真实 API 载荷在 stub DOM 上跑渲染冒烟（18 项检查全通过）
+
+
+---
+
+## v0.5 — Phase B：成本 / 批量 / 多模型 / 角色一致性
+
+### 新增能力
+
+| 能力 | 说明 |
+|------|------|
+| 成本账本 | 每个阶段落一条 `CostEntry`（token / 秒数 / 字符 → USD），存 `cost_report.json` |
+| 预算门控 | `BUDGET_USD` > 0 时开工前检查「已花 + 预估」，超了抛 `BudgetExceeded`（HTTP 400）并说明差额 |
+| 批量生产 | `BatchManager` + `Pipeline.run_chain`：多主题自动跑完整链路，可 `stop_after` 任一步骤 |
+| 多模型切换 | 项目级 `llm_model` / 单次请求 `{"model": ...}`；候选与单价走配置，账本记录实际模型 |
+| 角色一致性 | 参考图（base64 上传到 `refs/`）+ seed 透传到 `VideoRequest`；mock provider 用参考图取色 |
+| UI | 第 7 面板成本表、第 8 面板批量生产、项目级模型下拉、角色参考图上传 |
+
+### 设计取舍
+
+| 决定 | 原因 |
+|------|------|
+| 预算比较留 `1e-9` 容差 | `0.5 - 0.4 = 0.099999...`，浮点直接比大小会把「刚好够」判成超预算 |
+| 不知道花费时（LLM 阶段）只要还有余额就放行 | 事前估不准 token，但如果已经顶到预算就该拒绝，否则最后一点额度会被无限刷 |
+| 批量复用 `_run_*_job` 而不是另写一套 | 进度/错误/落盘行为与单步执行完全一致，不会出现两条代码路径不一致 |
+| 集合成阶段也记账（usd=0） | 本地 ffmpeg 不花钱，但时长/分段数对排查「为什么这次慢」很有用 |
+| 参考图用 base64 JSON 而不是 multipart | 不引入 `python-multipart` 依赖，上传接口保持最小 |
+
+### 验证
+
+- `ruff check src tests` 全绿；`pytest -q` **230 passed**（新增 cost / batch / consistency / API 用例）
+- 批量端到端（离线假 LLM + mock 视频/配音 + **真实 ffmpeg 合成**，不花 LLM 额度）：
+  2 个主题 → 2 条 15.02s 成片（`h264 1080x1920 24fps + aac 44.1kHz 立体声 + mov_text 中文字幕轨`），
+  批量状态 `succeeded`，单项目成本账本 6 条（bible/script/storyboard/video/audio/compose），
+  视频 15s × $0.05 = $0.75、配音 9 字 × $15/M = $0.000135 与预期一致
+- 预算：把预算压到「刚好等于已花费」后，下一阶段被拒绝且项目状态不变（不会被误标 FAILED）
+- UI：真实载荷在 stub DOM 上跑渲染冒烟（25 项检查全通过，含成本表 / 批量表 / 模型下拉 / 参考图入口）

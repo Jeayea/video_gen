@@ -271,6 +271,16 @@ body {
 .clip-card .clip-error { color: var(--red); font-size: 11px; margin-top: 6px; }
 .clip-card.pending { opacity: 0.6; }
 
+.char-tag .ref-upload {
+  font-size: 10px; color: var(--accent2); cursor: pointer; border: 1px dashed var(--border);
+  border-radius: 4px; padding: 0 4px; margin-left: 4px;
+}
+.char-tag .ref-upload input { display: none; }
+.btn-xs { padding: 0 5px; font-size: 10px; }
+.cost-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.cost-table th, .cost-table td { text-align: left; padding: 4px 6px; border-bottom: 1px solid var(--border); }
+.cost-table thead th { color: var(--text2); font-weight: 500; }
+.cost-table tfoot th { color: var(--text); }
 .voice-map { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 10px; }
 .voice-row { display: flex; align-items: center; gap: 6px; font-size: 12px; }
 .voice-row .voice-name { color: var(--text2); }
@@ -295,7 +305,7 @@ body {
 
 <div class="header">
   <h1>videogen</h1>
-  <span class="badge">v0.4</span>
+  <span class="badge">v0.5</span>
   <span style="flex:1"></span>
   <span id="health" style="font-size:12px;color:var(--text2)"></span>
   <span id="global-status" style="font-size:12px;color:var(--text2)"></span>
@@ -378,6 +388,11 @@ let currentProject = null;
 let currentVideo = null;
 let currentAudio = null;
 let currentCompose = null;
+let currentCost = null;
+let currentBatch = null;
+let modelInfo = null;
+let costPollTimer = null;
+let batchPollTimer = null;
 let videoPollTimer = null;
 let audioPollTimer = null;
 let composePollTimer = null;
@@ -516,6 +531,13 @@ async function renderProject(id) {
   currentVideo = await safeGet(`/api/projects/${id}/video/status`);
   currentAudio = await safeGet(`/api/projects/${id}/audio/status`);
   currentCompose = await safeGet(`/api/projects/${id}/compose/status`);
+  currentCost = await safeGet(`/api/projects/${id}/cost`);
+  if (!modelInfo) modelInfo = await safeGet('/api/models');
+  // 刷新页面后也能看到最近一次批量任务（进行中的继续轮询）
+  if (!currentBatch || !currentBatch.is_active) {
+    const batchList = await safeGet('/api/batches?limit=1');
+    if (Array.isArray(batchList) && batchList.length) currentBatch = batchList[0];
+  }
 
   const scriptTotal = currentScript ? currentScript.scenes.reduce((a, s) => a + s.duration_sec, 0) : null;
 
@@ -532,6 +554,11 @@ async function renderProject(id) {
       </div>
       <div style="font-size:12px;color:var(--text2);margin-top:6px">
         下一步：${esc(nextStep(p.status))}
+      </div>
+      <div class="voice-row" style="margin-top:8px">
+        <span class="voice-name">LLM 模型</span>
+        <select id="project-model"></select>
+        <span class="hint" id="model-hint"></span>
       </div>
     </div>
   `;
@@ -670,6 +697,54 @@ async function renderProject(id) {
     </div>
   `;
 
+  // 7. 成本
+  html += `
+    <div class="panel">
+      <h3><span class="num">7</span> 成本
+        <span id="cost-tags"></span>
+      </h3>
+      <div id="cost-body"><span style="color:var(--text2);font-size:12px">还没有产生花费</span></div>
+    </div>
+  `;
+
+  // 8. 批量生产
+  html += `
+    <div class="panel">
+      <h3><span class="num">8</span> 批量生产
+        <span id="batch-tags"></span>
+      </h3>
+      <div class="hint" style="margin-bottom:8px">
+        一次提交多个主题，自动跑完整条链路（<strong>跳过人工确认门控</strong>）。
+      </div>
+      <div class="edit-form active">
+        <label>主题列表（每行一个，最多 ${(modelInfo && modelInfo.batch_max_items) || 20} 条）
+          <textarea id="batch-items" placeholder="被裁员的程序员靠 AI 逆袭&#10;替嫁新娘反杀豪门"></textarea>
+        </label>
+        <div class="row">
+          <label>目标时长（秒）
+            <input id="batch-duration" type="number" min="5" max="600" value="45" />
+          </label>
+          <label>跑到哪一步
+            <select id="batch-stop">
+              <option value="storyboard">storyboard · 剧本+分镜</option>
+              <option value="video">video · 含视频片段</option>
+              <option value="audio">audio · 含配音</option>
+              <option value="compose" selected>compose · 完整成片</option>
+            </select>
+          </label>
+          <label>并发
+            <input id="batch-concurrency" type="number" min="1" max="4" value="1" />
+          </label>
+        </div>
+        <div class="form-actions">
+          <button class="btn btn-sm" onclick="doStartBatch()" id="btn-batch">开始批量生产</button>
+          <button class="btn btn-sm btn-danger" onclick="doCancelBatch()" id="btn-batch-cancel" style="display:none">取消批量</button>
+        </div>
+      </div>
+      <div id="batch-body"></div>
+    </div>
+  `;
+
   main.innerHTML = html;
   renderBible();
   renderScript();
@@ -677,6 +752,9 @@ async function renderProject(id) {
   renderVideo();
   renderAudio();
   renderCompose();
+  renderCost();
+  renderModelSelect();
+  renderBatch();
   await loadConsistency(id);
 }
 
@@ -695,7 +773,7 @@ function nextStep(status) {
     audio_generating: '配音生成中…',
     audio_ready: '合成成片（FFmpeg）',
     composing: '成片合成中…',
-    done: '已出片：可下载成片 / 重新合成',
+    done: '已出片：可下载成片 / 重新合成（也可以批量生产更多主题）',
   })[status] || status;
 }
 
@@ -706,9 +784,19 @@ function renderBible() {
     const bible = currentBible;
     if (!bible || !$('bible-view')) return;
     $('btn-bible-edit').style.display = '';
-    const chars = bible.characters.map(c =>
-      `<div class="char-tag"><span class="name">${esc(c.name)}</span> <span class="role">${esc(c.role)}</span></div>`
-    ).join('');
+    const chars = bible.characters.map(c => {
+      const hasRef = !!(c.reference_image);
+      return `<div class="char-tag" title="${esc(c.reference_image || '未设置参考图')}">
+        <span class="name">${esc(c.name)}</span>
+        <span class="role">${esc(c.role)}</span>
+        <label class="ref-upload">
+          ${hasRef ? '换图' : '参考图'}
+          <input type="file" accept="image/png,image/jpeg,image/webp"
+                 onchange="uploadReference('${esc(c.id)}', this)" />
+        </label>
+        ${hasRef ? `<button class="btn btn-xs" onclick="clearReference('${esc(c.id)}')">清除</button>` : ''}
+      </div>`;
+    }).join('');
     $('bible-view').innerHTML = `
       <div class="bible-chars">${chars}</div>
       <div style="font-size:12px;color:var(--text2);margin-top:8px">
@@ -1435,16 +1523,234 @@ function doCancelCompose() {
     api(`/api/projects/${currentProjectId}/compose/cancel`, { method: 'POST' }));
 }
 
+// ── 成本 ────────────────────────────────────────────────────────────
+
+function usd(v) { return `$${(Number(v) || 0).toFixed(4)}`; }
+
+const STAGE_LABEL = {
+  bible: '故事圣经', script: '剧本', storyboard: '分镜',
+  video: '视频片段', audio: '配音', compose: '合成', other: '其它',
+};
+
+function renderCost() {
+  const body = $('cost-body');
+  if (!body) return;
+  const cost = currentCost || {};
+  const summary = cost.summary || {};
+  const stages = cost.stages || {};
+  const rows = Object.keys(stages).sort();
+
+  $('cost-tags').innerHTML = summary.entries
+    ? `<span class="tag-mini">${usd(summary.total_usd)}</span>` +
+      `<span class="tag-mini">${summary.total_tokens || 0} tokens</span>` +
+      (summary.budget_usd > 0
+        ? `<span class="tag-mini ${summary.over_budget ? 'warn' : 'ok'}">预算 ${usd(summary.budget_usd)}（剩余 ${usd(summary.remaining_usd)}）</span>`
+        : '<span class="tag-mini">未设预算</span>')
+    : '';
+
+  if (!summary.entries) {
+    body.innerHTML = '<span style="color:var(--text2);font-size:12px">还没有产生花费</span>';
+    return;
+  }
+
+  const table = rows.map(stage => {
+    const row = stages[stage];
+    return `<tr>
+      <td>${esc(STAGE_LABEL[stage] || stage)}</td>
+      <td>${usd(row.usd)}</td>
+      <td>${row.tokens || 0}</td>
+      <td>${row.units ? row.units.toFixed(1) : '-'}</td>
+      <td>${row.calls || 0}</td>
+    </tr>`;
+  }).join('');
+
+  const est = cost.estimate || {};
+  body.innerHTML = `
+    <table class="cost-table">
+      <thead><tr><th>阶段</th><th>花费</th><th>tokens</th><th>秒/字符</th><th>次数</th></tr></thead>
+      <tbody>${table}</tbody>
+      <tfoot><tr><th>合计</th><th>${usd(summary.total_usd)}</th><th>${summary.total_tokens || 0}</th><th colspan="2"></th></tr></tfoot>
+    </table>
+    <div class="hint" style="margin-top:8px">
+      单价：LLM 输入 $${cost.prices.llm_input_per_mtok}/Mtok · 输出 $${cost.prices.llm_output_per_mtok}/Mtok ·
+      视频 $${cost.prices.video_per_second}/秒 · 配音 $${cost.prices.tts_per_mchar}/百万字
+      <br>按当前分镜预估：视频 ${usd(est.video_usd)} · 配音 ${usd(est.audio_usd)}（真实单价请在 .env 配）
+    </div>
+  `;
+}
+
+// ── 模型选择 ────────────────────────────────────────────────────────
+
+function renderModelSelect() {
+  const sel = $('project-model');
+  if (!sel || !modelInfo) return;
+  const current = (currentProject && currentProject.llm_model) || '';
+  const options = [`<option value="">默认（${esc(modelInfo.default)}）</option>`]
+    .concat(modelInfo.candidates.map(m =>
+      `<option value="${esc(m)}"${m === current ? ' selected' : ''}>${esc(m)}</option>`));
+  sel.innerHTML = options.join('');
+  sel.value = current;
+  sel.onchange = onModelChange;
+  $('model-hint').textContent = current
+    ? '本项目使用指定模型'
+    : `默认模型：${modelInfo.default}`;
+}
+
+async function onModelChange() {
+  const model = $('project-model').value;
+  await withBusy('保存模型设置...', () =>
+    api(`/api/projects/${currentProjectId}`, {
+      method: 'PUT',
+      body: JSON.stringify({ llm_model: model }),
+    }));
+}
+
+function currentModel() {
+  const sel = $('project-model');
+  return sel ? sel.value : '';
+}
+
+// ── 参考图（角色一致性）─────────────────────────────────────────────
+
+function readFileBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = String(reader.result || '');
+      resolve(result.substring(result.indexOf(',') + 1));
+    };
+    reader.onerror = () => reject(new Error('读取文件失败'));
+    reader.readAsDataURL(file);
+  });
+}
+
+async function uploadReference(charId, input) {
+  const file = input.files && input.files[0];
+  if (!file) return;
+  await withBusy(`上传 ${charId} 的参考图...`, async () => {
+    const content_base64 = await readFileBase64(file);
+    await api(`/api/projects/${currentProjectId}/characters/${encodeURIComponent(charId)}/reference`, {
+      method: 'POST',
+      body: JSON.stringify({ filename: file.name, content_base64 }),
+    });
+  });
+}
+
+async function clearReference(charId) {
+  await withBusy('清除参考图...', () =>
+    api(`/api/projects/${currentProjectId}/characters/${encodeURIComponent(charId)}/reference`, {
+      method: 'DELETE',
+    }));
+}
+
+// ── 批量生产 ────────────────────────────────────────────────────────
+
+const ITEM_STATUS_LABEL = {
+  pending: '等待', running: '进行中', succeeded: '完成', failed: '失败', cancelled: '已取消',
+};
+
+function stopBatchPolling() {
+  if (batchPollTimer) { clearTimeout(batchPollTimer); batchPollTimer = null; }
+}
+
+function renderBatch() {
+  const body = $('batch-body');
+  if (!body) return;
+  const batch = currentBatch;
+  const active = !!(batch && batch.is_active);
+
+  const tags = $('batch-tags');
+  if (tags) {
+    tags.innerHTML = batch
+      ? `<span class="tag-mini">${batch.summary.succeeded}/${batch.summary.total} 完成</span>` +
+        (batch.summary.failed ? `<span class="tag-mini warn">${batch.summary.failed} 失败</span>` : '') +
+        `<span class="tag-mini ${active ? '' : 'ok'}">${esc(batch.status)}</span>`
+      : '';
+  }
+
+  const cancelBtn = $('btn-batch-cancel');
+  const startBtn = $('btn-batch');
+  if (cancelBtn) cancelBtn.style.display = active ? '' : 'none';
+  if (startBtn) startBtn.disabled = active;
+
+  if (!batch) { body.innerHTML = ''; return; }
+
+  body.innerHTML = `
+    <div class="progress-wrap" style="display:block">
+      <div class="progress-bar"><div class="progress-fill" style="width:${batch.percent}%"></div></div>
+      <div class="progress-text">${esc(batch.message || batch.status)}（${batch.percent}%，批量 ${batch.id}）</div>
+    </div>
+    <table class="cost-table" style="margin-top:8px">
+      <thead><tr><th>#</th><th>标题</th><th>状态</th><th>阶段</th><th>项目</th></tr></thead>
+      <tbody>${batch.items.map(item => `
+        <tr>
+          <td>${item.index + 1}</td>
+          <td>${esc(item.title)}</td>
+          <td><span class="tag-mini ${item.status === 'failed' ? 'warn' : item.status === 'succeeded' ? 'ok' : ''}">${esc(ITEM_STATUS_LABEL[item.status] || item.status)}</span></td>
+          <td>${esc(item.stage || '-')}</td>
+          <td>${item.project_id
+            ? `<a href="#" onclick="selectProject('${item.project_id}');return false;">${esc(item.project_id)}</a>`
+            : '-'}</td>
+        </tr>
+        ${item.error ? `<tr><td></td><td colspan="4" class="clip-error">${esc(item.error)}</td></tr>` : ''}
+      `).join('')}</tbody>
+    </table>
+  `;
+
+  if (active) scheduleBatchPoll(); else stopBatchPolling();
+}
+
+function scheduleBatchPoll() {
+  stopBatchPolling();
+  batchPollTimer = setTimeout(refreshBatch, 1500);
+}
+
+async function refreshBatch() {
+  if (!currentBatch) return;
+  const data = await safeGet(`/api/batches/${currentBatch.id}`);
+  if (!data) return;
+  currentBatch = data;
+  renderBatch();
+}
+
+function doStartBatch() {
+  const lines = ($('batch-items').value || '')
+    .split('\n').map(x => x.trim()).filter(Boolean);
+  if (!lines.length) { alert('请至少填一个主题（每行一个）'); return; }
+  const payload = {
+    items: lines.map(text => ({ input_text: text })),
+    target_duration_sec: Number($('batch-duration').value || 45),
+    stop_after: $('batch-stop').value,
+    concurrency: Number($('batch-concurrency').value || 1),
+    model: currentModel(),
+    aspect_ratio: (currentProject && currentProject.aspect_ratio) || '9:16',
+  };
+  withBusy('提交批量任务...', async () => {
+    currentBatch = await api('/api/batches', { method: 'POST', body: JSON.stringify(payload) });
+    renderBatch();
+  });
+}
+
+function doCancelBatch() {
+  if (!currentBatch) return;
+  withBusy('取消批量任务...', () =>
+    api(`/api/batches/${currentBatch.id}/cancel`, { method: 'POST' }));
+}
+
 // ── 生成 / 确认 / 退回 ──────────────────────────────────────────────
 
 function doGenerateBible() {
   withBusy('生成故事圣经中（约 10 秒）...', () =>
-    api(`/api/projects/${currentProjectId}/bible/generate`, { method: 'POST' }));
+    api(`/api/projects/${currentProjectId}/bible/generate`, {
+      method: 'POST', body: JSON.stringify({ model: currentModel() }),
+    }));
 }
 
 function doGenerateScript() {
   withBusy('逐场生成剧本中（可能需要 1-3 分钟）...', () =>
-    api(`/api/projects/${currentProjectId}/script/generate`, { method: 'POST' }));
+    api(`/api/projects/${currentProjectId}/script/generate`, {
+      method: 'POST', body: JSON.stringify({ model: currentModel() }),
+    }));
 }
 
 function doConfirmScript() {
@@ -1460,7 +1766,9 @@ function doReopenScript() {
 
 function doGenerateStoryboard() {
   withBusy('生成分镜中（可能需要 1-3 分钟）...', () =>
-    api(`/api/projects/${currentProjectId}/storyboard/generate`, { method: 'POST' }));
+    api(`/api/projects/${currentProjectId}/storyboard/generate`, {
+      method: 'POST', body: JSON.stringify({ model: currentModel() }),
+    }));
 }
 
 function doConfirmStoryboard() {

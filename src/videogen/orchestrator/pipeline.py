@@ -9,6 +9,7 @@ from videogen.models.audio import AudioManifest
 from videogen.models.bible import StoryBible
 from videogen.models.compose import ComposeReport
 from videogen.models.consistency import ConsistencyReport
+from videogen.models.cost import CostReport, CostStage
 from videogen.models.project import Project, ProjectStatus
 from videogen.models.script import Script, ScriptOutline
 from videogen.models.storyboard import Storyboard
@@ -28,14 +29,24 @@ from videogen.services import (
     bible_service,
     compose_service,
     consistency_service,
+    cost_service,
     script_service,
     storyboard_service,
     video_service,
 )
 from videogen.utils.ffmpeg import ffmpeg_available
 from videogen.utils.file_store import FileStore
+from videogen.utils.text import count_speech_chars
 
 logger = logging.getLogger(__name__)
+
+
+def _pending_video_seconds(storyboard: Storyboard, manifest: VideoManifest | None) -> float:
+    """还需要生成的片段总时长（用来估算本次要花多少钱）。"""
+    if not manifest:
+        return float(storyboard.total_duration_sec)
+    ready = {c.shot_id for c in manifest.ready_clips}
+    return float(sum(s.duration_sec for s in storyboard.shots if s.id not in ready))
 
 
 class PipelineError(Exception):
@@ -154,8 +165,40 @@ class Pipeline:
             self._locks[project_id] = lock
         return lock
 
-    def _llm(self) -> LLMProvider:
-        return self._llm_factory()
+    def _llm(self, model: str = "") -> LLMProvider:
+        """拿一个 LLM provider；`model` 非空时切换到指定模型（多模型对比用）。"""
+        provider = self._llm_factory()
+        if model:
+            return provider.with_model(model)
+        return provider
+
+    # ── 成本记账 / 预算 ───────────────────────────────────
+
+    def cost_report(self, project_id: str) -> CostReport:
+        return cost_service.load_report(self.store, project_id)
+
+    def _guard_budget(self, project_id: str, *, upcoming_usd: float = 0.0, action: str) -> None:
+        report = cost_service.load_report(self.store, project_id)
+        cost_service.check_budget(report, upcoming_usd=upcoming_usd, action=action)
+
+    def _record_llm_cost(self, project_id: str, stage: CostStage, llm: LLMProvider) -> None:
+        """把这次阶段调用消耗的 token 记进账本（provider 不支持记账时跳过）。"""
+        take = getattr(llm, "take_usage", None)
+        if not callable(take):
+            return
+        usage = take()
+        if not usage.calls and not usage.total_tokens:
+            return
+        cost_service.record(
+            self.store,
+            project_id,
+            cost_service.llm_entry(
+                stage,
+                usage,
+                provider=getattr(llm, "name", type(llm).__name__),
+                model=getattr(llm, "model", ""),
+            ),
+        )
 
     def _video(self) -> VideoProvider:
         return self._video_factory()
@@ -208,17 +251,20 @@ class Pipeline:
 
     # ── 故事圣经 ──────────────────────────────────────────
 
-    async def generate_bible(self, project_id: str) -> StoryBible:
+    async def generate_bible(self, project_id: str, model: str = "") -> StoryBible:
         async with self._lock(project_id):
             project = self.get_project(project_id)
             self._require(project, GENERATE_BIBLE_STATUSES, "生成故事圣经")
-            llm = self._llm()
+            self._guard_budget(project_id, action="生成故事圣经")
+            llm = self._llm(model)
 
             try:
                 bible = await bible_service.generate_bible(project, llm)
             except Exception as exc:
                 self._fail(project, "故事圣经生成")
                 raise PipelineError(f"故事圣经生成失败：{exc}") from exc
+            finally:
+                self._record_llm_cost(project_id, CostStage.BIBLE, llm)
 
             self.store.save_bible(project_id, bible)
             # 圣经变了，旧的一致性报告和下游媒体全部作废
@@ -241,7 +287,7 @@ class Pipeline:
 
     # ── 剧本 ──────────────────────────────────────────────
 
-    async def generate_script(self, project_id: str) -> Script:
+    async def generate_script(self, project_id: str, model: str = "") -> Script:
         async with self._lock(project_id):
             project = self.get_project(project_id)
             self._require(project, GENERATE_SCRIPT_STATUSES, "生成剧本（需先退回剧本阶段）")
@@ -250,12 +296,15 @@ class Pipeline:
             if not bible:
                 raise PipelineError("故事圣经不存在，请先生成圣经")
 
-            llm = self._llm()
+            self._guard_budget(project_id, action="生成剧本")
+            llm = self._llm(model)
             try:
                 script, world_state = await self._run_script_generation(project, bible, llm)
             except Exception as exc:
                 self._fail(project, "剧本生成")
                 raise PipelineError(f"剧本生成失败：{exc}") from exc
+            finally:
+                self._record_llm_cost(project_id, CostStage.SCRIPT, llm)
 
             report = consistency_service.validate_script(
                 script, bible, world_state, project.target_duration_sec
@@ -361,7 +410,7 @@ class Pipeline:
 
     # ── 分镜 ──────────────────────────────────────────────
 
-    async def generate_storyboard(self, project_id: str) -> Storyboard:
+    async def generate_storyboard(self, project_id: str, model: str = "") -> Storyboard:
         async with self._lock(project_id):
             project = self.get_project(project_id)
             self._require(project, GENERATE_STORYBOARD_STATUSES, "生成分镜（需先确认剧本）")
@@ -380,12 +429,15 @@ class Pipeline:
                 )
 
             self._invalidate_media(project_id)
-            llm = self._llm()
+            self._guard_budget(project_id, action="生成分镜")
+            llm = self._llm(model)
             try:
                 storyboard = await self._run_storyboard_generation(project, script, bible, llm)
             except Exception as exc:
                 self._fail(project, "分镜生成")
                 raise PipelineError(f"分镜生成失败：{exc}") from exc
+            finally:
+                self._record_llm_cost(project_id, CostStage.STORYBOARD, llm)
 
             script_report = consistency_service.validate_script(
                 script, bible, self.store.load_world_state(project_id), project.target_duration_sec
@@ -486,6 +538,16 @@ class Pipeline:
             if not storyboard or not storyboard.shots:
                 raise PipelineError("分镜不存在或为空，无法生成视频")
 
+            # 只为「还没生成的那部分」预留预算
+            video = self.store.load_video_manifest(project_id)
+            pending = _pending_video_seconds(storyboard, video)
+            total_sec = storyboard.total_duration_sec
+            share = pending / total_sec if total_sec else 1.0
+            self._guard_budget(
+                project_id,
+                upcoming_usd=cost_service.estimate_video_usd(storyboard) * share,
+                action="生成视频片段",
+            )
             project.status = ProjectStatus.VIDEO_GENERATING
             self.store.save_project(project)
 
@@ -523,6 +585,8 @@ class Pipeline:
                     f"失败 {len(manifest.failed_clips)}）",
                 )
 
+            existing = self.store.load_video_manifest(project_id)
+            before = {c.shot_id for c in (existing.ready_clips if existing else [])}
             try:
                 manifest = await video_service.generate_clips(
                     project,
@@ -533,7 +597,9 @@ class Pipeline:
                     concurrency=settings.video_concurrency,
                     max_retries=settings.video_max_retries,
                     retry_backoff_sec=settings.video_retry_backoff_sec,
-                    existing=self.store.load_video_manifest(project_id),
+                    existing=existing,
+                    bible=self.store.load_bible(project_id),
+                    seed=settings.video_seed,
                     on_progress=on_progress,
                 )
             except asyncio.CancelledError:
@@ -549,6 +615,18 @@ class Pipeline:
                 await provider.aclose()
 
             self.store.save_video_manifest(project_id, manifest)
+            newly = [c for c in manifest.ready_clips if c.shot_id not in before]
+            if newly:
+                cost_service.record(
+                    self.store,
+                    project_id,
+                    cost_service.video_entry(
+                        manifest.provider,
+                        settings.video_provider,
+                        sum(c.duration_sec for c in newly),
+                        len(newly),
+                    ),
+                )
             # 片段变了，旧的成片一定过期
             self.store.purge_media(project_id, compose=True)
             self._settle_video_status(
@@ -633,6 +711,11 @@ class Pipeline:
             if not video or not video.ready_clips:
                 raise PipelineError("没有可用的视频片段，请先生成视频")
 
+            self._guard_budget(
+                project_id,
+                upcoming_usd=cost_service.estimate_audio_usd(storyboard),
+                action="生成配音",
+            )
             project.status = ProjectStatus.AUDIO_GENERATING
             self.store.save_project(project)
 
@@ -666,6 +749,8 @@ class Pipeline:
                     ),
                 )
 
+            existing_audio = self.store.load_audio_manifest(project_id)
+            before_audio = {c.id for c in (existing_audio.ready_clips if existing_audio else [])}
             try:
                 manifest = await audio_service.synthesize_all(
                     project,
@@ -692,6 +777,17 @@ class Pipeline:
             finally:
                 await provider.aclose()
 
+            newly = [c for c in manifest.ready_clips if c.id not in before_audio]
+            if newly:
+                cost_service.record(
+                    self.store,
+                    project_id,
+                    cost_service.audio_entry(
+                        manifest.provider,
+                        sum(count_speech_chars(c.text) for c in newly),
+                        len(newly),
+                    ),
+                )
             if manifest.ready_clips:
                 manifest.bgm = audio_service.pick_bgm(
                     storyboard, self._bgm(), preferred_id=settings.bgm_id
@@ -852,6 +948,13 @@ class Pipeline:
                 raise
 
             self.store.save_compose_report(project_id, report)
+            cost_service.record(
+                self.store,
+                project_id,
+                cost_service.compose_entry(
+                    report.ffmpeg or "ffmpeg", report.duration_sec, len(report.segments)
+                ),
+            )
             project.status = ProjectStatus.DONE
             self.store.save_project(project)
             ctx.set_progress(
@@ -929,6 +1032,78 @@ class Pipeline:
                 "重启恢复：项目 %s 原处于中断状态，已回退为 %s", project.id, project.status.value
             )
         return recovered
+
+    # ── 成本 / 批量 ───────────────────────────────────────
+
+    def cost_status(self, project_id: str) -> dict:
+        project = self.get_project(project_id)
+        report = cost_service.load_report(self.store, project_id)
+        storyboard = self.store.load_storyboard(project_id)
+        return {
+            "project_status": project.status.value,
+            "summary": report.summary(),
+            "stages": report.stage_totals(),
+            "budget_usd": report.budget_usd,
+            "prices": cost_service.PriceTable.from_settings().model_dump(),
+            "estimate": {
+                "video_usd": cost_service.estimate_video_usd(storyboard),
+                "audio_usd": cost_service.estimate_audio_usd(storyboard),
+            },
+        }
+
+    async def run_chain(
+        self,
+        project_id: str,
+        *,
+        stop_after: str = "compose",
+        model: str = "",
+        voices: dict[str, str] | None = None,
+        overrides: dict | None = None,
+        on_stage: Callable[[str], None] | None = None,
+    ) -> Project:
+        """从文本一路跑到成片，**跳过人工确认门控**（批量生产用）。
+
+        复用各自的任务执行体（`_run_*_job`），但用一个临时 JobContext，
+        这样进度/错误处理与单步执行完全一致，不会出现两套逻辑。
+        """
+        def stage(name: str) -> None:
+            if on_stage is not None:
+                try:
+                    on_stage(name)
+                except Exception:  # pragma: no cover - 进度回调不该影响生产
+                    logger.exception("批量阶段回调失败")
+
+        stage("bible")
+        await self.generate_bible(project_id, model=model)
+        stage("script")
+        await self.generate_script(project_id, model=model)
+        await self.confirm_script(project_id)
+        stage("storyboard")
+        await self.generate_storyboard(project_id, model=model)
+        await self.confirm_storyboard(project_id)
+        if stop_after == "storyboard":
+            return self.get_project(project_id)
+
+        stage("video")
+        await self._run_video_job(self._scratch(project_id, VIDEO_JOB_KIND), project_id)
+        if stop_after == "video":
+            return self.get_project(project_id)
+
+        stage("audio")
+        await self._run_audio_job(self._scratch(project_id, AUDIO_JOB_KIND), project_id, voices)
+        if stop_after == "audio":
+            return self.get_project(project_id)
+
+        stage("compose")
+        await self._run_compose_job(
+            self._scratch(project_id, COMPOSE_JOB_KIND), project_id, overrides
+        )
+        return self.get_project(project_id)
+
+    @staticmethod
+    def _scratch(project_id: str, kind: str) -> JobContext:
+        """给同步调用链用的临时上下文（不进任务表、不影响互斥）。"""
+        return JobContext(Job(project_id=project_id, kind=kind))
 
     # ── 读取 / 校验 / 删除 ────────────────────────────────
 

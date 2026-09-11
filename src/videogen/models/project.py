@@ -69,6 +69,8 @@ class Project(BaseModel):
     target_duration_sec: int = 45
     input_mode: InputMode = InputMode.THEME
     input_text: str = ""
+    #: 该项目的 LLM 模型（空 = 用 .env 里的默认）。多模型切换用。
+    llm_model: str = ""
 
     @property
     def output_resolution(self) -> tuple[int, int]:
