@@ -16,6 +16,7 @@ from videogen.models.bible import Character, StoryBible
 from videogen.models.project import AspectRatio, InputMode, Project
 from videogen.orchestrator.batch import STOP_AFTER_STAGES, BatchManager
 from videogen.orchestrator.pipeline import Pipeline, PipelineError, PipelineNotFound
+from videogen.providers import video as video_providers
 from videogen.providers.llm.base import LLMError
 from videogen.providers.tts.base import TTSProviderError
 from videogen.providers.video.base import VideoProviderError
@@ -60,6 +61,31 @@ async def lifespan(app: FastAPI):
         settings.subtitle_mode,
         "开启" if settings.bgm_enabled else "关闭",
     )
+    if settings.video_provider == "openrouter":
+        # 真实模型按秒计费，启动时把单价和最短时长打出来（绝不打印密钥）
+        try:
+            provider = video_providers.get_video_provider()
+            try:
+                price = await provider.price_per_second(resolution=settings.video_resolution)
+                caps = await provider.capabilities()
+                durations = caps.get("supported_durations") or []
+                unit = (
+                    f"{price:g}" if price is not None else "未知(.env VIDEO_PRICE_PER_SECOND)"
+                )
+                budget = (
+                    f"${settings.budget_usd:g}" if settings.budget_usd > 0 else "未限制"
+                )
+                logger.warning(
+                    "真实视频模型已启用：model=%s 单价=%s USD/秒 最短=%s秒 预算=%s",
+                    provider.model,
+                    unit,
+                    min(durations) if durations else "?",
+                    budget,
+                )
+            finally:
+                await provider.aclose()
+        except Exception:
+            logger.warning("读取视频模型能力/单价失败（不影响启动）", exc_info=True)
     try:
         recovered = await pipeline.recover_interrupted_jobs()
         if recovered:
@@ -238,6 +264,9 @@ async def health():
         "llm_model": settings.openrouter_model,
         "llm_key_configured": settings.has_llm_key,
         "video_provider": settings.video_provider,
+        "video_model": (
+            settings.openrouter_video_model if settings.video_provider == "openrouter" else "mock"
+        ),
         "ffmpeg_available": ffmpeg_available(),
         "video_concurrency": settings.video_concurrency,
         "auth_enabled": bool(settings.api_token.strip()),

@@ -183,3 +183,44 @@ pytest -q              → 71 passed
   视频 15s × $0.05 = $0.75、配音 9 字 × $15/M = $0.000135 与预期一致
 - 预算：把预算压到「刚好等于已花费」后，下一阶段被拒绝且项目状态不变（不会被误标 FAILED）
 - UI：真实载荷在 stub DOM 上跑渲染冒烟（25 项检查全通过，含成本表 / 批量表 / 模型下拉 / 参考图入口）
+
+
+---
+
+## v0.6 — 接入真实视频模型（OpenRouter / MiniMax H3）
+
+`VIDEO_PROVIDER=openrouter` 即可用真实模型出片，走 OpenRouter 统一的异步视频接口，
+复用同一把 `OPENROUTER_API_KEY`。
+
+### 新增
+
+| 能力 | 说明 |
+|------|------|
+| `OpenRouterVideoProvider` | `POST /api/v1/videos` 提交 → 轮询 `polling_url` → 下载 `unsigned_urls[0]` |
+| 能力驱动参数 | 分辨率/时长档位/是否支持 seed 与参考图全部运行时从 `/api/v1/videos/models` 读（带进程缓存），换模型不改代码 |
+| 时长档位对齐 | `planned_seconds()` 把镜头时长抬到模型支持的最短档（H3 是 5 秒），预算与记账都按**实际计费秒数**算 |
+| 真实单价 | `price_per_second()` 读 `pricing_skus.duration_seconds`（H3 = $0.13/s），账本不再依赖手填单价 |
+| 参考图一致性 | 参考图 → `input_references`（reference-to-video）；模型不支持时退回 `frame_images.first_frame` |
+| 错误映射 | 401/402/403/404/429/400 各自给出可读原因（参数不支持 / 余额不足 / 模型不存在…），消息绝不带密钥 |
+| 启动提醒 | 启用真实 provider 时启动日志打印 model / 单价 / 最短时长 / 预算 |
+
+### 开发中发现并处理的问题
+
+| # | 问题 | 处理 |
+|---|------|------|
+| B1 | H3 最短 5 秒，而分镜常见 2~4 秒 | 请求抬到 5 秒，多出的部分由合成阶段 `trim` 掉；预算与账本按 5 秒/镜计（45 秒成片 ≈ $9.75） |
+| B2 | H3 的 `seed` 能力是 `false`，带上会被 400 | 只在模型声明 `seed: true` 时才带该参数 |
+| B3 | 分辨率只支持 2K，配 1080p 会 400 | 与能力列表比对，自动换成支持的档位并告警 |
+| B4 | 参考图可能不被接受 | 400 且请求里带参考图时，去掉参考图重试一次并告警，不让一致性拖垮整条链路 |
+| B5 | 空下载会留下 0 字节文件 | 校验大小后删除，避免续跑把它当成"已生成" |
+| B6 | provider 可能在已关闭的事件循环里 `aclose()` | 关闭异常降级为 debug 日志（测试里最常见） |
+
+### 验证
+
+- `ruff check src tests` 全绿；`pytest -q` **256 passed**
+- 新增 `tests/test_video_openrouter.py`（26 例）**全部用 `httpx.MockTransport` 打桩**：
+  请求体（时长档位/分辨率/比例/无 seed/无音轨）、轮询状态机（pending→processing→completed）、
+  失败与超时、空下载、参数被拒后退化重试、参考图两种形态、错误映射（且断言消息里没有密钥）、
+  以及「账本按 $0.13 × 10 秒 = $1.30 记账」「预算不足时**不提交**任务」两条联动断言
+- 真实调用只做了两件不花钱的事：`GET /api/v1/key`（鉴权有效、非免费层、无限额）、
+  `GET /api/v1/videos/models`（H3 的能力与单价），以及一次 `/videos/<不存在的 job>` 确认鉴权生效

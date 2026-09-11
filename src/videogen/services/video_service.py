@@ -44,6 +44,7 @@ async def generate_clips(
     """
     manifest = existing or VideoManifest()
     manifest.provider = provider.name
+    manifest.model = provider.model
     manifest.aspect_ratio = project.aspect_ratio.value
     manifest.concurrency = max(1, concurrency)
 

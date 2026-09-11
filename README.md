@@ -13,7 +13,7 @@
 | 逐场剧本 + World State | ✅ | 逐场注入 bible + 前场摘要 + 世界状态，逐场落盘 |
 | 一致性校验 | ✅ | 人名/数字/时间线/时长 + 分镜层校验 |
 | 分镜 + 英文 video_prompt | ✅ | 每场 2-5 镜，时长自动对齐剧本 |
-| 视频片段生成 | ✅ | `VideoProvider` 抽象 + `MockVideoProvider`（ffmpeg 生成真实 MP4 占位片段） |
+| 视频片段生成 | ✅ | `VideoProvider` 抽象：`mock`（免费占位片段）+ `openrouter`（**真实视频模型**，默认 MiniMax H3） |
 | 配音 TTS | ✅ | `TTSProvider` 抽象 + `EdgeTTSProvider`（真实中文配音）+ `MockTTSProvider`（离线） |
 | 音画对齐 | ✅ | 配音比镜头长时按配音**拉长镜头**，合成时冻结末帧补足，不重烧视频额度 |
 | BGM 曲库 | ✅ | 扫 `BGM_DIR` + `bgm.json` 元数据，按镜头情绪自动选曲 |
@@ -23,7 +23,7 @@
 | 成本统计与预算 | ✅ | 按阶段记 token / 秒数 / 字符 → USD 账本，超预算直接拒绝开工 |
 | 批量生产 | ✅ | 一次提交多个主题自动跑完整链路（可指定跑到哪一步停） |
 | 多模型切换 | ✅ | 项目级或单次请求指定模型，候选列表 + 单价由配置给出 |
-| 角色一致性 | ✅ 接口 | 参考图上传 + seed 透传到 `VideoRequest`；mock provider 用参考图取色以便验证 |
+| 角色一致性 | ✅ | 参考图走 `input_references`（真实模型）或取色（mock），seed 仅在模型支持时透传 |
 
 ## 快速开始
 
@@ -88,6 +88,45 @@ VIDEO_GENERATING ─▶ VIDEO_READY ──生成配音──▶ AUDIO_GENERATING
 - 音画对齐：合成前把每个镜头时长按配音拉长（`AUDIO_GAP_SEC` 是留白），
   视频片段不够长就用 `tpad` 冻结末帧补足 —— 不重新生成视频
 - 合成前强校验：视频或配音有失败/占位文件时**直接拒绝**，绝不产出看起来成功的残缺成片
+
+## 真实视频模型（按秒计费）
+
+默认 `VIDEO_PROVIDER=mock`（不花钱）。要出真实画面，把它切成 `openrouter`：
+
+```bash
+VIDEO_PROVIDER=openrouter
+OPENROUTER_VIDEO_MODEL=minimax/hailuo-3   # MiniMax H3
+BUDGET_USD=12                              # 强烈建议先设预算（见下）
+```
+
+走的是 OpenRouter 统一的异步视频接口（`POST /api/v1/videos` → 轮询 → 下载），
+用的是你已有的那把 key。能力（分辨率/时长档位/单价/是否支持 seed 与参考图）
+是**运行时从 `/api/v1/videos/models` 读的**，不写死，所以换模型不用改代码。
+
+| 模型 | 分辨率 | 时长档位 | 单价 |
+|------|--------|----------|------|
+| `minimax/hailuo-3`（H3） | 2K | 5~15 秒 | **$0.13/秒**（+$0.04/张参考图） |
+| `minimax/hailuo-3-max`（H3 Max） | 480p / 768p | 5~15 秒 | $0.05 / $0.08 每秒 |
+| `minimax/hailuo-2.3` | 1080p（仅 16:9） | 6 / 10 秒 | $0.0817/秒 |
+
+**三个必须知道的坑，代码里都处理了：**
+
+1. **最短 5 秒**：H3 不支持 5 秒以下的镜头。我们的分镜常见 2~4 秒，请求会被抬到 5 秒，
+   多出来的部分由合成阶段裁掉（画面不会串味），但**计费按 5 秒算** —— 所以
+   「45 秒成片、15 个 3 秒镜头」实际计费 **75 秒 ≈ $9.75**。想省钱有两个办法：
+   把分镜改成「少而长」（9 镜 × 5 秒 = 45 秒 → $5.85），或者换 `hailuo-3-max` 跑 480p 草稿（$3.75）
+2. **不支持 seed**：H3 的 `seed` 能力是 `false`，所以请求里不会带 seed（带了会被 400）。
+   角色一致性改用 **参考图**（`input_references`，reference-to-video）：在 UI 的角色卡片上
+   传一张图，或 `POST /api/projects/{id}/characters/{cid}/reference`
+3. **参考图被拒会自动降级**：万一服务端不接受参考图，会**去掉参考图重试一次**并告警 ——
+   宁可这次一致性差一点，也不让整条链路挂掉
+
+预算与对账：账本里的视频花费用的是 OpenRouter 价目表里的真实单价 + 模型档位换算后的秒数
+（不是配置里的估计值），所以 `GET /api/projects/{id}/cost` 看到的就是实际口径。
+超预算时**在提交之前**就会被拒绝（`BudgetExceeded` → HTTP 400），不会"先跑完再发现爆了"。
+
+> 单个视频任务跑几分钟是常态；`VIDEO_CONCURRENCY` 控制同时提交几个（默认 3）。
+> **取消只是停止轮询，服务端任务可能仍在跑并计费** —— 这是异步视频 API 的固有行为。
 
 ## API
 
@@ -182,8 +221,8 @@ src/videogen/
 4. **任务状态在内存里**：多 worker 部署时 `GET /jobs/{id}` 可能查不到（项目状态本身已落盘，重启会自动回收）
 5. **锁是单进程内的**：多 worker / 多进程部署需要换成文件锁或数据库
 6. **合成是串行 CPU 活**：分段渲染并发受 `COMPOSE_CONCURRENCY` 限制，长片会占满 CPU
-7. **角色一致性只是接口就绪**：mock provider 只是「用参考图取色」证明参数透传，
-   真正的一致性要靠接上支持 reference image / seed 的真实 provider
+7. **真实视频模型的固有约束**：最短 5 秒（H3）、不支持 seed、取消不退款；
+   真实画面质量取决于 prompt，本项目只负责把参数与流程接对
 8. UI 没有鉴权登录页，`API_TOKEN` 通过 `?token=` 或 `localStorage` 传递
 
 ## 安全

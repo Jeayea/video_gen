@@ -21,7 +21,19 @@ class Settings(BaseSettings):
     llm_json_retries: int = 2
 
     # Video
+    #: mock = 免费占位片段；openrouter = 真实视频模型（按秒计费）
     video_provider: str = "mock"
+    #: OpenRouter 的视频模型（minimax/hailuo-3 = MiniMax H3；也支持 hailuo-3-max 等）
+    openrouter_video_model: str = "minimax/hailuo-3"
+    #: 分辨率交给模型能力校验，不支持会自动换成第一个支持的（H3 只支持 2K）
+    video_resolution: str = ""
+    #: 是否让视频模型自带音轨（我们用 TTS 配音，默认关）
+    video_generate_audio: bool = False
+    #: 角色一致性：把角色参考图传给视频模型
+    video_use_reference_images: bool = True
+    video_poll_interval_sec: float = 10.0
+    #: 单个片段最多等多久（真实模型通常 1-5 分钟）
+    video_timeout_sec: float = 900.0
     video_concurrency: int = 3
     video_max_retries: int = 2
     video_retry_backoff_sec: float = 1.5

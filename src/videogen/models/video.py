@@ -44,6 +44,8 @@ class VideoClip(BaseModel):
 
 class VideoManifest(BaseModel):
     provider: str = ""
+    #: provider 实际使用的模型（mock = "mock"；真实模型写 slug，便于对账）
+    model: str = ""
     aspect_ratio: str = "9:16"
     clips: list[VideoClip] = Field(default_factory=list)
     updated_at: str = Field(default_factory=lambda: datetime.now(UTC).isoformat())

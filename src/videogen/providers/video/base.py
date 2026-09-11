@@ -56,6 +56,8 @@ class VideoProvider(ABC):
 
     #: 写进 manifest 的 provider 标识
     name: str = "base"
+    #: 当前使用的模型（写进 manifest / 成本账本；mock 就是 "mock"）
+    model: str = ""
     #: 是否支持参考图（角色一致性用）
     supports_reference_image: bool = False
     #: 是否需要 ffmpeg
@@ -68,6 +70,18 @@ class VideoProvider(ABC):
     async def check_status(self, task_id: str) -> str:
         """查询远程任务状态（本地 provider 不需要，默认不支持）。"""
         raise VideoProviderError(f"{self.name} 不支持 check_status")
+
+    async def planned_seconds(self, requested_sec: float) -> float:
+        """按模型支持的档位，算出这个镜头**实际会被计费**的秒数。
+
+        真实模型常有最小时长（例如 MiniMax H3 最短 5 秒），估预算时必须按它算，
+        否则 3 秒的镜头会被低估成 3 秒。默认实现返回原样（mock 就是精确的）。
+        """
+        return max(0.0, float(requested_sec))
+
+    async def price_per_second(self, *, resolution: str = "") -> float | None:
+        """向 provider 问单价（USD/秒）；问不到返回 None，让上层用配置的单价。"""
+        return None
 
     async def aclose(self) -> None:
         """释放资源（HTTP 客户端等），默认什么都不做。"""

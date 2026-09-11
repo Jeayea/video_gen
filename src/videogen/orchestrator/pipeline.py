@@ -12,7 +12,7 @@ from videogen.models.consistency import ConsistencyReport
 from videogen.models.cost import CostReport, CostStage
 from videogen.models.project import Project, ProjectStatus
 from videogen.models.script import Script, ScriptOutline
-from videogen.models.storyboard import Storyboard
+from videogen.models.storyboard import Shot, Storyboard
 from videogen.models.video import VideoManifest
 from videogen.models.world_state import WorldState
 from videogen.orchestrator.jobs import Job, JobContext, JobManager
@@ -41,12 +41,12 @@ from videogen.utils.text import count_speech_chars
 logger = logging.getLogger(__name__)
 
 
-def _pending_video_seconds(storyboard: Storyboard, manifest: VideoManifest | None) -> float:
-    """还需要生成的片段总时长（用来估算本次要花多少钱）。"""
+def _pending_shots(storyboard: Storyboard, manifest: VideoManifest | None) -> list[Shot]:
+    """还需要生成的镜头（续跑时跳过已经就绪的）。"""
     if not manifest:
-        return float(storyboard.total_duration_sec)
+        return list(storyboard.shots)
     ready = {c.shot_id for c in manifest.ready_clips}
-    return float(sum(s.duration_sec for s in storyboard.shots if s.id not in ready))
+    return [s for s in storyboard.shots if s.id not in ready]
 
 
 class PipelineError(Exception):
@@ -180,6 +180,27 @@ class Pipeline:
     def _guard_budget(self, project_id: str, *, upcoming_usd: float = 0.0, action: str) -> None:
         report = cost_service.load_report(self.store, project_id)
         cost_service.check_budget(report, upcoming_usd=upcoming_usd, action=action)
+
+    async def _estimate_video_usd(self, shots: list[Shot]) -> float:
+        """按 provider 的计费档位与单价估算花费（问不到就退回配置单价）。"""
+        if not shots:
+            return 0.0
+        prices = cost_service.PriceTable.from_settings()
+        provider = self._video()
+        try:
+            price = await provider.price_per_second()
+            seconds = 0.0
+            for shot in shots:
+                seconds += await provider.planned_seconds(float(shot.duration_sec))
+        except Exception:
+            logger.warning("视频成本预估失败，按配置单价估算", exc_info=True)
+            return cost_service.estimate_video_usd(
+                Storyboard(shots=list(shots)), prices
+            )
+        finally:
+            await provider.aclose()
+        unit = prices.video_per_second if price is None else max(0.0, price)
+        return round(seconds * unit, 6)
 
     def _record_llm_cost(self, project_id: str, stage: CostStage, llm: LLMProvider) -> None:
         """把这次阶段调用消耗的 token 记进账本（provider 不支持记账时跳过）。"""
@@ -538,15 +559,11 @@ class Pipeline:
             if not storyboard or not storyboard.shots:
                 raise PipelineError("分镜不存在或为空，无法生成视频")
 
-            # 只为「还没生成的那部分」预留预算
+            # 只为「还没生成的那部分」预留预算；真实模型按自己的档位算秒数
             video = self.store.load_video_manifest(project_id)
-            pending = _pending_video_seconds(storyboard, video)
-            total_sec = storyboard.total_duration_sec
-            share = pending / total_sec if total_sec else 1.0
+            upcoming = await self._estimate_video_usd(_pending_shots(storyboard, video))
             self._guard_budget(
-                project_id,
-                upcoming_usd=cost_service.estimate_video_usd(storyboard) * share,
-                action="生成视频片段",
+                project_id, upcoming_usd=upcoming, action="生成视频片段"
             )
             project.status = ProjectStatus.VIDEO_GENERATING
             self.store.save_project(project)
@@ -588,6 +605,12 @@ class Pipeline:
             existing = self.store.load_video_manifest(project_id)
             before = {c.shot_id for c in (existing.ready_clips if existing else [])}
             try:
+                # 单价要在 provider 关闭前问（真实 provider 会去查自己的价目表）
+                price_per_second = await provider.price_per_second()
+            except Exception:
+                logger.warning("读取视频单价失败，记账用配置单价", exc_info=True)
+                price_per_second = None
+            try:
                 manifest = await video_service.generate_clips(
                     project,
                     storyboard,
@@ -622,9 +645,10 @@ class Pipeline:
                     project_id,
                     cost_service.video_entry(
                         manifest.provider,
-                        settings.video_provider,
+                        manifest.model or settings.video_provider,
                         sum(c.duration_sec for c in newly),
                         len(newly),
+                        price_per_second=price_per_second,
                     ),
                 )
             # 片段变了，旧的成片一定过期

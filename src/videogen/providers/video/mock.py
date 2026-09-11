@@ -46,6 +46,7 @@ class MockVideoProvider(VideoProvider):
     """
 
     name = "mock"
+    model = "mock"
     requires_ffmpeg = False  # 没有 ffmpeg 也能降级工作
     #: 支持参考图：mock 用参考图取色，方便肉眼确认「参考图真的传到了 provider」
     supports_reference_image = True

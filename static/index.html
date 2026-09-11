@@ -305,7 +305,7 @@ body {
 
 <div class="header">
   <h1>videogen</h1>
-  <span class="badge">v0.5</span>
+  <span class="badge">v0.6</span>
   <span style="flex:1"></span>
   <span id="health" style="font-size:12px;color:var(--text2)"></span>
   <span id="global-status" style="font-size:12px;color:var(--text2)"></span>
@@ -1083,6 +1083,9 @@ function videoHint(status) {
   if (status === 'storyboard_review') return '请先确认分镜，再生成视频片段';
   if (status === 'video_generating') return '正在生成…';
   if (status === 'video_ready') return '片段已就绪，可以生成配音';
+  if (v && v.manifest && v.manifest.provider === 'openrouter') {
+    return '真实模型按秒计费（最短 5 秒/镜头），预算不足会在提交前被拒绝';
+  }
   if (status === 'audio_ready') return '片段已就绪，可以补跑失败镜头或直接合成';
   if (status === 'done') return '已出片；补跑镜头会让成片作废，需要重新合成';
   return '确认分镜后可生成视频片段';
@@ -1099,8 +1102,10 @@ function renderVideo() {
   const active = !!(job && job.is_active);
   const status = currentProject ? currentProject.status : '';
 
+  const usedModel = (v.manifest && v.manifest.model) || '';
   $('video-tags').innerHTML = summary
     ? `<span class="tag-mini">${summary.ready}/${summary.total} 片段</span>` +
+      (usedModel ? `<span class="tag-mini">${esc(usedModel)}</span>` : '') +
       (summary.failed ? `<span class="tag-mini warn">${summary.failed} 失败</span>` : '') +
       (summary.placeholder ? `<span class="tag-mini warn">${summary.placeholder} 占位</span>` : '') +
       (summary.usable ? '<span class="tag-mini ok">可进合成</span>' : '')
