@@ -369,6 +369,18 @@ curl -s -X POST localhost:8001/api/projects/$PID/characters/references/generate 
 
 记账进 `image` 阶段（按张数 + provider 实报 `usage.cost`），预算不足会直接 402 拒绝开工。
 
+生成定妆照的 prompt 有两条踩过坑的硬规则（`build_portrait_prompt`）：
+
+- **一个中文字符都不许有**：图片模型会把 prompt 里的文字画进画面（真实事故：
+  中文名和风格名被当成海报标题 / 年龄标注印在图上）。所以名字、中文 `role`、
+  `style.genre` 都不进 prompt（`role` 映射成 protagonist / antagonist / …），
+  并显式写上 `no text, no typography, no labels, ... no poster layout`。
+- **不说 "character design sheet" / "poster"**：这类词会把画面带成带排版标注的海报，
+  而不是一张能锁住五官的干净证件照。
+
+另外 `refs/<cid>.*` 里有文件但圣经没登记（并发写坏 / 手工拷贝）时，
+`references/plan` 会把它列进 `orphans`，生成入口会**免费补登记**，不会重复扣钱。
+
 ### 免费的那一半：文本锚点
 
 参考图是「锁脸」的硬手段，但**没有参考图时也别让文字描述漂移**：分镜 LLM 有时把

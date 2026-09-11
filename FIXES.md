@@ -669,11 +669,52 @@ ffprobe: 只剩 h264 + aac（烧进去了，不再有 mov_text 流）
 顺手修掉的**老问题**：`resolve_ffmpeg()` 之前把「配置了但不存在」当「没配置」处理是对的，
 但现在候选列表里会保留 `FFMPEG_PATH` → `PATH` → 便携版的完整顺序，能力探测按 exe 分别缓存。
 
+### 真实生成 4 张角色图时暴露的两个真 bug（都修了）
+
+**① 并发批量写坏圣经（丢参考图登记）**
+
+第一次真实批量生成（`concurrency=2`，4 个角色）：4 张图**都**生成成功、文件都在
+`refs/`，但圣经里只剩 2 个角色 —— 每个任务各自 `load_bible`（生成前）→ 改自己那条 →
+`save_bible`（整份覆盖），后写的把先写的覆盖掉了。
+
+```
+修复前：char_1 林悦:（空）  char_2 李薇儿: refs/char_2.jpg
+        char_3 张姐:（空）  char_4 赵总:  refs/char_4.jpg
+```
+
+修法：`_write_reference()` 在**按项目串行化**的锁内**重新读一遍圣经**再改自己那一个角色
+（关键不是锁本身，而是「不要把生成前读到的旧快照写回去」）。
+
+复现-验证：`tests/test_character_image.py::test_concurrent_batch_does_not_lose_bible_updates`
+把假 provider 加上 `delay_sec` 让任务真的交错。把 writer 换回旧写法实测：
+**旧写法 4 张只留下 1 条登记，新写法 4/4**。
+
+顺手加了「孤儿图」处理：`refs/<cid>.*` 有文件但圣经没登记时，
+`reference_plan` 会把它列进 `orphans`，单个/批量生成都会**免费补登记**而不是重新花钱生成
+（本次就是这么把已经付过钱的 2 张找回来的，0 额外花费）。
+
+**② 图片模型把 prompt 里的中文画进了画面**
+
+prompt 里带着中文名 `林悦` 和风格 `都市复仇`，模型把「都市复仇（城商设畏）」当海报标题、
+把「林悦 20岁」当标注印在了图上 —— 这种带文字的图当视频参考图，文字很容易被带进画面。
+
+修法：定妆照 prompt 现在**一个中文字符都不许有**（名字 / 中文 `role` / `style.genre`
+全部不进 prompt，`role` 映射成 protagonist / antagonist / …），并且明确写
+`no text, no typography, no letters, ... no poster layout, no collage`，
+同时**删掉**原来的 `Cinematic character design sheet` —— "sheet / poster / design"
+这类词本身就会把画面带成带排版的海报。
+
 ### 测试
 
-新增 `tests/test_character_image.py`（16）、`tests/test_image_openrouter.py`（11）、
+新增 `tests/test_character_image.py`（22）、`tests/test_image_openrouter.py`（11）、
 `tests/test_ffmpeg_selection.py`（5），并在 `test_compose.py` 补 4 例 VTT/升级路径、
-`test_api.py` 补 4 例（plan / 单个 / 批量 / vtt / health）。全套 **397 passed**，ruff clean。
+`test_api.py` 补 5 例（plan / 单个 / 批量 / vtt / health）、`test_video.py` 补 3 例文本锚点。
+全套 **416 passed**，ruff clean。
+
+顺带修掉一个测试基线漏洞：`.env` 改成 `COMPOSE_SUBTITLE_MODE=burn` 后，
+`test_compose.py` 里两个默认 soft 的用例开始失败（真实行为变了）——
+`conftest` 现在强制 `compose_subtitle_mode=soft` / `compose_ambient_mode=off`，
+需要烧字幕的用例自己传 `overrides`（和当初 `VIDEO_PROVIDER` 漏进测试是同一类问题）。
 
 关键回归用例：
 

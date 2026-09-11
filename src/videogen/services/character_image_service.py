@@ -45,15 +45,25 @@ def build_portrait_prompt(
     生成的是**定妆照**而不是剧照：正面、中性表情、干净背景 —— 这样它作为
     视频模型的 `input_references` 才能稳定锁住五官，而不是把某个镜头的光影
     和角度也一起带进去。
+
+    两条硬规则（都是真实跑出来的教训）：
+
+    1. **prompt 里绝不能出现中文**。图片模型会把 prompt 里看到的文字**画进画面**
+       （真实事故：中文名「林悦」和风格「都市复仇」被当成海报标题印在图上了）。
+       所以名字、`role`、`style.genre/tone` 一律不进来 —— 角色图不需要它们。
+    2. **不要说 "sheet" / "poster" / "design"**。这会把画面带成「角色设定海报」
+       （带排版和标注）而不是一张干净的证件照。
+
+    `bible` 只留作签名兼容（风格/定位刻意不注入，理由见上）。
     """
     lines: list[str] = []
-    who = character.name or character.id
     tail: list[str] = []
     if character.age:
         tail.append(f"{character.age} years old")
-    if character.role:
-        tail.append(str(character.role))
-    subject = f"Character reference portrait of {who}"
+    role = _ROLE_EN.get(str(character.role or "").strip())
+    if role:
+        tail.append(role)
+    subject = "Character reference portrait of one person"
     if tail:
         subject += f" ({', '.join(tail)})"
     lines.append(subject)
@@ -61,24 +71,35 @@ def build_portrait_prompt(
     look = _one_line(character.visual_prompt) or _one_line(character.description)
     if look:
         lines.append(_base_look(look))
-    elif character.personality:
-        lines.append("Personality: " + ", ".join(character.personality))
+    else:
+        # personality 也是中文，绝不能进 prompt（会被画成文字）
+        lines.append("An ordinary person with a distinctive, consistent face")
 
     lines.append(
-        "Front-facing head-and-shoulders portrait, neutral calm expression, "
-        "even soft studio lighting, plain neutral background, sharp focus on the face, "
-        "photorealistic, consistent facial features and hairstyle"
+        "Front-facing head-and-shoulders portrait photograph of that single person, "
+        "neutral calm expression, even soft studio lighting, plain seamless neutral "
+        "background, sharp focus on the face, photorealistic, identical facial features "
+        "and hairstyle"
     )
-    style = bible.style if bible else None
-    if style is not None:
-        genre, tone = _one_line(style.genre), _one_line(style.tone)
-        if genre or tone:
-            lines.append("Visual style: " + " / ".join(p for p in (genre, tone) if p))
     lines.append(
-        f"Cinematic character design sheet, {aspect_ratio} composition, "
-        "no text, no watermark, no logo, single subject only"
+        "Plain studio photograph only — absolutely no text, no typography, no letters, "
+        "no words, no name, no labels, no captions, no title, no logo, no watermark, "
+        "no border, no poster layout, no collage, single subject only"
     )
+    lines.append(f"{aspect_ratio} composition")
     return "\n".join(lines)
+
+
+#: 角色定位转英文：中文 role 出现在 prompt 里会被画成文字（见上面的教训）
+_ROLE_EN = {
+    "主角": "protagonist",
+    "反派": "antagonist",
+    "配角": "supporting character",
+    "次要反派": "secondary antagonist",
+    "导师": "mentor",
+    "盟友": "ally",
+    "龙套": "background character",
+}
 
 
 def _one_line(text: str | None) -> str:
@@ -128,15 +149,20 @@ def reference_plan(
 
     rows: list[dict[str, object]] = []
     missing = 0
+    orphans: list[str] = []
     for character in bible.characters:
         has = _existing_reference(store, project_id, character) is not None
-        if not has:
+        orphan = None if has else _orphan_reference(store, project_id, character)
+        if orphan is not None:
+            orphans.append(character.id)
+        if not has and orphan is None:
             missing += 1
         rows.append(
             {
                 "id": character.id,
                 "name": character.name,
                 "has_reference": has,
+                "orphan_file": orphan.name if orphan else "",
                 "reference_image": character.reference_image,
                 "prompt_preview": build_portrait_prompt(
                     character, bible, aspect_ratio=settings.image_aspect_ratio
@@ -146,6 +172,8 @@ def reference_plan(
     return {
         "characters": rows,
         "missing": missing,
+        #: refs/ 里有文件但圣经没登记（并发写坏 / 手工拷贝）—— 会被**免费**补登记
+        "orphans": orphans,
         "total": len(rows),
         "estimated_usd": cost_service.estimate_image_usd(missing),
         "price_per_image": settings.image_price_usd,
@@ -155,9 +183,71 @@ def reference_plan(
 
 
 def _existing_reference(store: FileStore, project_id: str, character: Character) -> Path | None:
+    """圣经里登记了、且文件真的还在的参考图。"""
     if not character.reference_image:
         return None
     return store.resolve_artifact(project_id, character.reference_image)
+
+
+def _orphan_reference(store: FileStore, project_id: str, character: Character) -> Path | None:
+    """`refs/<char_id>.*` 里有文件，但圣经没登记（并发写坏 / 手工拷贝进来的）。
+
+    这种情况**不能当成「没有参考图」**去重新生成 —— 图已经有了，重新生成是白花钱。
+    """
+    if _existing_reference(store, project_id, character) is not None:
+        return None
+    for path in sorted(store.refs_dir(project_id).glob(f"{character.id}.*")):
+        if path.is_file() and path.suffix.lower() in _ALLOWED_SUFFIXES:
+            return path
+    return None
+
+
+#: 按项目串行化「读圣经 → 改一个角色 → 写回」。批量生成是并发的，如果每个任务各自
+#: `load_bible` 再整体 `save_bible`，后写的会把先写的覆盖掉（真实事故：4 张图都生成成功，
+#: 圣经里只留下 2 个角色 → 另外 2 个角色在视频阶段拿不到参考图）。
+_PROJECT_LOCKS: dict[str, asyncio.Lock] = {}
+
+
+def _lock_for(project_id: str) -> asyncio.Lock:
+    lock = _PROJECT_LOCKS.get(project_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _PROJECT_LOCKS[project_id] = lock
+    return lock
+
+
+async def _write_reference(
+    store: FileStore, project_id: str, char_id: str, relative: str
+) -> bool:
+    """把参考图路径写回圣经（锁内**重新读一遍**再改，只动自己那一个角色）。"""
+    async with _lock_for(project_id):
+        bible = store.load_bible(project_id)
+        if bible is None:
+            return False
+        index = next(
+            (i for i, item in enumerate(bible.characters) if item.id == char_id), None
+        )
+        if index is None:
+            return False
+        bible.characters[index] = bible.characters[index].model_copy(
+            update={"reference_image": relative}
+        )
+        store.save_bible(project_id, bible)
+        return True
+
+
+async def adopt_orphan_reference(
+    store: FileStore, project_id: str, character: Character
+) -> Path | None:
+    """把 refs/ 里已存在但没登记的图**免费**补登记，返回它的路径。"""
+    orphan = _orphan_reference(store, project_id, character)
+    if orphan is None:
+        return None
+    await _write_reference(store, project_id, character.id, f"refs/{orphan.name}")
+    logger.info(
+        "补登记已有角色图 project=%s char=%s file=%s", project_id, character.id, orphan.name
+    )
+    return orphan
 
 
 async def generate_character_image(
@@ -196,6 +286,19 @@ async def generate_character_image(
             "reference_image": character.reference_image,
             "cost_usd": 0.0,
         }
+    if existing is None and not force:
+        # 文件已经在 refs/ 里了（并发写坏或手工拷贝）：补登记，绝不重新花钱生成
+        adopted = await adopt_orphan_reference(store, project_id, character)
+        if adopted is not None:
+            return {
+                "char_id": char_id,
+                "name": character.name,
+                "skipped": True,
+                "adopted": True,
+                "reason": f"refs/ 里已有 {adopted.name}，已免费补登记",
+                "reference_image": f"refs/{adopted.name}",
+                "cost_usd": 0.0,
+            }
 
     own_provider = provider is None
     image_provider = provider or get_image_provider()
@@ -249,15 +352,7 @@ async def generate_character_image(
                 logger.debug("清理旧参考图失败: %s", stale)
 
     relative = f"refs/{saved.name}"
-    index = next(
-        (i for i, item in enumerate(bible.characters) if item.id == char_id),
-        None,
-    )
-    if index is not None:
-        bible.characters[index] = bible.characters[index].model_copy(
-            update={"reference_image": relative}
-        )
-        store.save_bible(project_id, bible)
+    await _write_reference(store, project_id, char_id, relative)
 
     entry = cost_service.image_entry(
         image_provider.name,
@@ -309,7 +404,14 @@ async def generate_all_references(
     targets = [c for c in bible.characters if not only or c.id in set(only)]
     if not targets:
         return {"results": [], "generated": 0, "failed": 0, "skipped": 0, "cost_usd": 0.0}
+    adopted: list[str] = []
     if not force:
+        # 先免费认领 refs/ 里已经存在但没登记的图，避免为同一张图再付一次钱
+        for character in targets:
+            if _existing_reference(store, project_id, character) is None and (
+                await adopt_orphan_reference(store, project_id, character)
+            ) is not None:
+                adopted.append(character.id)
         todo = [c for c in targets if _existing_reference(store, project_id, c) is None]
         skipped = len(targets) - len(todo)
     else:
@@ -321,6 +423,7 @@ async def generate_all_references(
             "generated": 0,
             "failed": 0,
             "skipped": skipped,
+            "adopted": adopted,
             "cost_usd": 0.0,
         }
 
@@ -373,5 +476,7 @@ async def generate_all_references(
         "generated": generated,
         "failed": failed,
         "skipped": skipped,
+        #: 免费补登记的角色（文件本来就在 refs/ 里）
+        "adopted": adopted,
         "cost_usd": total_usd,
     }

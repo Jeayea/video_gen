@@ -494,15 +494,20 @@ class FakeImageProvider(ImageProvider):
         actual_cost_usd: float | None = 0.04,
         fail_subjects: set[str] | None = None,
         suffix: str = ".png",
+        delay_sec: float = 0.0,
     ) -> None:
         self.actual_cost_usd = actual_cost_usd
         self.fail_subjects = set(fail_subjects or set())
         self.suffix = suffix
+        #: 制造真实 provider 那样的「等待」：并发批量时如果没有锁，就会互相覆盖圣经
+        self.delay_sec = delay_sec
         self.requests: list[ImageRequest] = []
         self.closed = 0
 
     async def generate(self, request: ImageRequest) -> GeneratedImage:
         self.requests.append(request)
+        if self.delay_sec:
+            await asyncio.sleep(self.delay_sec)
         if request.subject_id in self.fail_subjects:
             raise ImageProviderError(f"fake 图片失败 subject={request.subject_id}")
         target = Path(request.output_path)

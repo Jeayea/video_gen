@@ -30,6 +30,37 @@ def test_portrait_prompt_carries_appearance_and_neutral_framing(bible):
     assert "1:1" in prompt
 
 
+def test_portrait_prompt_never_contains_chinese(bible):
+    """真实事故：图片模型会把 prompt 里的中文画进画面（中文名 + 风格变成海报标题）。"""
+    import re
+
+    for character in bible.characters:
+        prompt = build_portrait_prompt(character, bible)
+        assert not re.search(r"[\u4e00-\u9fff]", prompt), prompt
+        assert character.name not in prompt  # 名字不能进 prompt
+        assert character.role not in prompt  # 中文 role 也不能
+        assert bible.style.genre not in prompt  # 风格标题同理
+        assert "no text" in prompt and "no poster layout" in prompt
+        lowered = prompt.lower()
+        # 不能出现会把画面带成「设定海报」的词（"no poster layout" 这种否定式除外）
+        assert "sheet" not in lowered
+        assert "poster" not in lowered.replace("no poster layout", "")
+
+
+def test_portrait_prompt_maps_role_to_english(bible):
+    prompt = build_portrait_prompt(bible.get_character("char_2"), bible)
+    assert "antagonist" in prompt
+    assert "22 years old" in prompt
+
+
+def test_portrait_prompt_survives_missing_visual_prompt():
+    from videogen.models.bible import Character
+
+    prompt = build_portrait_prompt(Character(id="c", name="无名", description=""))
+    assert prompt.startswith("Character reference portrait of one person")
+    assert "distinctive, consistent face" in prompt
+
+
 def test_portrait_prompt_keeps_only_the_base_look():
     """人设里的「后期逆袭/换造型」不能进定妆照，否则模型会画成一个模糊的中间态。"""
     from videogen.models.bible import Character
@@ -216,6 +247,59 @@ async def test_generate_all_estimates_then_records_total(store, bible):
         store, project.id, provider=FakeImageProvider(actual_cost_usd=0.04)
     )
     assert result["cost_usd"] == pytest.approx(len(bible.characters) * 0.04)
+    assert reference_plan(store, project.id)["missing"] == 0
+
+
+@pytest.mark.asyncio
+async def test_concurrent_batch_does_not_lose_bible_updates(store, bible):
+    """并发批量：4 个角色各写各的圣经条目，谁都不能被覆盖掉。
+
+    真实事故（这就是它的回归测试）：4 张图都生成成功、文件都在 refs/，
+    但圣经里只剩最后两个写回的角色 —— 另外两个角色在视频阶段拿不到参考图。
+    并发必须 ≥ 2 且 provider 真的会 await，否则复现不出来。
+    """
+    project = small_project(store)
+    store.save_bible(project.id, bible)
+
+    provider = FakeImageProvider(delay_sec=0.02)  # 让 4 个任务真的交错
+    result = await character_image_service.generate_all_references(
+        store, project.id, provider=provider, concurrency=4
+    )
+
+    assert result["generated"] == len(bible.characters)
+    saved = store.load_bible(project.id)
+    for character in bible.characters:
+        assert saved.get_character(character.id).reference_image, f"{character.id} 的参考图丢了"
+        assert store.resolve_artifact(project.id, saved.get_character(character.id).reference_image)
+    assert reference_plan(store, project.id)["missing"] == 0
+
+
+@pytest.mark.asyncio
+async def test_orphan_file_is_adopted_for_free_instead_of_regenerated(store, bible):
+    """refs/ 里有图但圣经没登记时：补登记，绝不重新花钱生成。"""
+    project = small_project(store)
+    store.save_bible(project.id, bible)
+    refs = store.refs_dir(project.id)
+    (refs / "char_1.jpg").write_bytes(b"\xff\xd8already-paid-for-this")
+
+    plan = reference_plan(store, project.id)
+    assert plan["orphans"] == ["char_1"]
+    assert plan["missing"] == len(bible.characters) - 1  # 孤儿不算「缺」
+
+    provider = FakeImageProvider()
+    single = await character_image_service.generate_character_image(
+        store, project.id, "char_1", provider=provider
+    )
+    assert single["adopted"] is True
+    assert single["cost_usd"] == 0.0
+    assert provider.requests == []  # 一分钱没花
+    assert store.load_bible(project.id).get_character("char_1").reference_image == "refs/char_1.jpg"
+
+    # 批量同样只补真正缺的那几个
+    batch = await character_image_service.generate_all_references(
+        store, project.id, provider=FakeImageProvider()
+    )
+    assert batch["generated"] == len(bible.characters) - 1
     assert reference_plan(store, project.id)["missing"] == 0
 
 
