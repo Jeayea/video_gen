@@ -1,0 +1,926 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>videogen — AI 短剧流水线</title>
+<style>
+:root {
+  --bg: #0f1117;
+  --surface: #1a1d27;
+  --border: #2a2d3a;
+  --text: #e4e4e7;
+  --text2: #9ca3af;
+  --accent: #6366f1;
+  --accent2: #818cf8;
+  --green: #22c55e;
+  --yellow: #eab308;
+  --red: #ef4444;
+  --radius: 10px;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  font-family: -apple-system, 'PingFang SC', 'Microsoft YaHei', sans-serif;
+  background: var(--bg); color: var(--text);
+  min-height: 100vh;
+}
+.header {
+  padding: 16px 24px;
+  border-bottom: 1px solid var(--border);
+  display: flex; align-items: center; gap: 12px;
+}
+.header h1 { font-size: 18px; font-weight: 600; }
+.header .badge {
+  background: var(--accent); color: #fff;
+  font-size: 11px; padding: 2px 8px; border-radius: 99px;
+}
+.layout {
+  display: grid;
+  grid-template-columns: 320px 1fr;
+  height: calc(100vh - 57px);
+}
+.sidebar {
+  border-right: 1px solid var(--border);
+  overflow-y: auto;
+  padding: 16px;
+}
+.sidebar h2 { font-size: 13px; color: var(--text2); margin-bottom: 12px; text-transform: uppercase; letter-spacing: 0.05em; }
+.create-form { display: flex; flex-direction: column; gap: 10px; margin-bottom: 20px; }
+.create-form label { font-size: 12px; color: var(--text2); }
+.create-form input, .create-form select, .create-form textarea {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: 6px; padding: 8px 10px; color: var(--text);
+  font-size: 13px; outline: none;
+}
+.create-form textarea { resize: vertical; min-height: 60px; }
+.create-form input:focus, .create-form textarea:focus, .create-form select:focus {
+  border-color: var(--accent);
+}
+.btn {
+  background: var(--accent); color: #fff; border: none;
+  padding: 8px 16px; border-radius: 6px; cursor: pointer;
+  font-size: 13px; font-weight: 500;
+  transition: background 0.15s;
+}
+.btn:hover { background: var(--accent2); }
+.btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.btn-outline {
+  background: transparent; border: 1px solid var(--border);
+  color: var(--text);
+}
+.btn-outline:hover { border-color: var(--accent); color: var(--accent2); }
+.btn-sm { padding: 5px 12px; font-size: 12px; }
+.btn-green { background: var(--green); }
+.btn-green:hover { background: #16a34a; }
+.btn-yellow { background: var(--yellow); color: #000; }
+.btn-yellow:hover { background: #ca8a04; }
+.btn-danger { background: transparent; border: 1px solid var(--red); color: var(--red); }
+.btn-danger:hover { background: var(--red); color: #fff; }
+
+.project-list { display: flex; flex-direction: column; gap: 6px; }
+.project-item {
+  padding: 10px 12px; border-radius: 8px; cursor: pointer;
+  border: 1px solid transparent;
+  transition: all 0.15s;
+  position: relative;
+}
+.project-item:hover { background: var(--surface); }
+.project-item.active { border-color: var(--accent); background: var(--surface); }
+.project-item .title { font-size: 13px; font-weight: 500; padding-right: 20px; }
+.project-item .meta { font-size: 11px; color: var(--text2); margin-top: 2px; }
+.project-item .del {
+  position: absolute; top: 8px; right: 8px;
+  background: transparent; border: none; color: var(--text2);
+  cursor: pointer; font-size: 13px; line-height: 1; padding: 2px 4px;
+  border-radius: 4px; display: none;
+}
+.project-item:hover .del { display: block; }
+.project-item .del:hover { color: var(--red); background: #7f1d1d33; }
+
+.main { overflow-y: auto; padding: 24px; }
+.empty { text-align: center; padding: 80px 20px; color: var(--text2); }
+.empty h3 { font-size: 16px; margin-bottom: 8px; }
+
+.panel {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 20px; margin-bottom: 16px;
+}
+.panel.pending { opacity: 0.75; border-style: dashed; }
+.panel h3 {
+  font-size: 14px; font-weight: 600; margin-bottom: 12px;
+  display: flex; align-items: center; gap: 8px;
+}
+.panel h3 .num {
+  background: var(--accent); color: #fff;
+  width: 22px; height: 22px; border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 11px;
+}
+.panel-actions { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; }
+.hint { font-size: 12px; color: var(--text2); line-height: 1.7; }
+
+.status-tag {
+  display: inline-block; font-size: 11px; padding: 2px 8px;
+  border-radius: 99px; font-weight: 500;
+}
+.status-draft { background: #374151; color: #d1d5db; }
+.status-script_review { background: #78350f; color: #fbbf24; }
+.status-storyboard_review { background: #78350f; color: #fbbf24; }
+.status-script_confirmed { background: #14532d; color: #4ade80; }
+.status-storyboard_confirmed { background: #14532d; color: #4ade80; }
+.status-failed { background: #7f1d1d; color: #fca5a5; }
+.status-done { background: #14532d; color: #4ade80; }
+
+.tag-mini {
+  font-size: 11px; padding: 1px 6px; border-radius: 4px;
+  background: var(--bg); border: 1px solid var(--border); color: var(--text2);
+}
+.tag-mini.warn { border-color: var(--yellow); color: var(--yellow); }
+.tag-mini.ok { border-color: var(--green); color: var(--green); }
+
+.script-content { font-size: 13px; line-height: 1.6; }
+.scene-block {
+  border: 1px solid var(--border); border-radius: 8px;
+  padding: 12px; margin-bottom: 10px;
+}
+.scene-block .heading { font-weight: 600; font-size: 13px; color: var(--accent2); }
+.scene-block .summary { color: var(--text2); font-size: 12px; margin: 4px 0 8px; }
+.scene-block .dialogue { font-size: 12px; }
+.scene-block .dialogue .speaker { color: var(--accent2); font-weight: 500; }
+.scene-block .duration { font-size: 11px; color: var(--text2); margin-top: 6px; }
+
+.shot-block {
+  border: 1px solid var(--border); border-radius: 8px;
+  padding: 10px 12px; margin-bottom: 8px; font-size: 12px;
+}
+.shot-block .shot-header { display: flex; gap: 8px; align-items: center; margin-bottom: 4px; }
+.shot-block .shot-no { font-weight: 600; color: var(--accent2); }
+.shot-block .camera { color: var(--text2); }
+.shot-block .prompt {
+  background: var(--bg); border-radius: 4px; padding: 6px 8px;
+  margin-top: 6px; font-family: monospace; font-size: 11px;
+  color: #a5b4fc; word-break: break-all;
+}
+
+.issue-list { margin-top: 8px; }
+.issue-item {
+  font-size: 12px; padding: 6px 10px; border-radius: 6px;
+  margin-bottom: 4px; display: flex; gap: 8px; align-items: flex-start;
+}
+.issue-error { background: #7f1d1d33; border-left: 3px solid var(--red); }
+.issue-warning { background: #78350f33; border-left: 3px solid var(--yellow); }
+.issue-info { background: #1e3a5f33; border-left: 3px solid #60a5fa; }
+
+.loading {
+  display: inline-block; width: 16px; height: 16px;
+  border: 2px solid var(--border); border-top-color: var(--accent);
+  border-radius: 50%; animation: spin 0.6s linear infinite;
+  vertical-align: middle; margin-right: 6px;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+.bible-chars { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.char-tag {
+  background: var(--bg); border: 1px solid var(--border);
+  padding: 4px 10px; border-radius: 6px; font-size: 12px;
+}
+.char-tag .name { font-weight: 500; }
+.char-tag .role { color: var(--text2); font-size: 11px; }
+
+/* JSON Editor */
+.json-editor {
+  display: none;
+  margin-top: 10px;
+}
+.json-editor.active { display: block; }
+.json-editor textarea {
+  width: 100%;
+  min-height: 320px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px;
+  color: #93c5fd;
+  font-family: 'SF Mono', 'Fira Code', monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  resize: vertical;
+  outline: none;
+  tab-size: 2;
+}
+.json-editor textarea:focus { border-color: var(--accent); }
+.json-editor .editor-actions {
+  display: flex; gap: 8px; margin-top: 8px; align-items: center;
+}
+.json-editor .error-msg {
+  color: var(--red); font-size: 12px; margin-left: 8px;
+}
+
+/* Scene/Shot edit forms */
+.edit-form {
+  display: none;
+  margin-top: 10px;
+  padding: 12px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.edit-form.active { display: block; }
+.edit-form label {
+  display: block; font-size: 11px; color: var(--text2);
+  margin-bottom: 4px; margin-top: 8px;
+}
+.edit-form label:first-child { margin-top: 0; }
+.edit-form input, .edit-form textarea, .edit-form select {
+  width: 100%;
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: 6px; padding: 6px 10px; color: var(--text);
+  font-size: 12px; outline: none;
+}
+.edit-form textarea { resize: vertical; min-height: 50px; font-family: inherit; }
+.edit-form input:focus, .edit-form textarea:focus { border-color: var(--accent); }
+.edit-form .row { display: flex; gap: 8px; }
+.edit-form .row > * { flex: 1; }
+.edit-form .form-actions { display: flex; gap: 8px; margin-top: 12px; }
+
+.scene-actions { display: flex; gap: 6px; margin-top: 8px; }
+.shot-actions { display: flex; gap: 6px; margin-top: 6px; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>videogen</h1>
+  <span class="badge">v0.2</span>
+  <span style="flex:1"></span>
+  <span id="health" style="font-size:12px;color:var(--text2)"></span>
+  <span id="global-status" style="font-size:12px;color:var(--text2)"></span>
+</div>
+
+<div class="layout">
+  <div class="sidebar">
+    <h2>新建项目</h2>
+    <div class="create-form">
+      <label>标题</label>
+      <input id="inp-title" placeholder="都市逆袭短剧" value="">
+      <label>输入模式</label>
+      <select id="inp-mode">
+        <option value="theme">主题/关键词</option>
+        <option value="outline">故事大纲</option>
+        <option value="full_script">完整剧本</option>
+      </select>
+      <label>输入内容</label>
+      <textarea id="inp-text" placeholder="例如：一个被裁员的程序员靠 AI 逆袭创业"></textarea>
+      <label>画面比例</label>
+      <select id="inp-aspect">
+        <option value="9:16">竖屏 9:16（抖音）</option>
+        <option value="16:9">横屏 16:9（B站）</option>
+        <option value="1:1">方形 1:1</option>
+      </select>
+      <label>目标时长（秒）</label>
+      <input id="inp-duration" type="number" value="45" min="5" max="600">
+      <button class="btn" onclick="createProject()">创建项目</button>
+    </div>
+
+    <h2>项目列表</h2>
+    <div class="project-list" id="project-list"></div>
+  </div>
+
+  <div class="main" id="main">
+    <div class="empty">
+      <h3>选择或创建一个项目</h3>
+      <p>输入创意 → 生成圣经 → 生成剧本 → 确认 → 生成分镜 → 确认</p>
+    </div>
+  </div>
+</div>
+
+<script>
+// ── 状态与鉴权 ──────────────────────────────────────────────────────
+
+const STATUS_LABEL = {
+  draft: '草稿',
+  script_review: '剧本待确认',
+  script_confirmed: '剧本已确认',
+  storyboard_review: '分镜待确认',
+  storyboard_confirmed: '分镜已确认',
+  video_generating: '视频生成中',
+  video_ready: '视频就绪',
+  audio_generating: '配音生成中',
+  audio_ready: '配音就绪',
+  composing: '合成中',
+  done: '完成',
+  failed: '失败',
+};
+
+// 支持 ?token=xxx 一次性注入，然后记住
+(function initToken() {
+  const fromUrl = new URLSearchParams(location.search).get('token');
+  if (fromUrl) {
+    localStorage.setItem('videogen_token', fromUrl);
+    history.replaceState(null, '', location.pathname);
+  }
+})();
+
+function authHeaders() {
+  const token = localStorage.getItem('videogen_token');
+  return token ? { 'X-API-Token': token } : {};
+}
+
+let currentProjectId = null;
+let currentBible = null;
+let currentScript = null;
+let currentStoryboard = null;
+let currentProject = null;
+
+const $ = id => document.getElementById(id);
+
+async function api(path, opts = {}) {
+  const resp = await fetch(path, {
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    ...opts,
+  });
+  if (!resp.ok) {
+    const err = await resp.json().catch(() => ({}));
+    throw new Error(err.detail || resp.statusText);
+  }
+  return resp.json();
+}
+
+function statusTag(status) {
+  const label = STATUS_LABEL[status] || status;
+  return `<span class="status-tag status-${status}">${esc(label)}</span>`;
+}
+
+function esc(s) {
+  return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+function el(id) { return $(id); }
+
+// ── 通用动作包装：忙提示 + 刷新 ─────────────────────────────────────
+
+async function withBusy(label, fn) {
+  $('global-status').innerHTML = `<span class="loading"></span>${esc(label)}`;
+  try {
+    await fn();
+    await refresh();
+  } catch (e) {
+    alert(`${label}失败：${e.message}`);
+  } finally {
+    $('global-status').textContent = '';
+  }
+}
+
+async function refresh() {
+  await loadProjects();
+  if (currentProjectId) await renderProject(currentProjectId);
+}
+
+async function loadHealth() {
+  try {
+    const h = await api('/api/health');
+    const ok = h.llm_key_configured;
+    $('health').innerHTML =
+      `<span class="tag-mini ${ok ? 'ok' : 'warn'}">LLM ${ok ? '已配置' : '未配置 Key'}</span>` +
+      (h.auth_enabled ? ' <span class="tag-mini ok">鉴权开启</span>' : '');
+  } catch (e) {
+    $('health').textContent = '';
+  }
+}
+
+// ── 项目列表 ────────────────────────────────────────────────────────
+
+async function loadProjects() {
+  const projects = await api('/api/projects');
+  const list = $('project-list');
+  if (projects.length === 0) {
+    list.innerHTML = '<p style="font-size:12px;color:var(--text2)">暂无项目</p>';
+    return;
+  }
+  list.innerHTML = projects.map(p => `
+    <div class="project-item ${p.id === currentProjectId ? 'active' : ''}"
+         onclick="selectProject('${p.id}')">
+      <button class="del" title="删除项目"
+              onclick="event.stopPropagation(); deleteProject('${p.id}', '${esc(p.title)}')">✕</button>
+      <div class="title">${esc(p.title) || '未命名'}</div>
+      <div class="meta">${statusTag(p.status)} · ${p.aspect_ratio} · ${p.target_duration_sec}s</div>
+    </div>
+  `).join('');
+}
+
+async function createProject() {
+  const body = {
+    title: $('inp-title').value || '未命名项目',
+    input_mode: $('inp-mode').value,
+    input_text: $('inp-text').value,
+    aspect_ratio: $('inp-aspect').value,
+    target_duration_sec: parseInt($('inp-duration').value) || 45,
+  };
+  if (!body.input_text.trim()) { alert('请输入内容'); return; }
+  try {
+    $('global-status').textContent = '创建中...';
+    const p = await api('/api/projects', { method: 'POST', body: JSON.stringify(body) });
+    currentProjectId = p.id;
+    await refresh();
+  } catch (e) {
+    alert('创建失败: ' + e.message);
+  } finally {
+    $('global-status').textContent = '';
+  }
+}
+
+async function selectProject(id) {
+  currentProjectId = id;
+  await refresh();
+}
+
+async function deleteProject(id, title) {
+  if (!confirm(`确定删除项目「${title}」？该操作会删除磁盘上的全部产物。`)) return;
+  try {
+    await api(`/api/projects/${id}`, { method: 'DELETE' });
+    if (currentProjectId === id) {
+      currentProjectId = null;
+      $('main').innerHTML = '<div class="empty"><h3>项目已删除</h3><p>在左侧选择或创建项目</p></div>';
+    }
+    await loadProjects();
+  } catch (e) {
+    alert('删除失败: ' + e.message);
+  }
+}
+
+// ── 渲染 ────────────────────────────────────────────────────────────
+
+async function safeGet(path) {
+  try { return await api(path); } catch (e) { return null; }
+}
+
+async function renderProject(id) {
+  const p = await api(`/api/projects/${id}`);
+  currentProject = p;
+  const main = $('main');
+
+  // 先取数据再渲染，避免用到上一个项目残留的 currentScript/currentStoryboard
+  currentBible = await safeGet(`/api/projects/${id}/bible`);
+  currentScript = await safeGet(`/api/projects/${id}/script`);
+  currentStoryboard = await safeGet(`/api/projects/${id}/storyboard`);
+
+  const scriptTotal = currentScript ? currentScript.scenes.reduce((a, s) => a + s.duration_sec, 0) : null;
+
+  let html = `
+    <div class="panel">
+      <h3>项目信息 ${statusTag(p.status)}</h3>
+      <div style="font-size:13px;color:var(--text2)">
+        <strong style="color:var(--text)">${esc(p.title)}</strong> ·
+        ${p.aspect_ratio} · 目标 ${p.target_duration_sec}s ·
+        输入模式: ${esc(p.input_mode)}
+      </div>
+      <div style="font-size:12px;color:var(--text2);margin-top:6px">
+        输入: ${esc((p.input_text || '').substring(0, 100))}${(p.input_text || '').length > 100 ? '...' : ''}
+      </div>
+      <div style="font-size:12px;color:var(--text2);margin-top:6px">
+        下一步：${esc(nextStep(p.status))}
+      </div>
+    </div>
+  `;
+
+  // 1. 故事圣经
+  html += `
+    <div class="panel">
+      <h3><span class="num">1</span> 故事圣经</h3>
+      <div id="bible-view"><span style="color:var(--text2);font-size:12px">尚未生成</span></div>
+      <div class="json-editor" id="bible-editor">
+        <textarea id="bible-json"></textarea>
+        <div class="editor-actions">
+          <button class="btn btn-sm btn-green" onclick="saveBible()">保存</button>
+          <button class="btn btn-sm btn-outline" onclick="cancelEdit('bible')">取消</button>
+          <span class="error-msg" id="bible-error"></span>
+        </div>
+      </div>
+      <div class="panel-actions">
+        ${inStatus(p, ['draft','failed'])
+          ? '<button class="btn btn-sm" onclick="doGenerateBible()" id="btn-bible">生成圣经</button>' : ''}
+        <button class="btn btn-sm btn-outline" onclick="startEdit('bible')" id="btn-bible-edit" style="display:none">编辑 JSON</button>
+        ${inStatus(p, ['script_confirmed','storyboard_review','storyboard_confirmed'])
+          ? '<span class="hint">剧本已确认，圣经已锁定（如需修改请先退回剧本阶段）</span>' : ''}
+      </div>
+    </div>
+  `;
+
+  // 2. 剧本
+  html += `
+    <div class="panel">
+      <h3><span class="num">2</span> 剧本
+        ${p.status === 'script_review' ? '<span style="font-size:11px;color:var(--yellow)">待确认</span>' : ''}
+        ${scriptTotal !== null ? `<span class="tag-mini ${scriptTotal > p.target_duration_sec * 1.2 ? 'warn' : ''}">${scriptTotal}s / 目标 ${p.target_duration_sec}s</span>` : ''}
+        ${currentScript && currentScript.duration_normalized ? '<span class="tag-mini warn">时长已自动归一化</span>' : ''}
+      </h3>
+      <div id="script-view"><span style="color:var(--text2);font-size:12px">尚未生成</span></div>
+      <div id="consistency-content"></div>
+      <div class="json-editor" id="script-editor">
+        <textarea id="script-json"></textarea>
+        <div class="editor-actions">
+          <button class="btn btn-sm btn-green" onclick="saveScript()">保存</button>
+          <button class="btn btn-sm btn-outline" onclick="cancelEdit('script')">取消</button>
+          <span class="error-msg" id="script-error"></span>
+        </div>
+      </div>
+      <div class="panel-actions">
+        ${inStatus(p, ['draft','failed','script_review'])
+          ? '<button class="btn btn-sm" onclick="doGenerateScript()" id="btn-script">生成剧本</button>' : ''}
+        <button class="btn btn-sm btn-outline" onclick="startEdit('script')" id="btn-script-edit" style="display:none">编辑 JSON</button>
+        ${inStatus(p, ['script_review'])
+          ? '<button class="btn btn-sm btn-green" onclick="doConfirmScript()">确认剧本 → 进入分镜</button>' : ''}
+        ${inStatus(p, ['script_confirmed','storyboard_review','storyboard_confirmed'])
+          ? '<button class="btn btn-sm btn-danger" onclick="doReopenScript()">退回重生成剧本</button>' : ''}
+      </div>
+    </div>
+  `;
+
+  // 3. 分镜
+  html += `
+    <div class="panel">
+      <h3><span class="num">3</span> 分镜
+        ${p.status === 'storyboard_review' ? '<span style="font-size:11px;color:var(--yellow)">待确认</span>' : ''}
+        ${currentStoryboard && currentStoryboard.shots.length
+          ? `<span class="tag-mini">${currentStoryboard.shots.length} 镜</span>` : ''}
+      </h3>
+      <div id="storyboard-view"><span style="color:var(--text2);font-size:12px">尚未生成</span></div>
+      <div class="json-editor" id="storyboard-editor">
+        <textarea id="storyboard-json"></textarea>
+        <div class="editor-actions">
+          <button class="btn btn-sm btn-green" onclick="saveStoryboard()">保存</button>
+          <button class="btn btn-sm btn-outline" onclick="cancelEdit('storyboard')">取消</button>
+          <span class="error-msg" id="storyboard-error"></span>
+        </div>
+      </div>
+      <div class="panel-actions">
+        ${inStatus(p, ['script_confirmed','storyboard_review'])
+          ? '<button class="btn btn-sm" onclick="doGenerateStoryboard()" id="btn-storyboard">生成分镜</button>' : ''}
+        <button class="btn btn-sm btn-outline" onclick="startEdit('storyboard')" id="btn-storyboard-edit" style="display:none">编辑 JSON</button>
+        ${inStatus(p, ['storyboard_review'])
+          ? '<button class="btn btn-sm btn-green" onclick="doConfirmStoryboard()">确认分镜</button>' : ''}
+        ${inStatus(p, ['storyboard_confirmed'])
+          ? '<button class="btn btn-sm btn-danger" onclick="doReopenStoryboard()">退回重生成分镜</button>' : ''}
+      </div>
+    </div>
+  `;
+
+  // 4. 视频 / 配音 / 合成（尚未实现，明确标注而不是假装完成）
+  html += `
+    <div class="panel pending">
+      <h3><span class="num">4</span> 视频 · 配音 · 合成</h3>
+      <div class="hint">
+        该阶段尚未实现（DESIGN Phase 2/3）。已确认的分镜、英文 video_prompt、每镜时长都已就绪，
+        可直接交给下游视频生成流程。<br>
+        规划中：VideoProvider 抽象 + Mock 实现 → Edge-TTS 配音 → BGM 曲库 → FFmpeg 合成烧字幕。
+      </div>
+    </div>
+  `;
+
+  main.innerHTML = html;
+  renderBible();
+  renderScript();
+  renderStoryboard();
+  await loadConsistency(id);
+}
+
+function inStatus(p, statuses) { return statuses.includes(p.status); }
+
+function nextStep(status) {
+  return ({
+    draft: '生成故事圣经',
+    failed: '上次生成失败，可重试（已完成的场次会续跑）',
+    script_review: '检查剧本与校验报告 → 确认剧本',
+    script_confirmed: '生成分镜',
+    storyboard_review: '检查分镜 → 确认分镜',
+    storyboard_confirmed: '等待视频/配音/合成阶段（未实现）',
+  })[status] || status;
+}
+
+// ── 故事圣经 ────────────────────────────────────────────────────────
+
+function renderBible() {
+  try {
+    const bible = currentBible;
+    if (!bible || !$('bible-view')) return;
+    $('btn-bible-edit').style.display = '';
+    const chars = bible.characters.map(c =>
+      `<div class="char-tag"><span class="name">${esc(c.name)}</span> <span class="role">${esc(c.role)}</span></div>`
+    ).join('');
+    $('bible-view').innerHTML = `
+      <div class="bible-chars">${chars}</div>
+      <div style="font-size:12px;color:var(--text2);margin-top:8px">
+        ${esc(bible.style.genre)} · ${esc(bible.style.tone)} · ${esc(bible.style.pacing)} ·
+        ${bible.facts.length} 条关键事实 · ${bible.settings.length} 个场景
+      </div>
+      <details style="margin-top:8px">
+        <summary style="font-size:11px;color:var(--text2);cursor:pointer">查看完整 JSON</summary>
+        <pre style="background:var(--bg);border-radius:6px;padding:10px;font-size:11px;overflow-x:auto;max-height:250px;overflow-y:auto;margin-top:6px;color:#93c5fd">${esc(JSON.stringify(bible, null, 2))}</pre>
+      </details>
+    `;
+  } catch (e) { /* 面板渲染失败不应影响其它面板 */ }
+}
+
+async function saveBible() {
+  const errEl = $('bible-error');
+  errEl.textContent = '';
+  try {
+    const data = JSON.parse($('bible-json').value);
+    await api(`/api/projects/${currentProjectId}/bible`, { method: 'PUT', body: JSON.stringify(data) });
+    cancelEdit('bible');
+    await refresh();
+  } catch (e) {
+    errEl.textContent = e.message;
+  }
+}
+
+// ── 剧本 ────────────────────────────────────────────────────────────
+
+function renderScript() {
+  try {
+    const script = currentScript;
+    if (!script || !$('script-view')) return;
+    $('btn-script-edit').style.display = '';
+    $('script-view').innerHTML = `
+      <div style="margin-bottom:8px">
+        <strong>${esc(script.title)}</strong>
+        <span style="color:var(--text2);font-size:12px;margin-left:8px">${esc(script.logline || '')}</span>
+      </div>
+      <div class="script-content">
+        ${script.scenes.map((s, si) => `
+          <div class="scene-block" id="scene-${si}">
+            <div class="heading">${esc(s.heading || s.id)} <span class="tag-mini">${esc(s.id)}</span></div>
+            <div class="summary">${esc(s.summary)}</div>
+            <div class="dialogue">
+              ${s.dialogue.map(d => `<div><span class="speaker">${esc(d.speaker)}:</span> ${esc(d.line)}</div>`).join('')}
+            </div>
+            <div class="duration">${s.duration_sec}s · ${esc(s.emotion)}</div>
+            <div class="scene-actions">
+              <button class="btn btn-sm btn-outline" onclick="toggleSceneEdit(${si})">编辑</button>
+            </div>
+            <div class="edit-form" id="scene-edit-${si}">
+              <label>场次标题 (heading)</label>
+              <input id="se-${si}-heading" value="${esc(s.heading)}">
+              <label>摘要 (summary)</label>
+              <textarea id="se-${si}-summary">${esc(s.summary)}</textarea>
+              <label>情绪 (emotion)</label>
+              <input id="se-${si}-emotion" value="${esc(s.emotion)}">
+              <div class="row">
+                <div>
+                  <label>时长 (秒)</label>
+                  <input id="se-${si}-duration" type="number" value="${s.duration_sec}">
+                </div>
+              </div>
+              <label>对白 (每行: 说话人: 台词)</label>
+              <textarea id="se-${si}-dialogue" style="min-height:80px">${esc(s.dialogue.map(d => d.speaker + ': ' + d.line).join('\n'))}</textarea>
+              <div class="form-actions">
+                <button class="btn btn-sm btn-green" onclick="saveScene(${si})">保存此场</button>
+                <button class="btn btn-sm btn-outline" onclick="toggleSceneEdit(${si})">取消</button>
+              </div>
+            </div>
+          </div>
+        `).join('')}
+      </div>
+    `;
+  } catch (e) { /* 面板渲染失败不应影响其它面板 */ }
+}
+
+async function loadConsistency(pid) {
+  const cel = $('consistency-content');
+  if (!cel) return;
+  try {
+    const report = await api(`/api/projects/${pid}/consistency`);
+    if (!report.issues.length) {
+      cel.innerHTML = '<div style="margin-top:10px;font-size:12px;color:var(--text2)">一致性校验：无问题</div>';
+      return;
+    }
+    const errs = report.issues.filter(i => i.severity === 'error').length;
+    const warns = report.issues.filter(i => i.severity === 'warning').length;
+    cel.innerHTML = `
+      <div style="margin-top:10px;font-size:12px;color:var(--text2)">
+        一致性校验（${esc(report.stage || 'script')}）：
+        <span class="tag-mini ${errs ? 'warn' : ''}">${errs} 错误</span>
+        <span class="tag-mini ${warns ? 'warn' : ''}">${warns} 警告</span>
+        <span class="tag-mini">${report.issues.length - errs - warns} 提示</span>
+      </div>
+      <div class="issue-list">
+        ${report.issues.map(i => `
+          <div class="issue-item issue-${i.severity}">
+            <span>${esc(i.message)}${i.scene_id ? ` <span class="tag-mini">${esc(i.scene_id)}</span>` : ''}</span>
+          </div>
+        `).join('')}
+      </div>
+    `;
+  } catch (e) { cel.innerHTML = ''; }
+}
+
+function toggleSceneEdit(si) {
+  const elem = $(`scene-edit-${si}`);
+  if (elem) elem.classList.toggle('active');
+}
+
+async function saveScene(si) {
+  if (!currentScript) return;
+  const scene = currentScript.scenes[si];
+  scene.heading = $(`se-${si}-heading`).value;
+  scene.summary = $(`se-${si}-summary`).value;
+  scene.emotion = $(`se-${si}-emotion`).value;
+  scene.duration_sec = parseInt($(`se-${si}-duration`).value) || scene.duration_sec;
+
+  const dlgText = $(`se-${si}-dialogue`).value.trim();
+  scene.dialogue = dlgText ? dlgText.split('\n').filter(l => l.trim()).map(line => {
+    const idx = line.indexOf(':');
+    if (idx === -1) return { speaker: 'unknown', line: line.trim() };
+    return { speaker: line.substring(0, idx).trim(), line: line.substring(idx + 1).trim() };
+  }) : [];
+
+  try {
+    await api(`/api/projects/${currentProjectId}/script`, { method: 'PUT', body: JSON.stringify(currentScript) });
+    await refresh();
+  } catch (e) {
+    alert('保存失败: ' + e.message);
+  }
+}
+
+async function saveScript() {
+  const errEl = $('script-error');
+  errEl.textContent = '';
+  try {
+    const data = JSON.parse($('script-json').value);
+    await api(`/api/projects/${currentProjectId}/script`, { method: 'PUT', body: JSON.stringify(data) });
+    cancelEdit('script');
+    await refresh();
+  } catch (e) {
+    errEl.textContent = e.message;
+  }
+}
+
+// ── 分镜 ────────────────────────────────────────────────────────────
+
+function renderStoryboard() {
+  try {
+    const sb = currentStoryboard;
+    if (!sb || !$('storyboard-view')) return;
+    $('btn-storyboard-edit').style.display = '';
+    $('storyboard-view').innerHTML = sb.shots.map((s, si) => `
+      <div class="shot-block" id="shot-${si}">
+        <div class="shot-header">
+          <span class="shot-no">${s.shot_no}</span>
+          <span class="camera">${esc(s.camera)}</span>
+          <span style="color:var(--text2)">${s.duration_sec}s</span>
+          <span class="tag-mini">${esc(s.scene_id)}</span>
+          ${s.dialogue_text ? `<span style="color:var(--accent2)">💬 ${esc(s.dialogue_speaker)}</span>` : ''}
+        </div>
+        <div>${esc(s.visual_description)}</div>
+        ${s.video_prompt ? `<div class="prompt">${esc(s.video_prompt)}</div>` : ''}
+        <div class="shot-actions">
+          <button class="btn btn-sm btn-outline" onclick="toggleShotEdit(${si})">编辑</button>
+        </div>
+        <div class="edit-form" id="shot-edit-${si}">
+          <div class="row">
+            <div>
+              <label>镜头号</label>
+              <input id="sh-${si}-no" type="number" value="${s.shot_no}">
+            </div>
+            <div>
+              <label>时长 (秒)</label>
+              <input id="sh-${si}-duration" type="number" value="${s.duration_sec}">
+            </div>
+          </div>
+          <label>运镜 (camera)</label>
+          <input id="sh-${si}-camera" value="${esc(s.camera)}">
+          <label>画面描述</label>
+          <textarea id="sh-${si}-visual">${esc(s.visual_description)}</textarea>
+          <label>情绪 (mood)</label>
+          <input id="sh-${si}-mood" value="${esc(s.mood)}">
+          <label>Video Prompt (英文)</label>
+          <textarea id="sh-${si}-prompt" style="min-height:60px;font-family:monospace">${esc(s.video_prompt)}</textarea>
+          <div class="row">
+            <div>
+              <label>台词</label>
+              <input id="sh-${si}-dialogue" value="${esc(s.dialogue_text || '')}">
+            </div>
+            <div>
+              <label>说话人</label>
+              <input id="sh-${si}-speaker" value="${esc(s.dialogue_speaker || '')}">
+            </div>
+          </div>
+          <label>旁白 (narration)</label>
+          <input id="sh-${si}-narration" value="${esc(s.narration || '')}">
+          <div class="form-actions">
+            <button class="btn btn-sm btn-green" onclick="saveShot(${si})">保存此镜</button>
+            <button class="btn btn-sm btn-outline" onclick="toggleShotEdit(${si})">取消</button>
+          </div>
+        </div>
+      </div>
+    `).join('');
+  } catch (e) { /* 面板渲染失败不应影响其它面板 */ }
+}
+
+function toggleShotEdit(si) {
+  const elem = $(`shot-edit-${si}`);
+  if (elem) elem.classList.toggle('active');
+}
+
+async function saveShot(si) {
+  if (!currentStoryboard) return;
+  const shot = currentStoryboard.shots[si];
+  shot.shot_no = parseInt($(`sh-${si}-no`).value) || shot.shot_no;
+  shot.duration_sec = parseInt($(`sh-${si}-duration`).value) || shot.duration_sec;
+  shot.camera = $(`sh-${si}-camera`).value;
+  shot.visual_description = $(`sh-${si}-visual`).value;
+  shot.mood = $(`sh-${si}-mood`).value;
+  shot.video_prompt = $(`sh-${si}-prompt`).value;
+  shot.dialogue_text = $(`sh-${si}-dialogue`).value || null;
+  shot.dialogue_speaker = $(`sh-${si}-speaker`).value || null;
+  shot.narration = $(`sh-${si}-narration`).value || null;
+
+  try {
+    await api(`/api/projects/${currentProjectId}/storyboard`, { method: 'PUT', body: JSON.stringify(currentStoryboard) });
+    await refresh();
+  } catch (e) {
+    alert('保存失败: ' + e.message);
+  }
+}
+
+async function saveStoryboard() {
+  const errEl = $('storyboard-error');
+  errEl.textContent = '';
+  try {
+    const data = JSON.parse($('storyboard-json').value);
+    await api(`/api/projects/${currentProjectId}/storyboard`, { method: 'PUT', body: JSON.stringify(data) });
+    cancelEdit('storyboard');
+    await refresh();
+  } catch (e) {
+    errEl.textContent = e.message;
+  }
+}
+
+// ── JSON 编辑器 ─────────────────────────────────────────────────────
+
+function startEdit(kind) {
+  const view = $(`${kind}-view`);
+  const editor = $(`${kind}-editor`);
+  const textarea = $(`${kind}-json`);
+  const data = { bible: currentBible, script: currentScript, storyboard: currentStoryboard }[kind];
+  if (!data) return;
+  textarea.value = JSON.stringify(data, null, 2);
+  view.style.display = 'none';
+  editor.classList.add('active');
+  textarea.focus();
+}
+
+function cancelEdit(kind) {
+  const view = $(`${kind}-view`);
+  const editor = $(`${kind}-editor`);
+  const errEl = $(`${kind}-error`);
+  view.style.display = '';
+  editor.classList.remove('active');
+  if (errEl) errEl.textContent = '';
+}
+
+// ── 生成 / 确认 / 退回 ──────────────────────────────────────────────
+
+function doGenerateBible() {
+  withBusy('生成故事圣经中（约 10 秒）...', () =>
+    api(`/api/projects/${currentProjectId}/bible/generate`, { method: 'POST' }));
+}
+
+function doGenerateScript() {
+  withBusy('逐场生成剧本中（可能需要 1-3 分钟）...', () =>
+    api(`/api/projects/${currentProjectId}/script/generate`, { method: 'POST' }));
+}
+
+function doConfirmScript() {
+  withBusy('确认剧本...', () =>
+    api(`/api/projects/${currentProjectId}/script/confirm`, { method: 'POST' }));
+}
+
+function doReopenScript() {
+  if (!confirm('退回剧本阶段会以草稿状态重新生成剧本（旧分镜将被清空），继续？')) return;
+  withBusy('退回剧本阶段...', () =>
+    api(`/api/projects/${currentProjectId}/script/reopen`, { method: 'POST' }));
+}
+
+function doGenerateStoryboard() {
+  withBusy('生成分镜中（可能需要 1-3 分钟）...', () =>
+    api(`/api/projects/${currentProjectId}/storyboard/generate`, { method: 'POST' }));
+}
+
+function doConfirmStoryboard() {
+  withBusy('确认分镜...', () =>
+    api(`/api/projects/${currentProjectId}/storyboard/confirm`, { method: 'POST' }));
+}
+
+function doReopenStoryboard() {
+  withBusy('退回分镜阶段...', () =>
+    api(`/api/projects/${currentProjectId}/storyboard/reopen`, { method: 'POST' }));
+}
+
+// ── 初始化 ──────────────────────────────────────────────────────────
+
+loadHealth();
+loadProjects();
+</script>
+</body>
+</html>
