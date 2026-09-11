@@ -149,6 +149,36 @@ async def test_resume_only_regenerates_failed(store, ready_project):
 
 
 @pytest.mark.asyncio
+async def test_switching_provider_regenerates_ready_clips(store, ready_project):
+    """mock → 真实模型时不能沿用旧占位片段（否则看起来像换了 provider 没生效）。"""
+    first = FakeVideoProvider()
+    await run_clips(store, ready_project, first)
+    assert len(first.calls) == shot_count(store, ready_project)
+
+    switched = FakeVideoProvider()
+    switched.name = "openrouter"
+    switched.model = "minimax/hailuo-3"
+    manifest = await run_clips(store, ready_project, switched)
+
+    assert len(switched.calls) == shot_count(store, ready_project), "换了 provider 必须全部重跑"
+    assert manifest.provider == "openrouter"
+    assert manifest.model == "minimax/hailuo-3"
+    assert len(manifest.ready_clips) == shot_count(store, ready_project)
+
+
+@pytest.mark.asyncio
+async def test_switching_model_regenerates_ready_clips(store, ready_project):
+    first = FakeVideoProvider()
+    first.model = "minimax/hailuo-3"
+    await run_clips(store, ready_project, first)
+
+    other = FakeVideoProvider()
+    other.model = "minimax/hailuo-3-max"
+    await run_clips(store, ready_project, other)
+    assert len(other.calls) == shot_count(store, ready_project)
+
+
+@pytest.mark.asyncio
 async def test_placeholder_is_flagged(store, ready_project):
     provider = FakeVideoProvider(media_kind=MediaKind.PLACEHOLDER)
     manifest = await run_clips(store, ready_project, provider)

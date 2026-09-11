@@ -43,6 +43,22 @@ async def generate_clips(
     - **进度**：每完成一个镜头回调一次 `on_progress`，调用方负责落盘/更新任务
     """
     manifest = existing or VideoManifest()
+    # 换了 provider / 模型（例如 mock → 真实模型）时，旧片段一律作废重跑，
+    # 否则「跳过已就绪片段」的续跑逻辑会一直沿用占位视频，看起来像没生效。
+    switched = _provider_switched(manifest, provider)
+    if switched:
+        logger.warning(
+            "视频 provider/模型变更：%s/%s -> %s/%s，已就绪的 %d 个片段将重新生成",
+            manifest.provider or "?",
+            manifest.model or "?",
+            provider.name,
+            provider.model or "?",
+            len(manifest.ready_clips),
+        )
+        for stale in manifest.clips:
+            stale.status = ClipStatus.PENDING
+            stale.error = ""
+            stale.task_id = None
     manifest.provider = provider.name
     manifest.model = provider.model
     manifest.aspect_ratio = project.aspect_ratio.value
@@ -177,6 +193,17 @@ async def _generate_one(
         clip.error = ""
         manifest.upsert(clip)
         return
+
+
+def _provider_switched(manifest: VideoManifest, provider: VideoProvider) -> bool:
+    """旧清单是不是另一个 provider / 模型的产物。"""
+    if not manifest.clips:
+        return False
+    if manifest.provider and manifest.provider != provider.name:
+        return True
+    return bool(
+        manifest.model and provider.model and manifest.model != provider.model
+    )
 
 
 def resolve_reference(
