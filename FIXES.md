@@ -368,3 +368,93 @@ COMPOSE_AMBIENT_MODE=under 成片音轨 mean = -23.2 dB（人声没被拉低，n
 
 **成本量级**：一次按场调用（1 张图 + 约 1.5k 提示 token）≈ **$0.001**，一个 15 镜 / 4 场的项目
 跑一轮 `narration` ≈ $0.004 —— 相比视频按秒计费可以忽略。真正花钱的是"是否 force 重跑"。
+
+## v0.10 — 成本前置（preflight）+ 短镜头合并 + 一个预算被绕过的真 bug
+
+### 背景：点一下「生成视频片段」其实要 $9.75
+
+用户项目里 15 个镜头共 45 秒，切到真实模型后按钮写着「生成缺失片段」，看起来是补几个，
+实际（因为 provider 变更会作废旧片段）是**全部 15 个重跑**；而 H3 最短 5 秒/镜头，
+计费 15×5=75 秒 × $0.13 = **$9.75**。用户当时设了 `BUDGET_USD=12` —— 差一点就刚好放行。
+
+### 修掉的 bug：预算门控被「换 provider」绕过
+
+`start_video_generation` 用 `_pending_shots()`（只跳过已就绪片段）估预算，
+而真正下单的 `video_service.generate_clips()` 会先判 `_provider_switched()` 把旧片段全部
+重置为待生成。两者口径不一致，于是：
+
+```
+旧清单 provider=mock，已就绪 15 个
+新 provider=openrouter
+预算门控：待生成 0 个 → 预估 $0.0000 → 放行
+实际执行：全部 15 个重跑      → 花掉 $9.75
+```
+
+修法：把「provider 是否变了」抽成唯一事实来源 `video_service.provider_switched()`，
+预算门控、preflight、真正下单三处共用；`_estimate_video_usd` 与 `_guard_budget` 都按
+「会重跑就按全部镜头算」。回归用例 `test_budget_gate_blocks_full_regeneration_after_provider_switch`
+就是钉这个场景（修之前它会失败：预估 $0 直接放行）。
+
+### 新增：成本前置（`services/preflight_service.py`）
+
+`GET /api/projects/{id}/preflight?action=all|video|audio|compose` 返回动手前的账单：
+
+- **计费口径**：`planned_seconds()` 按模型档位算（3 秒 → 5 秒），单价优先问 provider
+  （`price_per_second()`，读 `pricing_skus`）再用配置；`price_source` 标明来源
+- **重跑判定**：`regenerate_all` + `regenerate_reason`（`mock → openrouter`），UI 据此改按钮文案
+- **预算投影**：已花 / 本次预估 / 本次后剩余 / 是否超 / 还差多少（`BUDGET_USD=0` 视为不限）
+- **省钱建议**：`merge_plan`（合并后镜头数、计费秒数、可省 USD、是否值得做）
+- **多档位差异提示**：`模型最短 5 秒/镜头：分镜 45 秒实际要买 75 秒，多付 30 秒 ≈ $3.90`
+- provider 建不起来（没 key / 没依赖）**也不报错**：用 `UnavailableVideoProvider` 退回配置单价 + 告警，
+  因为「看一眼要花多少」本身不该失败
+- 配音侧一并算上 LLM 文案的 token 预估（`narration/polish/full` 才有）
+
+### 新增：短镜头合并（`storyboard_service.merge_shots`）
+
+`POST /api/projects/{id}/storyboard/merge-shots`（默认 `dry_run=true` 只预览）：
+
+- 规则（只看「对白会不会丢」）：没有对白的镜头可被吸收；主镜头一个字都没有时对白可以接管；
+  **同一说话人**的连续两句可以并成一条配音（会自动补句号）；主镜头已有旁白或说话人不同则不行
+  —— 一条配音只能有一个声音。只合并**连续**镜头（叙事顺序不乱）；凑够 `min_sec` 就停，`max_sec` 封顶
+- 主镜头保留原 id（旧片段/配音的对齐关系不炸）；被吸收镜头的画面描述追加过去；
+  主镜头本来没文案时**把旁白接过来**，已有文案时逐条记进 `dropped_lines`（对白一条不丢）
+- 写盘后重新编号 `shot_no`、清掉 `duration_normalized/audio_aligned`，下游媒体全部作废，
+  项目状态回到 `STORYBOARD_CONFIRMED`
+- **已有可用片段时默认拒绝**（合并会让付费片段作废），要 `force=true` —— UI 会把这句话写在确认框里
+
+### UI
+
+- 视频面板常驻一行：「本次生成 N/M 个片段 · 计费 Xs × $Y/s ≈ $Z · 预算剩余 …」，
+  并在换模型时提示「已就绪的 N 个片段要全部重跑」；省钱建议也在这行
+- 点「生成视频片段」→ 先拉一次 preflight → `confirm()` 列出数字（**免费/mock 且不需要重跑时不弹**，不烦人）；
+  超预算直接不提交并说明还差多少
+- 按钮文案按 preflight 变：`重新生成全部 15 个片段` / `生成缺失片段` / `重试 N 个失败镜头`
+- 分镜面板加「合并短镜头（省钱）」：先预览 → 确认框列出 `15 → 5 个 / 45s → 45s / 省 ≈ $3.90`，
+  有付费片段时明确写「会让它们作废」
+- 成本面板加「下一次操作预估」块（视频含档位单价、配音含 LLM 文案、合成 $0）
+
+### 测试
+
+新增 `tests/test_preflight.py`（24 例）：档位计费、换 provider 全量重跑、只算缺失片段、
+provider 不可用降级、预算投影（超支/不限）、配音 LLM 文案单算、合并的 6 条安全规则、
+pipeline 预览→应用→force 流程，以及**预算绕过 bug 的回归用例**；
+`test_video_openrouter.py` 补 `duration_options()`（含未知模型返回空）；
+`FakeVideoProvider` 支持模拟「按秒单价 + 时长档位」。全套 **349 passed**，ruff clean。
+
+### 真实项目实测（只读调用真实 provider 的模型能力表，零费用）
+
+对用户现有项目（`e8e40d3d9d29`，15 镜 / 45 秒 / 15 个 mock 片段）跑 preflight：
+
+```
+project_status: video_ready
+video: provider=openrouter model=minimax/hailuo-3 price=$0.13/s(provider) min=5.0s
+  镜头 15 个 → 本次生成 15 个 | 分镜 45s → 计费 75.0s | 预估 $9.7500
+  regenerate_all: True  (mock → openrouter，mock → minimax/hailuo-3)
+  warnings: ['模型最短 5 秒/镜头：分镜 45 秒实际要买 75 秒，多付 30 秒 ≈ $3.9000',
+             'provider / 模型变了（mock → openrouter），已就绪的 15 个片段会全部重新生成']
+audio: script_mode=narration → 1 个镜头 / 1 帧 ≈ $0.0006（edge-tts 本身免费）
+budget: 预算 $12 · 已花 $0 · 本次后剩余 ≈ $2.25 · 不够则直接不提交
+merge: 15 → 12 个镜头 · 75s → 64s 计费 · 省 ≈ $1.43 · dropped_lines: []
+```
+
+这组数字正是用户点下按钮前最需要知道的东西：**按钮写着「生成缺失片段」，实际是全部 15 个重跑**。

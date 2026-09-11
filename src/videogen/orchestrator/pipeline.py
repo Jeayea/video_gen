@@ -32,6 +32,7 @@ from videogen.services import (
     compose_service,
     consistency_service,
     cost_service,
+    preflight_service,
     script_service,
     storyboard_service,
     video_service,
@@ -183,6 +184,24 @@ class Pipeline:
     def _guard_budget(self, project_id: str, *, upcoming_usd: float = 0.0, action: str) -> None:
         report = cost_service.load_report(self.store, project_id)
         cost_service.check_budget(report, upcoming_usd=upcoming_usd, action=action)
+
+    async def _budget_shots(
+        self, storyboard: Storyboard, video: VideoManifest | None
+    ) -> list[Shot]:
+        """预算口径：这次真正会去生成哪些镜头。
+
+        与 `video_service.generate_clips` 的续跑逻辑保持一致 —— 换了 provider / 模型时
+        已就绪的片段会被判为过期并全部重生成，所以预算也得按「全部」算。
+        """
+        provider = self._video()
+        try:
+            switched = bool(video) and video_service.provider_switched(video, provider)
+        except Exception:  # 判断不了就按「最坏情况全部重跑」保守估
+            logger.warning("provider 变更判断失败，按全部镜头预估预算", exc_info=True)
+            switched = bool(video and video.clips)
+        finally:
+            await provider.aclose()
+        return list(storyboard.shots) if switched else _pending_shots(storyboard, video)
 
     async def _estimate_video_usd(self, shots: list[Shot]) -> float:
         """按 provider 的计费档位与单价估算花费（问不到就退回配置单价）。"""
@@ -545,6 +564,127 @@ class Pipeline:
             )
             return storyboard
 
+    # ── 成本前置（preflight）──────────────────────────────
+
+    async def preflight(
+        self, project_id: str, *, action: str = "all", script_mode: str = ""
+    ) -> dict:
+        """动手花钱之前把账算清楚（镜头数 / 计费秒数 / 单价 / 预算余额 / 省钱建议）。
+
+        与真正扣费同一口径：能问 provider 就用它的单价与档位，问不到才退回配置单价。
+        provider 都建不起来（没 key / 没依赖）也不报错 —— 退回配置单价 + 告警，
+        因为「看一眼要花多少」这件事本身不该失败。
+        """
+        project = self.get_project(project_id)
+        provider = None
+        try:
+            provider = self._video()
+        except Exception as exc:  # noqa: BLE001 - 估不出价不该让接口 500
+            logger.warning("视频 provider 初始化失败，按配置单价估算：%s", exc)
+        try:
+            return await preflight_service.preflight(
+                project=project,
+                storyboard=self.store.load_storyboard(project_id),
+                video=self.store.load_video_manifest(project_id),
+                audio=self.store.load_audio_manifest(project_id),
+                provider=provider or preflight_service.UnavailableVideoProvider(),
+                report=self.cost_report(project_id),
+                settings=get_settings(),
+                action=action,
+                script_mode=script_mode,
+            )
+        finally:
+            if provider is not None:
+                await provider.aclose()
+
+    async def merge_short_shots(
+        self,
+        project_id: str,
+        *,
+        min_sec: float | None = None,
+        max_sec: float = 0.0,
+        dry_run: bool = True,
+        force: bool = False,
+    ) -> dict:
+        """把太短的镜头合并成更少更长的片段（省钱），`dry_run` 只算不写。
+
+        安全底线：
+        - 有对白的镜头绝不被吸收、也绝不互相合并（不同说话人不能共用一条配音）
+        - 已经有**可用片段**时默认拒绝（合并会让花钱买来的片段作废），要 `force=True`
+        """
+        self._reject_if_running(project_id, VIDEO_JOB_KIND, "视频生成")
+        async with self._lock(project_id):
+            project = self.get_project(project_id)
+            self._require(project, GENERATE_VIDEO_STATUSES, "合并镜头")
+            storyboard = self.store.load_storyboard(project_id)
+            if not storyboard or not storyboard.shots:
+                raise PipelineError("分镜不存在或为空，无法合并镜头")
+
+            settings = get_settings()
+            target = min_sec if min_sec is not None else settings.video_min_shot_sec
+            if not target or target <= 0:
+                target = await self._min_billable_seconds()
+
+            video = self.store.load_video_manifest(project_id)
+            ready = len(video.ready_clips) if video else 0
+            report = storyboard_service.merge_shots(
+                storyboard, min_sec=target, max_sec=max_sec, dry_run=True
+            )
+            if dry_run:
+                payload = report.summary()
+                payload["ready_clips"] = ready
+                payload["force_required"] = bool(ready)
+                return payload
+
+            if ready and not force:
+                raise PipelineError(
+                    f"已有 {ready} 个可用片段，合并会让它们作废（重新生成要再花钱）。"
+                    "确认要合并请带 force=true"
+                )
+
+            report = storyboard_service.merge_shots(
+                storyboard, min_sec=target, max_sec=max_sec, dry_run=False
+            )
+            if report.to_shots != report.from_shots:
+                self.store.save_storyboard(project_id, storyboard)
+                # 镜头没了/时长变了 -> 片段、配音、成片全部作废
+                self.store.purge_media(project_id, video=True, audio=True, compose=True)
+                was_video_ready = project.status in {
+                    ProjectStatus.VIDEO_READY,
+                    ProjectStatus.AUDIO_READY,
+                    ProjectStatus.DONE,
+                    ProjectStatus.AUDIO_GENERATING,
+                    ProjectStatus.COMPOSING,
+                }
+                project.status = ProjectStatus.STORYBOARD_CONFIRMED
+                self.store.save_project(project)
+                logger.info(
+                    "合并短镜头：%d -> %d 个镜头（最短 %ss），下游媒体已作废（原状态 %s）",
+                    report.from_shots,
+                    report.to_shots,
+                    target,
+                    "video_ready 等" if was_video_ready else project.status.value,
+                )
+            payload = report.summary()
+            payload["ready_clips"] = ready
+            payload["force_required"] = False
+            payload["purged_media"] = report.to_shots != report.from_shots
+            return payload
+
+    async def _min_billable_seconds(self) -> float:
+        """问 provider 的最短计费档位（问不到就按 1 秒 = 没有档位约束）。"""
+        provider = None
+        try:
+            provider = self._video()
+            options = await provider.duration_options()
+        except Exception:  # 问不到就不做档位对齐
+            logger.warning("视频档位查询失败，合并按 1 秒处理", exc_info=True)
+            return 1.0
+        finally:
+            if provider is not None:
+                await provider.aclose()
+        return options[0] if options else 1.0
+
     # ── 视频阶段 ──────────────────────────────────────────
 
     async def start_video_generation(self, project_id: str) -> Job:
@@ -562,9 +702,12 @@ class Pipeline:
             if not storyboard or not storyboard.shots:
                 raise PipelineError("分镜不存在或为空，无法生成视频")
 
-            # 只为「还没生成的那部分」预留预算；真实模型按自己的档位算秒数
+            # 只为「还没生成的那部分」预留预算；真实模型按自己的档位算秒数。
+            # 注意：换 provider/模型时旧片段会**全部重跑**，预算必须按全部算 ——
+            # 否则「生成缺失片段」会把预算门控绕过去（真实场景：mock → H3 一次 $9.75）。
             video = self.store.load_video_manifest(project_id)
-            upcoming = await self._estimate_video_usd(_pending_shots(storyboard, video))
+            targets = await self._budget_shots(storyboard, video)
+            upcoming = await self._estimate_video_usd(targets)
             self._guard_budget(
                 project_id, upcoming_usd=upcoming, action="生成视频片段"
             )

@@ -305,7 +305,7 @@ body {
 
 <div class="header">
   <h1>videogen</h1>
-  <span class="badge">v0.9</span>
+  <span class="badge">v0.10</span>
   <span style="flex:1"></span>
   <span id="health" style="font-size:12px;color:var(--text2)"></span>
   <span id="global-status" style="font-size:12px;color:var(--text2)"></span>
@@ -537,6 +537,7 @@ async function renderProject(id) {
   currentAudio = await safeGet(`/api/projects/${id}/audio/status`);
   currentCompose = await safeGet(`/api/projects/${id}/compose/status`);
   currentCost = await safeGet(`/api/projects/${id}/cost`);
+  await loadPreflight('all');
   if (!modelInfo) modelInfo = await safeGet('/api/models');
   // 刷新页面后也能看到最近一次批量任务（进行中的继续轮询）
   if (!currentBatch || !currentBatch.is_active) {
@@ -644,6 +645,8 @@ async function renderProject(id) {
         <button class="btn btn-sm btn-outline" onclick="startEdit('storyboard')" id="btn-storyboard-edit" style="display:none">编辑 JSON</button>
         ${inStatus(p, ['storyboard_review'])
           ? '<button class="btn btn-sm btn-green" onclick="doConfirmStoryboard()">确认分镜</button>' : ''}
+        ${inStatus(p, ['storyboard_confirmed','video_ready','audio_ready','done'])
+          ? '<button class="btn btn-sm btn-outline" onclick="doMergeShots()">合并短镜头（省钱）</button>' : ''}
         ${inStatus(p, ['storyboard_confirmed','video_ready','audio_ready','done'])
           ? '<button class="btn btn-sm btn-danger" onclick="doReopenStoryboard()">退回重生成分镜</button>' : ''}
       </div>
@@ -1168,12 +1171,17 @@ function renderVideo() {
 
   const canStart = ['storyboard_confirmed', 'video_ready', 'audio_ready', 'done'].includes(status) && !active;
   const buttons = [];
+  const planLine = videoPlanLine(status);
+  if (planLine) buttons.push(`<div class="hint" style="flex-basis:100%">${planLine}</div>`);
   if (active) {
     buttons.push('<button class="btn btn-sm btn-danger" onclick="doCancelVideo()">取消生成</button>');
   }
   if (canStart) {
     const hasClips = summary && (summary.ready || summary.failed);
-    const label = !hasClips ? '生成视频片段'
+    const plan = (currentPreflight && currentPreflight.video) || null;
+    // 换模型/provider 后旧片段会全部重跑，按钮文案必须说清楚（否则「生成缺失片段」是骗人的）
+    const label = plan && plan.regenerate_all ? `重新生成全部 ${plan.to_generate} 个片段`
+      : !hasClips ? '生成视频片段'
       : summary.failed ? `重试 ${summary.failed} 个失败镜头`
       : '生成缺失片段';
     buttons.push(`<button class="btn btn-sm" onclick="doGenerateVideo()">${label}</button>`);
@@ -1208,10 +1216,105 @@ async function refreshVideoPanel() {
   }
 }
 
+// ── 成本前置（preflight）─────────────────────────────────────────────
+
+let currentPreflight = null;
+
+async function loadPreflight(action) {
+  if (!currentProjectId) return null;
+  currentPreflight = await safeGet(
+    `/api/projects/${currentProjectId}/preflight?action=${action || 'all'}&script_mode=${audioScriptMode}`
+  );
+  return currentPreflight;
+}
+
+function videoPlanLine(status) {
+  const plan = currentPreflight && currentPreflight.video;
+  if (!plan || !plan.shots_total) return '';
+  if (status === 'storyboard_review') return '';
+  const parts = [
+    `本次生成 ${plan.to_generate}/${plan.shots_total} 个片段`,
+    `计费 ${plan.billed_seconds}s × $${plan.price_per_second}/s ≈ <strong>${usd(plan.estimated_usd)}</strong>`,
+    plan.price_source === 'config' ? '（单价取配置）' : '',
+  ].filter(Boolean).join(' · ');
+  const extra = [];
+  if (plan.regenerate_all) extra.push(`⚠️ ${esc(plan.regenerate_reason)}：已就绪的 ${plan.existing_ready} 个片段要全部重跑`);
+  if (plan.budget && plan.budget.limited) {
+    extra.push(`预算剩余 ${usd(plan.budget.remaining_usd)}` +
+      (plan.budget.over_budget ? `（不足，还差 ${usd(plan.budget.shortfall_usd)}，会被拒绝）` : ''));
+  }
+  const merge = plan.merge_plan;
+  if (merge && merge.worth_it) {
+    extra.push(`合并短镜头：${merge.from_shots} → ${merge.to_shots} 个可省 ≈ ${usd(merge.saving_usd)}`);
+  }
+  return parts + (extra.length ? '<br>' + extra.join('<br>') : '');
+}
+
+function planConfirmText(plan) {
+  const lines = [
+    `将生成 ${plan.to_generate} 个片段（共 ${plan.shots_total} 个镜头）`,
+    `计费 ${plan.billed_seconds}s × $${plan.price_per_second}/s ≈ ${usd(plan.estimated_usd)}`,
+  ];
+  if (plan.regenerate_all) {
+    lines.push(`⚠️ ${plan.regenerate_reason}：已就绪的 ${plan.existing_ready} 个片段会全部重新生成`);
+  }
+  if (plan.budget && plan.budget.limited) {
+    lines.push(`预算 ${usd(plan.budget.budget_usd)} · 已花 ${usd(plan.budget.spent_usd)} · 剩余 ${usd(plan.budget.remaining_usd)}`);
+  }
+  lines.push('', '确认开始生成吗？');
+  return lines.join('\n');
+}
+
 function doGenerateVideo() {
   stopVideoPolling();
-  withBusy('提交视频生成任务...', async () => {
+  withBusy('估算花费...', async () => {
+    const pre = await loadPreflight('video');
+    const plan = pre && pre.video;
+    if (!plan) throw new Error('拿不到成本预估，已取消提交');
+    if (plan.budget && plan.budget.over_budget) {
+      alert('预算不足，已取消提交：\n\n' + planConfirmText(plan) +
+        `\n还差 ${usd(plan.budget.shortfall_usd)}（可改 BUDGET_USD=0 关闭限制）`);
+      return;
+    }
+    // 免费（mock）就不用每次都点确认
+    if (plan.estimated_usd > 0 || plan.regenerate_all) {
+      if (!confirm(planConfirmText(plan))) return;
+    }
     await api(`/api/projects/${currentProjectId}/video/generate`, { method: 'POST' });
+  });
+}
+
+async function doMergeShots() {
+  withBusy('试算合并...', async () => {
+    const pre = await loadPreflight('video');
+    const saving = pre && pre.video && pre.video.merge_plan ? pre.video.merge_plan.saving_usd : 0;
+    const preview = await api(`/api/projects/${currentProjectId}/storyboard/merge-shots`, {
+      method: 'POST',
+      body: JSON.stringify({ dry_run: true }),
+    });
+    if (preview.to_shots >= preview.from_shots) {
+      alert('没有可以合并的镜头：\n\n' + (preview.warnings || []).join('\n'));
+      return;
+    }
+    const text = [
+      `镜头：${preview.from_shots} → ${preview.to_shots} 个（每镜最短 ${preview.min_sec}s）`,
+      `总时长：${preview.from_seconds}s → ${preview.to_seconds}s`,
+      saving > 0 ? `视频计费预计省 ≈ ${usd(saving)}` : '',
+      preview.dropped_lines && preview.dropped_lines.length
+        ? `⚠️ 会丢掉 ${preview.dropped_lines.length} 条旁白（对白一条都不会丢）` : '',
+      preview.force_required
+        ? `⚠️ 已有 ${preview.ready_clips} 个可用片段，合并会让它们作废（重新生成要再花钱）` : '',
+      '', '确认合并吗？（合并后镜头变少，无法自动还原）',
+    ].filter(Boolean).join('\n');
+    if (!confirm(text)) return;
+    await api(`/api/projects/${currentProjectId}/storyboard/merge-shots`, {
+      method: 'POST',
+      body: JSON.stringify({
+        dry_run: false,
+        min_sec: preview.min_sec,
+        force: !!preview.force_required,
+      }),
+    });
   });
 }
 
@@ -1658,6 +1761,18 @@ function renderCost() {
   }).join('');
 
   const est = cost.estimate || {};
+  const pre = currentPreflight;
+  const upcoming = pre
+    ? `<div class="hint" style="margin-top:8px">
+         <strong>下一次操作预估</strong>（成本前置 preflight）：
+         视频 ${pre.video ? usd(pre.video.estimated_usd) : '—'}（${pre.video ? pre.video.billed_seconds + 's × $' + pre.video.price_per_second : '—'}）·
+         配音 ${pre.audio ? usd(pre.audio.estimated_usd) : '—'}${pre.audio && pre.audio.script_usd ? `（含 LLM 文案 ${usd(pre.audio.script_usd)}）` : ''} ·
+         合成 ${pre.compose ? usd(pre.compose.estimated_usd) : '—'}
+         ${pre.budget && pre.budget.limited
+           ? `<br>预算 ${usd(pre.budget.budget_usd)} · 已花 ${usd(pre.budget.spent_usd)} · 本次后剩余 ${usd(pre.budget.budget_usd - pre.budget.projected_usd)}`
+           : '<br>未设预算上限（BUDGET_USD=0）'}
+       </div>`
+    : '';
   body.innerHTML = `
     <table class="cost-table">
       <thead><tr><th>阶段</th><th>花费</th><th>tokens</th><th>秒/字符</th><th>次数</th></tr></thead>
@@ -1669,6 +1784,7 @@ function renderCost() {
       视频 $${cost.prices.video_per_second}/秒 · 配音 $${cost.prices.tts_per_mchar}/百万字
       <br>按当前分镜预估：视频 ${usd(est.video_usd)} · 配音 ${usd(est.audio_usd)}（真实单价请在 .env 配）
     </div>
+    ${upcoming}
   `;
 }
 

@@ -313,6 +313,8 @@ class FakeVideoProvider(VideoProvider):
         delay: float = 0.0,
         media_kind: MediaKind = MediaKind.VIDEO,
         supports_reference_image: bool = False,
+        price_usd_per_sec: float | None = None,
+        duration_options: list[float] | None = None,
     ):
         self.supports_reference_image = supports_reference_image
         self.requests: list[VideoRequest] = []
@@ -324,6 +326,24 @@ class FakeVideoProvider(VideoProvider):
         self.active = 0
         self.max_active = 0
         self.closed = 0
+        #: 成本前置用例用：模拟真实模型的「最短档位 + 按秒单价」
+        self.price_usd_per_sec = price_usd_per_sec
+        self.duration_options_sec = sorted(float(x) for x in (duration_options or []))
+
+    async def planned_seconds(self, requested_sec: float) -> float:
+        """有档位就抬到最近的一档（与 OpenRouter 的 `_clamp_duration` 同语义）。"""
+        if not self.duration_options_sec:
+            return max(0.0, float(requested_sec))
+        for option in self.duration_options_sec:
+            if option >= requested_sec:
+                return option
+        return self.duration_options_sec[-1]
+
+    async def duration_options(self) -> list[float]:
+        return list(self.duration_options_sec)
+
+    async def price_per_second(self, *, resolution: str = "") -> float | None:
+        return self.price_usd_per_sec
 
     def attempts_for(self, shot_id: str) -> int:
         return self.calls.count(shot_id)

@@ -440,6 +440,41 @@ async def reopen_storyboard(project_id: str):
     return {"status": "ok", "project_status": project.status.value}
 
 
+class MergeShotsRequest(BaseModel):
+    """合并短镜头（省钱）：默认只预览，`dry_run=false` 才真的写盘。
+
+    真实视频模型按最短档位计费（H3 最短 5 秒），3 秒的镜头也是 5 秒的钱 ——
+    把几个短镜头合成一个长镜头能直接省钱，代价是镜头语言变粗。
+    """
+
+    #: 目标最短时长（秒）；留空 = 用模型最短档位（H3 是 5）
+    min_sec: float | None = Field(default=None, gt=0, le=60)
+    #: 单个镜头时长上限（0 = 不限制）
+    max_sec: float = Field(default=0.0, ge=0, le=60)
+    dry_run: bool = True
+    #: 已有可用片段时是否强制合并（会让已付费片段作废）
+    force: bool = False
+
+
+@app.post("/api/projects/{project_id}/storyboard/merge-shots")
+async def merge_shots(project_id: str, req: MergeShotsRequest | None = None):
+    """把太短的镜头合并成更少更长的片段（默认只算不写）。"""
+    body = req or MergeShotsRequest()
+    return await pipeline.merge_short_shots(
+        project_id,
+        min_sec=body.min_sec,
+        max_sec=body.max_sec,
+        dry_run=body.dry_run,
+        force=body.force,
+    )
+
+
+@app.get("/api/projects/{project_id}/preflight")
+async def preflight(project_id: str, action: str = "all", script_mode: str = ""):
+    """动手花钱前先看账：镜头数 / 计费秒数 / 单价 / 预估 USD / 预算余额 / 省钱建议。"""
+    return await pipeline.preflight(project_id, action=action, script_mode=script_mode)
+
+
 # ── World State / Outline / Consistency ─────────────────────
 
 

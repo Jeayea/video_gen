@@ -197,6 +197,19 @@ class OpenRouterVideoProvider(VideoProvider):
         caps = await self.capabilities()
         return _clamp_duration(float(requested_sec), caps.get("supported_durations"))
 
+    async def duration_options(self) -> list[float]:
+        """模型支持的时长档位（升序）。H3 是 5~15 秒，所以 3 秒的镜头也按 5 秒计费。"""
+        caps = await self.capabilities()
+        raw = caps.get("supported_durations")
+        if not isinstance(raw, list):
+            return []
+        values: list[float] = []
+        for item in raw:
+            value = _as_float(item)
+            if value is not None and value > 0:
+                values.append(value)
+        return sorted(set(values))
+
     # ── 生成 ──────────────────────────────────────────────
 
     async def generate(self, request: VideoRequest) -> GeneratedClip:

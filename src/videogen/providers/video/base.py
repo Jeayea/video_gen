@@ -103,6 +103,13 @@ class VideoProvider(ABC):
         """
         return max(0.0, float(requested_sec))
 
+    async def duration_options(self) -> list[float]:
+        """模型支持的时长档位（秒，升序）；返回空列表 = 没有档位限制。
+
+        成本前置（preflight）用它算「最少要买多少秒」和「合并成几个镜头最省」。
+        """
+        return []
+
     async def price_per_second(self, *, resolution: str = "") -> float | None:
         """向 provider 问单价（USD/秒）；问不到返回 None，让上层用配置的单价。"""
         return None

@@ -670,3 +670,44 @@ def test_budget_exceeded_returns_400(client, monkeypatch):
     assert resp.status_code == 400
     assert "预算不足" in resp.json()["detail"]
     assert client.get(f"/api/projects/{pid}").json()["status"] == "storyboard_confirmed"
+
+
+# ── 成本前置（preflight）/ 合并短镜头 ─────────────────────
+
+
+def test_preflight_endpoint(client):
+    pid = prepare_confirmed_storyboard(client)
+
+    data = client.get(f"/api/projects/{pid}/preflight").json()
+    assert data["action"] == "all"
+    assert data["video"]["to_generate"] > 0
+    assert data["audio"]["action"] == "audio"
+    assert data["upcoming_usd"] >= 0
+    assert "budget" in data
+
+    only_video = client.get(f"/api/projects/{pid}/preflight?action=video").json()
+    assert only_video["audio"] is None and only_video["compose"] is None
+
+
+def test_merge_shots_endpoint_preview_then_apply(client):
+    pid = prepare_confirmed_storyboard(client)
+
+    before = client.get(f"/api/projects/{pid}/storyboard").json()
+    preview = client.post(f"/api/projects/{pid}/storyboard/merge-shots", json={}).json()
+    assert preview["dry_run"] is True
+    unchanged = client.get(f"/api/projects/{pid}/storyboard").json()
+    assert len(unchanged["shots"]) == len(before["shots"])
+
+    if preview["to_shots"] < preview["from_shots"]:
+        applied = client.post(
+            f"/api/projects/{pid}/storyboard/merge-shots",
+            json={"dry_run": False, "min_sec": 5},
+        ).json()
+        assert applied["dry_run"] is False
+        after = client.get(f"/api/projects/{pid}/storyboard").json()
+        assert len(after["shots"]) == applied["to_shots"]
+
+    bad = client.post(
+        f"/api/projects/{pid}/storyboard/merge-shots", json={"min_sec": 0}
+    )
+    assert bad.status_code == 422  # 0 秒没有意义，别让它悄悄什么都不做

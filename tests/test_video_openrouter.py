@@ -187,6 +187,28 @@ async def test_capabilities_are_parsed_and_cached():
 
 
 @pytest.mark.asyncio
+async def test_duration_options_expose_billing_tiers():
+    """成本前置靠它算「3 秒的镜头也要买 5 秒」——档位必须升序且去重。"""
+    recorder = Recorder()
+    provider = make_provider(recorder)
+
+    options = await provider.duration_options()
+
+    assert options[0] == 5 and options[-1] == 15
+    assert options == sorted(set(options))
+    # 档位与计费秒数是同一份数据
+    assert await provider.planned_seconds(3) == 5.0
+    assert recorder.models_calls == 1  # 档位与计费共用同一份缓存的能力表
+
+
+@pytest.mark.asyncio
+async def test_duration_options_empty_when_model_unknown():
+    recorder = Recorder(models=[])
+    provider = make_provider(recorder, model="someone/brand-new-model")
+    assert await provider.duration_options() == []
+
+
+@pytest.mark.asyncio
 async def test_unknown_model_does_not_break(monkeypatch):
     recorder = Recorder(models=[])
     provider = make_provider(recorder, model="someone/brand-new-model")
