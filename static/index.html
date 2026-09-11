@@ -245,13 +245,49 @@ body {
 
 .scene-actions { display: flex; gap: 6px; margin-top: 8px; }
 .shot-actions { display: flex; gap: 6px; margin-top: 6px; }
+
+/* 视频片段 */
+.clip-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: 10px; margin-top: 10px;
+}
+.clip-card {
+  border: 1px solid var(--border); border-radius: 8px;
+  padding: 8px; background: var(--bg); font-size: 12px;
+}
+.clip-card video {
+  width: 100%; border-radius: 6px; background: #000; display: block;
+  aspect-ratio: 9 / 16; object-fit: contain;
+}
+.clip-card .clip-head {
+  display: flex; align-items: center; gap: 6px; margin-bottom: 6px; flex-wrap: wrap;
+}
+.clip-card .clip-no { font-weight: 600; color: var(--accent2); }
+.clip-card .clip-prompt {
+  color: var(--text2); font-size: 11px; margin-top: 6px; line-height: 1.5;
+  max-height: 52px; overflow: hidden;
+}
+.clip-card .clip-error { color: var(--red); font-size: 11px; margin-top: 6px; }
+.clip-card.pending { opacity: 0.6; }
+
+.progress-wrap { margin-top: 10px; }
+.progress-bar {
+  height: 8px; background: var(--bg); border-radius: 99px; overflow: hidden;
+  border: 1px solid var(--border);
+}
+.progress-fill {
+  height: 100%; background: var(--accent); width: 0%;
+  transition: width 0.3s ease;
+}
+.progress-text { font-size: 12px; color: var(--text2); margin-top: 6px; }
 </style>
 </head>
 <body>
 
 <div class="header">
   <h1>videogen</h1>
-  <span class="badge">v0.2</span>
+  <span class="badge">v0.3</span>
   <span style="flex:1"></span>
   <span id="health" style="font-size:12px;color:var(--text2)"></span>
   <span id="global-status" style="font-size:12px;color:var(--text2)"></span>
@@ -331,6 +367,8 @@ let currentBible = null;
 let currentScript = null;
 let currentStoryboard = null;
 let currentProject = null;
+let currentVideo = null;
+let videoPollTimer = null;
 
 const $ = id => document.getElementById(id);
 
@@ -463,6 +501,7 @@ async function renderProject(id) {
   currentBible = await safeGet(`/api/projects/${id}/bible`);
   currentScript = await safeGet(`/api/projects/${id}/script`);
   currentStoryboard = await safeGet(`/api/projects/${id}/storyboard`);
+  currentVideo = await safeGet(`/api/projects/${id}/video/status`);
 
   const scriptTotal = currentScript ? currentScript.scenes.reduce((a, s) => a + s.duration_sec, 0) : null;
 
@@ -565,14 +604,22 @@ async function renderProject(id) {
     </div>
   `;
 
-  // 4. 视频 / 配音 / 合成（尚未实现，明确标注而不是假装完成）
+  // 4. 视频片段（真实可用；配音/合成仍是 Phase 3）
   html += `
-    <div class="panel pending">
-      <h3><span class="num">4</span> 视频 · 配音 · 合成</h3>
-      <div class="hint">
-        该阶段尚未实现（DESIGN Phase 2/3）。已确认的分镜、英文 video_prompt、每镜时长都已就绪，
-        可直接交给下游视频生成流程。<br>
-        规划中：VideoProvider 抽象 + Mock 实现 → Edge-TTS 配音 → BGM 曲库 → FFmpeg 合成烧字幕。
+    <div class="panel">
+      <h3><span class="num">4</span> 视频片段
+        <span id="video-tags"></span>
+      </h3>
+      <div id="video-body">
+        <span style="color:var(--text2);font-size:12px">尚未生成</span>
+      </div>
+      <div class="progress-wrap" id="video-progress" style="display:none">
+        <div class="progress-bar"><div class="progress-fill" id="video-progress-fill"></div></div>
+        <div class="progress-text" id="video-progress-text"></div>
+      </div>
+      <div class="panel-actions" id="video-actions"></div>
+      <div class="hint" style="margin-top:10px">
+        配音（Edge-TTS）与 FFmpeg 合成仍是 Phase 3，尚未实现；上面生成的片段已可直接交给下游流程。
       </div>
     </div>
   `;
@@ -581,6 +628,7 @@ async function renderProject(id) {
   renderBible();
   renderScript();
   renderStoryboard();
+  renderVideo();
   await loadConsistency(id);
 }
 
@@ -877,6 +925,135 @@ function cancelEdit(kind) {
   view.style.display = '';
   editor.classList.remove('active');
   if (errEl) errEl.textContent = '';
+}
+
+// ── 视频片段 ────────────────────────────────────────────────────────
+
+function stopVideoPolling() {
+  if (videoPollTimer) { clearTimeout(videoPollTimer); videoPollTimer = null; }
+}
+
+function clipStatusLabel(status) {
+  return ({ pending: '待生成', generating: '生成中', ready: '就绪', failed: '失败', skipped: '跳过' })[status] || status;
+}
+
+function videoHint(status) {
+  if (status === 'storyboard_review') return '请先确认分镜，再生成视频片段';
+  if (status === 'video_generating') return '正在生成…';
+  if (status === 'video_ready') return '片段已就绪（配音 / 合成属 Phase 3）';
+  return '确认分镜后可生成视频片段';
+}
+
+function renderVideo() {
+  const body = $('video-body');
+  const actions = $('video-actions');
+  if (!body || !actions) return;
+
+  const v = currentVideo || {};
+  const job = v.job;
+  const summary = v.summary;
+  const active = !!(job && job.is_active);
+  const status = currentProject ? currentProject.status : '';
+
+  $('video-tags').innerHTML = summary
+    ? `<span class="tag-mini">${summary.ready}/${summary.total} 片段</span>` +
+      (summary.failed ? `<span class="tag-mini warn">${summary.failed} 失败</span>` : '') +
+      (summary.placeholder ? `<span class="tag-mini warn">${summary.placeholder} 占位</span>` : '') +
+      (summary.usable ? '<span class="tag-mini ok">可进合成</span>' : '')
+    : '';
+
+  const clips = (v.manifest && v.manifest.clips) || [];
+  if (!clips.length) {
+    body.innerHTML = `<span style="color:var(--text2);font-size:12px">尚未生成${
+      status === 'storyboard_review' ? '（请先确认分镜）' : ''}</span>`;
+  } else {
+    const shots = {};
+    ((currentStoryboard && currentStoryboard.shots) || []).forEach(s => { shots[s.id] = s; });
+    body.innerHTML = `<div class="clip-grid">${clips.map(c => {
+      const shot = shots[c.shot_id] || {};
+      const playable = c.status === 'ready' && c.media_kind === 'video';
+      const statusClass = c.status === 'failed' ? 'warn' : c.status === 'ready' ? 'ok' : '';
+      return `
+        <div class="clip-card ${c.status === 'ready' ? '' : 'pending'}">
+          <div class="clip-head">
+            <span class="clip-no">#${shot.shot_no != null ? shot.shot_no : '?'}</span>
+            <span class="tag-mini">${esc(c.scene_id || '')}</span>
+            <span style="color:var(--text2)">${c.duration_sec}s</span>
+            <span class="tag-mini ${statusClass}">${esc(clipStatusLabel(c.status))}</span>
+            ${c.media_kind === 'placeholder' ? '<span class="tag-mini warn">占位文件</span>' : ''}
+          </div>
+          ${playable
+            ? `<video controls preload="metadata" src="/api/projects/${currentProjectId}/clips/${encodeURIComponent(c.shot_id)}"></video>`
+            : `<div style="font-size:11px;color:var(--text2)">${
+                c.media_kind === 'placeholder' ? '未检测到 ffmpeg，仅写了占位文件' : '等待生成…'}</div>`}
+          ${c.prompt ? `<div class="clip-prompt">${esc(c.prompt)}</div>` : ''}
+          ${c.error ? `<div class="clip-error">${esc(c.error)}</div>` : ''}
+        </div>`;
+    }).join('')}</div>`;
+  }
+
+  const wrap = $('video-progress');
+  if (active) {
+    wrap.style.display = '';
+    $('video-progress-fill').style.width = `${job.percent || 0}%`;
+    $('video-progress-text').textContent =
+      `${job.message || '生成中'}（${job.percent || 0}%，任务 ${job.id}）`;
+  } else {
+    wrap.style.display = 'none';
+  }
+
+  const canStart = ['storyboard_confirmed', 'video_ready'].includes(status) && !active;
+  const buttons = [];
+  if (active) {
+    buttons.push('<button class="btn btn-sm btn-danger" onclick="doCancelVideo()">取消生成</button>');
+  }
+  if (canStart) {
+    const hasClips = summary && (summary.ready || summary.failed);
+    const label = !hasClips ? '生成视频片段'
+      : summary.failed ? `重试 ${summary.failed} 个失败镜头`
+      : '生成缺失片段';
+    buttons.push(`<button class="btn btn-sm" onclick="doGenerateVideo()">${label}</button>`);
+  }
+  if (!buttons.length) {
+    buttons.push(`<span class="hint">${esc(videoHint(status))}</span>`);
+  }
+  actions.innerHTML = buttons.join('');
+
+  if (active) scheduleVideoPoll(); else stopVideoPolling();
+}
+
+function scheduleVideoPoll() {
+  stopVideoPolling();
+  videoPollTimer = setTimeout(refreshVideoPanel, 1500);
+}
+
+async function refreshVideoPanel() {
+  if (!currentProjectId) return;
+  const previousJobId = currentVideo && currentVideo.job ? currentVideo.job.id : null;
+  const status = await safeGet(`/api/projects/${currentProjectId}/video/status`);
+  if (!status) return;
+  currentVideo = status;
+
+  const job = status.job;
+  const active = !!(job && job.is_active);
+  renderVideo();
+
+  // 任务刚结束 → 整体刷新，更新项目状态标签
+  if (!active && job && job.id === previousJobId) {
+    await refresh();
+  }
+}
+
+function doGenerateVideo() {
+  stopVideoPolling();
+  withBusy('提交视频生成任务...', async () => {
+    await api(`/api/projects/${currentProjectId}/video/generate`, { method: 'POST' });
+  });
+}
+
+function doCancelVideo() {
+  withBusy('取消生成...', () =>
+    api(`/api/projects/${currentProjectId}/video/cancel`, { method: 'POST' }));
 }
 
 // ── 生成 / 确认 / 退回 ──────────────────────────────────────────────

@@ -1,6 +1,46 @@
-# FIXES — v0.2 修复记录
+# FIXES — 修复记录
 
-> 对照 [REVIEW.md](REVIEW.md) 的问题清单逐条修复。验证方式：71 个离线测试（`FakeLLM` 注入）+ `ruff` + 一次真实 OpenRouter 端到端跑通。
+> 对照 [REVIEW.md](REVIEW.md) 的问题清单逐条修复。验证方式：104 个离线测试（`FakeLLM` / `FakeVideoProvider` 注入）+ `ruff` + 一次真实 OpenRouter 文本链路 + 一次真实 ffmpeg 视频链路。
+
+## v0.3 · Phase 2 视频阶段（新增）
+
+| 能力 | 实现 | 位置 |
+|------|------|------|
+| VideoProvider 抽象 | `generate(VideoRequest) -> GeneratedClip`；约定失败必须抛 `VideoProviderError`，不许返回空文件假装成功 | `providers/video/base.py` |
+| MockVideoProvider | 有 ffmpeg 时用 `libx264` 生成真实 MP4（纯色 + 横扫白条，一眼看出是视频）；没有 ffmpeg 时写 `.placeholder.json` 并把 `media_kind` 标成 `placeholder` | `providers/video/mock.py` |
+| ffmpeg 解析 | `FFMPEG_PATH` → `PATH` → `imageio-ffmpeg` 自带二进制；找不到就明确报错/降级，不静默失败 | `utils/ffmpeg.py` |
+| 并发 + 重试 + 隔离 | 信号量控并发，单镜失败重试 N 次（指数退避），仍失败只标记该镜头不阻塞其他镜头；失败/取消清理半截文件 | `services/video_service.py` |
+| 断点续跑 | `video_manifest.json` 记录每镜状态，已 ready 且文件仍在的镜头直接跳过，重试只补失败/缺失的 | 同上 + `pipeline._run_video_job` |
+| 后台任务队列 | 提交即返回 job；进度/百分比、取消、单项目互斥、历史上限裁剪、退出时取消所有任务 | `orchestrator/jobs.py` |
+| 状态与恢复 | `VIDEO_GENERATING → VIDEO_READY`；全失败退回 `STORYBOARD_CONFIRMED`（可重试）；启动时回收卡在「进行中」的项目 | `orchestrator/pipeline.py` |
+| API | `video/generate`(202) · `video/status` · `video/manifest` · `video/cancel` · `clips/{shot_id}` · `jobs/{id}` | `main.py` |
+| Web UI | 第 4 阶段真实面板：片段网格 + 内嵌播放 + 进度条轮询 + 取消 + 重试失败镜头 + 占位/失败标记 | `static/index.html` |
+
+### 开发过程中发现并修掉的两个真实 bug
+
+1. **取消一个还没被调度的任务会永远卡在 queued**：任务在首次执行前被 `task.cancel()`，协程体根本不会运行，
+   状态就永远停在 `queued`（`is_active=True`）。修法：`cancel()` 里同步落定状态，`shutdown()` 同理；
+   `_run()` 开头对已取消的任务直接返回。→ `orchestrator/jobs.py`
+2. **重复提交视频任务会阻塞到上一个任务跑完**：正在跑的视频任务会一直持有项目锁，而「是否已有任务」的检查
+   原本在锁内，于是第二次 POST 会挂住几分钟（真实 provider 场景）。修法：锁外先查任务表快速拒绝，
+   锁内再查一次防竞态。→ `pipeline.start_video_generation()`
+
+### 真实验证（MockVideoProvider + 真实 ffmpeg）
+
+手工构造 2 场 4 镜（3/3/4/4 秒，9:16）→ `POST /video/generate` → 1 秒内 4/4 成功：
+
+```
+scene_1_shot_1.mp4  3.00s  h264 540x960 yuv420p 24fps
+scene_1_shot_2.mp4  3.00s  h264 540x960 yuv420p 24fps
+scene_2_shot_1.mp4  4.00s  h264 540x960 yuv420p 24fps
+scene_2_shot_2.mp4  4.00s  h264 540x960 yuv420p 24fps
+project_status: video_ready | summary: ready=4 failed=0 usable=True duration=14s
+GET /clips/scene_2_shot_1 → 200 video/mp4 (6959 bytes)
+GET /clips/..%2F..%2Fmeta → 404（越界被拒）
+再次提交 → 21ms 返回，0 次重复生成（续跑生效）
+```
+
+## v0.2 · 文本链路修复
 
 ## P0 · 阻断级
 

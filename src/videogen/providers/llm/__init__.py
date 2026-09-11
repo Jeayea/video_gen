@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from videogen.config import get_settings
 from videogen.providers.llm.base import LLMError, LLMJSONError, LLMMessage, LLMProvider
-from videogen.providers.llm.openrouter import OpenRouterProvider, scrub_secrets
+from videogen.providers.llm.openrouter import OpenRouterProvider
+from videogen.utils.redact import scrub_secrets
 
 __all__ = [
     "LLMError",

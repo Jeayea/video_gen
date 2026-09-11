@@ -22,6 +22,11 @@ class Settings(BaseSettings):
 
     # Video
     video_provider: str = "mock"
+    video_concurrency: int = 3
+    video_max_retries: int = 2
+    video_retry_backoff_sec: float = 1.5
+    video_fps: int = 24
+    video_crf: int = 30
 
     # TTS
     tts_provider: str = "edge"

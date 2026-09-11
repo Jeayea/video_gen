@@ -1,6 +1,6 @@
 [project]
 name = "videogen"
-version = "0.2.0"
+version = "0.3.0"
 description = "剧本生成 + AI 短剧自动化流水线"
 requires-python = ">=3.11"
 dependencies = [
@@ -13,6 +13,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# 便携 ffmpeg（pip 装一个自带二进制，不用 brew）；视频阶段需要
+media = ["imageio-ffmpeg>=0.5"]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.24",

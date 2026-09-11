@@ -4,15 +4,26 @@ import asyncio
 import logging
 from collections.abc import Callable
 
+from videogen.config import get_settings
 from videogen.models.bible import StoryBible
 from videogen.models.consistency import ConsistencyReport
 from videogen.models.project import Project, ProjectStatus
 from videogen.models.script import Script, ScriptOutline
 from videogen.models.storyboard import Storyboard
+from videogen.models.video import VideoManifest
 from videogen.models.world_state import WorldState
+from videogen.orchestrator.jobs import Job, JobContext, JobManager
 from videogen.providers import llm as llm_providers
+from videogen.providers import video as video_providers
 from videogen.providers.llm.base import LLMProvider
-from videogen.services import bible_service, consistency_service, script_service, storyboard_service
+from videogen.providers.video.base import VideoProvider
+from videogen.services import (
+    bible_service,
+    consistency_service,
+    script_service,
+    storyboard_service,
+    video_service,
+)
 from videogen.utils.file_store import FileStore
 
 logger = logging.getLogger(__name__)
@@ -52,6 +63,23 @@ EDIT_BIBLE_STATUSES = {ProjectStatus.DRAFT, ProjectStatus.FAILED, ProjectStatus.
 EDIT_SCRIPT_STATUSES = {ProjectStatus.DRAFT, ProjectStatus.FAILED, ProjectStatus.SCRIPT_REVIEW}
 EDIT_STORYBOARD_STATUSES = {ProjectStatus.SCRIPT_CONFIRMED, ProjectStatus.STORYBOARD_REVIEW}
 
+#: 视频生成入口：确认分镜后开跑，或在 VIDEO_READY 下补跑失败/未生成的镜头。
+#: 允许 VIDEO_GENERATING 是为了让「任务已死但状态没收拾干净」的项目也能手动重试。
+GENERATE_VIDEO_STATUSES = {
+    ProjectStatus.STORYBOARD_CONFIRMED,
+    ProjectStatus.VIDEO_READY,
+    ProjectStatus.VIDEO_GENERATING,
+}
+
+#: 进程重启后需要收尾的「进行中」状态
+TRANSIENT_STATUSES = {
+    ProjectStatus.VIDEO_GENERATING,
+    ProjectStatus.AUDIO_GENERATING,
+    ProjectStatus.COMPOSING,
+}
+
+VIDEO_JOB_KIND = "video"
+
 
 class Pipeline:
     """项目流水线编排：管理阶段流转、人工确认门控和断点续跑。
@@ -66,9 +94,13 @@ class Pipeline:
         self,
         store: FileStore | None = None,
         llm_factory: Callable[[], LLMProvider] | None = None,
+        video_factory: Callable[[], VideoProvider] | None = None,
+        jobs: JobManager | None = None,
     ):
         self.store = store or FileStore()
         self._llm_factory = llm_factory or (lambda: llm_providers.get_llm())
+        self._video_factory = video_factory or (lambda: video_providers.get_video_provider())
+        self.jobs = jobs or JobManager()
         self._locks: dict[str, asyncio.Lock] = {}
 
     # ── 基础设施 ──────────────────────────────────────────
@@ -82,6 +114,9 @@ class Pipeline:
 
     def _llm(self) -> LLMProvider:
         return self._llm_factory()
+
+    def _video(self) -> VideoProvider:
+        return self._video_factory()
 
     def get_project(self, project_id: str) -> Project:
         project = self.store.load_project(project_id)
@@ -375,6 +410,151 @@ class Pipeline:
                 project, self.store.load_bible(project_id), self.store.load_script(project_id)
             )
             return storyboard
+
+    # ── 视频阶段 ──────────────────────────────────────────
+
+    async def start_video_generation(self, project_id: str) -> Job:
+        """提交视频生成后台任务，立即返回 Job（进度用 video_status 查）。"""
+        # 快速路径：正在跑的任务会一直持有项目锁，所以必须先看任务表，
+        # 否则重复提交会阻塞到上一个任务跑完（真实 provider 可能是几分钟）。
+        self._reject_if_video_running(project_id)
+
+        async with self._lock(project_id):
+            project = self.get_project(project_id)
+            self._reject_if_video_running(project_id)
+            self._require(project, GENERATE_VIDEO_STATUSES, "生成视频（需先确认分镜）")
+
+            storyboard = self.store.load_storyboard(project_id)
+            if not storyboard or not storyboard.shots:
+                raise PipelineError("分镜不存在或为空，无法生成视频")
+
+            project.status = ProjectStatus.VIDEO_GENERATING
+            self.store.save_project(project)
+
+        return self.jobs.submit(
+            project_id,
+            VIDEO_JOB_KIND,
+            lambda ctx: self._run_video_job(ctx, project_id),
+        )
+
+    def _reject_if_video_running(self, project_id: str) -> None:
+        running = self.jobs.active_for(project_id, VIDEO_JOB_KIND)
+        if running:
+            raise PipelineError(f"该项目已有视频生成任务在运行（job={running.id}）")
+
+    async def _run_video_job(self, ctx: JobContext, project_id: str) -> None:
+        async with self._lock(project_id):
+            project = self.get_project(project_id)
+            storyboard = self.store.load_storyboard(project_id) or Storyboard()
+            provider = self._video()
+            project_dir = self.store.ensure_project_dir(project_id)
+            clips_dir = self.store.clips_dir(project_id)
+            settings = get_settings()
+
+            def on_progress(manifest: VideoManifest) -> None:
+                self.store.save_video_manifest(project_id, manifest)
+                done = len(manifest.ready_clips) + len(manifest.failed_clips)
+                ctx.set_progress(
+                    done=done,
+                    total=len(manifest.clips),
+                    message=f"片段 {done}/{len(manifest.clips)}（成功 {len(manifest.ready_clips)}，"
+                    f"失败 {len(manifest.failed_clips)}）",
+                )
+
+            try:
+                manifest = await video_service.generate_clips(
+                    project,
+                    storyboard,
+                    provider,
+                    clips_dir,
+                    project_dir,
+                    concurrency=settings.video_concurrency,
+                    max_retries=settings.video_max_retries,
+                    retry_backoff_sec=settings.video_retry_backoff_sec,
+                    existing=self.store.load_video_manifest(project_id),
+                    on_progress=on_progress,
+                )
+            except asyncio.CancelledError:
+                # 取消：保留已生成片段，状态退回可重试的位置
+                self._settle_video_status(project, self.store.load_video_manifest(project_id))
+                raise
+            finally:
+                await provider.aclose()
+
+            self.store.save_video_manifest(project_id, manifest)
+            self._settle_video_status(project, manifest)
+            ctx.set_progress(
+                done=len(manifest.clips),
+                total=len(manifest.clips),
+                message=(
+                    f"完成：成功 {len(manifest.ready_clips)}，"
+                    f"失败 {len(manifest.failed_clips)}"
+                ),
+            )
+            if not manifest.ready_clips:
+                raise PipelineError(
+                    f"全部 {len(manifest.clips)} 个片段生成失败，请检查 provider 配置 / ffmpeg"
+                )
+
+    def _settle_video_status(self, project: Project, manifest: VideoManifest | None) -> None:
+        """有可用片段就进 VIDEO_READY，否则退回 STORYBOARD_CONFIRMED（可重试）。"""
+        project.status = (
+            ProjectStatus.VIDEO_READY
+            if manifest and manifest.ready_clips
+            else ProjectStatus.STORYBOARD_CONFIRMED
+        )
+        self.store.save_project(project)
+
+    def get_video_manifest(self, project_id: str) -> VideoManifest | None:
+        return self.store.load_video_manifest(project_id)
+
+    def video_status(self, project_id: str) -> dict:
+        project = self.get_project(project_id)
+        manifest = self.store.load_video_manifest(project_id)
+        active = self.jobs.active_for(project_id, VIDEO_JOB_KIND)
+        latest = self.jobs.list(project_id, limit=1)
+        job = active or (latest[0] if latest else None)
+        return {
+            "project_status": project.status.value,
+            "summary": manifest.summary() if manifest else None,
+            "manifest": manifest.model_dump() if manifest else None,
+            "job": job.to_public() if job else None,
+        }
+
+    async def cancel_video_generation(self, project_id: str) -> int:
+        self.get_project(project_id)
+        cancelled = await self.jobs.cancel_project(project_id, VIDEO_JOB_KIND)
+        if cancelled:
+            async with self._lock(project_id):
+                project = self.get_project(project_id)
+                self._settle_video_status(project, self.store.load_video_manifest(project_id))
+        return cancelled
+
+    async def recover_interrupted_jobs(self) -> list[str]:
+        """进程重启后，把卡在「进行中」状态的项目收回到可继续的状态。
+
+        内存里的任务在重启后就没了，但 meta.json 里可能还写着 VIDEO_GENERATING。
+        """
+        recovered: list[str] = []
+        for project in self.store.list_projects():
+            if project.status not in TRANSIENT_STATUSES:
+                continue
+            manifest = self.store.load_video_manifest(project.id)
+            if project.status == ProjectStatus.VIDEO_GENERATING:
+                self._settle_video_status(project, manifest)
+            else:
+                # 配音/合成阶段未实现，回退到视频就绪
+                project.status = (
+                    ProjectStatus.VIDEO_READY
+                    if manifest and manifest.ready_clips
+                    else ProjectStatus.STORYBOARD_CONFIRMED
+                )
+                self.store.save_project(project)
+            recovered.append(project.id)
+            logger.warning(
+                "重启恢复：项目 %s 原处于中断状态，已回退为 %s", project.id, project.status.value
+            )
+        return recovered
 
     # ── 读取 / 校验 / 删除 ────────────────────────────────
 

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import time
+
 import pytest
 from fastapi.testclient import TestClient
 
-from tests.fakes import FakeLLM
+from tests.fakes import FakeLLM, FakeVideoProvider
 from videogen import main
 from videogen.orchestrator.pipeline import Pipeline
 from videogen.utils.file_store import FileStore
@@ -13,11 +15,16 @@ from videogen.utils.file_store import FileStore
 def client(tmp_path, monkeypatch):
     store = FileStore(tmp_path / "projects")
     llm = FakeLLM()
-    pipeline = Pipeline(store, llm_factory=lambda: llm)
+    video = FakeVideoProvider()
+    pipeline = Pipeline(store, llm_factory=lambda: llm, video_factory=lambda: video)
     # 端点运行时从模块全局取 store/pipeline，这里替换成临时目录的实例
     monkeypatch.setattr(main, "store", store)
     monkeypatch.setattr(main, "pipeline", pipeline)
     with TestClient(main.app) as test_client:
+        # 测试里要检查产物/调用次数，挂到 client 上方便取用
+        test_client.videogen_store = store
+        test_client.videogen_pipeline = pipeline
+        test_client.videogen_video = video
         yield test_client
 
 
@@ -35,11 +42,33 @@ def create_project(client: TestClient, **overrides) -> dict:
     return resp.json()
 
 
+def prepare_confirmed_storyboard(client: TestClient) -> str:
+    """走完文本链路，返回已确认分镜的项目 id。"""
+    pid = create_project(client)["id"]
+    assert client.post(f"/api/projects/{pid}/bible/generate").status_code == 200
+    assert client.post(f"/api/projects/{pid}/script/generate").status_code == 200
+    assert client.post(f"/api/projects/{pid}/script/confirm").status_code == 200
+    assert client.post(f"/api/projects/{pid}/storyboard/generate").status_code == 200
+    assert client.post(f"/api/projects/{pid}/storyboard/confirm").status_code == 200
+    return pid
+
+
+def wait_video_job(client: TestClient, project_id: str, timeout: float = 15.0) -> dict:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        status = client.get(f"/api/projects/{project_id}/video/status").json()
+        job = status.get("job")
+        if job and not job["is_active"]:
+            return status
+        time.sleep(0.02)
+    raise AssertionError("视频任务未在超时内结束")
+
+
 def test_health(client):
     resp = client.get("/api/health")
     assert resp.status_code == 200
     data = resp.json()
-    assert data["stages_implemented"] == ["bible", "script", "storyboard"]
+    assert data["stages_implemented"] == ["bible", "script", "storyboard", "video"]
     assert "llm_key_configured" in data
     # 绝不能把密钥暴露给前端
     assert "key" not in {k for k in data if "configured" not in k}
@@ -164,3 +193,129 @@ def test_api_token_enforced_when_configured(tmp_path, monkeypatch):
         assert test_client.get("/api/projects", headers=good).status_code == 200
         assert test_client.get("/api/projects?token=s3cret").status_code == 200
         assert test_client.get("/api/projects", headers={"X-API-Token": "wrong"}).status_code == 401
+
+
+# ── 视频阶段（后台任务）────────────────────────────────
+
+
+def test_video_generate_requires_confirmed_storyboard(client):
+    pid = create_project(client)["id"]
+    client.post(f"/api/projects/{pid}/bible/generate")
+    client.post(f"/api/projects/{pid}/script/generate")
+    client.post(f"/api/projects/{pid}/script/confirm")
+    client.post(f"/api/projects/{pid}/storyboard/generate")  # 还没确认
+
+    resp = client.post(f"/api/projects/{pid}/video/generate")
+    assert resp.status_code == 400
+    assert "storyboard_review" in resp.json()["detail"]
+
+
+def test_video_flow_through_api(client):
+    pid = prepare_confirmed_storyboard(client)
+    expected = len(client.get(f"/api/projects/{pid}/storyboard").json()["shots"])
+
+    # 生成前状态
+    before = client.get(f"/api/projects/{pid}/video/status").json()
+    assert before["project_status"] == "storyboard_confirmed"
+    assert before["manifest"] is None
+
+    resp = client.post(f"/api/projects/{pid}/video/generate")
+    assert resp.status_code == 202
+    job_id = resp.json()["job"]["id"]
+    assert resp.json()["job"]["kind"] == "video"
+
+    status = wait_video_job(client, pid)
+    assert status["job"]["status"] == "succeeded"
+    assert status["job"]["percent"] == 100
+    assert status["project_status"] == "video_ready"
+    assert status["summary"]["ready"] == expected
+    assert status["summary"]["usable"] is True
+
+    # Job 查询接口
+    assert client.get(f"/api/jobs/{job_id}").json()["status"] == "succeeded"
+    assert client.get(f"/api/projects/{pid}/jobs").json()[0]["id"] == job_id
+
+    # 片段可下载
+    manifest = client.get(f"/api/projects/{pid}/video/manifest").json()
+    first = manifest["clips"][0]
+    clip_resp = client.get(f"/api/projects/{pid}/clips/{first['shot_id']}")
+    assert clip_resp.status_code == 200
+    assert clip_resp.headers["content-type"].startswith("video/mp4")
+    assert clip_resp.content
+
+    # 再点一次：已就绪的片段不重复生成（续跑）
+    calls_before = len(client.videogen_video.calls)
+    assert client.post(f"/api/projects/{pid}/video/generate").status_code == 202
+    wait_video_job(client, pid)
+    assert len(client.videogen_video.calls) == calls_before
+
+
+def test_video_regenerate_only_failed_clips(client):
+    pid = prepare_confirmed_storyboard(client)
+    storyboard = client.get(f"/api/projects/{pid}/storyboard").json()
+    failed_shot = storyboard["shots"][0]["id"]
+    client.videogen_video.fail_shots = {failed_shot}
+    client.videogen_video.fail_times = 99
+
+    client.post(f"/api/projects/{pid}/video/generate")
+    status = wait_video_job(client, pid)
+    assert status["summary"]["failed"] == 1
+    assert status["summary"]["ready"] == len(storyboard["shots"]) - 1
+    assert status["project_status"] == "video_ready"  # 部分失败也能进下一步
+
+    # 修好 provider 后重试：只有失败的那个镜头被重新生成
+    client.videogen_video.fail_shots = set()
+    calls_before = len(client.videogen_video.calls)
+    client.post(f"/api/projects/{pid}/video/generate")
+    status = wait_video_job(client, pid)
+    assert len(client.videogen_video.calls) == calls_before + 1
+    assert status["summary"]["failed"] == 0
+
+
+def test_video_cancel_through_api(client):
+    pid = prepare_confirmed_storyboard(client)
+    client.videogen_video.delay = 0.3
+
+    job_id = client.post(f"/api/projects/{pid}/video/generate").json()["job"]["id"]
+    time.sleep(0.05)
+    assert client.post(f"/api/projects/{pid}/video/cancel").json()["cancelled"] == 1
+    time.sleep(0.2)
+
+    status = client.get(f"/api/projects/{pid}/video/status").json()
+    assert status["job"]["status"] == "cancelled"
+    # 没有可用片段 → 退回可重试状态
+    assert status["project_status"] == "storyboard_confirmed"
+    assert client.get(f"/api/jobs/{job_id}").json()["status"] == "cancelled"
+
+
+def test_video_duplicate_job_rejected_through_api(client):
+    pid = prepare_confirmed_storyboard(client)
+    client.videogen_video.delay = 0.3
+
+    assert client.post(f"/api/projects/{pid}/video/generate").status_code == 202
+    resp = client.post(f"/api/projects/{pid}/video/generate")
+    assert resp.status_code == 400
+    assert "已有视频生成任务" in resp.json()["detail"]
+    client.post(f"/api/projects/{pid}/video/cancel")
+    time.sleep(0.25)
+
+
+def test_video_endpoints_unknown_project(client):
+    assert client.post("/api/projects/nope/video/generate").status_code == 404
+    assert client.get("/api/projects/nope/video/status").status_code == 404
+    assert client.get("/api/projects/nope/jobs").status_code == 404
+    assert client.get("/api/jobs/nope").status_code == 404
+
+
+def test_clip_endpoint_404_when_no_manifest(client):
+    pid = prepare_confirmed_storyboard(client)
+    assert client.get(f"/api/projects/{pid}/clips/shot_1").status_code == 404
+    assert client.get(f"/api/projects/{pid}/video/manifest").status_code == 404
+
+
+def test_health_reports_video_stage(client):
+    data = client.get("/api/health").json()
+    assert "video" in data["stages_implemented"]
+    assert data["stages_pending"] == ["audio", "compose"]
+    assert data["video_provider"] == "mock"
+    assert "ffmpeg_available" in data

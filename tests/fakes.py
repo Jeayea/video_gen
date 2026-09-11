@@ -1,13 +1,22 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import re
+from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel
 
+from videogen.models.video import MediaKind
 from videogen.providers.llm.base import LLMError, LLMMessage, LLMProvider
 from videogen.providers.llm.openrouter import OpenRouterProvider
+from videogen.providers.video.base import (
+    GeneratedClip,
+    VideoProvider,
+    VideoProviderError,
+    VideoRequest,
+)
 
 SCENE_ID_RE = re.compile(r"场次(?:\s*ID)?[:：]\s*(\S+)")
 
@@ -199,3 +208,71 @@ class FlakyJSONProvider(OpenRouterProvider):
         if self.bad_responses:
             return self.bad_responses.pop(0)
         return json.dumps(self.good_payload, ensure_ascii=False)
+
+
+class FakeVideoProvider(VideoProvider):
+    """离线假视频 provider：写一个小文件代替真实转码。
+
+    可以配置：指定镜头始终失败、前 N 次失败、人为延时（用来验证并发/取消）。
+    """
+
+    name = "fake"
+    requires_ffmpeg = False
+
+    def __init__(
+        self,
+        *,
+        fail_shots: set[str] | None = None,
+        fail_times: int = 0,
+        delay: float = 0.0,
+        media_kind: MediaKind = MediaKind.VIDEO,
+    ):
+        self.fail_shots = set(fail_shots or ())
+        self.fail_times = fail_times
+        self.delay = delay
+        self.media_kind = media_kind
+        self.calls: list[str] = []
+        self.active = 0
+        self.max_active = 0
+        self.closed = 0
+
+    def attempts_for(self, shot_id: str) -> int:
+        return self.calls.count(shot_id)
+
+    async def generate(self, request: VideoRequest) -> GeneratedClip:
+        self.calls.append(request.shot_id)
+        self.active += 1
+        self.max_active = max(self.max_active, self.active)
+        try:
+            if self.delay:
+                await asyncio.sleep(self.delay)
+            should_fail = (
+                request.shot_id in self.fail_shots
+                and self.attempts_for(request.shot_id) <= self.fail_times
+            )
+            if should_fail:
+                raise VideoProviderError(f"fake 生成失败 shot={request.shot_id}")
+            target = Path(request.output_path)
+            if self.media_kind == MediaKind.PLACEHOLDER:
+                target = target.with_suffix(".placeholder.json")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(b"fake-clip")
+            return GeneratedClip(
+                path=target,
+                media_kind=self.media_kind,
+                duration_sec=request.duration_sec,
+                task_id=f"fake-{request.shot_id}",
+            )
+        finally:
+            self.active -= 1
+
+    async def aclose(self) -> None:
+        self.closed += 1
+
+
+class AlwaysFailVideoProvider(FakeVideoProvider):
+    """所有镜头都失败，用来验证「零可用片段」时的收尾。"""
+
+    async def generate(self, request: VideoRequest) -> GeneratedClip:
+        self.calls.append(request.shot_id)
+        raise VideoProviderError("全量失败")

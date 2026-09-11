@@ -11,28 +11,14 @@ from pydantic import BaseModel, ValidationError
 
 from videogen.config import get_settings
 from videogen.providers.llm.base import LLMError, LLMJSONError, LLMMessage, LLMProvider
+from videogen.utils.redact import scrub_secrets
 
 logger = logging.getLogger(__name__)
 
 #: 出现这些状态码时做指数退避重试
 _RETRY_STATUS = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
 
-_SECRET_PATTERNS = (
-    re.compile(r"sk-[A-Za-z0-9_\-]{8,}"),
-    re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._\-]{8,}"),
-    re.compile(r"(?i)(api[_-]?key\"?\s*[:=]\s*\"?)[A-Za-z0-9._\-]{8,}"),
-)
-
-
-def scrub_secrets(text: str) -> str:
-    """把任何疑似密钥的内容替换掉。
-
-    所有对外抛出的异常、日志都走这里，避免密钥进入日志/前端/报告。
-    """
-    out = text or ""
-    for pattern in _SECRET_PATTERNS:
-        out = pattern.sub(lambda m: (m.group(1) if m.groups() else "") + "***", out)
-    return out
+__all__ = ["OpenRouterProvider", "scrub_secrets"]
 
 
 class OpenRouterProvider(LLMProvider):

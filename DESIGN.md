@@ -562,21 +562,23 @@ FFMPEG_PATH=ffmpeg
 
 ---
 
-## 10. 实现状态（v0.2，2026-09-11 更新）
+## 10. 实现状态（v0.3，2026-09-11 更新）
 
 ### 已落地
 
 - **Phase 1 全部完成**：故事圣经 → 逐场剧本（注入 bible + 前场摘要 + world_state）→ 一致性校验 → 分镜（英文 video_prompt）→ Web UI 分阶段确认
+- **Phase 2 视频生成已完成**：`VideoProvider` 抽象 + `MockVideoProvider`（ffmpeg 产出真实占位 MP4）、
+  按镜头并发生成、失败重试与隔离、断点续跑、后台任务队列（进度/取消/单项目互斥）、
+  UI 内嵌播放与失败镜头重试
 - 状态机与本文档 §3.2 的差异：新增 `SCRIPT_CONFIRMED` / `STORYBOARD_CONFIRMED` 两个显式确认态，取代原先把 `SCRIPT_GENERATED` 当「已确认」用的写法；旧数据在读取时自动迁移
-- `VIDEO_READY` 不再被写入 —— Phase 2 未实现前，确认分镜停在 `STORYBOARD_CONFIRMED`，不会假装视频就绪
 - 时长控制：大纲阶段下发每场预算，生成后按 `target_duration_sec` 归一化，分镜再按场对齐
 - LLM 输出强制过 Pydantic schema，失败回灌错误重试；脏字段（`7.5` / `"约10秒"` / `null`）容错兜底
-- 生成失败可续跑：逐场/逐镜落盘 + `outline.json`，重试只补缺失部分
+- 生成失败可续跑：逐场/逐镜落盘 + `outline.json` + `video_manifest.json`，重试只补缺失部分
 
-### 尚未实现（Phase 2-4）
+### 尚未实现（Phase 3-4）
 
-- `video_service` / `audio_service` / `compose_service`、`VideoProvider` / `TTSProvider` / BGM 曲库 / FFmpeg 合成 / 字幕
-- 后台任务队列与进度查询（当前生成接口是同步长请求）
+- `audio_service` / `compose_service`、`TTSProvider`（Edge-TTS）、BGM 曲库、FFmpeg 拼接与字幕烧录
+- 任务状态目前只在进程内存里（项目状态已落盘，重启会自动回收）
 - 成本统计与额度控制
 
 > §2.3 的目录结构是目标形态，当前实际结构见 [README.md](README.md#代码结构)；

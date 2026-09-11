@@ -5,7 +5,7 @@ import secrets
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -14,6 +14,8 @@ from videogen.config import get_settings
 from videogen.models.project import AspectRatio, InputMode, Project
 from videogen.orchestrator.pipeline import Pipeline, PipelineError, PipelineNotFound
 from videogen.providers.llm.base import LLMError
+from videogen.providers.video.base import VideoProviderError
+from videogen.utils.ffmpeg import ffmpeg_available
 from videogen.utils.file_store import FileStore
 
 logging.basicConfig(level=logging.INFO)
@@ -32,7 +34,22 @@ async def lifespan(app: FastAPI):
         logger.warning("未检测到 LLM API Key，生成类接口会失败（请在 .env 配置）")
     if settings.api_token:
         logger.info("API Token 校验已开启")
+    logger.info(
+        "视频 provider=%s concurrency=%d ffmpeg=%s",
+        settings.video_provider,
+        settings.video_concurrency,
+        "可用" if ffmpeg_available() else "不可用（将降级为占位文件）",
+    )
+    try:
+        recovered = await pipeline.recover_interrupted_jobs()
+        if recovered:
+            logger.warning("已恢复 %d 个中断的项目：%s", len(recovered), ", ".join(recovered))
+    except Exception:
+        logger.exception("恢复中断任务失败")
+
     yield
+
+    await pipeline.jobs.shutdown()
     logger.info("videogen shutting down")
 
 
@@ -78,6 +95,11 @@ async def _llm_error_handler(request: Request, exc: LLMError):
     return JSONResponse({"detail": str(exc)}, status_code=502)
 
 
+@app.exception_handler(VideoProviderError)
+async def _video_error_handler(request: Request, exc: VideoProviderError):
+    return JSONResponse({"detail": str(exc)}, status_code=502)
+
+
 # ── Request Models ──────────────────────────────────────────
 
 
@@ -107,9 +129,13 @@ async def health():
         "llm_provider": settings.llm_provider,
         "llm_model": settings.openrouter_model,
         "llm_key_configured": settings.has_llm_key,
+        "video_provider": settings.video_provider,
+        "ffmpeg_available": ffmpeg_available(),
+        "video_concurrency": settings.video_concurrency,
         "auth_enabled": bool(settings.api_token.strip()),
-        "stages_implemented": ["bible", "script", "storyboard"],
-        "stages_pending": ["video", "audio", "compose"],
+        "stages_implemented": ["bible", "script", "storyboard", "video"],
+        "stages_pending": ["audio", "compose"],
+        "active_jobs": pipeline.jobs.active_count,
     }
 
 
@@ -282,6 +308,65 @@ async def revalidate(project_id: str):
     if not report:
         raise HTTPException(404, "故事圣经不存在，无法校验")
     return report.model_dump()
+
+
+# ── Video / Jobs Routes ─────────────────────────────────────
+
+
+@app.post("/api/projects/{project_id}/video/generate", status_code=202)
+async def generate_video(project_id: str):
+    """提交视频生成后台任务（异步，用 video/status 查进度）。"""
+    job = await pipeline.start_video_generation(project_id)
+    return {"job": job.to_public()}
+
+
+@app.get("/api/projects/{project_id}/video/status")
+async def video_status(project_id: str):
+    return pipeline.video_status(project_id)
+
+
+@app.get("/api/projects/{project_id}/video/manifest")
+async def video_manifest(project_id: str):
+    manifest = pipeline.get_video_manifest(project_id)
+    if not manifest:
+        raise HTTPException(404, "视频清单不存在")
+    return manifest.model_dump()
+
+
+@app.post("/api/projects/{project_id}/video/cancel")
+async def cancel_video(project_id: str):
+    cancelled = await pipeline.cancel_video_generation(project_id)
+    return {"cancelled": cancelled}
+
+
+@app.get("/api/projects/{project_id}/clips/{shot_id}")
+async def get_clip(project_id: str, shot_id: str):
+    """读取某个镜头的视频片段（路径经过越界校验）。"""
+    manifest = pipeline.get_video_manifest(project_id)
+    if not manifest:
+        raise HTTPException(404, "视频清单不存在")
+    clip = manifest.get(shot_id)
+    if not clip or not clip.path:
+        raise HTTPException(404, "该镜头还没有视频文件")
+    path = store.resolve_artifact(project_id, clip.path)
+    if not path:
+        raise HTTPException(404, "视频文件不存在（可能已被清理）")
+    media_type = "video/mp4" if path.suffix == ".mp4" else "application/json"
+    return FileResponse(path, media_type=media_type, filename=path.name)
+
+
+@app.get("/api/projects/{project_id}/jobs")
+async def list_project_jobs(project_id: str, limit: int = 20):
+    pipeline.get_project(project_id)
+    return [job.to_public() for job in pipeline.jobs.list(project_id, limit=limit)]
+
+
+@app.get("/api/jobs/{job_id}")
+async def get_job(job_id: str):
+    job = pipeline.jobs.get(job_id)
+    if not job:
+        raise HTTPException(404, "任务不存在")
+    return job.to_public()
 
 
 # ── Static UI ───────────────────────────────────────────────

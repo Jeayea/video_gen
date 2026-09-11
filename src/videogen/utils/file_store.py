@@ -21,6 +21,7 @@ from videogen.models.project import (
 )
 from videogen.models.script import Script, ScriptOutline
 from videogen.models.storyboard import Storyboard
+from videogen.models.video import VideoManifest
 from videogen.models.world_state import WorldState
 
 T = TypeVar("T", bound=BaseModel)
@@ -175,6 +176,25 @@ class FileStore:
 
     def load_consistency(self, project_id: str) -> ConsistencyReport | None:
         return self._load(project_id, "consistency_report", ConsistencyReport)
+
+    # --- Video ---
+    def save_video_manifest(self, project_id: str, manifest: VideoManifest) -> None:
+        self._save(project_id, "video_manifest", manifest)
+
+    def load_video_manifest(self, project_id: str) -> VideoManifest | None:
+        return self._load(project_id, "video_manifest", VideoManifest)
+
+    def resolve_artifact(self, project_id: str, relative: str) -> Path | None:
+        """把产物相对路径安全地解析成绝对路径（禁止越出项目目录）。"""
+        if not self.is_valid_id(project_id) or not relative:
+            return None
+        root = self.project_dir(project_id).resolve()
+        candidate = (root / relative).resolve()
+        try:
+            candidate.relative_to(root)
+        except ValueError:
+            return None
+        return candidate if candidate.is_file() else None
 
     # --- Clips / Audio / Output dirs（Phase 2+）---
     def clips_dir(self, project_id: str) -> Path:
