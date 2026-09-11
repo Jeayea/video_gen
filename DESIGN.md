@@ -570,7 +570,7 @@ FFMPEG_PATH=ffmpeg
 
 ---
 
-## 10. 实现状态（v0.11，2026-09-11 更新）
+## 10. 实现状态（v0.12，2026-09-11 更新）
 
 ### 已落地
 
@@ -614,6 +614,12 @@ FFMPEG_PATH=ffmpeg
   免费（mock）且无需重跑时不打扰。`POST /storyboard/merge-shots`（默认 dry_run）把短镜头
   合并成更少更长的片段，**有对白的镜头绝不合并**，已有可用片段时需显式 `force`。
   同时修掉「换 provider 时预算门控按 0 个待生成镜头放行」的漏洞（见 FIXES v0.10）
+
+- **记账口径修正（v0.12）**：视频/音频的记账从「和上次清单做集合差」改为
+  「条目上的 `cost_recorded` 标记」，修掉「换 provider 全量重跑 / 文案改写后重合成」
+  静默漏记（真实事故：实花 $9.75、账本 $0.0011）；新增 `POST /cost/reconcile` 幂等补齐，
+  `/cost` 暴露 `video_actual_usd` / `video_ledger_usd` / `video_unrecorded_usd` 三个口径；
+  另外只有**真的重跑过片段**才作废成片（依据 `VideoClip.generated_at`）
 
 ### 尚未实现（后续可做）
 

@@ -515,10 +515,18 @@ async def test_rerunning_video_keeps_audio_but_drops_compose(
     await wait_for_job(media_pipeline, job2.id)
 
     assert store.load_audio_manifest(video_ready_project.id) is not None
-    # 成片必须作废，否则会拿着旧画面当新成片
-    assert not (store.project_dir(video_ready_project.id) / "output").exists()
+    # 片段一个都没重跑 → 成片不算过期，不该被删（否则「空跑」会白扔成片）
+    assert (output / "final.mp4").exists()
     # 配音仍在 -> 状态保持 AUDIO_READY，可以直接重新合成
     assert store.load_project(video_ready_project.id).status == ProjectStatus.AUDIO_READY
+
+    # 真的重跑片段（把一个片段标成失败，逼它重新生成）→ 成片必须作废
+    manifest = store.load_video_manifest(video_ready_project.id)
+    manifest.clips[0].status = ClipStatus.FAILED
+    store.save_video_manifest(video_ready_project.id, manifest)
+    job3 = await media_pipeline.start_video_generation(video_ready_project.id)
+    await wait_for_job(media_pipeline, job3.id)
+    assert not (store.project_dir(video_ready_project.id) / "output").exists()
 
 
 @pytest.mark.asyncio

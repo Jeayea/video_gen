@@ -501,3 +501,75 @@ v0.10 把「3 秒镜头也买 5 秒」的浪费算给了用户看，并提供事
 `tests/test_preflight.py` 扩到 34 例：`duration_constraints()` 文案、`plan_shot_count`/`fit_durations`
 的档位数学、按档位塌缩镜头且保留对白、合不动时保留并告警、场次过短抬到 min 并告警、
 以及「有档位 → 5 镜 / 无档位 → 10 镜（原行为不变）」两条 pipeline 级用例。全套 **359 passed**，ruff clean。
+
+## v0.12 — 修掉「花了 $9.75，账本只记 $0.0011」的漏记账 bug
+
+### 现场
+
+用户跑完真实链路（15 个 H3 片段 + Edge-TTS + FFmpeg 成片），成本面板只显示 **$0.00112**
+（两条 audio + 一条 compose），而视频片段上每条都写着 `cost_usd: 0.65` —— 实花 **$9.75**。
+
+### 根因：用「和上次清单做集合差」判断哪些是新生成的花费
+
+```python
+before = {c.shot_id for c in existing.ready_clips}          # 先记下旧片段 id
+manifest = await video_service.generate_clips(...)          # 内部：换 provider → 旧片段全部重置
+newly = [c for c in manifest.ready_clips if c.shot_id not in before]   # ← 空集合！
+```
+
+真实场景恰好命中：项目里已有 15 个 **mock** 片段 → 切到 `openrouter` → `generate_clips`
+判定「provider 变了」把它们全部重置再重跑。**重跑后的 shot_id 和旧的一模一样**，
+于是「新生成」的差集为空，`cost_service.record()` 一次都没被调用 —— $9.75 静默消失。
+（v0.10 修预算门控时只统一了「预估」口径，漏了「记账」口径。）
+
+音频阶段有同一类问题：文案被 LLM 改写后重新合成，clip id 不变 → 同样漏记（paid TTS 会少算钱）。
+
+### 修法：按条目上的「已记账」标记，而不是集合差
+
+- `VideoClip.cost_recorded` / `AudioClip.cost_recorded`：这条的花费是否已入账
+- 重新生成/重新合成时**清掉标记**（`video_service._generate_one`、provider 变更重置、
+  `audio_service.synthesize_all` 的 PENDING 分支）—— 重跑就是重新计费
+- 记账后**打标记并落盘**（顺序很关键：先记账再 save，否则标记丢失会重复记账）
+- 这样同时解决三件事：换 provider 全量重跑、文案改写后重合成、进程在「产物已落盘、
+  账本还没写」时挂掉 —— 下次续跑只补记账，不会重复计费
+
+### 顺带修掉：空跑会删成片
+
+原来 `_run_video_job` 结束时**无条件** `purge_media(compose=True)`。于是「重跑视频但一个片段
+都没重生成」这种空跑会把已经渲染好的成片删掉。现在只有**真的重跑过片段**才作废成片 ——
+判断依据是 `VideoClip.generated_at`（每次成功生成打时间戳；`task_id` 在假 provider /
+部分真实 provider 上是确定性的，不能当唯一依据）。
+
+### 新增：补齐记账（`POST /api/projects/{id}/cost/reconcile`）
+
+给已经被老版本漏记的项目用：读片段上的实测 `cost_usd` 补进账本，
+**不调 API、不动媒体、不动项目状态**，幂等。`GET /cost` 现在同时给出：
+
+- `video_actual_usd`：片段实测花费合计（provider 报的 `usage.cost`）
+- `video_ledger_usd`：账本里视频阶段记了多少
+- `video_unrecorded_usd`：还没入账的部分（> 0 时 UI 显示「漏记 $X」+ 一键补齐按钮）
+
+### 现场修复
+
+对用户项目 `e8e40d3d9d29` 执行补齐：
+
+```
+修复前：账本合计 $0.001120 | 视频实测 $9.7500 | 账本内视频 $0.0000 | 漏记 $9.7500
+补齐：  记录 $9.75 / 15 个片段
+修复后：账本合计 $9.751120 | 预算 $12 → 剩余 $2.2489 | 成片（65.02s，19.1MB）完好
+```
+
+### 这次真实跑出来的另外两个事实
+
+1. **成片 65 秒而不是 45 秒**：分镜是 45 秒 / 15 个 2-4 秒的镜头，但 H3 最短 5 秒 →
+   每个片段都是 5 秒 → 实际画面比分镜长，成片自然变长（同时为 75 秒付费）。
+   v0.11 的「分镜档位感知」正是为这件事做的：按档位重排后是 8 镜 / 45 秒 ≈ $5.85
+2. **配音文案（narration）真实生效**：`scene_3_shot_1` 是唯一没台词的镜头，
+   抽了 1 帧 → LLM 写出「林悦身着华服，自信地走上T台，聚光灯下她光芒万丈。」，
+   成本 $0.00112
+
+### 测试
+
+`tests/test_preflight.py` 新增 6 例：换 provider 重跑必须记账、重跑不重复记账、
+空跑保留成片、`reconcile` 幂等补齐、LLM 改写文案后重新合成要重新记账、
+`cost_status` 的实测/账本/漏记三个口径。全套 **366 passed**，ruff clean。

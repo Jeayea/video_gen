@@ -240,6 +240,8 @@ async def synthesize_all(
             logger.info("配音 %s 文案变更，重新合成", current.id)
         current.status = ClipStatus.PENDING
         current.error = ""
+        # 重新合成 = 重新计费：清掉上一条的记账标记（否则新花费进不了账本）
+        current.cost_recorded = False
         current.media_kind = MediaKind.AUDIO
         current.provider = provider.name
         current.voice = desired_voice

@@ -758,8 +758,18 @@ async def delete_reference(project_id: str, char_id: str):
 
 @app.get("/api/projects/{project_id}/cost")
 async def project_cost(project_id: str):
-    """成本账本：按阶段的花费 / token / 秒数 / 字符 + 预算与预估。"""
+    """成本账本：按阶段的花费 / token / 秒数 / 字符 + 预算与预估。
+
+    额外给出视频的「片段实测花费 vs 账本」：`video_unrecorded_usd > 0` 说明有漏记，
+    调 `cost/reconcile` 可以按实测补齐（不调 API、不动媒体）。
+    """
     return pipeline.cost_status(project_id)
+
+
+@app.post("/api/projects/{project_id}/cost/reconcile")
+async def reconcile_cost(project_id: str):
+    """把视频片段上实测但没记账的花费补进账本（幂等，只补差额）。"""
+    return await pipeline.reconcile_video_cost(project_id)
 
 
 # ── 批量生产 ────────────────────────────────────────────────

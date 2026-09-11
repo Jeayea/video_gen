@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
 
 from videogen.models.bible import StoryBible
@@ -59,6 +60,9 @@ async def generate_clips(
             stale.status = ClipStatus.PENDING
             stale.error = ""
             stale.task_id = None
+            # 旧花费已经记过账了，重跑要当成一笔新账（否则新花费永远进不了账本）
+            stale.cost_usd = 0.0
+            stale.cost_recorded = False
     manifest.provider = provider.name
     manifest.model = provider.model
     manifest.aspect_ratio = project.aspect_ratio.value
@@ -153,7 +157,10 @@ async def _generate_one(
         seed=shot_seed,
     )
 
+    # 重新生成 = 重新计费：清掉上一条的金额与「已记账」标记
     clip.status = ClipStatus.GENERATING
+    clip.cost_usd = 0.0
+    clip.cost_recorded = False
     clip.prompt = request.prompt
     _emit(on_progress, manifest)
 
@@ -204,6 +211,7 @@ async def _generate_one(
         clip.duration_sec = generated.duration_sec or request.duration_sec
         clip.task_id = generated.task_id
         clip.cost_usd = round(generated.actual_cost_usd or 0.0, 6)
+        clip.generated_at = datetime.now(UTC).isoformat()
         clip.error = ""
         manifest.upsert(clip)
         return

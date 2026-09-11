@@ -801,7 +801,10 @@ class Pipeline:
                 )
 
             existing = self.store.load_video_manifest(project_id)
-            before = {c.shot_id for c in (existing.ready_clips if existing else [])}
+            # 用「上一次的生成时间」判断这一轮是否真的重跑过片段（换 provider 也算重跑）
+            before_generated = {
+                c.shot_id: c.generated_at for c in (existing.clips if existing else [])
+            }
             try:
                 # 单价要在 provider 关闭前问（真实 provider 会去查自己的价目表）
                 price_per_second = await provider.price_per_second()
@@ -835,34 +838,23 @@ class Pipeline:
             finally:
                 await provider.aclose()
 
+            recorded = self._record_video_cost(
+                project_id, manifest, price_per_second=price_per_second, settings=settings
+            )
+            # 必须在记账（打 cost_recorded 标记）之后再落盘，否则标记丢了会重复记账
             self.store.save_video_manifest(project_id, manifest)
-            newly = [c for c in manifest.ready_clips if c.shot_id not in before]
-            if newly:
-                actual = round(sum(c.cost_usd for c in newly), 6)
-                if actual > 0 and price_per_second:
-                    expected = sum(c.duration_sec for c in newly) * price_per_second
-                    if expected > 0 and actual > expected * 1.2:
-                        logger.warning(
-                            "实际扣费 $%.4f 高于价目表估算 $%.4f（%s）："
-                            "建议按实际值调整 VIDEO_PRICE_PER_SECOND 或依赖账本",
-                            actual,
-                            expected,
-                            manifest.model,
-                        )
-                cost_service.record(
-                    self.store,
-                    project_id,
-                    cost_service.video_entry(
-                        manifest.provider,
-                        manifest.model or settings.video_provider,
-                        sum(c.duration_sec for c in newly),
-                        len(newly),
-                        price_per_second=price_per_second,
-                        actual_usd=actual if actual > 0 else None,
-                    ),
+            if recorded:
+                logger.info(
+                    "视频阶段记账 $%.4f（%s）", recorded, manifest.model or manifest.provider
                 )
-            # 片段变了，旧的成片一定过期
-            self.store.purge_media(project_id, compose=True)
+            # 只有**真的重跑了片段**才作废旧成片：否则「补记账」这种空跑会把成片删掉
+            regenerated = [
+                c
+                for c in manifest.ready_clips
+                if c.generated_at and before_generated.get(c.shot_id) != c.generated_at
+            ]
+            if regenerated:
+                self.store.purge_media(project_id, compose=True)
             self._settle_video_status(
                 project, manifest, self.store.load_audio_manifest(project_id)
             )
@@ -877,6 +869,78 @@ class Pipeline:
                 raise PipelineError(
                     f"全部 {len(manifest.clips)} 个片段生成失败，请检查 provider 配置 / ffmpeg"
                 )
+
+    def _record_video_cost(
+        self,
+        project_id: str,
+        manifest: VideoManifest,
+        *,
+        price_per_second: float | None,
+        settings: Settings,
+    ) -> float:
+        """把「还没记过账」的片段花费写进账本，返回这次记了多少 USD。
+
+        按片段上的 `cost_recorded` 标记，而不是「和上一次清单做集合差」：
+        1. **换 provider 全部重跑**时 shot_id 没变，差集会空掉（真实事故：$9.75 一条都没记）
+        2. 进程在「片段已落盘、账本还没写」时挂掉，下次续跑只补记账，不会重复计费
+        3. 失败重试成功只记一次
+        """
+        unrecorded = [c for c in manifest.ready_clips if not c.cost_recorded]
+        if not unrecorded:
+            return 0.0
+        actual = round(sum(c.cost_usd for c in unrecorded), 6)
+        seconds = sum(c.duration_sec for c in unrecorded)
+        if actual > 0 and price_per_second:
+            expected = seconds * price_per_second
+            if expected > 0 and actual > expected * 1.2:
+                logger.warning(
+                    "实际扣费 $%.4f 高于价目表估算 $%.4f（%s）："
+                    "建议按实际值调整 VIDEO_PRICE_PER_SECOND 或依赖账本",
+                    actual,
+                    expected,
+                    manifest.model,
+                )
+        cost_service.record(
+            self.store,
+            project_id,
+            cost_service.video_entry(
+                manifest.provider,
+                manifest.model or settings.video_provider,
+                seconds,
+                len(unrecorded),
+                price_per_second=price_per_second,
+                actual_usd=actual if actual > 0 else None,
+            ),
+        )
+        for clip in unrecorded:
+            clip.cost_recorded = True
+        return actual
+
+    async def reconcile_video_cost(self, project_id: str) -> dict:
+        """把视频清单里「已实测但没记账」的花费补进账本。
+
+        给老版本留下的项目用：只读片段上的 `cost_usd`（provider 报的实际扣费），
+        **不调 API、不动媒体、不动项目状态**，可以反复调用（幂等）。
+        """
+        self.get_project(project_id)
+        manifest = self.store.load_video_manifest(project_id)
+        if manifest is None:
+            raise PipelineError("视频片段清单不存在，没有可补记的花费")
+        before = self.cost_report(project_id)
+        recorded = self._record_video_cost(
+            project_id, manifest, price_per_second=None, settings=get_settings()
+        )
+        self.store.save_video_manifest(project_id, manifest)
+        report = self.cost_report(project_id)
+        return {
+            "recorded_usd": round(recorded, 6),
+            "clips": len(manifest.ready_clips),
+            "total_before_usd": before.total_usd,
+            "total_after_usd": report.total_usd,
+            "budget_usd": report.budget_usd,
+            "remaining_usd": report.remaining_usd,
+            "warnings": [] if recorded else ["没有需要补记的片段花费"],
+        }
 
     def _settle_video_status(
         self,
@@ -1047,7 +1111,6 @@ class Pipeline:
                 on_progress=on_progress,
             )
 
-            before_audio = {c.id for c in existing_audio.ready_clips}
             try:
                 manifest = await audio_service.synthesize_all(
                     project,
@@ -1074,17 +1137,21 @@ class Pipeline:
             finally:
                 await provider.aclose()
 
-            newly = [c for c in manifest.ready_clips if c.id not in before_audio]
-            if newly:
+            # 与视频同一套规则：按条目上的「已记账」标记记，而不是和上次清单做集合差
+            # （否则「文案被 LLM 改写后重新合成」这种同 id 重跑会漏记）
+            unrecorded = [c for c in manifest.ready_clips if not c.cost_recorded]
+            if unrecorded:
                 cost_service.record(
                     self.store,
                     project_id,
                     cost_service.audio_entry(
                         manifest.provider,
-                        sum(count_speech_chars(c.text) for c in newly),
-                        len(newly),
+                        sum(count_speech_chars(c.text) for c in unrecorded),
+                        len(unrecorded),
                     ),
                 )
+                for clip in unrecorded:
+                    clip.cost_recorded = True
             if manifest.ready_clips:
                 manifest.bgm = audio_service.pick_bgm(
                     storyboard, self._bgm(), preferred_id=settings.bgm_id
@@ -1409,8 +1476,17 @@ class Pipeline:
         project = self.get_project(project_id)
         report = cost_service.load_report(self.store, project_id)
         storyboard = self.store.load_storyboard(project_id)
+        video = self.store.load_video_manifest(project_id)
+        ready = video.ready_clips if video else []
+        # 片段上的 cost_usd 是 provider 报的**实测扣费**；账本可能漏记（老版本 bug）
+        actual_video = round(sum(c.cost_usd for c in ready), 6)
+        unrecorded_video = round(sum(c.cost_usd for c in ready if not c.cost_recorded), 6)
+        ledger_video = round(sum(e.usd for e in report.entries if e.stage == CostStage.VIDEO), 6)
         return {
             "project_status": project.status.value,
+            "video_actual_usd": actual_video,
+            "video_ledger_usd": ledger_video,
+            "video_unrecorded_usd": unrecorded_video,
             "summary": report.summary(),
             "stages": report.stage_totals(),
             "budget_usd": report.budget_usd,

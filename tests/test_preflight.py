@@ -11,6 +11,7 @@ import pytest
 from tests.conftest import build_confirmed_project, wait_for_job
 from tests.fakes import FakeBgmLibrary, FakeLLM, FakeTTSProvider, FakeVideoProvider
 from videogen.config import get_settings
+from videogen.models.compose import ComposeReport
 from videogen.models.cost import CostReport, CostStage
 from videogen.models.project import Project, ProjectStatus
 from videogen.models.script import Scene, Script
@@ -425,6 +426,120 @@ async def test_preflight_bundles_sections_and_budget(store):
     assert result["budget"]["limited"] is False
 
 
+# ── 视频记账（真实扣过的钱必须进账本）────────────────
+
+
+class CostReportingProvider(FakeVideoProvider):
+    """带单价、并且每段都报「实际扣费」的假 provider（模拟真实 API 的 usage.cost）。
+
+    名字刻意叫 real：和 mock 片段放一起时会被判定为「换了 provider → 全部重跑」。
+    """
+
+    name = "real"
+
+    def __init__(self, *, actual_cost_usd: float = 0.65, **kwargs):
+        # 刻意不给时长档位：分镜保持 10 镜，账目算式好对（档位另有专门的用例）
+        super().__init__(price_usd_per_sec=0.13, **kwargs)
+        self.actual_cost_usd = actual_cost_usd
+
+    async def generate(self, request):
+        clip = await super().generate(request)
+        clip.actual_cost_usd = self.actual_cost_usd
+        return clip
+
+
+@pytest.mark.asyncio
+async def test_video_cost_is_recorded_after_provider_switch(store):
+    """换 provider 全部重跑时，同 id 的旧片段不该让新花费「看起来不是新的」。
+
+    真实事故：mock 片段已就绪 → 切 openrouter 全部重跑 15 段（$9.75），
+    账本里一条 video 记录都没有，成本面板显示 $0.0011。
+    """
+    cheap = media_pipeline(store, FakeVideoProvider())
+    project = await build_confirmed_project(store, cheap)
+    job = await cheap.start_video_generation(project.id)
+    await wait_for_job(cheap, job.id)
+    assert store.load_video_manifest(project.id).ready_clips  # 先有 mock 片段
+
+    pipeline = media_pipeline(store, CostReportingProvider())
+    job = await pipeline.start_video_generation(project.id)
+    await wait_for_job(pipeline, job.id)
+
+    manifest = store.load_video_manifest(project.id)
+    assert len(manifest.ready_clips) == 10  # 全部重跑过
+    report = cost_service.load_report(store, project.id)
+    video_entries = [e for e in report.entries if e.stage == CostStage.VIDEO]
+    assert video_entries, "换 provider 重跑的 $6.50 必须进账本"
+    assert sum(e.usd for e in video_entries) == pytest.approx(10 * 0.65)
+    billable = [e for e in video_entries if e.usd > 0]
+    assert len(billable) == 1 and billable[0].calls == 10
+    assert billable[0].provider == "real"
+    # mock 那一轮的 $0 记录仍在（两次运行 = 两条账）
+    assert len(video_entries) == 2
+    # 每条片段的实测花费都标记为「已记账」，避免下次重跑重复记
+    assert all(clip.cost_recorded for clip in manifest.ready_clips)
+
+
+@pytest.mark.asyncio
+async def test_video_cost_is_not_recorded_twice(store):
+    pipeline = media_pipeline(store, CostReportingProvider())
+    project = await build_confirmed_project(store, pipeline)
+    for _ in range(2):
+        job = await pipeline.start_video_generation(project.id)
+        await wait_for_job(pipeline, job.id)
+
+    report = cost_service.load_report(store, project.id)
+    video_entries = [e for e in report.entries if e.stage == CostStage.VIDEO]
+    assert len(video_entries) == 1
+    assert sum(e.usd for e in video_entries) == pytest.approx(10 * 0.65)
+
+
+@pytest.mark.asyncio
+async def test_rerun_without_regeneration_keeps_finished_film(store):
+    """没真的重跑片段时不该把成片作废（否则「补记账」会把成片删掉）。"""
+    pipeline = media_pipeline(store, CostReportingProvider())
+    project = await build_confirmed_project(store, pipeline)
+    job = await pipeline.start_video_generation(project.id)
+    await wait_for_job(pipeline, job.id)
+
+    output_dir = store.output_dir(project.id)
+    film = output_dir / "final.mp4"
+    film.write_bytes(b"fake-film")
+    store.save_compose_report(project.id, ComposeReport(output_path="output/final.mp4"))
+
+    job = await pipeline.start_video_generation(project.id)  # 无待生成片段
+    await wait_for_job(pipeline, job.id)
+
+    assert film.exists(), "没有重新生成片段就不该删成片"
+    assert store.load_compose_report(project.id) is not None
+
+
+@pytest.mark.asyncio
+async def test_reconcile_backfills_missing_video_cost(store):
+    """账本漏了视频记账时，能从片段实测花费补记（不再调 API、不动媒体）。"""
+    pipeline = media_pipeline(store, CostReportingProvider())
+    project = await build_confirmed_project(store, pipeline)
+    job = await pipeline.start_video_generation(project.id)
+    await wait_for_job(pipeline, job.id)
+
+    # 模拟老版本留下的状态：账本被清空 + 片段标记为未记账
+    store.save_cost_report(project.id, CostReport(budget_usd=0.0))
+    manifest = store.load_video_manifest(project.id)
+    for clip in manifest.clips:
+        clip.cost_recorded = False
+    store.save_video_manifest(project.id, manifest)
+
+    result = await pipeline.reconcile_video_cost(project.id)
+
+    assert result["recorded_usd"] == pytest.approx(10 * 0.65)
+    assert result["clips"] == 10
+    report = cost_service.load_report(store, project.id)
+    assert sum(e.usd for e in report.entries if e.stage == CostStage.VIDEO) == pytest.approx(6.5)
+    # 幂等：再补一次不会重复记
+    again = await pipeline.reconcile_video_cost(project.id)
+    assert again["recorded_usd"] == 0
+
+
 # ── 分镜阶段的计费档位（v0.11「一开始就少而长」）──────
 
 
@@ -651,3 +766,40 @@ async def test_generate_video_uses_same_billing_basis_as_preflight(store):
     finally:
         settings.budget_usd = original
     assert upcoming == pytest.approx(expected)
+
+
+@pytest.mark.asyncio
+async def test_audio_cost_is_recorded_when_text_changes(store):
+    """LLM 改写文案后重新合成同一条配音，也要重新记账（同 id 重跑不能漏记）。"""
+    llm = FakeLLM(voice_text="第一版")
+    # 必须固定同一个 LLM 实例：这样才能在第二轮改文案，验证「同 id 重跑要重新记账」
+    pipeline = Pipeline(
+        store,
+        llm_factory=lambda: llm,
+        video_factory=lambda: CostReportingProvider(),
+        tts_factory=lambda: FakeTTSProvider(),
+        bgm_factory=lambda: FakeBgmLibrary(),
+    )
+    project = await build_confirmed_project(store, pipeline)
+    job = await pipeline.start_video_generation(project.id)
+    await wait_for_job(pipeline, job.id)
+
+    def audio_entries():
+        report = cost_service.load_report(store, project.id)
+        return [e for e in report.entries if e.stage == CostStage.AUDIO]
+
+    job = await pipeline.start_audio_generation(
+        project.id, script_mode="narration", use_vision=False
+    )
+    await wait_for_job(pipeline, job.id)
+    first = len(audio_entries())
+    assert first == 2  # 配音文案的 LLM token + TTS 字符各一条
+
+    # 强制重跑文案 -> 部分条目重新合成 -> 必须再记一条（char 数）
+    llm.voice_text = "第二版"
+    job = await pipeline.start_audio_generation(
+        project.id, script_mode="narration", use_vision=False, force_script=True
+    )
+    await wait_for_job(pipeline, job.id)
+    assert len(audio_entries()) == first + 2  # 又一条 LLM + 又一条 TTS（重跑就有新花费）
+    assert all(clip.cost_recorded for clip in store.load_audio_manifest(project.id).ready_clips)

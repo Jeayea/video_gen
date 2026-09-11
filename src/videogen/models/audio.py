@@ -54,6 +54,8 @@ class AudioClip(BaseModel):
     script_source: str = ""
     #: LLM 给的写这句的理由（排查/人工核对用，不参与合成）
     note: str = ""
+    #: 这条配音的花费是否已经记进账本（重新合成时会清掉，与视频片段同一套规则）
+    cost_recorded: bool = False
     status: ClipStatus = ClipStatus.PENDING
     media_kind: MediaKind = MediaKind.AUDIO
     #: 相对项目目录的路径，如 "audio/scene_1_shot_1.mp3"

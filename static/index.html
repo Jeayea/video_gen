@@ -305,7 +305,7 @@ body {
 
 <div class="header">
   <h1>videogen</h1>
-  <span class="badge">v0.11</span>
+  <span class="badge">v0.12</span>
   <span style="flex:1"></span>
   <span id="health" style="font-size:12px;color:var(--text2)"></span>
   <span id="global-status" style="font-size:12px;color:var(--text2)"></span>
@@ -1759,8 +1759,10 @@ function renderCost() {
   const stages = cost.stages || {};
   const rows = Object.keys(stages).sort();
 
+  const mismatch = (cost.video_unrecorded_usd || 0) > 0;
   $('cost-tags').innerHTML = summary.entries
-    ? `<span class="tag-mini">${usd(summary.total_usd)}</span>` +
+    ? `<span class="tag-mini ${mismatch ? 'warn' : ''}">${usd(summary.total_usd)}</span>` +
+      (mismatch ? `<span class="tag-mini warn">漏记 ${usd(cost.video_unrecorded_usd)}</span>` : '') +
       `<span class="tag-mini">${summary.total_tokens || 0} tokens</span>` +
       (summary.budget_usd > 0
         ? `<span class="tag-mini ${summary.over_budget ? 'warn' : 'ok'}">预算 ${usd(summary.budget_usd)}（剩余 ${usd(summary.remaining_usd)}）</span>`
@@ -1808,7 +1810,17 @@ function renderCost() {
       <br>按当前分镜预估：视频 ${usd(est.video_usd)} · 配音 ${usd(est.audio_usd)}（真实单价请在 .env 配）
     </div>
     ${upcoming}
+    ${mismatch ? `<div class="hint" style="margin-top:8px;color:var(--warn)">
+        ⚠️ 视频片段实测花费 ${usd(cost.video_actual_usd)}，账本只记了 ${usd(cost.video_ledger_usd)}：
+        有 ${usd(cost.video_unrecorded_usd)} 没入账（老版本漏记的 bug）。
+        <button class="btn btn-sm btn-outline" onclick="doReconcileCost()">补齐视频记账</button>
+      </div>` : ''}
   `;
+}
+
+function doReconcileCost() {
+  withBusy('补齐视频记账...', () =>
+    api(`/api/projects/${currentProjectId}/cost/reconcile`, { method: 'POST' }));
 }
 
 // ── 模型选择 ────────────────────────────────────────────────────────

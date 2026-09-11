@@ -38,6 +38,12 @@ class VideoClip(BaseModel):
     task_id: str | None = None
     #: provider 报的实际扣费（USD），账本以它为准
     cost_usd: float = 0.0
+    #: 这笔花费是否已经记进账本。用标记而不是「和上次清单做集合差」——
+    #: 换 provider 全部重跑时 shot_id 没变，差集会把新花费当成旧的（真实事故）
+    cost_recorded: bool = False
+    #: 本次成功生成的时间（ISO）。用来判断「这一轮到底有没有重跑片段」：
+    #: task_id 在假 provider / 部分真实 provider 上可能是确定性的，不能当唯一依据
+    generated_at: str = ""
     attempts: int = 0
     error: str = ""
     prompt: str = ""
