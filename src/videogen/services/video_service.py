@@ -171,8 +171,13 @@ async def _generate_one(
         except Exception as exc:  # noqa: BLE001 - 单镜失败必须被隔离
             message = scrub_secrets(f"{type(exc).__name__}: {exc}")[:400]
             clip.error = message
+            # 生成已经成功、只是产物下载失败时**绝不能重试** —— 重新提交等于再买一次
+            retryable = bool(getattr(exc, "retryable", True))
+            job_id = str(getattr(exc, "job_id", "") or "")
+            if job_id:
+                clip.task_id = job_id
             _cleanup_partial(output)
-            if attempt < attempts:
+            if attempt < attempts and retryable:
                 logger.warning(
                     "镜头 %s 第 %d/%d 次生成失败，准备重试：%s", shot.id, attempt, attempts, message
                 )
@@ -182,7 +187,15 @@ async def _generate_one(
                 continue
             clip.status = ClipStatus.FAILED
             manifest.upsert(clip)
-            logger.error("镜头 %s 生成失败（已重试 %d 次）：%s", shot.id, max_retries, message)
+            if retryable:
+                logger.error("镜头 %s 生成失败（已重试 %d 次）：%s", shot.id, max_retries, message)
+            else:
+                logger.error(
+                    "镜头 %s 生成成功但落盘失败，已停止重试（避免重复计费）：job=%s %s",
+                    shot.id,
+                    job_id or "?",
+                    message,
+                )
             return
 
         clip.status = ClipStatus.READY
@@ -190,6 +203,7 @@ async def _generate_one(
         clip.media_kind = generated.media_kind
         clip.duration_sec = generated.duration_sec or request.duration_sec
         clip.task_id = generated.task_id
+        clip.cost_usd = round(generated.actual_cost_usd or 0.0, 6)
         clip.error = ""
         manifest.upsert(clip)
         return

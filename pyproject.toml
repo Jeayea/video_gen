@@ -1,6 +1,6 @@
 [project]
 name = "videogen"
-version = "0.6.0"
+version = "0.7.0"
 description = "剧本生成 + AI 短剧自动化流水线（文本 → 视频 → 配音 → 成片）"
 requires-python = ">=3.11"
 dependencies = [

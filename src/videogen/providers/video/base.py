@@ -9,6 +9,7 @@ from videogen.models.video import MediaKind
 
 __all__ = [
     "GeneratedClip",
+    "VideoArtifactError",
     "VideoProvider",
     "VideoProviderError",
     "VideoRequest",
@@ -16,7 +17,28 @@ __all__ = [
 
 
 class VideoProviderError(RuntimeError):
-    """视频生成失败（消息必须已脱敏）。"""
+    """视频生成失败（消息必须已脱敏）。
+
+    `retryable=True` 表示「重试一次可能成功」，上层会按配置重试；
+    重试是要花钱的，所以只有**还没生成成功**的失败才允许重试。
+    """
+
+    retryable: bool = True
+
+
+class VideoArtifactError(VideoProviderError):
+    """生成成功、但产物下载/落盘失败。
+
+    这类错误**绝对不能自动重试** —— 重新提交等于把已经生成好的片段再买一遍。
+    异常里带上 job id 与候选地址，好让人工把片子捞回来。
+    """
+
+    retryable = False
+
+    def __init__(self, message: str, *, job_id: str = "", urls: list[str] | None = None):
+        super().__init__(message)
+        self.job_id = job_id
+        self.urls = list(urls or [])
 
 
 class VideoRequest(BaseModel):
@@ -42,6 +64,8 @@ class GeneratedClip(BaseModel):
     media_kind: MediaKind = MediaKind.VIDEO
     duration_sec: int = 0
     task_id: str | None = None
+    #: provider 报的实际扣费（USD）。真实 API 会给，mock 为 None —— 记账以它为准
+    actual_cost_usd: float | None = None
 
 
 class VideoProvider(ABC):

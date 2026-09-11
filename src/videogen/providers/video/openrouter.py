@@ -12,6 +12,7 @@ from videogen.config import get_settings
 from videogen.models.video import MediaKind
 from videogen.providers.video.base import (
     GeneratedClip,
+    VideoArtifactError,
     VideoProvider,
     VideoProviderError,
     VideoRequest,
@@ -218,15 +219,12 @@ class OpenRouterVideoProvider(VideoProvider):
         )
 
         status = await self._poll(polling_url, job_id=job_id, shot_id=request.shot_id)
-        urls = status.get("unsigned_urls") or []
-        if not urls:
-            raise VideoProviderError(
-                f"任务 {job_id} 完成但没有返回视频地址：{scrub_secrets(str(status))[:200]}"
-            )
+        urls = [str(u) for u in (status.get("unsigned_urls") or [])]
 
         output = Path(request.output_path)
         output.parent.mkdir(parents=True, exist_ok=True)
-        await self._download(str(urls[0]), output)
+        # 注意：到这一步片段已经生成并扣费了，任何失败都必须抛不可重试的错误
+        await self._download(job_id, urls, output)
 
         duration = await probe_duration(output) or 0.0
         if duration <= 0:
@@ -235,18 +233,21 @@ class OpenRouterVideoProvider(VideoProvider):
         if duration <= 0:
             raise VideoProviderError(f"任务 {job_id} 的产物时长为 0，无法使用")
 
+        actual_cost = _usage_cost(status)
         logger.info(
-            "视频片段完成 shot=%s job=%s 时长=%.2fs 大小=%d bytes",
+            "视频片段完成 shot=%s job=%s 时长=%.2fs 大小=%d bytes 扣费=%s",
             request.shot_id,
             job_id,
             duration,
             output.stat().st_size,
+            f"${actual_cost:.4f}" if actual_cost else "未返回",
         )
         return GeneratedClip(
             path=output,
             media_kind=MediaKind.VIDEO,
             duration_sec=round(duration),
             task_id=job_id,
+            actual_cost_usd=actual_cost,
         )
 
     def _build_payload(self, request: VideoRequest, caps: dict[str, Any]) -> dict[str, Any]:
@@ -400,30 +401,77 @@ class OpenRouterVideoProvider(VideoProvider):
                 )
             await asyncio.sleep(self.poll_interval_sec)
 
-    async def _download(self, url: str, output: Path) -> None:
+    async def _download(self, job_id: str, urls: list[str], output: Path) -> None:
+        """按「官方 content 端点（带鉴权）→ unsigned_urls（带鉴权）→ 无鉴权」依次尝试。
+
+        `unsigned_urls` 是 `.../videos/{id}/content?index=0` 这种地址，**需要
+        Authorization 头**（官方 curl 示例里也是带的），裸下载会 401。
+        """
+        candidates: list[tuple[str, bool]] = [
+            (f"{self.base_url}/videos/{job_id}/content?index=0", True)
+        ]
+        candidates += [(url, True) for url in urls]
+        candidates += [(url, False) for url in urls]
+
+        failures: list[str] = []
+        tried: list[str] = []
+        for url, authorized in candidates:
+            tried.append(url)
+            ok, reason = await self._try_download(url, output, authorized=authorized)
+            if ok:
+                logger.info(
+                    "视频下载成功（%s）：%s",
+                    "带鉴权" if authorized else "无鉴权",
+                    url.split("?")[0],
+                )
+                return
+            failures.append(f"{url.split('?')[0]}({'带鉴权' if authorized else '匿名'}) {reason}")
+            output.unlink(missing_ok=True)
+
+        raise VideoArtifactError(
+            f"视频已生成但下载失败（job={job_id}，已尝试 {len(tried)} 个地址）："
+            + "；".join(failures[:3]),
+            job_id=job_id,
+            urls=tried,
+        )
+
+    async def _try_download(self, url: str, output: Path, *, authorized: bool) -> tuple[bool, str]:
+        """下载一次，返回 (是否成功, 失败原因)。"""
         client = await self._http()
+        headers = self._headers() if authorized else {}
         try:
-            async with client.stream("GET", url, timeout=httpx.Timeout(60.0, read=300.0)) as resp:
+            async with client.stream(
+                "GET", url, headers=headers, timeout=httpx.Timeout(60.0, read=300.0)
+            ) as resp:
                 if resp.status_code >= 400:
-                    raise VideoProviderError(f"下载视频失败：HTTP {resp.status_code}")
+                    return False, f"HTTP {resp.status_code}"
                 with output.open("wb") as handle:
                     async for chunk in resp.aiter_bytes(_CHUNK):
                         handle.write(chunk)
         except httpx.HTTPError as exc:
-            output.unlink(missing_ok=True)
-            raise VideoProviderError(
-                scrub_secrets(f"下载视频失败：{type(exc).__name__}: {exc}")
-            ) from exc
-        except BaseException:
-            output.unlink(missing_ok=True)
-            raise
+            return False, f"{type(exc).__name__}: {exc}"
 
         if not output.is_file() or output.stat().st_size == 0:
-            output.unlink(missing_ok=True)  # 不留 0 字节残file，避免被续跑误判
-            raise VideoProviderError("下载到的视频是空文件")
+            return False, "空文件"
+        return True, ""
 
 
 # ── 工具 ──────────────────────────────────────────────────
+
+
+def _usage_cost(status: dict[str, Any]) -> float | None:
+    """从轮询响应里读 OpenRouter 报的实际扣费（USD）。
+
+    这比按价目表推算更准（例如 2K 档位实际单价比 `pricing_skus` 里的基础档更高）。
+    """
+    usage = status.get("usage")
+    if not isinstance(usage, dict):
+        return None
+    for key in ("cost", "total_cost", "total_price"):
+        value = _as_float(usage.get(key))
+        if value is not None:
+            return value
+    return None
 
 
 def _as_float(value: Any) -> float | None:

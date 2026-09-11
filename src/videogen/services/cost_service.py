@@ -123,15 +123,18 @@ def video_entry(
     prices: PriceTable | None = None,
     *,
     price_per_second: float | None = None,
+    actual_usd: float | None = None,
 ) -> CostEntry:
     """记一条视频花费。
 
-    `price_per_second` 非空时以它为准（真实 provider 会从自己的价目表读，
-    例如 OpenRouter 的 `pricing_skus.duration_seconds`），否则用配置里的单价。
+    - `actual_usd` 非空（provider 在响应里报了真实扣费）时**以它为准**，最准
+    - 否则用 `price_per_second`（provider 从自己的价目表读的单价）× 计费秒数
+    - 都没有才退回配置里的单价
     """
     prices = prices or PriceTable.from_settings()
-    unit = prices.video_per_second if price_per_second is None else max(0.0, price_per_second)
     seconds = max(0.0, seconds)
+    unit = prices.video_per_second if price_per_second is None else max(0.0, price_per_second)
+    usd = max(0.0, actual_usd) if actual_usd is not None else round(seconds * unit, 6)
     return CostEntry(
         stage=CostStage.VIDEO,
         provider=provider,
@@ -139,7 +142,7 @@ def video_entry(
         calls=calls,
         units=round(seconds, 3),
         unit_kind="second",
-        usd=round(seconds * unit, 6),
+        usd=round(usd, 6),
     )
 
 

@@ -19,7 +19,11 @@ from videogen.models.project import Project
 from videogen.models.storyboard import Shot, Storyboard
 from videogen.orchestrator.pipeline import Pipeline
 from videogen.providers.video import clear_video_capability_cache, get_video_provider
-from videogen.providers.video.base import VideoProviderError, VideoRequest
+from videogen.providers.video.base import (
+    VideoArtifactError,
+    VideoProviderError,
+    VideoRequest,
+)
 from videogen.providers.video.mock import MockVideoProvider
 from videogen.providers.video.openrouter import OpenRouterVideoProvider
 from videogen.services import cost_service
@@ -65,17 +69,44 @@ def _clear_caps():
 
 
 class Recorder:
-    """记录请求，并按脚本返回响应。"""
+    """记录请求，并按脚本返回响应。
 
-    def __init__(self, *, models=None, submit_status=202, polls=None, download_bytes=VIDEO_BYTES):
+    - `content_ok=False`：官方 content 端点 404（用来验证回退到 unsigned_urls）
+    - `unsigned_requires_auth=True`：unsigned_urls 也要求 Authorization（真实行为，
+      裸下载会 401）
+    - `cost=0.83`：轮询响应里带上 `usage.cost`，验证账本以实际扣费为准
+    """
+
+    def __init__(
+        self,
+        *,
+        models=None,
+        submit_status=202,
+        polls=None,
+        download_bytes=VIDEO_BYTES,
+        content_ok: bool = True,
+        unsigned_requires_auth: bool = True,
+        cost: float | None = None,
+    ):
         self.models = models if models is not None else [HAILUO3]
         self.submit_status = submit_status
-        self.polls = list(polls or [{"status": "completed", "unsigned_urls": ["https://cdn/v.mp4"]}])
+        self.polls = list(
+            polls or [{"status": "completed", "unsigned_urls": ["https://cdn/v.mp4"]}]
+        )
         self.download_bytes = download_bytes
+        self.content_ok = content_ok
+        self.unsigned_requires_auth = unsigned_requires_auth
+        self.cost = cost
         self.requests: list[httpx.Request] = []
         self.bodies: list[dict] = []
         self.models_calls = 0
         self.submits = 0
+
+    def _poll_payload(self, poll: dict) -> dict:
+        payload = {"id": "job-1", **poll}
+        if self.cost is not None:
+            payload["usage"] = {"cost": self.cost, "is_byok": False}
+        return payload
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
@@ -104,10 +135,17 @@ class Recorder:
                     "status": "pending",
                 },
             )
-        if path.endswith("/videos/job-1"):
+        if path.endswith("/videos/job-1/content"):
+            if not self.content_ok:
+                return httpx.Response(404, json={"error": {"message": "content not ready"}})
+            return httpx.Response(200, content=self.download_bytes)
+        if path.endswith("/videos/job-1") and request.method == "GET":
             poll = self.polls.pop(0) if len(self.polls) > 1 else self.polls[0]
-            return httpx.Response(200, json={"id": "job-1", **poll})
+            return httpx.Response(200, json=self._poll_payload(poll))
         if request.url.host == "cdn":
+            # 真实环境里 unsigned_urls 也需要 Authorization，裸下载会 401
+            if self.unsigned_requires_auth and "authorization" not in request.headers:
+                return httpx.Response(401, json={"error": {"message": "unauthorized"}})
             return httpx.Response(200, content=self.download_bytes)
         return httpx.Response(404, json={"error": {"message": "not found"}})
 
@@ -268,14 +306,27 @@ async def test_empty_download_is_rejected(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_no_urls_in_completed_response(tmp_path):
+async def test_no_unsigned_urls_still_tries_content_endpoint(tmp_path):
+    """即使响应里没有 unsigned_urls，也先试官方的 content 端点。"""
     recorder = Recorder(polls=[{"status": "completed"}])
     provider = make_provider(recorder)
     provider.poll_interval_sec = 0.01
 
-    with pytest.raises(VideoProviderError) as exc:
+    clip = await provider.generate(request_for(tmp_path))
+    assert clip.path.is_file()
+
+
+@pytest.mark.asyncio
+async def test_no_urls_and_content_unavailable_raises_artifact_error(tmp_path):
+    recorder = Recorder(polls=[{"status": "completed"}], content_ok=False)
+    provider = make_provider(recorder)
+    provider.poll_interval_sec = 0.01
+
+    with pytest.raises(VideoArtifactError) as exc:
         await provider.generate(request_for(tmp_path))
-    assert "没有返回视频地址" in str(exc.value)
+    message = str(exc.value)
+    assert "下载失败" in message and "job-1" in message
+    assert exc.value.retryable is False
 
 
 # ── 错误映射（消息要能直接给用户看）────────────────────
@@ -518,3 +569,151 @@ def test_cost_service_price_override():
     assert entry.usd == pytest.approx(1.3)
     entry_default = cost_service.video_entry("mock", "mock", 10, 2, price_per_second=None)
     assert entry_default.usd == 0.0  # 默认单价 0
+
+
+# ── 下载鉴权 / 实际扣费 / 不重复计费（真实调用踩出来的坑）──────
+
+
+@pytest.mark.asyncio
+async def test_download_prefers_authenticated_content_endpoint(tmp_path):
+    """unsigned_urls 裸下载会 401，必须优先走带鉴权的 content 端点。"""
+    recorder = Recorder()
+    provider = make_provider(recorder)
+    provider.poll_interval_sec = 0.01
+
+    await provider.generate(request_for(tmp_path))
+
+    downloads = [r for r in recorder.requests if "/content" in r.url.path]
+    assert downloads, "应该请求过 content 端点"
+    assert downloads[0].headers.get("authorization") == "Bearer test-key-not-a-real-secret"
+    assert downloads[0].url.params.get("index") == "0"
+
+
+@pytest.mark.asyncio
+async def test_download_falls_back_to_unsigned_url_with_auth(tmp_path):
+    recorder = Recorder(content_ok=False)
+    provider = make_provider(recorder)
+    provider.poll_interval_sec = 0.01
+
+    clip = await provider.generate(request_for(tmp_path))
+
+    assert clip.path.is_file()
+    cdn_requests = [r for r in recorder.requests if r.url.host == "cdn"]
+    assert cdn_requests, "content 端点失败后应该回退到 unsigned_urls"
+    assert cdn_requests[0].headers.get("authorization", "").startswith("Bearer ")
+
+
+@pytest.mark.asyncio
+async def test_download_failure_is_not_retryable_and_carries_job_id(tmp_path):
+    """生成成功后的下载失败必须标记为不可重试（重试=再买一次）。"""
+    recorder = Recorder(content_ok=False)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "cdn":
+            return httpx.Response(403, json={"error": {"message": "forbidden"}})
+        return recorder.handler(request)
+
+    provider = OpenRouterVideoProvider(
+        api_key="test-key",
+        model="minimax/hailuo-3",
+        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+    provider.poll_interval_sec = 0.01
+
+    with pytest.raises(VideoArtifactError) as exc:
+        await provider.generate(request_for(tmp_path))
+
+    assert exc.value.retryable is False
+    assert exc.value.job_id == "job-1"
+    assert exc.value.urls, "要留下候选地址方便人工捞回"
+    assert not (tmp_path / "clip.mp4").exists()
+
+
+@pytest.mark.asyncio
+async def test_video_service_does_not_regenerate_after_artifact_failure(store):
+    """回归：下载失败时只能提交一次 —— 之前重试 3 次白烧了 3 份钱。"""
+    recorder = Recorder(content_ok=False)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "cdn":
+            return httpx.Response(401, json={"error": {"message": "unauthorized"}})
+        return recorder.handler(request)
+
+    def factory() -> OpenRouterVideoProvider:
+        provider = OpenRouterVideoProvider(
+            api_key="test-key",
+            model="minimax/hailuo-3",
+            client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        )
+        provider.poll_interval_sec = 0.01
+        return provider
+
+    pipeline = Pipeline(store, llm_factory=lambda: FakeLLM(scenes=1), video_factory=factory)
+    project = _project(store, shots=1)
+
+    job = await pipeline.start_video_generation(project.id)
+    finished = await wait_for_job(pipeline, job.id, timeout=30)
+
+    assert finished.status.value == "failed"
+    assert recorder.submits == 1, "已经生成成功过，绝不能再提交一次"
+    clip = store.load_video_manifest(project.id).clips[0]
+    assert clip.status.value == "failed"
+    assert clip.task_id == "job-1", "失败也要留下 job id 方便人工捞回"
+    assert "job-1" in clip.error
+
+
+@pytest.mark.asyncio
+async def test_generation_failure_is_still_retried(store):
+    """真正的生成失败（还没出片、没扣费）仍然要重试。"""
+    recorder = Recorder(submit_status=500)
+
+    def factory() -> OpenRouterVideoProvider:
+        provider = make_provider(recorder)
+        provider.poll_interval_sec = 0.01
+        provider.max_http_retries = 1
+        return provider
+
+    pipeline = Pipeline(store, llm_factory=lambda: FakeLLM(scenes=1), video_factory=factory)
+    project = _project(store, shots=1)
+
+    job = await pipeline.start_video_generation(project.id)
+    await wait_for_job(pipeline, job.id, timeout=30)
+
+    assert recorder.submits >= 1
+    clip = store.load_video_manifest(project.id).clips[0]
+    assert clip.status.value == "failed"
+
+
+@pytest.mark.asyncio
+async def test_actual_cost_from_usage_is_recorded(store):
+    """provider 报的实际扣费要进账本（比价目表推算更准）。"""
+    recorder = Recorder(cost=0.83)
+
+    def factory() -> OpenRouterVideoProvider:
+        provider = make_provider(recorder)
+        provider.poll_interval_sec = 0.01
+        return provider
+
+    pipeline = Pipeline(store, llm_factory=lambda: FakeLLM(scenes=1), video_factory=factory)
+    project = _project(store, shots=1)
+
+    job = await pipeline.start_video_generation(project.id)
+    await wait_for_job(pipeline, job.id, timeout=30)
+
+    clip = store.load_video_manifest(project.id).clips[0]
+    assert clip.cost_usd == pytest.approx(0.83)
+
+    entry = next(e for e in store.load_cost_report(project.id).entries if e.stage.value == "video")
+    assert entry.usd == pytest.approx(0.83), "有实际扣费时不要用价目表推算"
+    assert entry.units == 5.0
+
+
+def test_video_entry_prefers_actual_cost():
+    entry = cost_service.video_entry(
+        "openrouter", "minimax/hailuo-3", 5, 1, price_per_second=0.13, actual_usd=0.83
+    )
+    assert entry.usd == pytest.approx(0.83)
+    fallback = cost_service.video_entry(
+        "openrouter", "minimax/hailuo-3", 5, 1, price_per_second=0.13
+    )
+    assert fallback.usd == pytest.approx(0.65)

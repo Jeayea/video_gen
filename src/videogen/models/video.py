@@ -36,6 +36,8 @@ class VideoClip(BaseModel):
     aspect_ratio: str = "9:16"
     provider: str = ""
     task_id: str | None = None
+    #: provider 报的实际扣费（USD），账本以它为准
+    cost_usd: float = 0.0
     attempts: int = 0
     error: str = ""
     prompt: str = ""

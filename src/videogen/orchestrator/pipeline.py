@@ -640,6 +640,17 @@ class Pipeline:
             self.store.save_video_manifest(project_id, manifest)
             newly = [c for c in manifest.ready_clips if c.shot_id not in before]
             if newly:
+                actual = round(sum(c.cost_usd for c in newly), 6)
+                if actual > 0 and price_per_second:
+                    expected = sum(c.duration_sec for c in newly) * price_per_second
+                    if expected > 0 and actual > expected * 1.2:
+                        logger.warning(
+                            "实际扣费 $%.4f 高于价目表估算 $%.4f（%s）："
+                            "建议按实际值调整 VIDEO_PRICE_PER_SECOND 或依赖账本",
+                            actual,
+                            expected,
+                            manifest.model,
+                        )
                 cost_service.record(
                     self.store,
                     project_id,
@@ -649,6 +660,7 @@ class Pipeline:
                         sum(c.duration_sec for c in newly),
                         len(newly),
                         price_per_second=price_per_second,
+                        actual_usd=actual if actual > 0 else None,
                     ),
                 )
             # 片段变了，旧的成片一定过期
