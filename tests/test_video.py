@@ -196,6 +196,37 @@ def test_build_prompt_appends_constraints(store, ready_project):
     assert f"{shot.duration_sec} seconds" in prompt
 
 
+def test_build_prompt_injects_bible_appearance_for_consistency(store, ready_project, bible):
+    """在场角色的圣经外貌要确定性地进入每个镜头 prompt（脸不统一的文本侧兜底）。"""
+    storyboard = store.load_storyboard(ready_project.id)
+    shot = next(s for s in storyboard.shots if s.character_in_frame)
+    char_id = shot.character_in_frame[0]
+    character = bible.get_character(char_id)
+    shot.video_prompt = "A medium shot of a young woman walking"  # 故意不写外貌
+
+    prompt = video_service.build_prompt(shot, ready_project, bible)
+
+    assert character.name in prompt
+    assert character.visual_prompt.split(",")[0][:30] in prompt
+    assert "consistent face" in prompt
+
+
+def test_appearance_anchor_skips_descriptions_already_in_the_prompt(store, ready_project, bible):
+    storyboard = store.load_storyboard(ready_project.id)
+    shot = next(s for s in storyboard.shots if s.character_in_frame)
+    character = bible.get_character(shot.character_in_frame[0])
+    # 分镜 LLM 已经抄过外貌 -> 不要重复拼一遍
+    shot.video_prompt = f"Close-up. {character.visual_prompt}"
+
+    prompt = video_service.build_prompt(shot, ready_project, bible)
+    assert prompt.count(character.visual_prompt.split(",")[0][:30]) == 1
+
+
+def test_appearance_anchor_is_empty_without_bible(store, ready_project):
+    shot = store.load_storyboard(ready_project.id).shots[0]
+    assert video_service.appearance_anchor(shot, None, "x") == ""
+
+
 # ── pipeline / job 层 ─────────────────────────────────
 
 

@@ -149,7 +149,7 @@ async def _generate_one(
     request = VideoRequest(
         shot_id=shot.id,
         scene_id=shot.scene_id,
-        prompt=build_prompt(shot, project),
+        prompt=build_prompt(shot, project, bible),
         duration_sec=max(1, shot.duration_sec),
         aspect_ratio=project.aspect_ratio.value,
         output_path=output,
@@ -268,8 +268,13 @@ def resolve_reference(
     return None, (default_seed or None)
 
 
-def build_prompt(shot: Shot, project: Project) -> str:
-    """组装给视频模型的 prompt（video_prompt 已在分镜阶段转成纯英文）。"""
+def build_prompt(shot: Shot, project: Project, bible: StoryBible | None = None) -> str:
+    """组装给视频模型的 prompt（video_prompt 已在分镜阶段转成纯英文）。
+
+    给了 `bible` 就额外拼一段**在场角色的圣经外貌**：视频模型每个镜头都是独立生成的，
+    分镜 LLM 有时把 `character.visual_prompt` 抄进 `video_prompt`、有时只写
+    "a young woman" —— 抄了就跳过，没抄就补上，让同一个角色在每个镜头里的文字描述一致。
+    """
     base = (shot.video_prompt or shot.visual_description or "").strip()
     if not base:
         base = "cinematic shot"
@@ -278,8 +283,41 @@ def build_prompt(shot: Shot, project: Project) -> str:
         parts.append(f"aspect ratio {project.aspect_ratio.value}")
     if shot.mood:
         parts.append(f"mood: {shot.mood}")
+    anchor = appearance_anchor(shot, bible, base)
+    if anchor:
+        parts.append(anchor)
     parts.append(f"{max(1, shot.duration_sec)} seconds")
     return ", ".join(parts)
+
+
+#: 每个角色的外貌描述最多带这么多字符，避免 prompt 被圣经挤爆
+_APPEARANCE_MAX_CHARS = 180
+
+
+def appearance_anchor(shot: Shot, bible: StoryBible | None, base: str = "") -> str:
+    """在场角色的外貌锚点（跨镜头一致性用的文字版）。
+
+    `base` 里已经出现过的描述会跳过（分镜 LLM 抄过就不重复）。
+    """
+    if not bible:
+        return ""
+    haystack = base.lower()
+    chunks: list[str] = []
+    for char_id in shot.character_in_frame or []:
+        character = bible.get_character(char_id)
+        if character is None:
+            continue
+        look = " ".join(str(character.visual_prompt or "").split())
+        if not look:
+            continue
+        head = look.split(",")[0].strip().lower()
+        if head and head in haystack:
+            continue
+        chunks.append(f"{character.name or char_id}: {look[:_APPEARANCE_MAX_CHARS]}")
+        haystack += " " + head
+    if not chunks:
+        return ""
+    return "same characters as before, consistent face and hairstyle — " + "; ".join(chunks)
 
 
 def _mentions(text: str, aspect_ratio: str) -> bool:

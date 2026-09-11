@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -17,15 +17,19 @@ from videogen.models.project import AspectRatio, InputMode, Project
 from videogen.orchestrator.batch import STOP_AFTER_STAGES, BatchManager
 from videogen.orchestrator.pipeline import Pipeline, PipelineError, PipelineNotFound
 from videogen.providers import video as video_providers
+from videogen.providers.image.base import ImageProviderError
 from videogen.providers.llm.base import LLMError
 from videogen.providers.tts.base import TTSProviderError
 from videogen.providers.video.base import VideoProviderError
+from videogen.services import character_image_service, subtitle_service
+from videogen.services.character_image_service import CharacterImageError
 from videogen.services.cost_service import BudgetExceeded, PriceTable
 from videogen.utils.ffmpeg import (
     ffmpeg_available,
     ffmpeg_capabilities,
     ffprobe_available,
     resolve_ffmpeg,
+    resolve_ffmpeg_for,
 )
 from videogen.utils.file_store import FileStore
 
@@ -192,6 +196,25 @@ class ReferenceImageRequest(BaseModel):
     content_base64: str = Field(min_length=1)
 
 
+class GenerateReferenceRequest(BaseModel):
+    """AI 生成角色参考图（会真的调图片模型，按张计费）。"""
+
+    #: 已经有参考图时是否重新生成（默认跳过，不花钱）
+    force: bool = False
+    #: 是否把已有参考图作为图生图输入（出「同一角色的另一个角度」）
+    use_reference: bool = False
+    #: 自定义 prompt（留空 = 用角色设定自动拼）
+    prompt: str = ""
+
+
+class GenerateReferencesRequest(BaseModel):
+    """批量生成角色参考图：默认只补没有图的角色。"""
+
+    force: bool = False
+    only: list[str] = Field(default_factory=list)
+    concurrency: int = Field(default=2, ge=1, le=4)
+
+
 class BatchItemRequest(BaseModel):
     title: str = ""
     input_text: str = Field(min_length=1)
@@ -269,6 +292,8 @@ async def list_models():
 @app.get("/api/health")
 async def health():
     caps = await ffmpeg_capabilities()
+    burn_exe, burn_caps = await resolve_ffmpeg_for({"subtitles"})
+    can_burn = "subtitles" in burn_caps
     return {
         "status": "ok",
         "version": __version__,
@@ -279,6 +304,9 @@ async def health():
         "video_model": (
             settings.openrouter_video_model if settings.video_provider == "openrouter" else "mock"
         ),
+        "image_provider": settings.image_provider,
+        "image_model": settings.openrouter_image_model,
+        "image_price_usd": settings.image_price_usd,
         "ffmpeg_available": ffmpeg_available(),
         "video_concurrency": settings.video_concurrency,
         "auth_enabled": bool(settings.api_token.strip()),
@@ -293,8 +321,10 @@ async def health():
         "ffprobe_available": ffprobe_available(),
         # 只暴露可执行文件路径与能力，不涉及任何密钥
         "ffmpeg_path": resolve_ffmpeg(),
-        "ffmpeg_can_burn_subtitles": "subtitles" in caps,
+        "ffmpeg_can_burn_subtitles": can_burn,
+        "ffmpeg_burn_path": burn_exe if can_burn else "",
         "ffmpeg_can_embed_subtitles": "mov_text" in caps,
+        "ffmpeg_auto_upgrade": settings.ffmpeg_auto_upgrade,
         "stages_implemented": ["bible", "script", "storyboard", "video", "audio", "compose"],
         "stages_pending": [],
         "active_jobs": pipeline.jobs.active_count,
@@ -671,6 +701,30 @@ async def get_subtitles(project_id: str):
     return FileResponse(path, media_type="application/x-subrip", filename=path.name)
 
 
+@app.get("/api/projects/{project_id}/subtitles.vtt")
+async def get_subtitles_vtt(project_id: str):
+    """字幕的 WebVTT 版本，给浏览器 `<video><track>` 预览用。
+
+    浏览器**不认** SRT，也**不渲染** mp4 里的 mov_text 软字幕轨 —— 所以想在页面上
+    看见字幕，必须有这份 VTT。已经合成过的老项目没有 `subtitles.vtt` 文件，
+    这里就地把 srt 转出来，不需要重新合成。
+    """
+
+    report = pipeline.get_compose_report(project_id)
+    if not report or not report.subtitles_path:
+        raise HTTPException(404, "字幕文件不存在")
+    if report.subtitles_vtt_path:
+        cached = store.resolve_artifact(project_id, report.subtitles_vtt_path)
+        if cached and cached.is_file():
+            body = cached.read_text(encoding="utf-8")
+            return Response(content=body, media_type="text/vtt; charset=utf-8")
+    path = store.resolve_artifact(project_id, report.subtitles_path)
+    if not path or not path.is_file():
+        raise HTTPException(404, "字幕文件不存在（可能已被清理）")
+    body = subtitle_service.srt_to_vtt(path.read_text(encoding="utf-8"))
+    return Response(content=body, media_type="text/vtt; charset=utf-8")
+
+
 # ── 角色一致性（参考图）────────────────────────────────────
 
 
@@ -751,6 +805,51 @@ async def delete_reference(project_id: str, char_id: str):
     for stale in store.refs_dir(project_id).glob(f"{char_id}.*"):
         stale.unlink(missing_ok=True)
     return {"status": "ok", "removed": bool(character.reference_image)}
+
+
+@app.get("/api/projects/{project_id}/characters/references/plan")
+async def references_plan(project_id: str):
+    """哪些角色还没有参考图 + 补齐一遍的预估花费（**不调 API、不花钱**）。"""
+    pipeline.get_project(project_id)
+    return character_image_service.reference_plan(store, project_id)
+
+
+@app.post("/api/projects/{project_id}/characters/references/generate")
+async def generate_references(project_id: str, req: GenerateReferencesRequest):
+    """批量 AI 生成角色参考图（默认只补缺失的；单角色失败不影响其它）。"""
+    pipeline.get_project(project_id)
+    try:
+        return await character_image_service.generate_all_references(
+            store,
+            project_id,
+            force=req.force,
+            only=req.only or None,
+            concurrency=req.concurrency,
+        )
+    except BudgetExceeded as exc:
+        raise HTTPException(402, str(exc)) from exc
+    except (CharacterImageError, ImageProviderError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/api/projects/{project_id}/characters/{char_id}/reference/generate")
+async def generate_reference(project_id: str, char_id: str, req: GenerateReferenceRequest):
+    """给一个角色 AI 生成参考图（定妆照）；已有图默认跳过，force=true 才重画。"""
+    _load_character(project_id, char_id)
+    try:
+        result = await character_image_service.generate_character_image(
+            store,
+            project_id,
+            char_id,
+            force=req.force,
+            use_reference=req.use_reference,
+            prompt_override=req.prompt,
+        )
+    except BudgetExceeded as exc:
+        raise HTTPException(402, str(exc)) from exc
+    except (CharacterImageError, ImageProviderError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {"status": "ok", **result}
 
 
 # ── 成本 ────────────────────────────────────────────────────

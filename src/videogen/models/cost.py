@@ -12,6 +12,8 @@ class CostStage(str, Enum):
     BIBLE = "bible"
     SCRIPT = "script"
     STORYBOARD = "storyboard"
+    #: AI 生成角色参考图（角色一致性）
+    IMAGE = "image"
     VIDEO = "video"
     AUDIO = "audio"
     COMPOSE = "compose"

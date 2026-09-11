@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 
 import pytest
 
@@ -19,7 +20,12 @@ from videogen.orchestrator.pipeline import Pipeline, PipelineError
 from videogen.providers.tts.mock import MockTTSProvider
 from videogen.providers.video.mock import MockVideoProvider
 from videogen.services import compose_service, subtitle_service
-from videogen.utils.ffmpeg import ffmpeg_available
+from videogen.utils.ffmpeg import (
+    ffmpeg_available,
+    ffmpeg_capabilities_for,
+    probe_streams,
+    resolve_ffmpeg,
+)
 
 requires_ffmpeg = pytest.mark.skipif(
     not ffmpeg_available(), reason="环境里没有 ffmpeg，跳过真实合成用例"
@@ -610,14 +616,21 @@ async def test_compose_is_idempotent_on_rerun(store):
 @requires_ffmpeg
 @pytest.mark.asyncio
 async def test_burn_degrades_when_libass_is_missing(store, monkeypatch):
-    """请求烧字幕但 ffmpeg 没有 libass 时，必须降级成软字幕 + 明确告警。"""
+    """请求烧字幕但**任何** ffmpeg 都没有 libass 时，必须降级成软字幕 + 明确告警。"""
     pipeline = real_pipeline(store)
     project = await prepare_media(store, pipeline, small_project(store, shots=1))
 
     async def fake_caps() -> set[str]:
         return {"mov_text", "libx264", "aac"}  # 故意没有 subtitles
 
+    async def no_libass_candidate(required):
+        # 候选里也找不到带 libass 的（否则会「升级」而不是降级）
+        return resolve_ffmpeg(), {"mov_text", "libx264", "aac"}
+
     monkeypatch.setattr(pipeline_module.compose_service, "ffmpeg_capabilities", fake_caps)
+    monkeypatch.setattr(
+        pipeline_module.compose_service, "resolve_ffmpeg_for", no_libass_candidate
+    )
 
     job = await pipeline.start_compose(project.id, overrides={"compose_subtitle_mode": "burn"})
     finished = await wait_for_job(pipeline, job.id, timeout=120)
@@ -626,7 +639,41 @@ async def test_burn_degrades_when_libass_is_missing(store, monkeypatch):
     report = store.load_compose_report(project.id)
     assert report.subtitle_mode == SubtitleMode.BURN
     assert report.subtitle_mode_effective == SubtitleMode.SOFT
+    assert report.subtitle_ffmpeg == ""
     assert any("libass" in w for w in report.warnings)
+
+
+@requires_ffmpeg
+@pytest.mark.asyncio
+async def test_burn_upgrades_to_a_libass_capable_ffmpeg(store, monkeypatch):
+    """主 ffmpeg 没有 libass 时，自动换用候选里带 libass 的那个，真的把字幕烧进画面。"""
+    portable = pytest.importorskip("imageio_ffmpeg").get_ffmpeg_exe()
+    portable_caps = await ffmpeg_capabilities_for(portable)
+    if "subtitles" not in portable_caps or "libx264" not in portable_caps:
+        pytest.skip("imageio-ffmpeg 便携版不带 libass，无法验证升级路径")
+
+    pipeline = real_pipeline(store)
+    project = await prepare_media(store, pipeline, small_project(store, shots=1))
+
+    async def fake_caps() -> set[str]:
+        return {"mov_text", "libx264", "aac"}  # 主 ffmpeg 假装没有 libass
+
+    monkeypatch.setattr(pipeline_module.compose_service, "ffmpeg_capabilities", fake_caps)
+
+    job = await pipeline.start_compose(project.id, overrides={"compose_subtitle_mode": "burn"})
+    finished = await wait_for_job(pipeline, job.id, timeout=180)
+    assert finished.status.value == "succeeded", finished.error
+
+    report = store.load_compose_report(project.id)
+    assert report.subtitle_mode_effective == SubtitleMode.BURN
+    assert report.subtitle_ffmpeg == str(Path(portable).resolve())
+    assert any("libass" in w for w in report.warnings)
+
+    # 烧进去的字幕不再是独立流：成片里只剩 video + audio
+    final = store.ensure_project_dir(project.id) / report.output_path
+    streams = await probe_streams(final)
+    assert streams is not None and "video" in streams
+    assert "subtitle" not in streams
 
 
 @requires_ffmpeg
@@ -647,6 +694,10 @@ async def test_subtitles_fall_back_to_srt_only_when_mov_text_missing(store, monk
     assert report.subtitle_mode_effective == SubtitleMode.NONE
     assert (store.ensure_project_dir(project.id) / report.subtitles_path).is_file()
     assert any("mov_text" in w for w in report.warnings)
+    # 即使降级到「只有侧挂文件」，也要有浏览器能用的 vtt
+    assert report.subtitles_vtt_path
+    vtt = (store.ensure_project_dir(project.id) / report.subtitles_vtt_path).read_text("utf-8")
+    assert vtt.startswith("WEBVTT")
 
 
 @requires_ffmpeg
@@ -661,3 +712,49 @@ async def test_mock_audio_and_video_have_expected_kinds(store):
     assert video.is_usable and audio.is_usable
     assert all(c.media_kind == MediaKind.VIDEO for c in video.ready_clips)
     assert all(c.media_kind == MediaKind.AUDIO for c in audio.ready_clips)
+
+
+# ── 字幕文本格式（srt / vtt）─────────────────────────────
+# Web 预览必须靠 vtt：浏览器既不认 srt，也不渲染 mp4 里的 mov_text 软字幕轨。
+
+
+def _cues() -> list[ComposeSegment]:
+    return [
+        ComposeSegment(shot_id="s1", index=0, duration_sec=2.5, text="林悦：你好"),
+        ComposeSegment(shot_id="s2", index=1, duration_sec=2.5, text="李薇儿：再见"),
+        ComposeSegment(shot_id="s3", index=2, duration_sec=2.0, text=""),  # 静音镜头不出字幕
+    ]
+
+
+def test_build_vtt_uses_dot_milliseconds_and_skips_empty_text():
+    vtt = subtitle_service.build_vtt(_cues())
+    assert vtt.startswith("WEBVTT\n\n")
+    assert "00:00:00.000 --> 00:00:02.500" in vtt
+    assert "00:00:02.500 --> 00:00:05.000" in vtt
+    assert vtt.count("-->") == 2  # 空文本不产生 cue
+    assert "林悦：你好" in vtt
+    assert "," not in vtt.split("-->")[0][-30:]  # 时间戳里没有逗号
+
+
+def test_build_srt_and_vtt_have_the_same_cues():
+    segments = _cues()
+    srt = subtitle_service.build_srt(segments)
+    vtt = subtitle_service.build_vtt(segments)
+    assert srt.count("-->") == vtt.count("-->")
+    for cue in ("林悦：你好", "李薇儿：再见"):
+        assert cue in srt and cue in vtt
+
+
+def test_srt_to_vtt_converts_existing_files():
+    srt = "1\n00:00:01,000 --> 00:00:03,250\n对白\n"
+    vtt = subtitle_service.srt_to_vtt(srt)
+    assert vtt.startswith("WEBVTT\n\n")
+    assert "00:00:01.000 --> 00:00:03.250" in vtt
+    assert "对白" in vtt
+    # 已经是 vtt 就原样返回（幂等）
+    assert subtitle_service.srt_to_vtt(vtt).strip() == vtt.strip()
+    assert subtitle_service.srt_to_vtt("").strip() == "WEBVTT"
+
+
+def test_build_vtt_without_cues_is_still_valid():
+    assert subtitle_service.build_vtt([]) == "WEBVTT\n"

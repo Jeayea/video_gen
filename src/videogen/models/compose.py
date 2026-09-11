@@ -29,6 +29,8 @@ class ComposeReport(BaseModel):
 
     output_path: str = ""
     subtitles_path: str | None = None
+    #: 浏览器可直接播放的 WebVTT 侧挂字幕（UI 预览用；soft/burn 都导出）
+    subtitles_vtt_path: str | None = None
     duration_sec: float = 0.0
     subtitle_mode: SubtitleMode = SubtitleMode.SOFT
     #: 实际生效的字幕模式（请求 burn 但 ffmpeg 没有 libass 时会降级）
@@ -44,6 +46,8 @@ class ComposeReport(BaseModel):
     video_provider: str = ""
     tts_provider: str = ""
     ffmpeg: str = ""
+    #: 真正执行烧字幕的那个 ffmpeg（主 ffmpeg 无 libass 时是另一个候选）
+    subtitle_ffmpeg: str = ""
     warnings: list[str] = Field(default_factory=list)
     created_at: str = Field(default_factory=lambda: datetime.now(UTC).isoformat())
 
@@ -53,6 +57,7 @@ class ComposeReport(BaseModel):
             "duration_sec": self.duration_sec,
             "subtitle_mode": self.subtitle_mode_effective or self.subtitle_mode,
             "subtitles": bool(self.subtitles_path),
+            "subtitles_vtt": bool(self.subtitles_vtt_path),
             "bgm": self.bgm_id,
             "ambient": self.ambient_mode_effective,
             "warnings": len(self.warnings),

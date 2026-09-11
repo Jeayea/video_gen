@@ -116,6 +116,20 @@ def test_health(client):
     assert "key" not in {k for k in data if "configured" not in k}
 
 
+def test_health_reports_burn_and_image_capabilities(client):
+    """字幕能不能烧、角色图用什么模型，都要能从 /health 看出来（都不含密钥）。"""
+    data = client.get("/api/health").json()
+    assert data["image_provider"] == "mock"  # 测试基线强制 mock
+    assert data["image_model"]
+    assert data["image_price_usd"] >= 0
+    assert isinstance(data["ffmpeg_can_burn_subtitles"], bool)
+    assert data["ffmpeg_auto_upgrade"] is True
+    if data["ffmpeg_can_burn_subtitles"]:
+        assert data["ffmpeg_burn_path"]  # 能烧就必须告诉前端用哪个二进制
+    else:
+        assert data["ffmpeg_burn_path"] == ""
+
+
 def test_index_and_static_mounted(client):
     assert client.get("/").status_code == 200
     assert client.get("/static/index.html").status_code == 200
@@ -600,6 +614,91 @@ def test_reference_image_validation(client, monkeypatch):
     resp = client.post(url, json={"filename": "a.png", "content_base64": PNG_BASE64})
     assert resp.status_code == 400
     assert "太大" in resp.json()["detail"]
+
+
+def test_ai_reference_plan_and_generation_flow(client):
+    """AI 生成角色图：plan（不花钱）→ 单个生成 → 批量补齐 → 预览 + 记账。"""
+    pid = prepare_confirmed_storyboard(client)
+
+    plan = client.get(f"/api/projects/{pid}/characters/references/plan")
+    assert plan.status_code == 200, plan.text
+    body = plan.json()
+    assert body["missing"] == body["total"] > 0
+    assert body["estimated_usd"] == pytest.approx(body["missing"] * body["price_per_image"])
+    assert body["provider"] == "mock"  # 测试基线强制 mock，绝不打真实图片接口
+
+    one = client.post(
+        f"/api/projects/{pid}/characters/char_1/reference/generate", json={"force": False}
+    )
+    assert one.status_code == 200, one.text
+    assert one.json()["reference_image"] == "refs/char_1.png"
+    assert one.json()["skipped"] is False
+
+    # 再点一次：已有图，默认跳过、不花钱
+    again = client.post(
+        f"/api/projects/{pid}/characters/char_1/reference/generate", json={}
+    )
+    assert again.json()["skipped"] is True
+    assert again.json()["cost_usd"] == 0.0
+
+    preview = client.get(f"/api/projects/{pid}/characters/char_1/reference")
+    assert preview.status_code == 200
+    assert preview.content.startswith(b"\x89PNG")
+
+    batch = client.post(
+        f"/api/projects/{pid}/characters/references/generate", json={"concurrency": 2}
+    )
+    assert batch.status_code == 200, batch.text
+    assert batch.json()["skipped"] == 1  # char_1 已经有了
+    assert batch.json()["failed"] == 0
+    assert client.get(f"/api/projects/{pid}/characters/references/plan").json()["missing"] == 0
+
+    cost = client.get(f"/api/projects/{pid}/cost").json()
+    assert cost["stages"]["image"]["calls"] == cost["stages"]["image"]["units"]
+
+
+def test_ai_reference_generation_unknown_character_and_project(client):
+    pid = prepare_confirmed_storyboard(client)
+    assert client.post(
+        f"/api/projects/{pid}/characters/char_nope/reference/generate", json={}
+    ).status_code == 404
+    assert client.post(
+        "/api/projects/nope/characters/references/generate", json={}
+    ).status_code == 404
+    assert client.get("/api/projects/nope/characters/references/plan").status_code == 404
+
+
+def test_subtitles_vtt_is_served_for_old_projects(client):
+    """老项目只有 srt 时，`subtitles.vtt` 要能就地转出来（不用重新合成）。"""
+    pid = prepare_confirmed_storyboard(client)
+    store = client.videogen_store
+    output = store.output_dir(pid)
+    srt = (
+        "1\n00:00:00,000 --> 00:00:02,500\n林悦：你好\n\n"
+        "2\n00:00:03,000 --> 00:00:05,000\n李薇儿：再见\n"
+    )
+    (output / "subtitles.srt").write_text(srt, encoding="utf-8")
+    from videogen.models.compose import ComposeReport
+
+    store.save_compose_report(
+        pid,
+        ComposeReport(
+            output_path="output/final.mp4",
+            subtitles_path="output/subtitles.srt",
+            duration_sec=5.0,
+        ),
+    )
+
+    resp = client.get(f"/api/projects/{pid}/subtitles.vtt")
+    assert resp.status_code == 200, resp.text
+    assert resp.headers["content-type"].startswith("text/vtt")
+    assert resp.text.startswith("WEBVTT")
+    assert "00:00:00.000 --> 00:00:02.500" in resp.text  # 逗号已经换成点号
+    assert "林悦：你好" in resp.text
+
+    # 没有合成报告时是 404，而不是空字幕
+    other = prepare_confirmed_storyboard(client)
+    assert client.get(f"/api/projects/{other}/subtitles.vtt").status_code == 404
 
 
 def wait_batch(client: TestClient, batch_id: str, timeout: float = 20.0) -> dict:

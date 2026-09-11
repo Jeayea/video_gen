@@ -136,6 +136,22 @@ class Settings(BaseSettings):
     static_dir: Path | None = None
     ffmpeg_path: str = "ffmpeg"
     ffprobe_path: str = ""
+    #: 主 ffmpeg 缺能力（例如没有 libass 烧不了字幕）时，是否自动换用候选里
+    #: 能满足要求的那个（imageio-ffmpeg 便携版通常带 libass）
+    ffmpeg_auto_upgrade: bool = True
+    # 角色图（AI 生成参考图）
+    image_provider: str = "openrouter"
+    openrouter_image_model: str = "bytedance-seed/seedream-4.5"
+    #: 角色图宽高比 / 分辨率档位（留空 = 交给模型默认）
+    image_aspect_ratio: str = "1:1"
+    image_resolution: str = ""
+    image_timeout_sec: float = 180.0
+    #: 图片接口失败重试的退避基数（秒）；测试里置 0
+    image_retry_backoff_sec: float = 2.0
+    #: 模型没报 usage.cost 时用于记账的单价（USD / 张）
+    image_price_usd: float = 0.04
+    #: 生成角色图时是否带上已有参考图（做「同一角色的另一角度」）
+    image_use_existing_reference: bool = False
 
     # 安全：留空表示不校验（仅建议在本机 127.0.0.1 上跑）；设置后所有 /api 请求需带
     # X-API-Token 头或 ?token= 查询参数

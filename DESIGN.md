@@ -511,9 +511,15 @@ KLING_SECRET_KEY=
 TTS_PROVIDER=edge            # edge | openai
 OPENAI_API_KEY=              # openai tts 时用
 
+# 角色图（AI 定妆照 = H3 下唯一的角色一致性锚点）
+IMAGE_PROVIDER=openrouter
+OPENROUTER_IMAGE_MODEL=bytedance-seed/seedream-4.5   # $0.04/张
+IMAGE_PRICE_USD=0.04
+
 # 路径
 PROJECTS_DIR=./projects
 FFMPEG_PATH=ffmpeg
+FFMPEG_AUTO_UPGRADE=true      # 主 ffmpeg 缺能力时自动换候选（如烧字幕要 libass）
 ```
 
 ---
@@ -570,7 +576,7 @@ FFMPEG_PATH=ffmpeg
 
 ---
 
-## 10. 实现状态（v0.12，2026-09-11 更新）
+## 10. 实现状态（v0.13，2026-09-11 更新）
 
 ### 已落地
 
@@ -620,6 +626,20 @@ FFMPEG_PATH=ffmpeg
   静默漏记（真实事故：实花 $9.75、账本 $0.0011）；新增 `POST /cost/reconcile` 幂等补齐，
   `/cost` 暴露 `video_actual_usd` / `video_ledger_usd` / `video_unrecorded_usd` 三个口径；
   另外只有**真的重跑过片段**才作废成片（依据 `VideoClip.generated_at`）
+
+- **Phase B（v0.13）**：
+  - **字幕真的看得见**：字幕模式三种都额外导出 `output/subtitles.vtt`（浏览器只认 VTT，
+    既不认 SRT 也不渲染 mov_text 软轨），Web 面板用 `<track>` 预览；
+    `GET /subtitles.vtt` 对老项目就地由 srt 转换，不必重新合成
+  - **ffmpeg 能力感知**：`resolve_ffmpeg_for(required)` 按需要的滤镜在候选
+    （`FFMPEG_PATH` → `PATH` → `imageio-ffmpeg` 便携版）里挑 exe，主 ffmpeg 没有 libass
+    就自动换带 libass 的那个来烧字幕，并把 `subtitle_ffmpeg` 写进报告；
+    都没有才降级 + 告警。`FFMPEG_AUTO_UPGRADE=false` 可关
+  - **AI 生成角色定妆照**：`providers/image`（OpenRouter `POST /api/v1/images` + mock）→
+    `services/character_image_service.py` 把 `character.visual_prompt` 组装成
+    「正面 / 中性表情 / 干净背景 / 无文字」的定妆照 prompt，落盘 `refs/<cid>.png` 并写回圣经；
+    之后每个镜头由 `input_references` 带给视频模型 —— 这是 H3 下**唯一**能锁住五官的手段
+    （H3 `seed: false`）。记账新增 `CostStage.IMAGE`；预算不足直接 402
 
 ### 尚未实现（后续可做）
 

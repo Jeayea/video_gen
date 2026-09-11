@@ -186,6 +186,14 @@ body {
 }
 .char-tag .name { font-weight: 500; }
 .char-tag .role { color: var(--text2); font-size: 11px; }
+.char-tag .ref-thumb {
+  width: 34px; height: 34px; border-radius: 50%; object-fit: cover;
+  border: 1px solid var(--border); background: #000;
+}
+.char-tag .ref-thumb.empty {
+  display: inline-flex; align-items: center; justify-content: center;
+  font-size: 9px; color: var(--text2);
+}
 
 /* JSON Editor */
 .json-editor {
@@ -390,6 +398,7 @@ let currentAudio = null;
 let currentCompose = null;
 let currentCost = null;
 let currentBatch = null;
+let serverHealth = null;
 let modelInfo = null;
 let costPollTimer = null;
 let batchPollTimer = null;
@@ -444,9 +453,11 @@ async function refresh() {
 async function loadHealth() {
   try {
     const h = await api('/api/health');
+    serverHealth = h;
     const ok = h.llm_key_configured;
     $('health').innerHTML =
       `<span class="tag-mini ${ok ? 'ok' : 'warn'}">LLM ${ok ? '已配置' : '未配置 Key'}</span>` +
+      (h.ffmpeg_can_burn_subtitles ? ' <span class="tag-mini ok">可烧字幕</span>' : '') +
       (h.auth_enabled ? ' <span class="tag-mini ok">鉴权开启</span>' : '');
     // 配音文案的默认模式跟着服务端配置走（off = 不额外花钱）
     if (h.audio_script_mode && SCRIPT_MODES.some(([value]) => value === h.audio_script_mode)) {
@@ -804,11 +815,20 @@ function renderBible() {
     $('btn-bible-edit').style.display = '';
     const chars = bible.characters.map(c => {
       const hasRef = !!(c.reference_image);
+      const thumb = hasRef
+        ? `<img class="ref-thumb" alt="${esc(c.name)} 参考图"
+                src="/api/projects/${currentProjectId}/characters/${encodeURIComponent(c.id)}/reference?t=${Date.now()}" />`
+        : '<span class="ref-thumb empty">无图</span>';
       return `<div class="char-tag" title="${esc(c.reference_image || '未设置参考图')}">
+        ${thumb}
         <span class="name">${esc(c.name)}</span>
         <span class="role">${esc(c.role)}</span>
+        <button class="btn btn-xs btn-green" title="用图片模型生成定妆照（按张计费）"
+                onclick="generateReference('${esc(c.id)}', ${hasRef ? 'true' : 'false'})">
+          ${hasRef ? 'AI 重画' : 'AI 生成'}
+        </button>
         <label class="ref-upload">
-          ${hasRef ? '换图' : '参考图'}
+          ${hasRef ? '换图' : '上传'}
           <input type="file" accept="image/png,image/jpeg,image/webp"
                  onchange="uploadReference('${esc(c.id)}', this)" />
         </label>
@@ -817,6 +837,10 @@ function renderBible() {
     }).join('');
     $('bible-view').innerHTML = `
       <div class="bible-chars">${chars}</div>
+      <div class="panel-actions" style="margin-top:8px">
+        <button class="btn btn-sm" onclick="generateAllReferences()">AI 补齐缺失的角色图</button>
+        <span class="hint" id="ref-plan-hint"></span>
+      </div>
       <div style="font-size:12px;color:var(--text2);margin-top:8px">
         ${esc(bible.style.genre)} · ${esc(bible.style.tone)} · ${esc(bible.style.pacing)} ·
         ${bible.facts.length} 条关键事实 · ${bible.settings.length} 个场景
@@ -826,6 +850,7 @@ function renderBible() {
         <pre style="background:var(--bg);border-radius:6px;padding:10px;font-size:11px;overflow-x:auto;max-height:250px;overflow-y:auto;margin-top:6px;color:#93c5fd">${esc(JSON.stringify(bible, null, 2))}</pre>
       </details>
     `;
+    refreshReferencePlan();
   } catch (e) { /* 面板渲染失败不应影响其它面板 */ }
 }
 
@@ -1613,31 +1638,58 @@ function renderCompose() {
   if (!report) {
     body.innerHTML = `<span style="color:var(--text2);font-size:12px">尚未合成</span>`;
   } else {
+    const trackSrc = report.subtitles_path
+      ? `<track id="compose-track" kind="subtitles" srclang="zh" label="中文" default
+               src="/api/projects/${currentProjectId}/subtitles.vtt">`
+      : '';
     body.innerHTML = `
-      <video controls preload="metadata" style="width:100%;max-width:320px;border-radius:8px;background:#000"
-             src="/api/projects/${currentProjectId}/final"></video>
+      <video id="compose-video" controls preload="metadata"
+             style="width:100%;max-width:320px;border-radius:8px;background:#000"
+             src="/api/projects/${currentProjectId}/final">${trackSrc}</video>
       <div class="panel-actions">
         <a class="btn btn-sm" href="/api/projects/${currentProjectId}/final" download>下载成片 MP4</a>
         ${report.subtitles_path
           ? `<a class="btn btn-sm btn-outline" href="/api/projects/${currentProjectId}/subtitles" download>下载字幕 SRT</a>` : ''}
       </div>
+      ${report.subtitles_path ? `
+      <label style="display:flex;gap:6px;align-items:center;font-size:12px;margin-top:6px">
+        <input type="checkbox" id="compose-subtitle-preview" checked /> 预览字幕（VTT 叠加）
+      </label>` : ''}
       <div class="hint" style="margin-top:8px">
         时长 ${report.duration_sec}s · 字幕模式 ${esc(report.subtitle_mode_effective || report.subtitle_mode)}
         · 环境音 ${esc(report.ambient_mode_effective || 'off')}
         ${report.bgm_id ? ` · BGM ${esc(report.bgm_id)}（${report.bgm_gain_db}dB）` : ' · 无 BGM'}
         · 视频 ${esc(report.video_provider)} / 配音 ${esc(report.tts_provider)}
       </div>
+      ${report.subtitle_mode_effective === 'soft'
+        ? `<div class="hint" style="margin-top:8px">软字幕（mov_text）只有部分桌面播放器认；
+           要在手机/网页里都能看见，选 burn 重新合成一次。</div>` : ''}
       ${(report.warnings && report.warnings.length)
         ? `<div class="hint" style="margin-top:8px">${report.warnings.map(esc).join('<br>')}</div>` : ''}
     `;
+    const track = $('compose-track');
+    const toggle = $('compose-subtitle-preview');
+    if (track && toggle) {
+      const apply = () => {
+        try { track.track.mode = toggle.checked ? 'showing' : 'hidden'; } catch (e) { /* 轨道还没加载完 */ }
+      };
+      toggle.onchange = apply;
+      track.addEventListener('load', apply);
+      apply();
+    }
   }
 
+  const burnHint = !serverHealth || serverHealth.ffmpeg_can_burn_subtitles
+    ? '需 libass'
+    : (serverHealth.ffmpeg_auto_upgrade
+        ? '当前主 ffmpeg 无 libass，会自动换用带 libass 的版本'
+        : '当前 ffmpeg 无 libass，会降级为软字幕');
   options.innerHTML = `
     <label>字幕模式
       <select id="compose-subtitle-mode">
-        <option value="soft">soft · mp4 内嵌字幕轨（推荐）</option>
-        <option value="burn">burn · 烧进画面（需 libass）</option>
-        <option value="none">none · 只导出 srt</option>
+        <option value="soft">soft · mp4 内嵌字幕轨（部分播放器不显示）</option>
+        <option value="burn">burn · 烧进画面（${esc(burnHint)}）</option>
+        <option value="none">none · 只导出 srt / vtt</option>
       </select>
     </label>
     <div class="row">
@@ -1747,7 +1799,7 @@ function doCancelCompose() {
 function usd(v) { return `$${(Number(v) || 0).toFixed(4)}`; }
 
 const STAGE_LABEL = {
-  bible: '故事圣经', script: '剧本', storyboard: '分镜',
+  bible: '故事圣经', script: '剧本', storyboard: '分镜', image: '角色图',
   video: '视频片段', audio: '配音', compose: '合成', other: '其它',
 };
 
@@ -1884,6 +1936,39 @@ async function clearReference(charId) {
   await withBusy('清除参考图...', () =>
     api(`/api/projects/${currentProjectId}/characters/${encodeURIComponent(charId)}/reference`, {
       method: 'DELETE',
+    }));
+}
+
+async function refreshReferencePlan() {
+  const hint = $('ref-plan-hint');
+  if (!hint || !currentProjectId) return;
+  try {
+    const plan = await api(`/api/projects/${currentProjectId}/characters/references/plan`);
+    hint.textContent = plan.missing
+      ? `缺 ${plan.missing}/${plan.total} 张 · 补齐约 ${usd(plan.estimated_usd)}（${plan.model}，$${plan.price_per_image}/张）`
+      : `参考图齐了（${plan.total}/${plan.total}）`;
+  } catch (e) {
+    hint.textContent = '';
+  }
+}
+
+async function generateReference(charId, hasRef) {
+  if (hasRef && !confirm('该角色已有参考图，重画会再花一次图片模型的钱，继续？')) return;
+  await withBusy(`AI 生成 ${charId} 的角色图...`, async () => {
+    const res = await api(
+      `/api/projects/${currentProjectId}/characters/${encodeURIComponent(charId)}/reference/generate`,
+      { method: 'POST', body: JSON.stringify({ force: !!hasRef }) });
+    if (res && res.cost_usd) console.info(`角色图花费 $${res.cost_usd}`);
+  });
+}
+
+async function generateAllReferences() {
+  const plan = await api(`/api/projects/${currentProjectId}/characters/references/plan`);
+  if (!plan.missing) { alert('所有角色都已有参考图'); return; }
+  if (!confirm(`将为 ${plan.missing} 个缺失角色生成参考图，预计 ${usd(plan.estimated_usd)}，继续？`)) return;
+  await withBusy(`AI 生成 ${plan.missing} 张角色图...`, () =>
+    api(`/api/projects/${currentProjectId}/characters/references/generate`, {
+      method: 'POST', body: JSON.stringify({}),
     }));
 }
 

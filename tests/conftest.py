@@ -4,8 +4,15 @@ import asyncio
 
 import pytest
 
-from tests.fakes import FakeBgmLibrary, FakeLLM, FakeTTSProvider, FakeVideoProvider
+from tests.fakes import (
+    FakeBgmLibrary,
+    FakeImageProvider,
+    FakeLLM,
+    FakeTTSProvider,
+    FakeVideoProvider,
+)
 from videogen.config import get_settings
+from videogen.models.bible import Character, StoryBible, StyleGuide
 from videogen.models.project import Project
 from videogen.orchestrator.pipeline import Pipeline
 from videogen.utils.file_store import FileStore
@@ -24,7 +31,10 @@ def fast_video_settings(monkeypatch):
     settings = get_settings()
     monkeypatch.setattr(settings, "video_retry_backoff_sec", 0.0)
     monkeypatch.setattr(settings, "tts_retry_backoff_sec", 0.0)
+    monkeypatch.setattr(settings, "image_retry_backoff_sec", 0.0)
     monkeypatch.setattr(settings, "video_provider", "mock")
+    # 角色图同理：默认工厂绝不能真的去打图片模型
+    monkeypatch.setattr(settings, "image_provider", "mock")
     monkeypatch.setattr(settings, "budget_usd", 0.0)
     # 配音文案：默认关掉，防止本地 .env 打开后让无关用例多调 LLM / 抽帧
     monkeypatch.setattr(settings, "audio_llm_script", "off")
@@ -50,6 +60,58 @@ def fake_tts() -> FakeTTSProvider:
 @pytest.fixture
 def fake_bgm() -> FakeBgmLibrary:
     return FakeBgmLibrary()
+
+
+@pytest.fixture
+def fake_image() -> FakeImageProvider:
+    return FakeImageProvider()
+
+
+@pytest.fixture
+def settings(fast_video_settings):
+    """当前（已被测试基线改写过的）配置对象。"""
+    return fast_video_settings
+
+
+@pytest.fixture
+def bible() -> StoryBible:
+    """一个小而完整的故事圣经：4 个角色 + 风格，够测角色图与参考图链路。"""
+    return StoryBible(
+        characters=[
+            Character(
+                id="char_1",
+                name="林悦",
+                age=20,
+                role="主角",
+                visual_prompt=(
+                    "A young woman with long straight dark brown hair, soft round face, "
+                    "wearing a simple grey top"
+                ),
+            ),
+            Character(
+                id="char_2",
+                name="李薇儿",
+                age=22,
+                role="反派",
+                visual_prompt="A sharp-featured young woman with a high ponytail and a smirk",
+            ),
+            Character(
+                id="char_3",
+                name="张姐",
+                age=38,
+                role="导师",
+                visual_prompt="A poised woman in her late thirties wearing a tailored suit",
+            ),
+            Character(
+                id="char_4",
+                name="赵总",
+                age=45,
+                role="配角",
+                visual_prompt="A middle-aged man with slicked-back hair and a flashy suit",
+            ),
+        ],
+        style=StyleGuide(genre="都市励志", tone="冷峻克制"),
+    )
 
 
 @pytest.fixture

@@ -11,6 +11,12 @@ from pydantic import BaseModel
 from videogen.models.audio import BgmTrack
 from videogen.models.video import MediaKind
 from videogen.providers.bgm.base import BgmLibrary
+from videogen.providers.image.base import (
+    GeneratedImage,
+    ImageProvider,
+    ImageProviderError,
+    ImageRequest,
+)
 from videogen.providers.llm.base import (
     LLMError,
     LLMMessage,
@@ -473,3 +479,47 @@ class FakeBgmLibrary(BgmLibrary):
 
     def tracks(self) -> list[BgmTrack]:
         return list(self._tracks)
+
+
+class FakeImageProvider(ImageProvider):
+    """离线假图片 provider：写一张极小的真 PNG，可指定单价/失败。"""
+
+    name = "fake"
+    model = "fake-image"
+    supports_reference_image = True
+
+    def __init__(
+        self,
+        *,
+        actual_cost_usd: float | None = 0.04,
+        fail_subjects: set[str] | None = None,
+        suffix: str = ".png",
+    ) -> None:
+        self.actual_cost_usd = actual_cost_usd
+        self.fail_subjects = set(fail_subjects or set())
+        self.suffix = suffix
+        self.requests: list[ImageRequest] = []
+        self.closed = 0
+
+    async def generate(self, request: ImageRequest) -> GeneratedImage:
+        self.requests.append(request)
+        if request.subject_id in self.fail_subjects:
+            raise ImageProviderError(f"fake 图片失败 subject={request.subject_id}")
+        target = Path(request.output_path)
+        if self.suffix and target.suffix != self.suffix:
+            target = target.with_suffix(self.suffix)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(_PNG_1PX)
+        return GeneratedImage(
+            path=target, media_type="image/png", actual_cost_usd=self.actual_cost_usd
+        )
+
+    async def aclose(self) -> None:
+        self.closed += 1
+
+
+#: 1x1 透明 PNG（合法的真 PNG，够用来验证「落盘 + 预览接口」）
+_PNG_1PX = bytes.fromhex(
+    "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4"
+    "890000000a49444154789c63000100000500010d0a2db40000000049454e44ae426082"
+)

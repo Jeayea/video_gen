@@ -20,7 +20,9 @@ __all__ = [
     "check_budget",
     "compose_entry",
     "estimate_audio_usd",
+    "estimate_image_usd",
     "estimate_video_usd",
+    "image_entry",
     "llm_entry",
     "load_report",
     "record",
@@ -171,6 +173,39 @@ def compose_entry(provider: str, seconds: float, segments: int) -> CostEntry:
         unit_kind="second",
         usd=0.0,
     )
+
+
+def image_entry(
+    provider: str,
+    model: str,
+    images: int,
+    *,
+    price_usd: float | None = None,
+    actual_usd: float | None = None,
+) -> CostEntry:
+    """记一条「AI 生成角色图」的花费（按张计费）。
+
+    `actual_usd` 非空时以 provider 报的实际扣费为准，否则用配置单价估算。
+    """
+    settings = get_settings()
+    unit = settings.image_price_usd if price_usd is None else max(0.0, price_usd)
+    count = max(0, images)
+    usd = max(0.0, actual_usd) if actual_usd is not None else round(count * unit, 6)
+    return CostEntry(
+        stage=CostStage.IMAGE,
+        provider=provider,
+        model=model,
+        calls=count,
+        units=float(count),
+        unit_kind="image",
+        usd=round(usd, 6),
+    )
+
+
+def estimate_image_usd(images: int, price_per_image: float | None = None) -> float:
+    """按张数预估角色图花费。"""
+    unit = get_settings().image_price_usd if price_per_image is None else price_per_image
+    return round(max(0, images) * max(0.0, unit), 6)
 
 
 # ── 预估与预算门控 ────────────────────────────────────

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import shutil
+from collections.abc import Iterable
 from pathlib import Path
 
 from videogen.config import get_settings
@@ -13,12 +14,15 @@ __all__ = [
     "FFmpegError",
     "describe_media",
     "ffmpeg_available",
+    "ffmpeg_candidates",
     "ffmpeg_capabilities",
+    "ffmpeg_capabilities_for",
     "ffprobe_available",
     "probe_duration",
     "probe_streams",
     "reset_ffmpeg_cache",
     "resolve_ffmpeg",
+    "resolve_ffmpeg_for",
     "resolve_ffprobe",
     "run_ffmpeg",
     "run_ffmpeg_capture",
@@ -34,6 +38,50 @@ _resolved_once = False
 _probe_resolved: str | None = None
 _probe_once = False
 _caps: set[str] | None = None
+#: 非主 ffmpeg 的能力缓存（key = 可执行文件绝对路径）
+_caps_by_exe: dict[str, set[str]] = {}
+
+
+def ffmpeg_candidates() -> list[str]:
+    """所有能找到的 ffmpeg，按优先级去重。
+
+    顺序：`FFMPEG_PATH` → `PATH` → `imageio-ffmpeg` 便携版。
+
+    做成「候选列表」而不是「只挑一个」是有原因的：不同来源的 ffmpeg 编译选项
+    差别很大（brew 的 9.0.1 就没有 libass，烧不了字幕，而 imageio-ffmpeg 的
+    便携版带 libass），所以要能按**需要的能力**换一个来用。
+    """
+    out: list[str] = []
+    configured = (get_settings().ffmpeg_path or "").strip()
+    if configured:
+        candidate = Path(configured).expanduser()
+        if candidate.is_file():
+            out.append(str(candidate))
+        else:
+            found = shutil.which(configured)
+            if found:
+                out.append(found)
+
+    found = shutil.which("ffmpeg")
+    if found:
+        out.append(found)
+
+    try:  # 可选依赖：pip install imageio-ffmpeg
+        import imageio_ffmpeg  # type: ignore[import-not-found]
+
+        out.append(imageio_ffmpeg.get_ffmpeg_exe())
+    except Exception:  # noqa: BLE001 - 没有就是没有
+        pass
+
+    seen: set[str] = set()
+    result: list[str] = []
+    for exe in out:
+        key = str(Path(exe).resolve()) if Path(exe).is_file() else exe
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(key)
+    return result
 
 
 def resolve_ffmpeg() -> str | None:
@@ -44,36 +92,20 @@ def resolve_ffmpeg() -> str | None:
     3. `imageio-ffmpeg` 附带的便携版（`pip install imageio-ffmpeg`）
 
     找不到返回 None —— 调用方必须显式处理，不允许假装成功。
+
+    需要**特定能力**（例如烧字幕要 libass）时用 `resolve_ffmpeg_for()`，
+    它会在这个顺序之外自动换用能满足要求的候选。
     """
     global _resolved, _resolved_once
     if _resolved_once:
         return _resolved
 
     _resolved_once = True
-    configured = get_settings().ffmpeg_path
+    candidates = ffmpeg_candidates()
+    _resolved = candidates[0] if candidates else None
 
-    if configured:
-        candidate = Path(configured).expanduser()
-        if candidate.is_file():
-            _resolved = str(candidate)
-            return _resolved
-        found = shutil.which(configured)
-        if found:
-            _resolved = found
-            return _resolved
-
-    found = shutil.which("ffmpeg")
-    if found:
-        _resolved = found
-        return _resolved
-
-    try:  # 可选依赖：pip install imageio-ffmpeg
-        import imageio_ffmpeg  # type: ignore[import-not-found]
-
-        _resolved = imageio_ffmpeg.get_ffmpeg_exe()
+    if _resolved and "imageio-ffmpeg" in _resolved:
         logger.info("使用 imageio-ffmpeg 自带的 ffmpeg")
-    except Exception:  # noqa: BLE001 - 没有就是没有，交给调用方报错
-        _resolved = None
 
     if not _resolved:
         logger.warning(
@@ -125,6 +157,7 @@ def reset_ffmpeg_cache() -> None:
     _probe_resolved = None
     _probe_once = False
     _caps = None
+    _caps_by_exe.clear()
 
 
 def ffmpeg_available() -> bool:
@@ -159,22 +192,14 @@ async def _capture(
     return process.returncode or 0, (stdout or b"").decode("utf-8", "replace")
 
 
-async def ffmpeg_capabilities() -> set[str]:
-    """探测 ffmpeg 支持的滤镜/编码器（结果缓存）。
-
-    只关心合成链路真正会用到的几项：没有 libass 就烧不了字幕，
-    没有 mov_text 就内嵌不了软字幕 —— 必须能降级而不是直接崩。
-    """
-    global _caps
-    if _caps is not None:
-        return _caps
+async def ffmpeg_capabilities_for(exe: str) -> set[str]:
+    """探测**指定** ffmpeg 的滤镜/编码器能力（按可执行文件缓存）。"""
+    if not exe:
+        return set()
+    if exe in _caps_by_exe:
+        return _caps_by_exe[exe]
 
     caps: set[str] = set()
-    exe = resolve_ffmpeg()
-    if not exe:
-        _caps = caps
-        return caps
-
     try:
         code, out = await _capture(exe, ["-hide_banner", "-filters"], timeout_sec=20.0)
         if code == 0:
@@ -185,10 +210,62 @@ async def ffmpeg_capabilities() -> set[str]:
             for token in _tokens(out):
                 caps.add(token)
     except Exception:
-        logger.warning("ffmpeg 能力探测失败，按最小能力处理", exc_info=True)
+        logger.warning("ffmpeg 能力探测失败（%s），按最小能力处理", exe, exc_info=True)
 
-    _caps = caps
+    _caps_by_exe[exe] = caps
     return caps
+
+
+async def ffmpeg_capabilities() -> set[str]:
+    """探测主 ffmpeg 支持的滤镜/编码器（结果缓存）。
+
+    只关心合成链路真正会用到的几项：没有 libass 就烧不了字幕，
+    没有 mov_text 就内嵌不了软字幕 —— 必须能降级而不是直接崩。
+    """
+    global _caps
+    if _caps is not None:
+        return _caps
+
+    exe = resolve_ffmpeg()
+    if not exe:
+        _caps = set()
+        return _caps
+
+    _caps = await ffmpeg_capabilities_for(exe)
+    return _caps
+
+
+async def resolve_ffmpeg_for(required: Iterable[str]) -> tuple[str | None, set[str]]:
+    """挑一个满足 `required` 能力的 ffmpeg，返回 `(exe, 它的能力集合)`。
+
+    先试主 ffmpeg；它缺能力时，若 `FFMPEG_AUTO_UPGRADE=true`（默认），
+    就按候选顺序换用第一个满足要求的 —— 典型场景是 `.env` 里
+    `FFMPEG_PATH=ffmpeg` 指到了没有 libass 的 brew 版，而
+    `imageio-ffmpeg` 的便携版能烧字幕。
+
+    找不到满足要求的就返回主 ffmpeg（**让调用方降级**，绝不假装能烧）。
+    """
+    needed = {item for item in required if item}
+    primary = resolve_ffmpeg()
+    primary_caps = await ffmpeg_capabilities() if primary else set()
+
+    if not needed or (primary and needed <= primary_caps):
+        return primary, primary_caps
+
+    if not get_settings().ffmpeg_auto_upgrade:
+        return primary, primary_caps
+
+    for exe in ffmpeg_candidates():
+        if exe == primary:
+            continue
+        caps = await ffmpeg_capabilities_for(exe)
+        if needed <= caps:
+            logger.info(
+                "主 ffmpeg 缺少 %s，本次改用 %s", ",".join(sorted(needed)), exe
+            )
+            return exe, caps
+
+    return primary, primary_caps
 
 
 def _tokens(output: str) -> list[str]:
@@ -201,13 +278,17 @@ def _tokens(output: str) -> list[str]:
 
 
 async def run_ffmpeg_capture(
-    args: list[str], *, timeout_sec: float = 120.0, cwd: Path | None = None
+    args: list[str],
+    *,
+    timeout_sec: float = 120.0,
+    cwd: Path | None = None,
+    exe: str | None = None,
 ) -> str:
     """异步执行 ffmpeg 并返回输出摘要（用于需要读输出的场景）。"""
-    exe = resolve_ffmpeg()
-    if not exe:
+    executable = exe or resolve_ffmpeg()
+    if not executable:
         raise FFmpegError(_NO_FFMPEG)
-    code, out = await _capture(exe, args, timeout_sec=timeout_sec, cwd=cwd)
+    code, out = await _capture(executable, args, timeout_sec=timeout_sec, cwd=cwd)
     if code != 0:
         raise FFmpegError(f"ffmpeg 退出码 {code}：{_tail(out)}")
     return out
@@ -298,19 +379,26 @@ _NO_FFMPEG = (
 
 
 async def run_ffmpeg(
-    args: list[str], *, timeout_sec: float = 120.0, cwd: Path | None = None
+    args: list[str],
+    *,
+    timeout_sec: float = 120.0,
+    cwd: Path | None = None,
+    exe: str | None = None,
 ) -> None:
     """异步执行 ffmpeg，失败时抛出带 stderr 摘要的 FFmpegError。
 
     `cwd` 用于让滤镜参数里的文件名保持相对路径（`subtitles=` 的转义很坑，
     切到产物目录里只写文件名最稳）。
+
+    `exe` 用于指定**非主** ffmpeg（例如烧字幕要用带 libass 的那个候选），
+    留空就用主 ffmpeg。
     """
-    exe = resolve_ffmpeg()
-    if not exe:
+    executable = exe or resolve_ffmpeg()
+    if not executable:
         raise FFmpegError(_NO_FFMPEG)
 
     process = await asyncio.create_subprocess_exec(
-        exe,
+        executable,
         *args,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,

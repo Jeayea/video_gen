@@ -17,6 +17,7 @@ from videogen.utils.ffmpeg import (
     ffmpeg_capabilities,
     probe_streams,
     resolve_ffmpeg,
+    resolve_ffmpeg_for,
     run_ffmpeg,
 )
 
@@ -210,8 +211,14 @@ async def _finish(
     font_scale: float = 0.05,
     margin_scale: float = 0.04,
     resolution: tuple[int, int] = (1080, 1920),
+    exe: str | None = None,
 ) -> SubtitleMode:
-    """最后一道工序：混 BGM + 挂字幕。返回真正生效的字幕模式。"""
+    """最后一道工序：混 BGM + 挂字幕。返回真正生效的字幕模式。
+
+    `exe` 只用于**烧字幕**那一趟：主 ffmpeg 没有 libass 时，调用方会传一个
+    带 libass 的候选（`resolve_ffmpeg_for({"subtitles"})`）；软字幕/无字幕
+    仍然走主 ffmpeg。
+    """
     effective = mode
     if mode == SubtitleMode.SOFT and "mov_text" not in caps:
         effective = SubtitleMode.NONE
@@ -264,7 +271,7 @@ async def _finish(
             "+faststart",
             output.name,
         ]
-        await run_ffmpeg(args, timeout_sec=BURN_TIMEOUT_SEC, cwd=cwd)
+        await run_ffmpeg(args, timeout_sec=BURN_TIMEOUT_SEC, cwd=cwd, exe=exe)
         return effective
 
     # 软字幕 / 无字幕：视频流可以 copy，只有需要混音时才对音频重编码
@@ -429,9 +436,20 @@ async def compose(
     width, height = _resolution(project)
     fps = max(1, settings.video_fps)
     caps = await ffmpeg_capabilities()
-    if settings.subtitle_mode == SubtitleMode.BURN and "subtitles" not in caps:
-        warnings.append("当前 ffmpeg 没有 libass，无法烧字幕，已降级为内嵌软字幕")
-    if settings.subtitle_mode != SubtitleMode.NONE and "mov_text" not in caps:
+    desired_mode = settings.subtitle_mode
+    burn_exe: str | None = None
+    if desired_mode == SubtitleMode.BURN:
+        # 主 ffmpeg 常常没有 libass（brew 的 9.x 就没有），别急着降级：
+        # 先在候选里找一个带 subtitles 滤镜的（imageio-ffmpeg 便携版带 libass）
+        candidate_exe, candidate_caps = await resolve_ffmpeg_for({"subtitles"})
+        if "subtitles" in candidate_caps:
+            burn_exe = candidate_exe
+            caps = candidate_caps  # 用「真正要执行的那个 exe」的能力判降级
+            if candidate_exe and candidate_exe != resolve_ffmpeg():
+                warnings.append(f"主 ffmpeg 没有 libass，烧字幕改用：{candidate_exe}")
+        else:
+            warnings.append("当前 ffmpeg 没有 libass，无法烧字幕，已降级为内嵌软字幕")
+    if desired_mode != SubtitleMode.NONE and "mov_text" not in caps:
         warnings.append("当前 ffmpeg 不支持 mov_text，字幕只导出 .srt 侧挂文件")
 
     ambient_mode = settings.ambient_mode
@@ -468,11 +486,17 @@ async def compose(
     await _concat(concat_file, base, cwd=output_dir)
 
     # 无论什么模式都导出 .srt 侧挂文件：平台上传/二次编辑都用得上
+    # 同时导出一份 .vtt：浏览器的 <track> 只认 VTT，认不出 SRT / mov_text
     subtitles_path: Path | None = None
+    subtitles_vtt_path: Path | None = None
     srt = subtitle_service.build_srt(segments, audio_manifest)
     if srt.strip():
         subtitles_path = output_dir / "subtitles.srt"
         subtitles_path.write_text(srt, encoding="utf-8")
+        subtitles_vtt_path = output_dir / "subtitles.vtt"
+        subtitles_vtt_path.write_text(
+            subtitle_service.build_vtt(segments, audio_manifest), encoding="utf-8"
+        )
     else:
         subtitles_path = None
         warnings.append("没有台词内容，未生成字幕")
@@ -499,6 +523,7 @@ async def compose(
         subtitle_file=subtitles_path,
         mode=SubtitleMode(settings.subtitle_mode),
         caps=caps,
+        exe=burn_exe,
         crf=settings.compose_crf,
         preset=settings.compose_preset,
         font=settings.compose_subtitle_font,
@@ -515,6 +540,9 @@ async def compose(
     report = ComposeReport(
         output_path=_relative(final, project_dir),
         subtitles_path=_relative(subtitles_path, project_dir) if subtitles_path else None,
+        subtitles_vtt_path=(
+            _relative(subtitles_vtt_path, project_dir) if subtitles_vtt_path else None
+        ),
         duration_sec=total_duration,
         subtitle_mode=SubtitleMode(settings.subtitle_mode),
         subtitle_mode_effective=effective_mode,
@@ -528,6 +556,7 @@ async def compose(
         video_provider=video_manifest.provider,
         tts_provider=audio_manifest.provider if audio_manifest else "",
         ffmpeg=resolve_ffmpeg() or "",
+        subtitle_ffmpeg=burn_exe if effective_mode == SubtitleMode.BURN else "",
         warnings=warnings,
     )
     _notify(on_progress, len(segments) + 2, len(segments) + 2, "合成完成")

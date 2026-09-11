@@ -62,7 +62,50 @@ def build_srt(
     audio: AudioManifest | None = None,
 ) -> str:
     """生成 SRT。时间轴按段落时长累加，和成片完全一致。"""
-    cues: list[str] = []
+    cues = _cues(segments, audio)
+    return "\n".join(f"{index}\n{start} --> {end}\n{text}\n" for index, start, end, text in cues)
+
+
+def build_vtt(
+    segments: list[ComposeSegment],
+    audio: AudioManifest | None = None,
+) -> str:
+    """生成 WebVTT。
+
+    和 SRT 的内容完全一样，只是时间戳用 `.` 分隔毫秒 ——
+    浏览器的 `<track>` **只认 VTT**，认不出 SRT（也不认 mp4 里的 mov_text 软轨），
+    所以 Web 预览必须有一份 VTT。
+    """
+    cues = _cues(segments, audio)
+    body = "\n".join(
+        f"{index}\n{start.replace(',', '.')} --> {end.replace(',', '.')}\n{text}\n"
+        for index, start, end, text in cues
+    )
+    return f"WEBVTT\n\n{body}" if body else "WEBVTT\n"
+
+
+def srt_to_vtt(srt: str) -> str:
+    """把 SRT 文本转成 WebVTT（给「已经合成过、还没导出 vtt」的老项目用）。"""
+    text = (srt or "").replace("\r\n", "\n").strip()
+    if not text:
+        return "WEBVTT\n"
+    if text.startswith("WEBVTT"):
+        return text if text.endswith("\n") else f"{text}\n"
+    lines: list[str] = []
+    for line in text.split("\n"):
+        if "-->" in line:
+            # 00:00:01,000 --> 00:00:04,000  →  点号毫秒
+            head, _, tail = line.partition("-->")
+            line = f"{head.strip().replace(',', '.')} --> {tail.strip().replace(',', '.')}"
+        lines.append(line)
+    return "WEBVTT\n\n" + "\n".join(lines) + "\n"
+
+
+def _cues(
+    segments: list[ComposeSegment], audio: AudioManifest | None
+) -> list[tuple[int, str, str, str]]:
+    """算出每条字幕的 (序号, 起, 止, 文本)，SRT / VTT 共用。"""
+    cues: list[tuple[int, str, str, str]] = []
     cursor = 0.0
     for segment in segments:
         start = cursor
@@ -82,9 +125,8 @@ def build_srt(
         if speech > 0:
             end = min(end, start + max(_MIN_CUE_SEC, speech + _TAIL_HOLD_SEC))
 
-        cues.append(f"{len(cues) + 1}\n{_stamp(start)} --> {_stamp(end)}\n{text}\n")
-
-    return "\n".join(cues)
+        cues.append((len(cues) + 1, _stamp(start), _stamp(end), text))
+    return cues
 
 
 def _stamp(seconds: float) -> str:
@@ -95,4 +137,4 @@ def _stamp(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
 
 
-__all__ = ["build_segments", "build_srt", "speaker_name_map"]
+__all__ = ["build_segments", "build_srt", "build_vtt", "speaker_name_map", "srt_to_vtt"]

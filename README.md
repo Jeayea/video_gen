@@ -301,6 +301,82 @@ AUDIO_LLM_FRAMES_PER_SHOT=1
   然后用原文案继续配音 —— 文案阶段永远不会把配音打死
 - 文案改动会**触发重新合成该条配音**（否则旧音频会盖住新文案），并作废旧成片
 
+## 字幕：为什么「有字幕」却看不见
+
+`soft` 模式把字幕写进 mp4 的 **mov_text 软字幕轨**（`ffprobe` 能看到 `codec_type=subtitle`），
+同时导出 `output/subtitles.srt`。问题是**浏览器不渲染 mov_text，也完全不认 SRT**：
+
+| 场景 | soft（mov_text） | burn（烧进画面） |
+|------|------------------|------------------|
+| Chrome / Safari 的 `<video>` | 看不见 | 看得见 |
+| 微信 / 抖音 / 手机相册 | 看不见 | 看得见 |
+| QuickTime / VLC | 要手动开字幕菜单 | 看得见 |
+| 二次编辑 | 可开关、可换字幕 | 已经烧死，改不了 |
+
+所以本项目的 Web 面板**永远额外导出一份 `output/subtitles.vtt`**，播放器用
+`<track kind="subtitles">` 叠加显示 —— 这条路径和成片里有没有硬字幕无关，
+`soft` / `burn` / `none` 都能预览（老项目没有 `.vtt` 文件时，
+`GET /api/projects/{id}/subtitles.vtt` 会就地由 srt 转换，不需要重新合成）。
+
+### burn 需要 libass，而 Homebrew 的 ffmpeg 常常没有
+
+`brew install ffmpeg` 的精简构建里没有 `--enable-libass`，`-filters` 里查不到
+`subtitles` 滤镜，于是「选了 burn 却被静默降级成 soft」。v0.13 起改成
+**能力感知的 ffmpeg 选择**：
+
+1. 先看主 ffmpeg（`FFMPEG_PATH` → `PATH`）有没有 `subtitles`
+2. 没有就按候选顺序找下一个：`imageio-ffmpeg` 的便携版**带 libass**（`pip install imageio-ffmpeg`）
+3. 找到就用它烧，并在 `compose_report.warnings` 与 `subtitle_ffmpeg` 里写清楚用了哪个二进制
+4. 都没有才降级，并且一定留下「没有 libass」的告警
+
+```bash
+# 看当前能不能烧（以及会烧的话用哪个二进制）
+curl -s localhost:8001/api/health | python3 -m json.tool | grep ffmpeg
+#   "ffmpeg_can_burn_subtitles": true,
+#   "ffmpeg_burn_path": ".../imageio_ffmpeg/binaries/ffmpeg-macos-aarch64-v7.1"
+```
+
+不想要这个自动行为就 `FFMPEG_AUTO_UPGRADE=false`（保持「主 ffmpeg 说不行就不行」）。
+
+## 角色一致性：从「AI 生成定妆照」到每个镜头
+
+真实视频模型（含 H3）**每个镜头都是独立生成**的：不给参考图，它每次都会重新「想」一张脸，
+于是同一个人在 15 个镜头里能长出 15 张脸。H3 的 `seed` 是 `false`，所以**唯一的身份锚点就是参考图**。
+
+链路（v0.13 完整可用）：
+
+```
+角色设定（bible.characters[].visual_prompt）
+   └─ AI 生成定妆照 ──> projects/<id>/refs/char_1.png
+        （图片模型：BYTEDANCE-SEED/SEEDREAM-4.5，$0.04/张）
+             └─> 每个镜头作为 input_references 传给视频模型（+$0.04/镜头）
+```
+
+- **AI 生成**：`POST /api/projects/{id}/characters/{cid}/reference/generate`
+  （`force=false` 时已有图就跳过，不花钱；`use_reference=true` 可基于已有图再出一个角度）
+- **批量补齐**：`POST /api/projects/{id}/characters/references/generate`（默认只补缺失的，
+  单角色失败不影响其它角色）
+- **先看价再决定**：`GET /api/projects/{id}/characters/references/plan` 只算不写——
+  缺几张、预估多少钱、prompt 长什么样，**不调 API**
+- **也可以自己上传**：`POST .../reference`（base64），UI 角色卡片上直接选文件
+
+```bash
+# 4 个角色大约 $0.16，先看 plan 再决定
+curl -s localhost:8001/api/projects/$PID/characters/references/plan | python3 -m json.tool
+curl -s -X POST localhost:8001/api/projects/$PID/characters/references/generate \
+     -H 'Content-Type: application/json' -d '{}'
+```
+
+记账进 `image` 阶段（按张数 + provider 实报 `usage.cost`），预算不足会直接 402 拒绝开工。
+
+### 免费的那一半：文本锚点
+
+参考图是「锁脸」的硬手段，但**没有参考图时也别让文字描述漂移**：分镜 LLM 有时把
+`character.visual_prompt` 抄进 `video_prompt`、有时只写一句 "a young woman"。
+`build_prompt()` 现在会读圣经，把在场角色**没被提到过的**外貌描述确定性地补进 prompt
+（提到了就跳过，不重复），并追加 `same characters as before, consistent face and hairstyle`。
+这条不花钱，对 mock/任何 provider 都生效。
+
 ## API
 
 | 方法 | 路径 | 说明 |
@@ -333,11 +409,14 @@ AUDIO_LLM_FRAMES_PER_SHOT=1
 | POST | `/api/projects/{id}/compose` | **提交合成任务**（202 + job；body 可覆盖字幕模式/环境音/BGM/画质） |
 | GET | `/api/projects/{id}/compose/status` | 合成进度 + 成片报告 |
 | POST | `/api/projects/{id}/compose/cancel` | 取消合成任务 |
-| GET | `/api/projects/{id}/final` · `/subtitles` | 下载成片 MP4 / 字幕 SRT |
+| GET | `/api/projects/{id}/final` · `/subtitles` · `/subtitles.vtt` | 下载成片 MP4 / 字幕 SRT / WebVTT（浏览器 `<track>` 预览用，老项目就地转换） |
 | GET | `/api/projects/{id}/preflight` | **成本前置**：镜头数 / 计费秒数 / 单价 / 预估 USD / 预算投影 / 省钱建议 |
 | GET | `/api/models` | 可选模型 / 单价 / 预算（前端下拉用） |
 | GET | `/api/projects/{id}/cost` | 成本账本：按阶段的花费、token、秒数、字符 + 预估 |
 | POST/GET/DELETE | `/api/projects/{id}/characters/{cid}/reference` | 角色参考图（base64 上传 / 下载 / 删除） |
+| GET | `/api/projects/{id}/characters/references/plan` | 角色图计划：缺几张 / 预估花费 / prompt 预览（**不调 API**） |
+| POST | `/api/projects/{id}/characters/{cid}/reference/generate` | **AI 生成该角色定妆照**（`force` 覆盖已有图，`use_reference` 走图生图） |
+| POST | `/api/projects/{id}/characters/references/generate` | **批量补齐缺失的角色图**（单角色失败不影响其它） |
 | POST | `/api/batches` | **批量生产**（202 + batch；`stop_after` 可只跑到 storyboard/video/audio） |
 | GET | `/api/batches` · `/api/batches/{id}` · `/api/batches/stages` | 批量列表 / 详情 / 可选阶段 |
 | POST | `/api/batches/{id}/cancel` | 取消批量任务 |
@@ -421,6 +500,13 @@ src/videogen/
     `VIDEO_MIN_SHOT_SEC=1` 关掉（mock provider 本来就没有档位，不受影响）
 14. **成片可能比分镜长**：片段真实时长由视频模型决定（H3 最短 5 秒），分镜写 3 秒也会拿到
     5 秒的画面，成片因此变长（也因此按 5 秒计费）—— 想严丝合缝就用分镜档位感知
+15. **角色一致性靠参考图，不靠 seed**：H3 的 `seed` 是 `false`，没有参考图时同一个角色在
+    不同镜头里就是不同的人（这不是 bug，是文生视频的固有行为）；参考图是按镜头额外计费的
+    （H3 的 `reference_images` SKU = $0.04/镜头）
+16. **AI 生成的定妆照不等于本人**：它只是「把这个角色的文字设定画成一张稳定的脸」，
+    第一次生成的脸就是这一版片子里的脸；不满意就重画一张（换图意味着已生成的片段要对齐重跑）
+17. **烧字幕是重编码**：`burn` 会让整片重新编码一遍（比 `soft` 慢、且视频流不再是无损 copy）；
+    需要「随时刻换字幕/多语言」就别烧，用 `soft` + `.vtt` 预览
 
 ## 安全
 

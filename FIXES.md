@@ -573,3 +573,111 @@ newly = [c for c in manifest.ready_clips if c.shot_id not in before]   # ← 空
 `tests/test_preflight.py` 新增 6 例：换 provider 重跑必须记账、重跑不重复记账、
 空跑保留成片、`reconcile` 幂等补齐、LLM 改写文案后重新合成要重新记账、
 `cost_status` 的实测/账本/漏记三个口径。全套 **366 passed**，ruff clean。
+
+## v0.13 — 字幕看得见 + 角色图（AI 定妆照）
+
+> 用户实测反馈的两个问题：**「角色的脸不统一」**、**「没有字幕」**。
+> 查下来都是真实原因，不是玄学。
+
+### 问题 1：没有字幕
+
+现场证据：
+
+```
+compose_report.json:  subtitle_mode="soft" → effective="soft"，warnings=[]
+ffprobe final.mp4:    stream 2 = mov_text / subtitle / language=zho   ← 字幕**在**片子里
+output/subtitles.srt: 9 条 cue，时间轴与画面逐镜对齐                   ← 也在
+```
+
+**根因**：`COMPOSE_SUBTITLE_MODE` 没配 → 默认 `soft` → 字幕是 mp4 里的 mov_text **软字幕轨**。
+Chrome/Safari 的 `<video>` 根本不渲染 mov_text，Web 面板也没给播放器挂 `<track>`，
+所以在页面上 / 手机里「就是没有字幕」。想烧字幕又被第二件事挡住：
+
+```
+FFMPEG_PATH=ffmpeg → /opt/homebrew/bin/ffmpeg 9.0.1
+build 里没有 --enable-libass → -filters 查不到 subtitles/ass/drawtext
+→ /health: ffmpeg_can_burn_subtitles = false → 选 burn 会静默降级回 soft
+```
+
+**修法（两条都做了）**：
+
+| 改动 | 位置 |
+|------|------|
+| `resolve_ffmpeg_for(required)`：按**所需能力**在候选里挑 exe（主 ffmpeg 不会烧就换 imageio-ffmpeg 便携版，它有 libass），找不到才降级并告警；`FFMPEG_AUTO_UPGRADE=false` 可关 | `utils/ffmpeg.py` |
+| `run_ffmpeg(..., exe=)` / `run_ffmpeg_capture(..., exe=)`：能指定非主 ffmpeg | 同上 |
+| 合成前算出「真正要执行的 exe」并用它的能力判降级；新增报告字段 `subtitle_ffmpeg` | `services/compose_service.py` |
+| 三种模式都额外导出 `output/subtitles.vtt`（浏览器只认 VTT） | `services/subtitle_service.py`（`build_vtt` / `srt_to_vtt`） |
+| `GET /subtitles.vtt`：老项目没有 vtt 文件时**就地由 srt 转换**，不用重新合成 | `main.py` |
+| 成片播放器挂 `<track>` + 「预览字幕」开关；字幕模式下拉标注当前能不能烧 | `static/index.html` |
+| `/health` 增加 `ffmpeg_burn_path` / `ffmpeg_auto_upgrade` | `main.py` |
+
+真实重合成验证（用户项目 `e8e40d3d9d29`，本地 ffmpeg，**零 API 花费**）：
+
+```
+subtitle_mode=burn → effective=burn
+subtitle_ffmpeg=.../imageio_ffmpeg/binaries/ffmpeg-macos-aarch64-v7.1
+warnings=["主 ffmpeg 没有 libass，烧字幕改用：...v7.1"]
+ffprobe: 只剩 h264 + aac（烧进去了，不再有 mov_text 流）
+抽帧 @2.0s / @16.5s：画面底部可见「李薇儿：哎呀，小悦…」「张姐：抬头！挺胸！…」
+```
+
+### 问题 2：角色的脸不统一
+
+现场证据（同一个人物「林悦」在不同镜头）：
+
+| 镜头 | 画面 |
+|------|------|
+| `scene_1_shot_3` | 棕色齐肩发、灰绿上衣、圆脸 |
+| `scene_2_shot_3` | 黑色高马尾、运动装、脸型不同 |
+
+**根因链**（查完的完整调用路径）：
+
+1. `story_bible.json` 的 4 个角色**都没有 `reference_image`**，项目里 `refs/` 目录压根不存在
+2. → `video_service.resolve_reference()` 返回 `(None, None)`
+3. → `openrouter._reference_payload()` 直接 `return {}`：payload 里**既没有 `input_references`
+   也没有 `frame_images`**
+4. → 15 个镜头全是**纯文生视频**，每个镜头独立抽一次脸
+
+叠加两个次要原因：
+
+- **seed 对 H3 是死的**：capabilities 里 `seed: false`，带上会 400 —— 唯一锚点只剩参考图
+- **`build_prompt(shot, project)` 根本不读 bible**：只有「分镜 LLM 恰好把
+  `character.visual_prompt` 抄进 `video_prompt`」的镜头才有外貌描述
+  （`scene_1_shot_2` 抄了，`scene_1_shot_3` 只有一句 "a young woman's face"）
+
+**修法：文本锚点（免费）+ AI 定妆照（$0.04/张）**
+
+先补不花钱的那一半：`build_prompt(shot, project, bible)` 现在会读圣经，把在场角色
+**没被提到过的** `visual_prompt` 确定性补进每个镜头的 prompt（分镜 LLM 已经抄过就跳过，
+不重复），并追加 `same characters as before, consistent face and hairstyle`。
+定妆照 prompt 组装也顺手截掉人设里的「人物弧光」（`Later, she transforms into…`）——
+定妆照要的是一张稳定的脸，不是中间态。
+
+**再做 AI 生成角色定妆照的完整链路**
+
+| 改动 | 位置 |
+|------|------|
+| `ImageProvider` 抽象（`generate(ImageRequest) -> GeneratedImage`，失败/产物错误分开，产物错误不重试=不重复买图） | `providers/image/base.py` |
+| OpenRouter 图片接口：`POST /api/v1/images`（`n/aspect_ratio/resolution/input_references`），读 `usage.cost`，全有或全无计费 → 失败重试安全 | `providers/image/openrouter.py` |
+| mock：纯 Python 手写 PNG（不花钱、不依赖 ffmpeg，颜色按 subject 哈希稳定） | `providers/image/mock.py` |
+| 角色图服务：定妆照 prompt 组装（正面/中性表情/干净背景/无文字）+ 落盘 `refs/<cid>.png` + 写回圣经 + 清理旧后缀 | `services/character_image_service.py` |
+| 批量补齐（默认只补缺失）、`reference_plan` 只算不写、预算不足 402 | 同上 + `main.py` |
+| 记账新增 `CostStage.IMAGE`（按张数 + 实报 cost） | `models/cost.py` / `services/cost_service.py` |
+| UI：角色卡片缩略图 + 「AI 生成 / AI 重画」+ 「AI 补齐缺失的角色图」+ 缺几张/预估花费提示 | `static/index.html` |
+| 文本锚点：`build_prompt` 读 bible 补在场角色外貌（免费，没参考图时也能减少漂移） | `services/video_service.py` |
+
+顺手修掉的**老问题**：`resolve_ffmpeg()` 之前把「配置了但不存在」当「没配置」处理是对的，
+但现在候选列表里会保留 `FFMPEG_PATH` → `PATH` → 便携版的完整顺序，能力探测按 exe 分别缓存。
+
+### 测试
+
+新增 `tests/test_character_image.py`（16）、`tests/test_image_openrouter.py`（11）、
+`tests/test_ffmpeg_selection.py`（5），并在 `test_compose.py` 补 4 例 VTT/升级路径、
+`test_api.py` 补 4 例（plan / 单个 / 批量 / vtt / health）。全套 **397 passed**，ruff clean。
+
+关键回归用例：
+
+- `test_burn_upgrades_to_a_libass_capable_ffmpeg`：主 ffmpeg 假装没 libass → 真的用便携版烧了一遍
+  → 断言成片里**不再有** subtitle 流
+- `test_burn_degrades_when_libass_is_missing`：**任何**候选都没有 libass → 降级 soft + 告警
+- `test_batch_isolation`：一个角色生成失败，其它角色照样拿到图
