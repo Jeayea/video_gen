@@ -305,7 +305,7 @@ body {
 
 <div class="header">
   <h1>videogen</h1>
-  <span class="badge">v0.10</span>
+  <span class="badge">v0.11</span>
   <span style="flex:1"></span>
   <span id="health" style="font-size:12px;color:var(--text2)"></span>
   <span id="global-status" style="font-size:12px;color:var(--text2)"></span>
@@ -970,7 +970,7 @@ function renderStoryboard() {
     const sb = currentStoryboard;
     if (!sb || !$('storyboard-view')) return;
     $('btn-storyboard-edit').style.display = '';
-    $('storyboard-view').innerHTML = sb.shots.map((s, si) => `
+    $('storyboard-view').innerHTML = storyboardTierHint(sb) + sb.shots.map((s, si) => `
       <div class="shot-block" id="shot-${si}">
         <div class="shot-header">
           <span class="shot-no">${s.shot_no}</span>
@@ -1023,6 +1023,29 @@ function renderStoryboard() {
       </div>
     `).join('');
   } catch (e) { /* 面板渲染失败不应影响其它面板 */ }
+}
+
+function storyboardTierHint(sb) {
+  const tier = sb.duration_tier;
+  const plan = (currentPreflight && currentPreflight.video) || null;
+  const rows = [];
+  if (tier && tier.min_sec > 1) {
+    const span = tier.max_sec ? `${tier.min_sec}~${tier.max_sec}s` : `≥${tier.min_sec}s`;
+    rows.push(`视频档位 ${esc(span)}（${tier.source === 'provider' ? '来自模型' : '来自配置'}）：
+      每个镜头都不短于最短计费时长，所以不会出现「买 ${tier.min_sec} 秒只剪 3 秒」`);
+  } else if (sb.shots && sb.shots.length) {
+    rows.push('当前视频 provider 没有最短时长档位（mock 按真实秒数），分镜不受档位约束');
+  }
+  if (plan && plan.shots_total) {
+    rows.push(`本片 ${plan.shots_total} 个镜头 · 预计计费 ${plan.billed_seconds}s × $${plan.price_per_second}/s ≈ ${usd(plan.estimated_usd)}` +
+      (plan.merge_plan && plan.merge_plan.worth_it
+        ? `；还可以合并短镜头省 ≈ ${usd(plan.merge_plan.saving_usd)}` : ''));
+  }
+  const warnings = sb.tier_warnings || [];
+  const warn = warnings.length
+    ? `<br>⚠️ ${warnings.map(esc).join('<br>⚠️ ')}` : '';
+  if (!rows.length && !warn) return '';
+  return `<div class="hint" style="margin-bottom:8px">${rows.join('<br>')}${warn}</div>`;
 }
 
 function toggleShotEdit(si) {

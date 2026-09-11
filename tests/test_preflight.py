@@ -13,7 +13,8 @@ from tests.fakes import FakeBgmLibrary, FakeLLM, FakeTTSProvider, FakeVideoProvi
 from videogen.config import get_settings
 from videogen.models.cost import CostReport, CostStage
 from videogen.models.project import Project, ProjectStatus
-from videogen.models.storyboard import Shot, Storyboard
+from videogen.models.script import Scene, Script
+from videogen.models.storyboard import DurationTier, Shot, Storyboard
 from videogen.models.video import ClipStatus, MediaKind, VideoClip, VideoManifest
 from videogen.orchestrator.pipeline import Pipeline, PipelineError
 from videogen.services import cost_service, preflight_service, storyboard_service
@@ -424,6 +425,143 @@ async def test_preflight_bundles_sections_and_budget(store):
     assert result["budget"]["limited"] is False
 
 
+# ── 分镜阶段的计费档位（v0.11「一开始就少而长」）──────
+
+
+def test_duration_constraints_text_mentions_shot_count_and_floor():
+    tier = DurationTier(min_sec=5, max_sec=15, source="provider")
+    text = storyboard_service.duration_constraints(9, tier)
+
+    assert "只拆 **1** 个镜头" in text
+    assert "5~15 秒" in text
+    assert "正好等于 9 秒" in text
+    assert storyboard_service.duration_constraints(9, None) == ""
+    # 最短 1 秒 = 没有档位，不该改分镜策略
+    assert storyboard_service.duration_constraints(9, DurationTier(min_sec=1)) == ""
+
+
+def test_apply_duration_tier_collapses_scene_and_keeps_dialogue():
+    storyboard = storyboard_of(
+        make_shot("s1", seconds=3, dialogue="这个项目是我做的。"),
+        make_shot("s2", seconds=3, shot_no=2),
+        make_shot("s3", seconds=3, shot_no=3),
+    )
+    tier = DurationTier(min_sec=5, max_sec=15, source="provider")
+    script = Script(scenes=[Scene(id="scene_1", heading="", duration_sec=9)])
+
+    warnings = storyboard_service.apply_duration_tier(storyboard, script, tier)
+
+    assert len(storyboard.shots) == 1
+    shot = storyboard.shots[0]
+    assert shot.duration_sec == 9  # 一场 9 秒 → 一个 9 秒镜头
+    assert shot.dialogue_text == "这个项目是我做的。"
+    assert shot.shot_no == 1
+    assert storyboard.duration_tier is tier
+    assert storyboard.total_duration_sec == 9
+    assert warnings == []
+
+
+def test_apply_duration_tier_keeps_extra_shots_when_dialogue_blocks_merging():
+    """不同说话人的镜头合不动就保留（宁可多几个镜头，也不丢谁的声音）。"""
+    storyboard = storyboard_of(
+        make_shot("s1", seconds=5, dialogue="甲说的话。", speaker="char_1"),
+        make_shot("s2", seconds=5, shot_no=2, dialogue="乙说的话。", speaker="char_2"),
+        make_shot("s3", seconds=5, shot_no=3, dialogue="丙说的话。", speaker="char_3"),
+        make_shot("s4", seconds=5, shot_no=4, dialogue="丁说的话。", speaker="char_4"),
+    )
+    tier = DurationTier(min_sec=5, max_sec=15, source="provider")
+    script = Script(scenes=[Scene(id="scene_1", heading="", duration_sec=20)])
+
+    warnings = storyboard_service.apply_duration_tier(storyboard, script, tier)
+
+    assert len(storyboard.shots) == 4  # 计划 3 个，但合不动
+    assert any("无法再合并" in w for w in warnings)
+    assert [shot.duration_sec for shot in storyboard.shots] == [5, 5, 5, 5]
+    assert [shot.dialogue_speaker for shot in storyboard.shots] == [
+        "char_1",
+        "char_2",
+        "char_3",
+        "char_4",
+    ]
+
+
+def test_apply_duration_tier_lifts_shot_to_min_and_warns():
+    """3 秒的镜头短于最短档位：反正也是花 5 秒的钱，就按 5 秒排。"""
+    storyboard = storyboard_of(make_shot("s1", seconds=3))
+    tier = DurationTier(min_sec=5, max_sec=15, source="provider")
+    script = Script(scenes=[Scene(id="scene_1", heading="", duration_sec=3)])
+
+    warnings = storyboard_service.apply_duration_tier(storyboard, script, tier)
+
+    assert storyboard.shots[0].duration_sec == 5
+    assert any("不够" in w and "最短" in w for w in warnings)
+
+
+@pytest.mark.asyncio
+async def test_storyboard_generation_uses_tier_from_provider(store):
+    """有档位的 provider：生成阶段就直接「少而长」，每个镜头都 ≥ 最短档位。"""
+    pipeline = media_pipeline(store, FakeReportProvider())
+    project = await build_confirmed_project(store, pipeline)
+    storyboard = store.load_storyboard(project.id)
+
+    assert storyboard.duration_tier is not None
+    assert storyboard.duration_tier.min_sec == 5
+    assert storyboard.duration_tier.source == "provider"
+    assert all(shot.duration_sec >= 5 for shot in storyboard.shots)
+    # 假分镜 5 场 × 6 秒 → 每场 1 个镜头（未受档位约束时是每场 2 个）
+    assert len(storyboard.shots) == 5
+    assert storyboard.total_duration_sec == 30
+    for scene_id in storyboard.scene_ids():
+        assert len(storyboard.shots_for_scene(scene_id)) == 1
+
+
+@pytest.mark.asyncio
+async def test_storyboard_generation_survives_broken_video_provider(store):
+    """视频 provider 建不起来（没 key / 没依赖）不能挡住分镜生成 —— 只是不受档位约束。"""
+
+    def boom():
+        raise RuntimeError("视频 provider 初始化失败（模拟没配 key）")
+
+    pipeline = Pipeline(
+        store,
+        llm_factory=lambda: FakeLLM(),
+        video_factory=boom,
+        tts_factory=lambda: FakeTTSProvider(),
+        bgm_factory=lambda: FakeBgmLibrary(),
+    )
+    project = await build_confirmed_project(store, pipeline)
+    storyboard = store.load_storyboard(project.id)
+
+    assert storyboard.duration_tier is None
+    assert len(storyboard.shots) == 10  # 老行为
+
+
+@pytest.mark.asyncio
+async def test_duration_tier_falls_back_to_config_when_provider_unavailable(store, monkeypatch):
+    """provider 问不到档位时，VIDEO_MIN_SHOT_SEC 仍能当兜底（配置 > 无约束）。"""
+    monkeypatch.setattr(get_settings(), "video_min_shot_sec", 5.0)
+    monkeypatch.setattr(get_settings(), "video_shot_target_sec", 8.0)
+
+    def boom():
+        raise RuntimeError("没有 key")
+
+    pipeline = Pipeline(store, llm_factory=lambda: FakeLLM(), video_factory=boom)
+    tier = await pipeline._duration_tier()
+
+    assert tier is not None
+    assert tier.min_sec == 5.0 and tier.source == "config"
+
+
+@pytest.mark.asyncio
+async def test_storyboard_generation_without_tier_keeps_old_behavior(store):
+    pipeline = media_pipeline(store, FakeVideoProvider())
+    project = await build_confirmed_project(store, pipeline)
+    storyboard = store.load_storyboard(project.id)
+
+    assert storyboard.duration_tier is None
+    assert len(storyboard.shots) == 10  # 5 场 × 2 镜（原有行为不变）
+
+
 # ── pipeline / API ────────────────────────────────────
 
 
@@ -439,9 +577,11 @@ def media_pipeline(store, video) -> Pipeline:
 
 @pytest.mark.asyncio
 async def test_pipeline_preflight_and_merge_flow(store):
-    provider = FakeReportProvider()
-    pipeline = media_pipeline(store, provider)
+    # 先用**没有档位**的 provider 建项目（分镜是「多而短」的 10 镜），
+    # 再换成有档位的 provider —— 模拟「先用 mock 跑通，再切真实模型」的真实流程
+    pipeline = media_pipeline(store, FakeVideoProvider())
     project = await build_confirmed_project(store, pipeline)
+    pipeline = media_pipeline(store, FakeReportProvider())
 
     plan = await pipeline.preflight(project.id, action="video")
     assert plan["video"]["to_generate"] > 0
@@ -463,12 +603,13 @@ async def test_pipeline_preflight_and_merge_flow(store):
 
 @pytest.mark.asyncio
 async def test_merge_requires_force_when_clips_are_paid_for(store):
-    provider = FakeReportProvider()
-    pipeline = media_pipeline(store, provider)
+    pipeline = media_pipeline(store, FakeVideoProvider())
     project = await build_confirmed_project(store, pipeline)
     job = await pipeline.start_video_generation(project.id)
     await wait_for_job(pipeline, job.id)
     assert store.load_video_manifest(project.id).ready_clips
+    # 换成有档位的模型（最短 5 秒）→ 现在的分镜有一堆 3 秒镜头可以合并
+    pipeline = media_pipeline(store, FakeReportProvider())
 
     preview = await pipeline.merge_short_shots(project.id)
     assert preview["force_required"] is True

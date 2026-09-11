@@ -458,3 +458,46 @@ merge: 15 → 12 个镜头 · 75s → 64s 计费 · 省 ≈ $1.43 · dropped_lin
 ```
 
 这组数字正是用户点下按钮前最需要知道的东西：**按钮写着「生成缺失片段」，实际是全部 15 个重跑**。
+
+## v0.11 — 分镜阶段就「少而长」（视频档位感知）
+
+### 背景
+
+v0.10 把「3 秒镜头也买 5 秒」的浪费算给了用户看，并提供事后合并。但事后合并只能补救、
+而且受「一条配音一个声音」的限制（不同说话人的镜头合不动）。真正省钱的写法是**一开始就别拆那么碎**：
+用户现有项目 15 镜 × 3 秒 = 计费 75 秒 = $9.75；若按 5 场各 1 镜 × 9 秒 = 45 秒 = **$5.85**。
+
+### 新增
+
+| 能力 | 实现 | 位置 |
+|------|------|------|
+| 档位解析 | `Pipeline._duration_tier()`：读 `provider.duration_options()`（H3 = 5~15s），拿不到就退回 `VIDEO_MIN_SHOT_SEC`；`min<=1` 视为无档位 | `orchestrator/pipeline.py` |
+| 镜头数规划 | `plan_shot_count(场时长, min, max, target)`：每个镜头都 ≥min、≤max，并贴近目标时长（默认 min×1.6 ≈ 8s） | `utils/duration.py` |
+| 时长分配 | `fit_durations(n, 总时长, min, max)`：不足 `n×min` 时**宁可让本场变长**（反正也是花 min 的钱） | 同上 |
+| 提示词硬约束 | `duration_constraints()`：把「本场只拆 N 个 / 每个 5~15 秒 / 加起来正好 X 秒」写进用户消息；`planned=1` 时额外提示「用连续动作+缓慢运镜，别写画面切换」 | `services/storyboard_service.py` |
+| 确定性兜底 | `apply_duration_tier()`：超编镜头按「不丢对白」规则合并（复用 v0.10 的 `_can_absorb`）→ 再 `fit_durations` 重分配 → 重新编号 `shot_no` | 同上 |
+| 落盘与展示 | `Storyboard.duration_tier` / `tier_warnings`；UI 分镜面板显示「视频档位 5~15s · 本片 N 镜 · 计费 M 秒 ≈ $X · ⚠️ 告警」 | `models/storyboard.py` / `static/index.html` |
+
+### 设计要点
+
+- **合不动就不合**：四镜各 5 秒、说话人各不相同时，计划可能是 3 镜，但合并会丢谁的声音 ——
+  于是保留 4 镜并写 `tier_warnings`。省钱永远让位于「不丢台词」
+- **场景可能变长**：3 秒的场次按最短 5 秒排（`fit_durations` 抬到 min），总时长因此 +2 秒；
+  这不是 bug 而是「反正也要花 5 秒」的正确写法，会写进 `tier_warnings`
+- **默认行为不变**：mock provider 没有档位（`duration_options()` 返回空）→ `_duration_tier()` 返回
+  `None` → 完全走原来的「2-5 镜 + `normalize_storyboard_durations`」。用户的 `.env` 是
+  `VIDEO_PROVIDER=openrouter`，所以真实链路会自动启用
+- 想关掉：`VIDEO_MIN_SHOT_SEC=1`（或把 `VIDEO_SHOT_TARGET_SEC` 调大以换取更长的镜头）
+
+### 预期效果（按模型档位 5~15s）
+
+```
+旧：15 镜 × 3 秒 = 45 秒分镜 → 计费 75 秒 → $9.75
+新： 5 镜 × 9 秒 = 45 秒分镜 → 计费 45 秒 → $5.85   （省 $3.90，档位浪费归零）
+```
+
+### 测试
+
+`tests/test_preflight.py` 扩到 34 例：`duration_constraints()` 文案、`plan_shot_count`/`fit_durations`
+的档位数学、按档位塌缩镜头且保留对白、合不动时保留并告警、场次过短抬到 min 并告警、
+以及「有档位 → 5 镜 / 无档位 → 10 镜（原行为不变）」两条 pipeline 级用例。全套 **359 passed**，ruff clean。

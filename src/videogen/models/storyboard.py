@@ -8,6 +8,26 @@ from videogen.utils.coerce import StrList, coerce_int, ensure_optional_str
 DEFAULT_SHOT_DURATION_SEC = 4
 
 
+class DurationTier(BaseModel):
+    """视频模型的计费档位（分镜阶段用它决定「一场分几镜」，避免买 5 秒只剪 3 秒）。
+
+    - `min_sec`：模型最短计费时长（H3 = 5 秒）。镜头短于它就等于白送钱
+    - `max_sec`：模型最长时长（H3 = 15 秒，0 = 不限制）
+    - `target_sec`：单个镜头的目标时长（0 = 自动取 min×1.6）
+    - `source`：档位来源（provider = 问了模型能力表；config = 配置兜底）
+    """
+
+    min_sec: float = 0.0
+    max_sec: float = 0.0
+    target_sec: float = 0.0
+    source: str = ""
+
+    @property
+    def active(self) -> bool:
+        """只有「最短时长 > 1 秒」才值得改变分镜策略（否则本来就不浪费）。"""
+        return self.min_sec > 1.0
+
+
 class VoiceDirection(BaseModel):
     """一条配音文案的念法建议（LLM 按画面情绪给，留空 = 用全局设置）。"""
 
@@ -79,6 +99,10 @@ class Storyboard(BaseModel):
     duration_normalized: bool = False
     #: 是否已按配音时长对齐过（对齐只会拉长镜头，不会裁掉配音）
     audio_aligned: bool = False
+    #: 生成时用的视频计费档位（没有真实 provider 时为空 = 不受档位约束）
+    duration_tier: DurationTier | None = None
+    #: 档位相关的告警（例如「有对白的镜头无法再合并，镜头数多于计划」）
+    tier_warnings: list[str] = Field(default_factory=list)
 
     @property
     def total_duration_sec(self) -> int:
@@ -94,6 +118,7 @@ class Storyboard(BaseModel):
 __all__ = [
     "DEFAULT_SHOT_DURATION_SEC",
     "MIN_SCENE_DURATION_SEC",
+    "DurationTier",
     "Shot",
     "ShotDraft",
     "Storyboard",

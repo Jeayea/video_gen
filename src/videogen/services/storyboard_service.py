@@ -8,9 +8,9 @@ from videogen.models.bible import StoryBible
 from videogen.models.llm_io import ShotsResponse
 from videogen.models.project import Project
 from videogen.models.script import Scene, Script
-from videogen.models.storyboard import Shot, Storyboard
+from videogen.models.storyboard import DurationTier, Shot, Storyboard
 from videogen.providers.llm.base import LLMMessage, LLMProvider
-from videogen.utils.duration import scale_durations
+from videogen.utils.duration import fit_durations, plan_shot_count, scale_durations
 from videogen.utils.text import clean_spoken_text
 
 logger = logging.getLogger(__name__)
@@ -18,8 +18,11 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "STORYBOARD_SYSTEM",
     "MergeReport",
+    "absorb_bucket",
+    "apply_duration_tier",
     "generate_shots_for_scene",
     "merge_shots",
+    "merge_to_count",
     "normalize_storyboard_durations",
     "plan_merge_buckets",
     "sanitize_video_prompt",
@@ -27,7 +30,8 @@ __all__ = [
 
 STORYBOARD_SYSTEM = """你是一位专业分镜师。根据剧本场景生成分镜脚本。
 
-每个场景拆成 2-5 个镜头。每个镜头输出：
+每个场景拆成 2-5 个镜头（如果用户消息里给了明确的镜头数与时长硬约束，以用户消息为准）。
+每个镜头输出：
 {
   "shot_no": 1,
   "duration_sec": 4,
@@ -100,16 +104,52 @@ def sanitize_video_prompt(prompt: str, bible: StoryBible) -> str:
     return text.strip()
 
 
+def duration_constraints(scene_sec: int, tier: DurationTier | None) -> str:
+    """把视频模型的计费档位翻译成给 LLM 的硬约束（没档位就返回空串）。"""
+    if tier is None or not tier.active:
+        return ""
+    planned = plan_shot_count(
+        scene_sec, min_sec=tier.min_sec, max_sec=tier.max_sec, target_sec=tier.target_sec
+    )
+    planned = max(1, planned)
+    low = f"{tier.min_sec:g}"
+    high = f"{tier.max_sec:g}" if tier.max_sec and tier.max_sec >= tier.min_sec else "不限"
+    per_shot = max(1, round(scene_sec / planned))
+    lines = [
+        f"- 本场只拆 **{planned}** 个镜头：视频模型按最短 {low} 秒/镜头计费，"
+        f"镜头短于 {low} 秒等于白花钱，所以宁少勿碎",
+        f"- 每个镜头时长必须在 {low}~{high} 秒之间，加起来正好等于 {scene_sec} 秒"
+        f"（每个约 {per_shot} 秒）",
+        "- 镜头少的时候要用「缓慢运镜 / 一个动作走完」来撑满时长，不要靠切碎镜头制造信息量",
+    ]
+    if planned == 1:
+        lines.append("- 本场只有一个镜头：用连续动作 + 缓慢推/摇，别在描述里写多个画面切换")
+    return "\n".join(lines)
+
+
 async def generate_shots_for_scene(
     llm: LLMProvider,
     project: Project,
     bible: StoryBible,
     scene: Scene,
+    *,
+    tier: DurationTier | None = None,
 ) -> list[Shot]:
-    """为一个场景生成镜头列表（id / shot_no / scene_id 由系统分配）。"""
+    """为一个场景生成镜头列表（id / shot_no / scene_id 由系统分配）。
+
+    `tier` 是视频模型的计费档位：给了就把「本场几个镜头、每镜多少秒」写成硬约束，
+    让模型一开始就产出「少而长」的分镜（事后合并只能补救，不如一开始就不浪费）。
+    """
     aspect_hint = _ASPECT_HINTS.get(project.aspect_ratio.value, _ASPECT_HINTS["9:16"])
     dialogue_text = "\n".join(f"  {d.speaker}: {d.line}" for d in scene.dialogue) or "（无对白）"
+    constraints = duration_constraints(scene.duration_sec, tier)
+    shot_count_rule = (
+        "按上面的镜头数与时长硬约束拆分"
+        if constraints
+        else f"拆成 2-5 个镜头，所有镜头时长加起来必须正好等于 {scene.duration_sec} 秒"
+    )
 
+    tier_block = f"\n## 时长硬约束（视频模型计费档位）\n{constraints}\n" if constraints else ""
     user_prompt = f"""## 角色与场景参考
 {_format_brief_bible(bible)}
 
@@ -122,9 +162,10 @@ async def generate_shots_for_scene(
 对白:
 {dialogue_text}
 
+{tier_block}
 ## 要求
 - 画面比例: {project.aspect_ratio.value} → {aspect_hint}
-- 拆成 2-5 个镜头，所有镜头时长加起来必须正好等于 {scene.duration_sec} 秒
+- {shot_count_rule}
 - video_prompt 必须是英文，且不得包含 char_N / loc_N 这类 id
 - 台词对应的镜头要标记 dialogue_text 和 dialogue_speaker（speaker 用角色 id）
 - 无对白的空镜/过渡镜 narration 可为 null
@@ -317,52 +358,9 @@ def merge_shots(
     for bucket in buckets:
         if len(bucket) == 1:
             continue
-        primary = bucket[0]
-        absorbed = bucket[1:]
-        report.merged.append(
-            {
-                "shot_id": primary.id,
-                "absorbed": [s.id for s in absorbed],
-                "from_sec": _secs(bucket),
-                "shots": len(bucket),
-            }
-        )
-        extra = [
-            clean_spoken_text(s.visual_description) for s in absorbed if s.visual_description
-        ]
-        if extra:
-            joined = "；".join(part for part in extra if part)
-            if joined:
-                primary.visual_description = "；".join(
-                    part for part in (clean_spoken_text(primary.visual_description), joined) if part
-                )
-        for shot in absorbed:
-            line = clean_spoken_text(shot.dialogue_text)
-            if not line:
-                continue
-            if not clean_spoken_text(primary.dialogue_text):
-                # 主镜头本来没有对白：让这条对白接管（原有的旁白会因此让位，报告里会记）
-                primary.dialogue_text = line
-                primary.dialogue_speaker = shot.dialogue_speaker
-                continue
-            primary.dialogue_text = _join_lines(primary.dialogue_text, line)
-        carried_narration = "\n".join(
-            clean_spoken_text(s.narration)
-            for s in absorbed
-            if clean_spoken_text(s.narration)
-        )
-        if not clean_spoken_text(primary.dialogue_text) and not clean_spoken_text(
-            primary.narration
-        ):
-            if carried_narration:
-                primary.narration = carried_narration
-        elif carried_narration:
-            for shot in absorbed:
-                line = clean_spoken_text(shot.narration)
-                if line:
-                    report.dropped_lines.append(f"{shot.id}: {line}")
+        absorb_bucket(bucket[0], bucket[1:], report)
         if not dry_run:
-            primary.duration_sec = _secs(bucket)
+            bucket[0].duration_sec = _secs(bucket)
 
     if not dry_run and report.to_shots != report.from_shots:
         keep: list[Shot] = []
@@ -383,3 +381,158 @@ def merge_shots(
     if report.to_shots == report.from_shots:
         report.warnings.append("没有可以合并的镜头（要么已经够长，要么都被对白占着）")
     return report
+
+
+def absorb_bucket(primary: Shot, absorbed: list[Shot], report: MergeReport) -> None:
+    """把 `absorbed` 这些镜头并进主镜头（文案、画面描述、丢线记录都记进 report）。
+
+    对白处理规则见 `_can_absorb`：同说话人并句、主镜头无文案时对白接管，
+    否则调用方根本不该吸收它。
+    """
+    report.merged.append(
+        {
+            "shot_id": primary.id,
+            "absorbed": [shot.id for shot in absorbed],
+            "from_sec": _secs([primary, *absorbed]),
+            "shots": len(absorbed) + 1,
+        }
+    )
+    extra = [
+        clean_spoken_text(shot.visual_description) for shot in absorbed if shot.visual_description
+    ]
+    joined = "；".join(part for part in extra if part)
+    if joined:
+        primary.visual_description = "；".join(
+            part for part in (clean_spoken_text(primary.visual_description), joined) if part
+        )
+    for shot in absorbed:
+        line = clean_spoken_text(shot.dialogue_text)
+        if not line:
+            continue
+        if not clean_spoken_text(primary.dialogue_text):
+            # 主镜头本来没有对白：让这条对白接管（原有旁白会让位，下面会记）
+            primary.dialogue_text = line
+            primary.dialogue_speaker = shot.dialogue_speaker
+            continue
+        primary.dialogue_text = _join_lines(primary.dialogue_text, line)
+    carried_narration = "\n".join(
+        clean_spoken_text(shot.narration) for shot in absorbed if clean_spoken_text(shot.narration)
+    )
+    if not clean_spoken_text(primary.dialogue_text) and not clean_spoken_text(primary.narration):
+        if carried_narration:
+            primary.narration = carried_narration
+    elif carried_narration:
+        for shot in absorbed:
+            line = clean_spoken_text(shot.narration)
+            if line:
+                report.dropped_lines.append(f"{shot.id}: {line}")
+
+
+def merge_to_count(shots: list[Shot], keep: int) -> tuple[list[list[Shot]], list[str]]:
+    """把一场里的镜头合并到**最多 keep 个**（分镜阶段按档位控制镜头数用）。
+
+    先吸收「没有对白 / 能被吸收」的最短的那一个；实在合不动（剩下的都是不同说话人的对白）
+    就停下并告警 —— 宁可多留几个镜头，也不丢谁的声音。
+    """
+    keep = max(1, int(keep))
+    buckets: list[list[Shot]] = [[shot] for shot in shots]
+    warnings: list[str] = []
+    while len(buckets) > keep:
+        order = sorted(
+            range(1, len(buckets)),
+            key=lambda index: (any(_has_text(s) for s in buckets[index]), _secs(buckets[index])),
+        )
+        merged = False
+        for index in order:
+            run = _try_absorb(buckets[index - 1], buckets[index])
+            if run is None:
+                continue
+            buckets[index - 1] = run
+            buckets.pop(index)
+            merged = True
+            break
+        if not merged:
+            labels = "、".join(bucket[0].id for bucket in buckets)
+            warnings.append(
+                f"这一场有 {len(buckets)} 个镜头无法再合并（不同说话人的对白不能共用一条配音）："
+                f"{labels}"
+            )
+            break
+    return buckets, warnings
+
+
+def _try_absorb(primary_run: list[Shot], extra: list[Shot]) -> list[Shot] | None:
+    """把 extra 整个并进 primary_run；只要有一个镜头不该被吸收就返回 None。"""
+    run = list(primary_run)
+    for shot in extra:
+        if not _can_absorb(run, shot):
+            return None
+        run.append(shot)
+    return run
+
+
+def apply_duration_tier(
+    storyboard: Storyboard, script: Script, tier: DurationTier
+) -> list[str]:
+    """按视频模型的计费档位把分镜「摊平」：每场镜头数合适、每个镜头都在档位内。
+
+    做的事（按场）：
+    1. 算出这一场该有几个镜头（`plan_shot_count`：每个镜头 ≥ min、≤ max，尽量贴近目标时长）
+    2. 多出来的镜头按「不丢对白」的规则合并掉（合不动就保留并告警）
+    3. 把这一场的时长按 `fit_durations` 重新分配（不足 min 的抬到 min —— 反正也是花 min 的钱）
+
+    返回告警列表。**不写盘**，由调用方决定保存。
+    """
+    warnings: list[str] = []
+    kept: list[Shot] = []
+    counters: dict[str, int] = {}
+    for scene in script.scenes:
+        shots = storyboard.shots_for_scene(scene.id)
+        if not shots:
+            continue
+        planned = plan_shot_count(
+            scene.duration_sec,
+            min_sec=tier.min_sec,
+            max_sec=tier.max_sec,
+            target_sec=tier.target_sec,
+        )
+        if planned <= 0:
+            kept.extend(shots)
+            continue
+        buckets, merge_warnings = merge_to_count(shots, planned)
+        warnings.extend(merge_warnings)
+        report = MergeReport(min_sec=tier.min_sec, max_sec=tier.max_sec)
+        primaries: list[Shot] = []
+        for bucket in buckets:
+            primary = bucket[0]
+            if len(bucket) > 1:
+                absorb_bucket(primary, bucket[1:], report)
+            primaries.append(primary)
+        durations = fit_durations(
+            len(primaries),
+            scene.duration_sec,
+            min_sec=round(tier.min_sec),
+            max_sec=round(tier.max_sec),
+        )
+        if scene.duration_sec < len(primaries) * tier.min_sec:
+            # 本场时长不够每个镜头的最短档位：会让片子比剧本长一点，但钱是一样的
+            warnings.append(
+                f"场次 {scene.id} 只有 {scene.duration_sec}s，不够 "
+                f"{len(primaries)} 个镜头各自最短 {tier.min_sec:g}s：已按 "
+                f"{sum(durations)}s 排（否则也是花同样的钱）"
+            )
+        for primary, seconds in zip(primaries, durations, strict=True):
+            primary.duration_sec = seconds
+        counters[scene.id] = 0
+        for primary in primaries:
+            counters[scene.id] += 1
+            primary.shot_no = counters[scene.id]
+            kept.append(primary)
+        if report.dropped_lines:
+            warnings.extend(f"合并 {primary.id} 时丢弃旁白 {line}" for line in report.dropped_lines)
+    storyboard.shots = kept
+    storyboard.duration_tier = tier
+    storyboard.tier_warnings = warnings
+    storyboard.audio_aligned = False
+    storyboard.duration_normalized = True
+    return warnings

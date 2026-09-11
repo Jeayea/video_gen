@@ -13,7 +13,7 @@ from videogen.models.consistency import ConsistencyReport
 from videogen.models.cost import CostReport, CostStage
 from videogen.models.project import Project, ProjectStatus
 from videogen.models.script import Script, ScriptOutline
-from videogen.models.storyboard import Shot, Storyboard
+from videogen.models.storyboard import DurationTier, Shot, Storyboard
 from videogen.models.video import VideoManifest
 from videogen.models.world_state import WorldState
 from videogen.orchestrator.jobs import Job, JobContext, JobManager
@@ -520,15 +520,33 @@ class Pipeline:
                 len(script.scenes),
             )
 
+        # 视频模型的最短计费档位（H3 = 5 秒）：分镜阶段就按它拆镜头，
+        # 否则 3 秒的镜头也要买 5 秒（事后合并只能补救，不如一开始就不浪费）
+        tier = await self._duration_tier()
+        if tier is not None:
+            logger.info(
+                "分镜按视频档位生成：最短 %gs / 目标 %ss（来源 %s）",
+                tier.min_sec,
+                tier.target_sec or round(tier.min_sec * 1.6, 1),
+                tier.source,
+            )
+
         covered = storyboard.scene_ids() if resuming else set()
         for scene in script.scenes:
             if scene.id in covered:
                 continue
-            shots = await storyboard_service.generate_shots_for_scene(llm, project, bible, scene)
+            shots = await storyboard_service.generate_shots_for_scene(
+                llm, project, bible, scene, tier=tier
+            )
             storyboard.shots.extend(shots)
             self.store.save_storyboard(project_id, storyboard)
 
-        storyboard_service.normalize_storyboard_durations(storyboard, script)
+        if tier is not None:
+            warnings = storyboard_service.apply_duration_tier(storyboard, script, tier)
+            for warning in warnings:
+                logger.warning("分镜档位对齐：%s", warning)
+        else:
+            storyboard_service.normalize_storyboard_durations(storyboard, script)
         self.store.save_storyboard(project_id, storyboard)
         return storyboard
 
@@ -670,6 +688,40 @@ class Pipeline:
             payload["force_required"] = False
             payload["purged_media"] = report.to_shots != report.from_shots
             return payload
+
+    async def _duration_tier(self) -> DurationTier | None:
+        """拿视频模型的计费档位（分镜阶段用来决定「一场分几镜」）。
+
+        问不到就退回配置里的 `VIDEO_MIN_SHOT_SEC`；都没有就返回 None = 不约束分镜
+        （mock provider 就是这种：它按真实秒数计费，没有最短档位）。
+        """
+        settings = get_settings()
+        configured = max(0.0, float(settings.video_min_shot_sec or 0.0))
+        provider = None
+        options: list[float] = []
+        source = "config"
+        try:
+            provider = self._video()
+            options = list(await provider.duration_options())
+            if options:
+                source = "provider"
+        except Exception:  # noqa: BLE001 - 问不到档位就不约束分镜，别卡住生成
+            logger.warning("视频档位查询失败，分镜不受档位约束（可用 VIDEO_MIN_SHOT_SEC 兜底）")
+        finally:
+            if provider is not None:
+                await provider.aclose()
+
+        min_sec = options[0] if options else configured
+        if min_sec <= 1.0:
+            return None
+        max_sec = options[-1] if len(options) > 1 else float(settings.video_max_shot_sec or 0.0)
+        target = max(0.0, float(settings.video_shot_target_sec or 0.0))
+        return DurationTier(
+            min_sec=round(min_sec, 3),
+            max_sec=round(max_sec, 3),
+            target_sec=round(target, 3),
+            source=source,
+        )
 
     async def _min_billable_seconds(self) -> float:
         """问 provider 的最短计费档位（问不到就按 1 秒 = 没有档位约束）。"""

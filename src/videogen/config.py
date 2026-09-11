@@ -36,6 +36,10 @@ class Settings(BaseSettings):
     video_timeout_sec: float = 900.0
     #: 合并短镜头时的目标最短时长（秒）。0 = 自动用模型最短计费档位（H3 是 5 秒）
     video_min_shot_sec: float = 0.0
+    #: 分镜阶段单个镜头的目标时长（秒）。0 = 自动取最短档位 × 1.6（H3 → 约 8 秒）
+    video_shot_target_sec: float = 0.0
+    #: 单个镜头的时长上限（秒）。0 = 用模型最长档位（H3 = 15 秒）
+    video_max_shot_sec: float = 0.0
     video_concurrency: int = 3
     video_max_retries: int = 2
     video_retry_backoff_sec: float = 1.5
