@@ -152,6 +152,10 @@ class Settings(BaseSettings):
     image_price_usd: float = 0.04
     #: 生成角色图时是否带上已有参考图（做「同一角色的另一角度」）
     image_use_existing_reference: bool = False
+    #: 追加到定妆照 prompt 末尾的额外约束（**必须英文**，中文会被模型画进画面）。
+    #: 角色设定里没写人种时，用 'East Asian cast, Chinese television drama'
+    #: 之类统一整组角色的面貌基调
+    image_prompt_suffix: str = ""
 
     # 安全：留空表示不校验（仅建议在本机 127.0.0.1 上跑）；设置后所有 /api 请求需带
     # X-API-Token 头或 ?token= 查询参数

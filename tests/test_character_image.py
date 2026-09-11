@@ -47,6 +47,18 @@ def test_portrait_prompt_never_contains_chinese(bible):
         assert "poster" not in lowered.replace("no poster layout", "")
 
 
+def test_portrait_prompt_appends_english_extra_hint(bible):
+    """角色设定没写人种时，靠 IMAGE_PROMPT_SUFFIX 统一整组面貌（必须是英文）。"""
+    prompt = build_portrait_prompt(
+        bible.get_character("char_1"),
+        bible,
+        extra="East Asian cast, Chinese television drama",
+    )
+    assert prompt.rstrip().endswith("East Asian cast, Chinese television drama")
+    plain = build_portrait_prompt(bible.get_character("char_1"), bible)
+    assert plain.strip().endswith("1:1 composition")  # 没配就不追加
+
+
 def test_portrait_prompt_maps_role_to_english(bible):
     prompt = build_portrait_prompt(bible.get_character("char_2"), bible)
     assert "antagonist" in prompt

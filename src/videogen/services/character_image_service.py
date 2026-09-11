@@ -39,6 +39,7 @@ def build_portrait_prompt(
     bible: StoryBible | None = None,
     *,
     aspect_ratio: str = "1:1",
+    extra: str = "",
 ) -> str:
     """把圣经里的角色设定拼成「角色参考图」prompt。
 
@@ -87,6 +88,9 @@ def build_portrait_prompt(
         "no border, no poster layout, no collage, single subject only"
     )
     lines.append(f"{aspect_ratio} composition")
+    suffix = _one_line(extra)
+    if suffix:
+        lines.append(suffix)
     return "\n".join(lines)
 
 
@@ -165,7 +169,10 @@ def reference_plan(
                 "orphan_file": orphan.name if orphan else "",
                 "reference_image": character.reference_image,
                 "prompt_preview": build_portrait_prompt(
-                    character, bible, aspect_ratio=settings.image_aspect_ratio
+                    character,
+                    bible,
+                    aspect_ratio=settings.image_aspect_ratio,
+                    extra=settings.image_prompt_suffix,
                 )[:400],
             }
         )
@@ -308,7 +315,10 @@ async def generate_character_image(
     reference_image = existing if (want_reference and existing is not None) else None
 
     prompt = _one_line(prompt_override) or build_portrait_prompt(
-        character, bible, aspect_ratio=settings.image_aspect_ratio
+        character,
+        bible,
+        aspect_ratio=settings.image_aspect_ratio,
+        extra=settings.image_prompt_suffix,
     )
 
     # 花钱前先看预算（角色图很便宜，但超支一样是超支）

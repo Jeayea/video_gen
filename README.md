@@ -378,6 +378,9 @@ curl -s -X POST localhost:8001/api/projects/$PID/characters/references/generate 
 - **不说 "character design sheet" / "poster"**：这类词会把画面带成带排版标注的海报，
   而不是一张能锁住五官的干净证件照。
 
+角色设定里没写人种时，整组角色容易「各长各的」——用 `IMAGE_PROMPT_SUFFIX` 统一基调
+（英文，例如 `East Asian cast, Chinese television drama`）；它是追加到 prompt 末尾的额外约束。
+
 另外 `refs/<cid>.*` 里有文件但圣经没登记（并发写坏 / 手工拷贝）时，
 `references/plan` 会把它列进 `orphans`，生成入口会**免费补登记**，不会重复扣钱。
 

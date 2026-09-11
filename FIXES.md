@@ -704,12 +704,23 @@ prompt 里带着中文名 `林悦` 和风格 `都市复仇`，模型把「都市
 同时**删掉**原来的 `Cinematic character design sheet` —— "sheet / poster / design"
 这类词本身就会把画面带成带排版的海报。
 
+**③ 定妆照的「人种漂移」（观察，未改数据）**
+
+4 张干净版定妆照里，林悦是东亚面孔，张姐 / 赵总却是欧美面孔 —— 圣经的
+`visual_prompt` 只写了「sophisticated woman in her late thirties」这类描述，**没写人种**，
+模型就各按各的理解画。这不是代码 bug（prompt 忠实反映了圣经），
+但会让同一部戏的演员表看起来不像一家人。两个可用的修法：
+
+- 在故事圣经里给每个角色补上人种/地域描述（数据侧，最准）
+- 或者用新增的 `IMAGE_PROMPT_SUFFIX`（英文，例如 `East Asian cast, Chinese television drama`）
+  统一整组基调（配置侧，一次覆盖所有角色）
+
 ### 测试
 
-新增 `tests/test_character_image.py`（22）、`tests/test_image_openrouter.py`（11）、
+新增 `tests/test_character_image.py`（23）、`tests/test_image_openrouter.py`（11）、
 `tests/test_ffmpeg_selection.py`（5），并在 `test_compose.py` 补 4 例 VTT/升级路径、
 `test_api.py` 补 5 例（plan / 单个 / 批量 / vtt / health）、`test_video.py` 补 3 例文本锚点。
-全套 **416 passed**，ruff clean。
+全套 **417 passed**，ruff clean。
 
 顺带修掉一个测试基线漏洞：`.env` 改成 `COMPOSE_SUBTITLE_MODE=burn` 后，
 `test_compose.py` 里两个默认 soft 的用例开始失败（真实行为变了）——
