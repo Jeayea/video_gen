@@ -65,6 +65,8 @@ class Batch(BaseModel):
     input_mode: InputMode = InputMode.THEME
     stop_after: str = "compose"
     model: str = ""
+    #: 配音文案模式（"" = 用 .env 配置；off/narration/polish/full）
+    audio_script_mode: str = ""
     concurrency: int = 1
     created_at: str = Field(default_factory=lambda: datetime.now(UTC).isoformat())
     started_at: str | None = None
@@ -138,6 +140,7 @@ class BatchManager:
         input_mode: InputMode = InputMode.THEME,
         stop_after: str = "compose",
         model: str = "",
+        audio_script_mode: str = "",
         concurrency: int = 1,
         max_items: int = 20,
     ) -> Batch:
@@ -164,6 +167,7 @@ class BatchManager:
             input_mode=input_mode,
             stop_after=stop_after,
             model=model,
+            audio_script_mode=audio_script_mode,
             concurrency=max(1, min(4, concurrency)),
         )
         self._batches[batch.id] = batch
@@ -235,6 +239,7 @@ class BatchManager:
                         project.id,
                         stop_after=batch.stop_after,
                         model=batch.model,
+                        script_mode=batch.audio_script_mode or None,
                         on_stage=_stage_recorder(item),
                     )
                 except asyncio.CancelledError:

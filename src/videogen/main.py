@@ -205,13 +205,22 @@ class BatchRequest(BaseModel):
     #: 批量跑到哪一步就停：storyboard（只要剧本+分镜）/ video / audio / compose（默认全流程）
     stop_after: str = "compose"
     model: str = ""
+    #: 配音文案模式（留空 = 用 .env 的 AUDIO_LLM_SCRIPT）
+    audio_script_mode: str = Field(default="", pattern="^(|off|narration|polish|full)$")
     concurrency: int = Field(default=1, ge=1, le=4)
 
 
 class AudioGenerateRequest(BaseModel):
-    """按角色换音色（可只给要改的说话人）。"""
+    """按角色换音色（可只给要改的说话人）+ 可选的配音文案模式。"""
 
     voices: dict[str, str] = Field(default_factory=dict)
+    #: off = 用分镜原文案；narration = 只给没台词的镜头补旁白；
+    #: polish = 只改写已有文案；full = 补旁白 + 改写 + 念法建议
+    script_mode: str | None = Field(default=None, pattern="^(off|narration|polish|full)$")
+    #: 是否把视频抽帧发给模型（None = 用配置）
+    use_vision: bool | None = None
+    #: 对已经生成过同模式文案的镜头再跑一次（None = 用配置，默认跳过不重复花钱）
+    force_script: bool | None = None
 
 
 class ComposeRequest(BaseModel):
@@ -275,6 +284,9 @@ async def health():
         "auth_enabled": bool(settings.api_token.strip()),
         "tts_provider": settings.tts_provider,
         "tts_voice": settings.tts_voice,
+        "audio_script_mode": settings.audio_script_mode,
+        "audio_script_vision": settings.audio_llm_vision,
+        "audio_script_model": settings.audio_llm_model or settings.openrouter_model,
         "bgm_enabled": settings.bgm_enabled,
         "bgm_dir": str(settings.bgm_path),
         "subtitle_mode": settings.subtitle_mode,
@@ -513,9 +525,18 @@ async def get_clip(project_id: str, shot_id: str):
 
 @app.post("/api/projects/{project_id}/audio/generate", status_code=202)
 async def generate_audio(project_id: str, req: AudioGenerateRequest | None = None):
-    """提交配音后台任务（异步，用 audio/status 查进度）。"""
+    """提交配音后台任务（异步，用 audio/status 查进度）。
+
+    `script_mode` 非 off 时会先让 LLM 看着画面写/改配音文案（额外花 LLM 额度）。
+    """
     voices = (req.voices if req else {}) or {}
-    job = await pipeline.start_audio_generation(project_id, voice_overrides=voices)
+    job = await pipeline.start_audio_generation(
+        project_id,
+        voice_overrides=voices,
+        script_mode=req.script_mode if req else None,
+        use_vision=req.use_vision if req else None,
+        force_script=req.force_script if req else None,
+    )
     return {"job": job.to_public()}
 
 
@@ -721,6 +742,7 @@ async def create_batch(req: BatchRequest):
             input_mode=req.input_mode,
             stop_after=req.stop_after,
             model=req.model,
+            audio_script_mode=req.audio_script_mode,
             concurrency=req.concurrency,
             max_items=settings.batch_max_items,
         )

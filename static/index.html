@@ -305,7 +305,7 @@ body {
 
 <div class="header">
   <h1>videogen</h1>
-  <span class="badge">v0.8</span>
+  <span class="badge">v0.9</span>
   <span style="flex:1"></span>
   <span id="health" style="font-size:12px;color:var(--text2)"></span>
   <span id="global-status" style="font-size:12px;color:var(--text2)"></span>
@@ -448,6 +448,11 @@ async function loadHealth() {
     $('health').innerHTML =
       `<span class="tag-mini ${ok ? 'ok' : 'warn'}">LLM ${ok ? '已配置' : '未配置 Key'}</span>` +
       (h.auth_enabled ? ' <span class="tag-mini ok">鉴权开启</span>' : '');
+    // 配音文案的默认模式跟着服务端配置走（off = 不额外花钱）
+    if (h.audio_script_mode && SCRIPT_MODES.some(([value]) => value === h.audio_script_mode)) {
+      audioScriptMode = h.audio_script_mode;
+    }
+    if (typeof h.audio_script_vision === 'boolean') audioScriptVision = h.audio_script_vision;
   } catch (e) {
     $('health').textContent = '';
   }
@@ -671,6 +676,7 @@ async function renderProject(id) {
       <div id="audio-body">
         <span style="color:var(--text2);font-size:12px">尚未生成</span>
       </div>
+      <div id="audio-script" class="edit-form"></div>
       <div class="progress-wrap" id="audio-progress" style="display:none">
         <div class="progress-bar"><div class="progress-fill" id="audio-progress-fill"></div></div>
         <div class="progress-text" id="audio-progress-text"></div>
@@ -734,6 +740,15 @@ async function renderProject(id) {
           </label>
           <label>并发
             <input id="batch-concurrency" type="number" min="1" max="4" value="1" />
+          </label>
+          <label>配音文案
+            <select id="batch-script-mode">
+              <option value="" selected>跟随 .env 配置</option>
+              <option value="off">off · 只用分镜原文案</option>
+              <option value="narration">narration · 补旁白</option>
+              <option value="polish">polish · 改写已有文案</option>
+              <option value="full">full · 补旁白 + 改写 + 念法</option>
+            </select>
           </label>
         </div>
         <div class="form-actions">
@@ -1248,6 +1263,48 @@ function currentVoiceOverrides() {
   return overrides;
 }
 
+// 配音文案（LLM 看画面写/改台词）—— 前端记住选择，不做本地持久化
+const SCRIPT_MODES = [
+  ['off', '只用分镜原文案'],
+  ['narration', '补旁白（只给没台词的镜头写）'],
+  ['polish', '改写已有台词/旁白'],
+  ['full', '补旁白 + 改写 + 念法建议'],
+];
+let audioScriptMode = 'off';
+let audioScriptVision = true;
+let audioScriptForce = false;
+
+function onScriptModeChange() {
+  const sel = $('audio-script-mode');
+  audioScriptMode = sel ? sel.value : 'off';
+  renderAudioScript();
+}
+
+function onScriptFlagChange() {
+  const vision = $('audio-script-vision');
+  const force = $('audio-script-force');
+  audioScriptVision = !!(vision && vision.checked);
+  audioScriptForce = !!(force && force.checked);
+}
+
+function renderAudioScript() {
+  const box = $('audio-script');
+  if (!box) return;
+  const options = SCRIPT_MODES
+    .map(([value, label]) => `<option value="${value}"${value === audioScriptMode ? ' selected' : ''}>${esc(label)}</option>`)
+    .join('');
+  box.innerHTML = `
+    <label>配音文案
+      <select id="audio-script-mode" onchange="onScriptModeChange()">${options}</select>
+    </label>
+    ${audioScriptMode === 'off' ? '' : `
+      <label class="check"><input type="checkbox" id="audio-script-vision"${audioScriptVision ? ' checked' : ''} onchange="onScriptFlagChange()"> 把视频抽帧发给模型（对得上画面，稍贵）</label>
+      <label class="check"><input type="checkbox" id="audio-script-force"${audioScriptForce ? ' checked' : ''} onchange="onScriptFlagChange()"> 强制重跑已生成的文案</label>
+      <div class="hint">会额外花 LLM 额度；同一模式重跑默认跳过已经写过的镜头。</div>
+    `}
+  `;
+}
+
 function onVoiceChange() {
   renderAudio();
 }
@@ -1269,6 +1326,7 @@ function renderAudio() {
       (summary.failed ? `<span class="tag-mini warn">${summary.failed} 失败</span>` : '') +
       (summary.placeholder ? `<span class="tag-mini warn">${summary.placeholder} 占位</span>` : '') +
       (summary.bgm ? `<span class="tag-mini ok">BGM: ${esc(summary.bgm)}</span>` : '') +
+      (summary.script_lines ? `<span class="tag-mini ok">LLM 文案 ${summary.script_lines}</span>` : '') +
       (summary.usable ? '<span class="tag-mini ok">可进合成</span>' : '')
     : '';
 
@@ -1296,15 +1354,19 @@ function renderAudio() {
       <div class="clip-grid">${clips.map(c => {
         const playable = c.status === 'ready' && c.media_kind === 'audio';
         const statusClass = c.status === 'failed' ? 'warn' : c.status === 'ready' ? 'ok' : '';
+        const delivery = [c.rate, c.volume, c.pitch].filter(Boolean).join(' / ');
         return `
           <div class="clip-card ${c.status === 'ready' ? '' : 'pending'}">
             <div class="clip-head">
               <span class="clip-no">${esc(speakerLabel(c))}</span>
               <span class="tag-mini">${esc(c.kind === 'narration' ? '旁白' : '对白')}</span>
+              ${c.script_source ? `<span class="tag-mini ok">LLM 文案</span>` : ''}
               <span style="color:var(--text2)">${(c.duration_sec || 0).toFixed(2)}s</span>
               <span class="tag-mini ${statusClass}">${esc(clipStatusLabel(c.status))}</span>
             </div>
             <div class="clip-prompt">${esc(c.text || '')}</div>
+            ${delivery ? `<div class="hint">念法：${esc(delivery)}</div>` : ''}
+            ${c.note ? `<div class="hint">${esc(c.note)}</div>` : ''}
             ${playable
               ? `<audio controls preload="none" src="/api/projects/${currentProjectId}/audio/${encodeURIComponent(c.id)}"></audio>`
               : ''}
@@ -1337,6 +1399,7 @@ function renderAudio() {
   if (canStart) {
     const label = changed ? '应用音色并重新生成'
       : summary && summary.failed ? `重试 ${summary.failed} 条失败配音`
+      : audioScriptMode !== 'off' ? '生成配音 + LLM 文案'
       : clips.length ? '补跑缺失配音' : '生成配音';
     buttons.push(`<button class="btn btn-sm" onclick="doGenerateAudio()">${label}</button>`);
   }
@@ -1344,6 +1407,7 @@ function renderAudio() {
     buttons.push(`<span class="hint">${esc(audioHint(status))}</span>`);
   }
   actions.innerHTML = buttons.join('');
+  renderAudioScript();
 
   if (active) scheduleAudioPoll(); else stopAudioPolling();
 }
@@ -1372,7 +1436,12 @@ function doGenerateAudio() {
   withBusy('提交配音任务...', () =>
     api(`/api/projects/${currentProjectId}/audio/generate`, {
       method: 'POST',
-      body: JSON.stringify({ voices }),
+      body: JSON.stringify({
+        voices,
+        script_mode: audioScriptMode,
+        use_vision: audioScriptVision,
+        force_script: audioScriptForce,
+      }),
     }));
 }
 
@@ -1745,6 +1814,7 @@ function doStartBatch() {
     items: lines.map(text => ({ input_text: text })),
     target_duration_sec: Number($('batch-duration').value || 45),
     stop_after: $('batch-stop').value,
+    audio_script_mode: ($('batch-script-mode') && $('batch-script-mode').value) || '',
     concurrency: Number($('batch-concurrency').value || 1),
     model: currentModel(),
     aspect_ratio: (currentProject && currentProject.aspect_ratio) || '9:16',

@@ -35,8 +35,57 @@ class LLMJSONError(LLMError):
 
 
 class LLMMessage(BaseModel):
+    """一条对话消息。
+
+    `content` 既可以是纯文本，也可以是 OpenAI 风格的多模态分片数组
+    （`{"type": "text"}` / `{"type": "image_url"}`）—— 配音阶段要让模型
+    「看着画面写台词」，就必须能把视频抽帧当图片发出去。
+    """
+
     role: str  # "system" | "user" | "assistant"
-    content: str
+    content: str | list[dict[str, Any]]
+
+
+def text_message(role: str, text: str) -> LLMMessage:
+    return LLMMessage(role=role, content=text)
+
+
+def image_message(role: str, text: str, frames: list[tuple[str, str]]) -> LLMMessage:
+    """把「一段正文 + 若干（说明, 图片 URL）」拼成一条多模态消息。
+
+    图片按顺序插在正文后面，每张图前面可以带一句自己的说明
+    （例如「镜头 scene_1_shot_2 的画面」）—— 不标清楚模型就会张冠李戴。
+    """
+    parts: list[dict[str, Any]] = [{"type": "text", "text": text}]
+    for label, url in frames:
+        if label:
+            parts.append({"type": "text", "text": label})
+        if url:
+            parts.append({"type": "image_url", "image_url": {"url": url}})
+    return LLMMessage(role=role, content=parts)
+
+
+def message_text(message: LLMMessage) -> str:
+    """取出消息里的文字部分（忽略图片）—— 记账 / 假 provider / 日志用。"""
+    content = message.content
+    if isinstance(content, str):
+        return content
+    chunks = [
+        str(part.get("text") or "")
+        for part in content
+        if isinstance(part, dict) and part.get("type") == "text"
+    ]
+    return "\n".join(chunk for chunk in chunks if chunk)
+
+
+def message_image_count(message: LLMMessage) -> int:
+    """消息里带了几张图（测试与成本估算用）。"""
+    content = message.content
+    if isinstance(content, str):
+        return 0
+    return sum(
+        1 for part in content if isinstance(part, dict) and part.get("type") == "image_url"
+    )
 
 
 class LLMProvider(ABC):

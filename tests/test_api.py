@@ -416,6 +416,48 @@ def test_audio_endpoints_full_flow(client):
     assert client.get(f"/api/projects/{pid}/audio/不存在的条目").status_code == 404
 
 
+def test_audio_script_mode_request(client, monkeypatch):
+    """配音文案模式能通过 API 传下去，非法值被挡在门口，默认不调 LLM。"""
+    from videogen.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "audio_llm_vision", False)
+    pid = prepare_confirmed_storyboard(client)
+    assert client.post(f"/api/projects/{pid}/video/generate").status_code == 202
+    wait_video_job(client, pid)
+
+    # 非法模式直接 422（配置笔误不该悄悄花钱）
+    bad = client.post(f"/api/projects/{pid}/audio/generate", json={"script_mode": "fll"})
+    assert bad.status_code == 422
+
+    resp = client.post(
+        f"/api/projects/{pid}/audio/generate",
+        json={"script_mode": "narration", "use_vision": False},
+    )
+    assert resp.status_code == 202, resp.text
+    status = wait_audio_job(client, pid)
+    assert status["job"]["status"] == "succeeded"
+    assert status["manifest"]["script_mode"] == "narration"
+    assert status["manifest"]["script_lines"] > 0
+    assert status["summary"]["script_lines"] > 0
+    # 旁白文案确实被写进了分镜
+    storyboard = client.get(f"/api/projects/{pid}/storyboard").json()
+    assert any(shot.get("voice_script_source") == "llm:narration" for shot in storyboard["shots"])
+
+    health = client.get("/api/health").json()
+    assert health["audio_script_mode"] == "off"
+    assert "audio_script_model" in health
+
+
+def test_audio_default_does_not_call_llm(client):
+    pid = prepare_confirmed_storyboard(client)
+    assert client.post(f"/api/projects/{pid}/video/generate").status_code == 202
+    wait_video_job(client, pid)
+    assert client.post(f"/api/projects/{pid}/audio/generate", json={}).status_code == 202
+    status = wait_audio_job(client, pid)
+    assert status["manifest"]["script_mode"] == "off"
+    assert status["manifest"]["script_lines"] == 0
+
+
 def test_audio_generate_requires_video(client):
     pid = prepare_confirmed_storyboard(client)
     resp = client.post(f"/api/projects/{pid}/audio/generate")

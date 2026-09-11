@@ -14,7 +14,9 @@ class SelectiveLLM(FakeLLM):
     """遇到带「炸弹」字样的输入就失败：用来验证批量里的部分失败。"""
 
     def _respond(self, messages):
-        if "炸弹" in messages[-1].content and "资深短剧策划" in messages[0].content:
+        from videogen.providers.llm.base import message_text
+
+        if "炸弹" in message_text(messages[-1]) and "资深短剧策划" in message_text(messages[0]):
             from videogen.providers.llm.base import LLMError
 
             raise LLMError("故意失败的项目")
@@ -118,6 +120,33 @@ async def test_batch_runs_video_stage(store):
         assert store.load_project(item.project_id).status == ProjectStatus.VIDEO_READY
         manifest = store.load_video_manifest(item.project_id)
         assert manifest.ready_clips
+
+
+@pytest.mark.asyncio
+async def test_batch_runs_audio_stage_with_llm_script(store, monkeypatch):
+    """批量也能带配音文案模式：语法与单条一致，逐条项目各自记账。"""
+    from videogen.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "audio_llm_vision", False)
+    manager = BatchManager()
+    llm = FakeLLM(voice_text="批量补的旁白")
+    pipeline = build(store, llm)
+    batch = manager.submit(
+        pipeline,
+        [{"input_text": "逆袭", "title": "A"}],
+        stop_after="audio",
+        audio_script_mode="narration",
+        target_duration_sec=30,
+    )
+
+    finished = await wait_batch(manager, batch.id)
+    assert finished.status == BatchStatus.SUCCEEDED
+    item = finished.items[0]
+    assert store.load_project(item.project_id).status == ProjectStatus.AUDIO_READY
+    manifest = store.load_audio_manifest(item.project_id)
+    assert manifest.script_mode == "narration"
+    assert manifest.script_lines > 0
+    assert any(c.script_source == "llm:narration" for c in manifest.clips)
 
 
 @pytest.mark.asyncio

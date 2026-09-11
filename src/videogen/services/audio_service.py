@@ -215,22 +215,44 @@ async def synthesize_all(
         current = manifest.get(clip.id) or clip
         desired_voice = manifest.voice_map.get(current.speaker, settings.tts_voice)
         voice_changed = bool(current.voice) and current.voice != desired_voice
+        # 文案或念法变了也必须重新合成 —— 否则 LLM 改写过的台词会被旧音频盖住
+        text_changed = bool(current.text) and clean_spoken_text(current.text) != clean_spoken_text(
+            clip.text
+        )
+        delivery_changed = (
+            current.rate or "",
+            current.volume or "",
+            current.pitch or "",
+        ) != (clip.rate or "", clip.volume or "", clip.pitch or "")
         if (
             current.status == ClipStatus.READY
             and not voice_changed
+            and not text_changed
+            and not delivery_changed
             and _clip_file_exists(project_dir, current)
         ):
-            continue  # 续跑：已经有音频、音色也没换的不重复花额度
+            continue  # 续跑：已经有音频、音色/文案都没变的不重复花额度
         if voice_changed:
             logger.info(
                 "配音 %s 音色变更（%s -> %s），重新合成", current.id, current.voice, desired_voice
             )
+        if text_changed:
+            logger.info("配音 %s 文案变更，重新合成", current.id)
         current.status = ClipStatus.PENDING
         current.error = ""
         current.media_kind = MediaKind.AUDIO
         current.provider = provider.name
         current.voice = desired_voice
+        current.kind = clip.kind
+        current.speaker = clip.speaker
+        current.speaker_name = clip.speaker_name
+        current.scene_id = clip.scene_id
         current.text = clip.text
+        current.rate = clip.rate
+        current.volume = clip.volume
+        current.pitch = clip.pitch
+        current.note = clip.note
+        current.script_source = clip.script_source
         manifest.upsert(current)
         todo.append(current)
 
@@ -281,6 +303,7 @@ def _collect_lines(
     for shot in storyboard.shots:
         dialogue = clean_spoken_text(shot.dialogue_text)
         narration = clean_spoken_text(shot.narration)
+        direction = shot.voice_direction
         if dialogue:
             if narration:
                 manifest.warnings.append(
@@ -296,6 +319,11 @@ def _collect_lines(
                     speaker=speaker,
                     speaker_name=_name_of(characters.get(speaker)) if speaker else "",
                     text=dialogue,
+                    rate=direction.rate if direction else "",
+                    volume=direction.volume if direction else "",
+                    pitch=direction.pitch if direction else "",
+                    note=direction.note if direction else "",
+                    script_source=shot.voice_script_source,
                 )
             )
         elif narration:
@@ -308,6 +336,11 @@ def _collect_lines(
                     speaker=NARRATOR,
                     speaker_name="旁白",
                     text=narration,
+                    rate=direction.rate if direction else "",
+                    volume=direction.volume if direction else "",
+                    pitch=direction.pitch if direction else "",
+                    note=direction.note if direction else "",
+                    script_source=shot.voice_script_source,
                 )
             )
     return lines
@@ -330,9 +363,10 @@ async def _synthesize_one(
         clip_id=clip.id,
         text=clip.text,
         voice=clip.voice or settings.tts_voice,
-        rate=settings.tts_rate,
-        volume=settings.tts_volume,
-        pitch=settings.tts_pitch,
+        # 逐条念法优先（LLM 按画面给的建议），否则用全局设置
+        rate=clip.rate or settings.tts_rate,
+        volume=clip.volume or settings.tts_volume,
+        pitch=clip.pitch or settings.tts_pitch,
         output_path=output,
     )
 

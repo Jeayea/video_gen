@@ -26,6 +26,9 @@ def fast_video_settings(monkeypatch):
     monkeypatch.setattr(settings, "tts_retry_backoff_sec", 0.0)
     monkeypatch.setattr(settings, "video_provider", "mock")
     monkeypatch.setattr(settings, "budget_usd", 0.0)
+    # 配音文案：默认关掉，防止本地 .env 打开后让无关用例多调 LLM / 抽帧
+    monkeypatch.setattr(settings, "audio_llm_script", "off")
+    monkeypatch.setattr(settings, "audio_llm_vision", False)
     return settings
 
 

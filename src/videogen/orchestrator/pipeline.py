@@ -3,8 +3,9 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Callable
+from pathlib import Path
 
-from videogen.config import get_settings
+from videogen.config import Settings, get_settings
 from videogen.models.audio import AudioManifest
 from videogen.models.bible import StoryBible
 from videogen.models.compose import ComposeReport
@@ -25,6 +26,7 @@ from videogen.providers.llm.base import LLMProvider
 from videogen.providers.tts.base import TTSProvider
 from videogen.providers.video.base import VideoProvider
 from videogen.services import (
+    audio_script_service,
     audio_service,
     bible_service,
     compose_service,
@@ -36,6 +38,7 @@ from videogen.services import (
 )
 from videogen.utils.ffmpeg import ffmpeg_available
 from videogen.utils.file_store import FileStore
+from videogen.utils.redact import scrub_secrets
 from videogen.utils.text import count_speech_chars
 
 logger = logging.getLogger(__name__)
@@ -727,11 +730,19 @@ class Pipeline:
     # ── 配音阶段 ──────────────────────────────────────────
 
     async def start_audio_generation(
-        self, project_id: str, voice_overrides: dict[str, str] | None = None
+        self,
+        project_id: str,
+        voice_overrides: dict[str, str] | None = None,
+        *,
+        script_mode: str | None = None,
+        use_vision: bool | None = None,
+        force_script: bool | None = None,
     ) -> Job:
         """提交配音后台任务（进度用 audio_status 查）。
 
         `voice_overrides` 可以按角色换音色；换了音色的条目会重新合成（其余续跑）。
+        `script_mode` 覆盖配置里的配音文案模式（off / narration / polish / full），
+        非 off 时会先让 LLM 看着画面写/改文案（会花 LLM 额度）。
         """
         self._reject_if_running(project_id, AUDIO_JOB_KIND, "配音")
 
@@ -747,46 +758,101 @@ class Pipeline:
             if not video or not video.ready_clips:
                 raise PipelineError("没有可用的视频片段，请先生成视频")
 
-            self._guard_budget(
-                project_id,
-                upcoming_usd=cost_service.estimate_audio_usd(storyboard),
-                action="生成配音",
+            settings = get_settings()
+            mode = audio_script_service.normalize_mode(
+                script_mode if script_mode is not None else settings.audio_script_mode
             )
+            upcoming = cost_service.estimate_audio_usd(storyboard)
+            if mode != "off":
+                script_shots = self._script_target_count(storyboard, mode, force=force_script)
+                upcoming += audio_script_service.estimate_voice_script_usd(
+                    script_shots,
+                    frames=audio_script_service.planned_frames(script_shots, settings),
+                )
+            self._guard_budget(project_id, upcoming_usd=upcoming, action="生成配音")
             project.status = ProjectStatus.AUDIO_GENERATING
             self.store.save_project(project)
 
         return self.jobs.submit(
             project_id,
             AUDIO_JOB_KIND,
-            lambda ctx: self._run_audio_job(ctx, project_id, voice_overrides),
+            lambda ctx: self._run_audio_job(
+                ctx,
+                project_id,
+                voice_overrides,
+                script_mode=script_mode,
+                use_vision=use_vision,
+                force_script=force_script,
+            ),
         )
 
+    @staticmethod
+    def _script_target_count(storyboard: Storyboard, mode: str, *, force: bool | None) -> int:
+        """预算门禁用：这一轮大概要处理多少个镜头。"""
+        settings = get_settings()
+        resolved_force = settings.audio_llm_force if force is None else force
+        groups, _ = audio_script_service.script_targets(storyboard, mode, force=resolved_force)
+        return sum(len(shots) for _, shots in groups)
+
     async def _run_audio_job(
-        self, ctx: JobContext, project_id: str, voice_overrides: dict[str, str] | None = None
+        self,
+        ctx: JobContext,
+        project_id: str,
+        voice_overrides: dict[str, str] | None = None,
+        *,
+        script_mode: str | None = None,
+        use_vision: bool | None = None,
+        force_script: bool | None = None,
     ) -> None:
         async with self._lock(project_id):
             project = self.get_project(project_id)
             storyboard = self.store.load_storyboard(project_id) or Storyboard()
             bible = self.store.load_bible(project_id)
+            script = self.store.load_script(project_id)
+            video = self.store.load_video_manifest(project_id)
             provider = self._tts()
             project_dir = self.store.ensure_project_dir(project_id)
             audio_dir = self.store.audio_dir(project_id)
             settings = get_settings()
+            mode = audio_script_service.normalize_mode(
+                script_mode if script_mode is not None else settings.audio_script_mode
+            )
+            existing_audio = self.store.load_audio_manifest(project_id) or AudioManifest()
+            existing_audio.script_mode = mode
 
             def on_progress(manifest: AudioManifest) -> None:
                 self.store.save_audio_manifest(project_id, manifest)
                 done = len(manifest.ready_clips) + len(manifest.failed_clips)
+                total = len(manifest.clips)
                 ctx.set_progress(
                     done=done,
-                    total=len(manifest.clips),
+                    total=total,
                     message=(
-                        f"配音 {done}/{len(manifest.clips)}（成功 {len(manifest.ready_clips)}，"
+                        f"配音 {done}/{total}（成功 {len(manifest.ready_clips)}，"
                         f"失败 {len(manifest.failed_clips)}）"
-                    ),
+                    )
+                    if total
+                    else "配音文案准备中…",
                 )
 
-            existing_audio = self.store.load_audio_manifest(project_id)
-            before_audio = {c.id for c in (existing_audio.ready_clips if existing_audio else [])}
+            # ── 可选：让 LLM 看着真实画面写/改配音文案 ──
+            await self._apply_voice_script(
+                ctx,
+                project,
+                storyboard,
+                script,
+                bible,
+                video,
+                project_dir=project_dir,
+                settings=settings,
+                mode=mode,
+                use_vision=use_vision,
+                force=force_script,
+                manifest=existing_audio,
+                on_progress=on_progress,
+            )
+
+            before_audio = {c.id for c in existing_audio.ready_clips}
             try:
                 manifest = await audio_service.synthesize_all(
                     project,
@@ -799,7 +865,7 @@ class Pipeline:
                     concurrency=settings.tts_concurrency,
                     max_retries=settings.tts_max_retries,
                     retry_backoff_sec=settings.tts_retry_backoff_sec,
-                    existing=self.store.load_audio_manifest(project_id),
+                    existing=existing_audio,
                     voice_overrides=voice_overrides,
                     on_progress=on_progress,
                 )
@@ -848,6 +914,77 @@ class Pipeline:
             )
             if failed and not ready:
                 raise PipelineError(f"全部 {failed} 条配音生成失败，请检查 TTS 配置 / 网络")
+
+    async def _apply_voice_script(
+        self,
+        ctx: JobContext,
+        project: Project,
+        storyboard: Storyboard,
+        script: Script | None,
+        bible: StoryBible | None,
+        video: VideoManifest | None,
+        *,
+        project_dir: Path,
+        settings: Settings,
+        mode: str,
+        use_vision: bool | None,
+        force: bool | None,
+        manifest: AudioManifest,
+        on_progress: Callable[[AudioManifest], None],
+    ) -> None:
+        """配音前置：让 LLM 看着画面写/改文案，把结果写回分镜。
+
+        失败一律降级：文案写不出来就用原文案继续配音，绝不让这一步把配音打死。
+        """
+        if mode == "off":
+            return
+        llm = self._llm(settings.audio_llm_model)
+        ctx.set_progress(done=0, total=0, message=f"生成配音文案（{mode}）…")
+        try:
+            outcome = await audio_script_service.apply_voice_script(
+                llm=llm,
+                project=project,
+                storyboard=storyboard,
+                script=script,
+                bible=bible,
+                video=video,
+                project_dir=project_dir,
+                frames_dir=self.store.frames_dir(project.id),
+                settings=settings,
+                mode=mode,
+                use_vision=use_vision,
+                force=force,
+            )
+        except Exception as exc:  # 文案阶段失败不能阻断配音
+            logger.warning("配音文案阶段失败，改用原文案配音", exc_info=True)
+            manifest.warnings.append(
+                f"配音文案（{mode}）生成失败，已用原文案配音："
+                f"{scrub_secrets(f'{type(exc).__name__}: {exc}')[:200]}"
+            )
+            self.store.save_audio_manifest(project.id, manifest)
+            on_progress(manifest)
+            return
+        finally:
+            self._record_llm_cost(project.id, CostStage.AUDIO, llm)
+
+        manifest.script_mode = outcome.mode
+        manifest.script_model = outcome.model
+        manifest.script_frames += outcome.frames
+        manifest.script_lines += outcome.touched
+        for warning in outcome.warnings:
+            if warning not in manifest.warnings:
+                manifest.warnings.append(warning)
+        log_summary = logger.info if outcome.touched else logger.warning
+        log_summary(
+            "配音文案（%s）：%d 个镜头被写/改，跳过 %d 个已生成的，警告 %d 条",
+            outcome.mode,
+            outcome.touched,
+            outcome.skipped,
+            len(outcome.warnings),
+        )
+        self.store.save_storyboard(project.id, storyboard)
+        self.store.save_audio_manifest(project.id, manifest)
+        on_progress(manifest)
 
     def _settle_audio_status(
         self,
@@ -1098,6 +1235,7 @@ class Pipeline:
         voices: dict[str, str] | None = None,
         overrides: dict | None = None,
         on_stage: Callable[[str], None] | None = None,
+        script_mode: str | None = None,
     ) -> Project:
         """从文本一路跑到成片，**跳过人工确认门控**（批量生产用）。
 
@@ -1128,7 +1266,12 @@ class Pipeline:
             return self.get_project(project_id)
 
         stage("audio")
-        await self._run_audio_job(self._scratch(project_id, AUDIO_JOB_KIND), project_id, voices)
+        await self._run_audio_job(
+            self._scratch(project_id, AUDIO_JOB_KIND),
+            project_id,
+            voices,
+            script_mode=script_mode,
+        )
         if stop_after == "audio":
             return self.get_project(project_id)
 

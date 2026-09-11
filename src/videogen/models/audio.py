@@ -46,6 +46,14 @@ class AudioClip(BaseModel):
     speaker_name: str = ""
     text: str = ""
     voice: str = ""
+    #: 逐条念法（留空 = 用全局设置）。LLM 会根据画面情绪给建议
+    rate: str = ""
+    volume: str = ""
+    pitch: str = ""
+    #: 这条文案的来源："llm:narration" / "llm:polish" / "llm:full"，空 = 分镜原文
+    script_source: str = ""
+    #: LLM 给的写这句的理由（排查/人工核对用，不参与合成）
+    note: str = ""
     status: ClipStatus = ClipStatus.PENDING
     media_kind: MediaKind = MediaKind.AUDIO
     #: 相对项目目录的路径，如 "audio/scene_1_shot_1.mp3"
@@ -76,6 +84,14 @@ class AudioManifest(BaseModel):
     voice_map: dict[str, str] = Field(default_factory=dict)
     #: 音画对齐结果（镜头时长被拉长的记录）
     adjustments: list[DurationAdjustment] = Field(default_factory=list)
+    #: 配音文案模式：off / narration / polish / full（最近一轮）
+    script_mode: str = "off"
+    #: 写文案用的模型（空 = 没调过 LLM）
+    script_model: str = ""
+    #: 累计抽了多少帧发给模型（0 = 纯文本 / 没跑过）
+    script_frames: int = 0
+    #: 累计被 LLM 写/改的条目数
+    script_lines: int = 0
     warnings: list[str] = Field(default_factory=list)
     #: 是否已经把时长对齐回分镜
     aligned: bool = False
@@ -148,6 +164,9 @@ class AudioManifest(BaseModel):
             "duration_sec": self.total_duration_sec,
             "usable": self.is_usable,
             "bgm": self.bgm.title or self.bgm.id if self.bgm else "",
+            "script_mode": self.script_mode,
+            "script_lines": self.script_lines,
+            "script_frames": self.script_frames,
         }
 
 

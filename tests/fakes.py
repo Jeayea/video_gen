@@ -11,7 +11,13 @@ from pydantic import BaseModel
 from videogen.models.audio import BgmTrack
 from videogen.models.video import MediaKind
 from videogen.providers.bgm.base import BgmLibrary
-from videogen.providers.llm.base import LLMError, LLMMessage, LLMProvider
+from videogen.providers.llm.base import (
+    LLMError,
+    LLMMessage,
+    LLMProvider,
+    message_image_count,
+    message_text,
+)
 from videogen.providers.llm.openrouter import OpenRouterProvider
 from videogen.providers.tts.base import (
     GeneratedAudio,
@@ -44,10 +50,14 @@ class FakeLLM(LLMProvider):
         fail_at: str | None = None,
         include_stage_direction: bool = True,
         video_prompt_with_ids: bool = False,
+        voice_text: str = "补写的旁白",
+        voice_empty_shots: set[str] | None = None,
+        voice_rate: str = "-10%",
     ):
         self.scene_duration_sec = scene_duration_sec
         self.scenes = scenes
-        self.fail_at = fail_at  # "bible" | "outline" | "scene:<id>" | "storyboard:<id>"
+        #: "bible" | "outline" | "scene:<id>" | "storyboard:<id>" | "audio_script"
+        self.fail_at = fail_at
         self.include_stage_direction = include_stage_direction
         self.video_prompt_with_ids = video_prompt_with_ids
         self.calls: list[list[LLMMessage]] = []
@@ -55,6 +65,16 @@ class FakeLLM(LLMProvider):
         self.token_estimate = 3
         self.model = "fake-model"
         self.models_used: list[str] = []
+        #: 配音文案相关：返回的文案模板 / 故意留空的镜头 / 给的语速建议
+        self.voice_text = voice_text
+        self.voice_empty_shots = set(voice_empty_shots or ())
+        self.voice_rate = voice_rate
+        #: 配音文案调用里收到的图片总数（验证「真的把画面发过去了」）
+        self.image_count = 0
+        #: 收到过图片的调用次数
+        self.vision_calls = 0
+        #: 配音文案各模式的调用次数
+        self.voice_modes: list[str] = []
 
     # ── LLMProvider 接口 ──────────────────────────────
 
@@ -93,7 +113,7 @@ class FakeLLM(LLMProvider):
     def _record(self, messages: list[LLMMessage], reply: str) -> None:
         """按字符数粗算 token，让成本链路在离线测试里也有数可记。"""
         self.record_usage(
-            input_tokens=sum(len(m.content) for m in messages) // self.token_estimate,
+            input_tokens=sum(len(message_text(m)) for m in messages) // self.token_estimate,
             output_tokens=len(reply) // self.token_estimate + 1,
         )
 
@@ -104,8 +124,8 @@ class FakeLLM(LLMProvider):
             raise LLMError(f"fake failure at {stage}")
 
     def _respond(self, messages: list[LLMMessage]) -> dict:
-        system = messages[0].content
-        user = messages[-1].content
+        system = message_text(messages[0])
+        user = message_text(messages[-1])
 
         # 用各阶段 system prompt 里独一无二的锚点判断，避免误匹配
         if "资深短剧策划" in system:
@@ -129,7 +149,41 @@ class FakeLLM(LLMProvider):
             sid = scene_id.group(1) if scene_id else "scene_1"
             self._maybe_fail(f"scene:{sid}")
             return self._scene(sid)
+        if "配音导演" in system:
+            self._maybe_fail("audio_script")
+            return self._voice_script(messages)
         return {}
+
+    def _voice_script(self, messages: list[LLMMessage]) -> dict:
+        """按用户提示里列出的镜头 id 逐条给文案（可配置留空 / 语速建议）。"""
+        user = message_text(messages[-1])
+        images = message_image_count(messages[-1])
+        self.image_count += images
+        if images:
+            self.vision_calls += 1
+        mode = (
+            "full"
+            if "完整配音文案" in user
+            else "polish"
+            if "改写已有文案" in user
+            else "narration"
+        )
+        self.voice_modes.append(mode)
+
+        lines = []
+        for shot_id in re.findall(r"### 镜头 (\S+?)（", user):
+            if shot_id in self.voice_empty_shots:
+                lines.append({"shot_id": shot_id, "text": "", "note": "刻意留白"})
+                continue
+            lines.append(
+                {
+                    "shot_id": shot_id,
+                    "text": f"{self.voice_text}（{shot_id}）",
+                    "rate": self.voice_rate if mode == "full" else "",
+                    "note": f"{mode} 模式生成",
+                }
+            )
+        return {"lines": lines}
 
     def _bible(self) -> dict:
         return {

@@ -59,6 +59,23 @@ class Settings(BaseSettings):
     #: 配音比镜头长时的最大容忍倍率，超过只告警不裁音频
     audio_align_max_ratio: float = 2.0
 
+    # 配音文案（可选：让 LLM 看着真实画面写/改台词，会额外花 LLM 额度）
+    #: off = 只用分镜里的原文案；narration = 只给没台词的镜头补旁白；
+    #: polish = 只把已有文案改得更口语/更贴画面；full = 补旁白 + 改写 + 念法建议
+    audio_llm_script: str = "off"
+    #: 是否把视频抽帧发给模型（关掉 = 纯文本，便宜但对不上画面）
+    audio_llm_vision: bool = True
+    #: 每个镜头抽几帧（1-3）；帧越多越准也越贵
+    audio_llm_frames_per_shot: int = 1
+    #: 抽帧缩放后的宽度（像素），越小越便宜
+    audio_llm_frame_width: int = 640
+    #: 配音文案单独指定模型（留空 = 用当前 LLM 模型）
+    audio_llm_model: str = ""
+    #: 单句文案的硬上限字符数，超了截断（防止模型写论文）
+    audio_llm_max_chars: int = 60
+    #: 对已经生成过文案的镜头再跑一次（默认跳过，避免重复花钱）
+    audio_llm_force: bool = False
+
     # BGM
     bgm_enabled: bool = True
     bgm_dir: Path = Path("./assets/bgm")
@@ -157,6 +174,20 @@ class Settings(BaseSettings):
     def subtitle_mode(self) -> str:
         mode = (self.compose_subtitle_mode or "soft").strip().lower()
         return mode if mode in {"soft", "burn", "none"} else "soft"
+
+    @property
+    def audio_script_mode(self) -> str:
+        """配音文案模式，非法值一律当成 off（绝不让配置笔误偷偷花钱）。"""
+        mode = (self.audio_llm_script or "off").strip().lower()
+        return mode if mode in {"off", "narration", "polish", "full"} else "off"
+
+    @property
+    def audio_frame_count(self) -> int:
+        return min(3, max(1, int(self.audio_llm_frames_per_shot or 1)))
+
+    @property
+    def audio_frame_width(self) -> int:
+        return min(1600, max(160, int(self.audio_llm_frame_width or 640)))
 
 
 _settings: Settings | None = None

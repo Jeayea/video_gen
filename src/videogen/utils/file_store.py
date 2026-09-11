@@ -228,6 +228,8 @@ class FileStore:
         if video:
             self.remove_artifact(project_id, "video_manifest")
             shutil.rmtree(directory / "clips", ignore_errors=True)
+            # 抽帧是从片段里来的，片段没了帧也必须一起走
+            shutil.rmtree(directory / "frames", ignore_errors=True)
         if audio:
             self.remove_artifact(project_id, "audio_manifest")
             shutil.rmtree(directory / "audio", ignore_errors=True)
@@ -266,6 +268,12 @@ class FileStore:
     def refs_dir(self, project_id: str) -> Path:
         """角色参考图目录（角色一致性用）。"""
         d = self.ensure_project_dir(project_id) / "refs"
+        d.mkdir(exist_ok=True)
+        return d
+
+    def frames_dir(self, project_id: str) -> Path:
+        """视频抽帧目录（配音文案让 LLM 看画面用）。"""
+        d = self.ensure_project_dir(project_id) / "frames"
         d.mkdir(exist_ok=True)
         return d
 

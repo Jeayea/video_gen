@@ -7,7 +7,13 @@ from videogen.models.storyboard import ShotDraft
 from videogen.models.world_state import WorldStateDelta
 from videogen.utils.coerce import coerce_int
 
-__all__ = ["OutlineResponse", "SceneResponse", "ShotsResponse"]
+__all__ = [
+    "OutlineResponse",
+    "SceneResponse",
+    "ShotsResponse",
+    "VoiceLineDraft",
+    "VoiceScriptResponse",
+]
 
 
 class OutlineResponse(BaseModel):
@@ -56,6 +62,37 @@ class ShotsResponse(BaseModel):
     shots: list[ShotDraft] = Field(default_factory=list)
 
     @field_validator("shots", mode="before")
+    @classmethod
+    def _none_to_empty(cls, value: object) -> object:
+        if value is None:
+            return []
+        if isinstance(value, dict):
+            return [value]
+        return value
+
+
+class VoiceLineDraft(BaseModel):
+    """配音文案（LLM 看着画面写/改出来的一句）。
+
+    - `text` 为空字符串表示「这个镜头刻意留白，不要配音」
+    - `rate` / `volume` / `pitch` 是念法建议，格式随便写（"+10%"、"稍慢"），
+      上层会解析成 edge-tts 认的 `+N%` / `+NHz`，解析不出来就用全局设置
+    """
+
+    shot_id: str = ""
+    text: str = ""
+    rate: str = ""
+    volume: str = ""
+    pitch: str = ""
+    note: str = ""
+
+
+class VoiceScriptResponse(BaseModel):
+    """单场配音文案的期望输出。"""
+
+    lines: list[VoiceLineDraft] = Field(default_factory=list)
+
+    @field_validator("lines", mode="before")
     @classmethod
     def _none_to_empty(cls, value: object) -> object:
         if value is None:

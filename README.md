@@ -16,6 +16,7 @@
 | 视频片段生成 | ✅ | `VideoProvider` 抽象：`mock`（免费占位片段）+ `openrouter`（**真实视频模型**，默认 MiniMax H3） |
 | 配音 TTS | ✅ | `TTSProvider` 抽象 + `EdgeTTSProvider`（真实中文配音）+ `MockTTSProvider`（离线） |
 | 音画对齐 | ✅ | 配音比镜头长时按配音**拉长镜头**，合成时冻结末帧补足，不重烧视频额度 |
+| 配音文案（LLM 看画面写/改） | ✅ | `AUDIO_LLM_SCRIPT=off\|narration\|polish\|full`，把片段抽帧发给多模态 LLM 写旁白/改台词，结果写回分镜 |
 | BGM 曲库 | ✅ | 扫 `BGM_DIR` + `bgm.json` 元数据，按镜头情绪自动选曲 |
 | FFmpeg 合成 + 字幕 | ✅ | 分段渲染 → concat → BGM 混音 → 字幕（soft 内嵌 / burn 烧录 / none 只导 srt） |
 | 后台任务队列 | ✅ | 提交即返回 job id，进度查询 / 取消 / 单项目互斥 / 重启恢复 |
@@ -158,6 +159,38 @@ ffmpeg 会报错的滤镜图。切换这个开关会让分段重新渲染。
 （`-19.5dB`）一样响，所以 `-20dB` 的衰减是必要的；混音后两次成片的音频**残差为 -49.7dB**，
 即环境音落在人声下面约 26dB —— 有氛围但不盖对白。想更"在场"可试 `-12 ~ -14dB`。
 
+## 配音文案（让 LLM 看着画面写台词）
+
+分镜里没台词的镜头，过去是「静默镜头」；打开这个开关后，会把**真实视频片段的抽帧**连同
+分镜与剧本一起发给多模态 LLM，让它写旁白、把台词改得更口语，并给出逐句念法建议。
+
+| 模式 | 做什么 | 花什么 |
+|------|--------|--------|
+| `off`（默认） | 只用分镜里的原文案 | 0 |
+| `narration` | 只给「没台词也没旁白」的镜头补旁白 | 一次 LLM 调用/场 |
+| `polish` | 只把已有台词/旁白改得更口语、更贴画面 | 一次 LLM 调用/场 |
+| `full` | 补旁白 + 改写 + 念法建议（`rate`/`volume`/`pitch`） | 一次 LLM 调用/场 |
+
+```bash
+# .env：让 LLM 给所有没台词的镜头补旁白（关掉抽帧更便宜）
+AUDIO_LLM_SCRIPT=narration
+AUDIO_LLM_VISION=true
+AUDIO_LLM_FRAMES_PER_SHOT=1
+```
+
+实现要点（都是些踩过的坑）：
+
+- **按场调用**而不是整片一次：一场 2-5 个镜头，图不会堆成一大坨，单场失败也只影响一场
+- **结果写回分镜**：`shot.narration / dialogue_text` 直接被改写，字幕因此自动跟着新文案走；
+  原文留在 `shot.voice_script_original` 里可人工核对
+- **同模式重跑跳过**：镜头带 `voice_script_source=llm:<mode>` 标记，重跑不再花钱；
+  想重新生成用 `force_script=true`（UI 有勾选框）
+- **抽帧缓存**在 `projects/<id>/frames/<shot>.jpg`，片段作废时一起清掉
+- **念法解析**：模型随口写「慢 10%」也能解析成 `+10%`，超出范围会夹到 `-50%~+100%`
+- **一律降级**：模型漏镜头、返回坏 JSON、抽帧失败、甚至整段调用失败，都只记 warning
+  然后用原文案继续配音 —— 文案阶段永远不会把配音打死
+- 文案改动会**触发重新合成该条配音**（否则旧音频会盖住新文案），并作废旧成片
+
 ## API
 
 | 方法 | 路径 | 说明 |
@@ -182,7 +215,7 @@ ffmpeg 会报错的滤镜图。切换这个开关会让分段重新渲染。
 | GET | `/api/projects/{id}/video/manifest` | 只取片段清单 |
 | POST | `/api/projects/{id}/video/cancel` | 取消正在跑的视频任务 |
 | GET | `/api/projects/{id}/clips/{shot_id}` | 取某个镜头的视频文件（路径经越界校验） |
-| POST | `/api/projects/{id}/audio/generate` | **提交配音任务**（202 + job；body 可带 `voices` 换音色） |
+| POST | `/api/projects/{id}/audio/generate` | **提交配音任务**（202 + job；body 可带 `voices` 换音色、`script_mode`/`use_vision`/`force_script` 控制 LLM 文案） |
 | GET | `/api/projects/{id}/audio/status` · `/audio/manifest` | 配音进度 / 清单（含音色表、对齐记录） |
 | POST | `/api/projects/{id}/audio/cancel` | 取消配音任务 |
 | GET | `/api/projects/{id}/audio/{clip_id}` | 试听某条配音 |
@@ -208,7 +241,8 @@ src/videogen/
 ├── main.py                   # FastAPI 入口（静态 UI / 可选 token 鉴权 / 错误映射）
 ├── models/                   # 数据模型（容错校验器、llm_io schema、video / audio / compose）
 ├── services/                 # bible / script / storyboard / consistency / video / audio
-│                             #   / subtitle（SRT 时间轴）/ compose（FFmpeg 合成）/ cost（记账）
+│                             #   / audio_script（LLM 看画面写配音文案）/ subtitle（SRT 时间轴）
+│                             #   / compose（FFmpeg 合成）/ cost（记账）
 ├── providers/llm/            # LLMProvider 抽象 + OpenRouter 实现（JSON 修复 + schema 重试）
 ├── providers/video/          # VideoProvider 抽象 + MockVideoProvider（ffmpeg 占位视频）
 ├── providers/tts/            # TTSProvider 抽象 + EdgeTTSProvider + MockTTSProvider
@@ -243,6 +277,10 @@ src/videogen/
   才混（没有 ffprobe 就明确降级并告警，不猜）
 - **字幕时间轴与成片一致**：SRT 按分段时长累加生成，每条字幕只覆盖「说话的那几秒」，
   默认字号 = `min(宽,高) × 5%`（竖屏 1080 宽 ≈ 54px）
+- **LLM 不掺和「最后一句」**：配音文案阶段只负责写/改文本，音色、时长对齐、字幕时间轴
+  仍然由确定性代码算；文案写坏了最多是「这句不好听」，不会让成片对不上轴
+- **多模态消息**：`LLMMessage.content` 支持 `str` 或 OpenAI 风格分片数组，
+  抽帧以 data URL 形式发送；文字部分用 `message_text()` 取，记账/日志不会被图片干扰
 
 ## 已知限制
 
@@ -256,6 +294,9 @@ src/videogen/
 7. **真实视频模型的固有约束**：最短 5 秒（H3）、不支持 seed、取消不退款；
    真实画面质量取决于 prompt，本项目只负责把参数与流程接对
 8. UI 没有鉴权登录页，`API_TOKEN` 通过 `?token=` 或 `localStorage` 传递
+9. **配音文案会改写分镜文本**：`narration` / `polish` / `full` 直接写进分镜（原文留在
+   `voice_script_original`），属于「人工确认后的产物被程序改动」——不想要就别开这个开关
+10. **抽帧是按镜头抽的静态图**：模型看到的是画面而不是运动，动作/运镜类信息它读不到
 
 ## 安全
 

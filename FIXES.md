@@ -311,3 +311,45 @@ COMPOSE_AMBIENT_MODE=under 成片音轨 mean = -23.2 dB（人声没被拉低，n
   与 `normalize=0`、可用性判定（无 ffprobe 降级、片段无音轨降级、off 模式不探测）、
   真实 ffmpeg 混音产物（仍是 1 路视频 + 1 路音频）、
   以及「off → under 必须改变成片字节」（证明分段真的重渲染了）
+
+## v0.9 — 配音文案交给多模态 LLM（看画面写/改台词）
+
+### 背景
+
+分镜里没台词的镜头以前只能是静默镜头；用户问的正是「TTS 能不能也调用 LLM 根据视频内容生成」。
+能，但关键是**看真实画面**而不是只看文字描述 —— 所以这一版把视频片段抽帧后按多模态消息发出去。
+
+### 新增
+
+| 能力 | 实现 | 位置 |
+|------|------|------|
+| 多模态消息 | `LLMMessage.content` 支持 `str \| list[dict]`；`image_message()` 把（说明, data URL）按顺序插进正文，`message_text()` 取文字部分 | `providers/llm/base.py` |
+| 抽帧 | `extract_frames()`：`-ss` 取 1-3 帧 → `scale=W:-2` → jpg，缓存在 `projects/<id>/frames/`，片段作废时一起清 | `services/audio_script_service.py` |
+| 文案生成 | `apply_voice_script()`：按场分组 → 抽帧 → `chat_json(schema=VoiceScriptResponse)` → 写回分镜 | 同上 |
+| 念法建议 | `rate`/`volume`/`pitch` 解析成 edge-tts 格式（`"慢 10%"` → `+10%`），超范围夹逼 | 同上 |
+| 断点续跑 | 镜头打 `voice_script_source=llm:<mode>` 标记，同模式重跑跳过；`force_script=True` 才重跑 | 同上 |
+| 接线 | 配音任务里先跑文案再合成；token 记到 `CostStage.AUDIO`；预算门禁把文案与 TTS 一起预估 | `orchestrator/pipeline.py` |
+| API/UI | `audio/generate` 支持 `script_mode`/`use_vision`/`force_script`；UI 有模式下拉 + 两个勾选框，逐条显示「LLM 文案」与念法 | `main.py` / `static/index.html` |
+
+### 顺带修掉的两个隐患
+
+1. **文案变了不重新合成**：`synthesize_all` 原先只比较音色，LLM 改过的台词会被旧音频盖住。
+   现在文案 / 念法（rate/volume/pitch）任一变化都会重新合成该条。→ `services/audio_service.py`
+2. **强制重跑形同虚设**：`narration` 模式的候选镜头是「本来就没台词的」，第一轮补完之后
+   就再也选不中了，`force` 无从生效。现在 `force` 会把「本模式补过的旁白」也重新纳入候选。
+   → `services/audio_script_service.py`
+
+### 设计取舍
+
+- **按场调用**而不是整片一次：一场 2-5 个镜头，图片数量可控；单场失败只影响一场
+- **一律降级**：调用失败 / 坏 JSON / 模型漏镜头 / 抽帧失败，都只记 warning 并用原文案继续配音，
+  文案阶段永远不会把配音打死（有专门的测试钉住这条）
+- **结果写回分镜**：好处是字幕自动跟着新文案走、续跑天然幂等；代价是「程序改了人工确认过的产物」，
+  原文留在 `voice_script_original` 供核对，已在 README「已知限制」里写明
+
+### 测试
+
+新增 `tests/test_audio_script.py`（33 个用例）：念法解析 / 超长截断 / 目标筛选 / 写回与标记 /
+失败降级 / 记账口径 / 第二轮不重复花钱 / force 重跑 / 文案变更触发重合成 / 真实抽帧（需要 ffmpeg）/
+设置来源 / API 参数与 422。`FakeLLM` 增加配音文案阶段（含「收到几张图」的计数），
+`conftest` 默认把文案模式设成 `off`，本地 `.env` 打开也不会污染用例。

@@ -441,6 +441,8 @@ class VideoProvider(ABC):
 - 每个有 `dialogue_text` 或 `narration` 的 shot 生成一段语音
 - 角色可分配不同 voice_id（先简单映射，后续支持音色克隆）
 - MVP 用 Edge-TTS（免费）或 OpenAI TTS
+- 文案来源可以是分镜原文，也可以是 LLM 看着画面写的（v0.9，见 §10）：
+  抽帧 → 多模态 `chat_json` → 写回 `shot.narration / dialogue_text` + 念法建议 → 再合成
 
 **BGM**
 - MVP：本地免版税曲库 + 按 `mood` 标签匹配
@@ -562,7 +564,7 @@ FFMPEG_PATH=ffmpeg
 
 ---
 
-## 10. 实现状态（v0.8，2026-09-11 更新）
+## 10. 实现状态（v0.9，2026-09-11 更新）
 
 ### 已落地
 
@@ -596,13 +598,19 @@ FFMPEG_PATH=ffmpeg
   `OPENROUTER_VIDEO_MODEL=minimax/hailuo-3`（MiniMax H3）。走 OpenRouter 统一的异步视频接口，
   参数按模型能力自动对齐（时长档位/分辨率/比例/seed/参考图），单价从价目表读并与预算门控联动
 
+- **配音文案交给多模态 LLM（v0.9）**：`AUDIO_LLM_SCRIPT=off|narration|polish|full`。
+  视频片段抽帧 → 与故事圣经/剧本/分镜一起发给多模态模型 → 写回 `shot.narration / dialogue_text`，
+  并可给逐句念法（`rate`/`volume`/`pitch`）。按场调用、断点续跑（同模式不重复花钱）、
+  任何失败都降级用原文案继续配音；token 记在 `CostStage.AUDIO` 并纳入预算门禁
+
 ### 尚未实现（后续可做）
 
 - 多模型**对比留档**（同一阶段两个模型的产物并排对比）：目前只支持切换与记账
 - 分镜阶段的「模型时长档位感知」：现在由 provider 抬到最短档再裁切，
   更省钱的写法是分镜直接产出 ≥5 秒的镜头（少而长）
 - 任务/批量状态仅在进程内存里（项目状态已落盘，重启会自动回收）
-- 一个镜头多音轨混音、配音情感/语速的逐句覆盖
+- 一个镜头多音轨混音
+- 视频**运动**信息进入文案生成：现在只抽静态帧，动作/运镜读不到
 
 > §2.3 的目录结构是目标形态，当前实际结构见 [README.md](README.md#代码结构)；
 > 问题审计与修复记录见 [REVIEW.md](REVIEW.md) 与 [FIXES.md](FIXES.md)。
