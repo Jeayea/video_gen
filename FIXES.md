@@ -289,6 +289,21 @@ pytest -q              → 71 passed
 现在 `conftest` 的 autouse fixture 强制 `video_provider=mock`、`budget_usd=0`、退避归零，
 测试与付费服务彻底隔离；需要真实 provider 的用例自己用 `httpx.MockTransport` 打桩。
 
+### 实测（用真实 H3 片段，本地 ffmpeg，零 API 费用）
+
+```
+H3 片段自带环境音   mean = -19.3 dB  peak = -1.2 dB   ← 几乎和人声一样响！
+Edge-TTS 人声        mean = -19.5 dB  peak = -5.9 dB
+COMPOSE_AMBIENT_MODE=off   成片音轨 mean = -23.2 dB
+COMPOSE_AMBIENT_MODE=under 成片音轨 mean = -23.2 dB（人声没被拉低，normalize=0 生效）
+两次成片音频相减的残差 = -49.7 dB（peak -29.3 dB）
+```
+
+残差比 16bit 量化噪声（-91dB）高 41dB → 环境音确实混进去了，且落在人声下面约 26dB。
+
+**调参建议**：H3 自带音轨本身很响，`-20 dB` 是保证对白清晰的安全默认；
+想要环境音更"在场"可以试 `-12 ~ -14 dB`。`off` 依旧是完全丢弃。
+
 ### 验证
 
 - `ruff check src tests` 全绿；`pytest -q` **281 passed**
