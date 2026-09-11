@@ -472,7 +472,10 @@ curl -s localhost:8001/api/projects/$PID/voices | python3 -m json.tool
 分镜提示词也同步收紧：情绪镜头优先中景/近景（大特写会让模型把表情演成舞台剧）、
 一个镜头只写一个连续动作、表演用克制的词（subtle / restrained）。
 
-## 剧本严谨：能确定性修的就别让人看
+## 剧本严谨：两层检查 + 拦确认
+
+**第一层：确定性修复**（不花 LLM、不改创作）
+
 
 `consistency_service.repair_storyboard()` 在分镜生成后、校验前跑一遍，修掉**不需要创作者决策**
 的问题：
@@ -482,6 +485,22 @@ curl -s localhost:8001/api/projects/$PID/voices | python3 -m json.tool
   本身就是穿帮。真实项目里 15 个镜头有 3 个中招
 
 不修的（缺 video_prompt、悬念没闭合、时长异常）仍然照报，留给人工或重新生成。
+
+**第二层：结构校验 + LLM 剧本医生**（`SCRIPT_STRICT` / `SCRIPT_LLM_REVIEW`，默认都开）
+
+| 检查 | 级别 | 判据 |
+|---|---|---|
+| 空场（既无台词也无概述） | ERROR | 机器一定能看出来 |
+| 相邻两场内容一字不差（纯注水） | ERROR | 机器一定能看出来 |
+| LLM 剧本医生报的硬伤 | ERROR/WARNING | 钩子 / 目标与阻力 / 转折 / 高潮 / 收束 / 因果链 / 人物动机 |
+| 结尾仍以悬念问句收尾 | WARNING | 正常台词里问句很多，**不能**当证据拦人 |
+| 全剧找不到对抗语汇 | WARNING | 同上，只是提示「可能没戏」 |
+| 时间线倒退、悬念未闭合 | WARNING/INFO | 见 `world_state` |
+
+**ERROR 会拦住「确认剧本 / 确认分镜」**，错误信息直接给出问题与建议；
+确认没问题可以带 `force=true` 强制继续（UI 会先弹原因再问你是否强制）。
+LLM 评审失败一律降级（只记 warning），绝不会因为它把生成链路打死 ——
+评审的 token 与生成合并记在同一条 `script` 账里。
 
 ## API
 

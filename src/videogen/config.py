@@ -72,6 +72,11 @@ class Settings(BaseSettings):
     #: 允许给角色选方言音色（例如东北话/陕西话）。默认不允许：同一部戏里混口音很出戏，
     #: 宁可「复用通用音色 + 音高区分」也不给主角上方言
     tts_allow_accent_voices: bool = False
+    # 剧本严格模式：结构硬伤（空场/重复场/结尾悬着/缺冲突/LLM 评审报 error）会阻止「确认剧本」，
+    # 需要 force=true 才能强制确认
+    script_strict: bool = True
+    #: 生成剧本后让 LLM 当一次剧本医生（结构/因果/动机），多花一次 LLM 调用（≈$0.001）
+    script_llm_review: bool = True
     tts_timeout_sec: float = 60.0
     #: 每句对白后面留的呼吸时间（秒），用于音画对齐
     audio_gap_sec: float = 0.25

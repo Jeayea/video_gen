@@ -850,3 +850,32 @@ scene_4_shot_4: 旧=另一个人 → 新=同一张脸 + 后期造型（桂冠/�
 复用+念法、性别冲突重配、年龄不匹配重配、音色池空则保留、方言默认禁用、确定性、
 未知说话人兜底），`test_video.py` 补 3 例（camera/mood 英文化、表演规范、未收录词丢弃），
 `test_consistency.py` 补 2 例（修复 presence、不猜未知说话人）。全套 **440 passed**，ruff clean。
+
+### 4. 剧本严谨：严格模式拦确认 + LLM 剧本医生
+
+第一层是确定性检查（不花钱）：
+
+| 检查 | 级别 | 判据 |
+|---|---|---|
+| 空场（无台词无概述） | ERROR（严格模式） | 机器一定能看出 |
+| 相邻两场内容一字不差 | ERROR（严格模式） | 一定是注水，没推进 |
+| 结尾仍以悬念问句收尾 | **WARNING（永远）** | 正常台词里问句太多，当证据会误伤 |
+| 全剧找不到对抗语汇 | **WARNING（永远）** | 只是「可能没戏」的提示 |
+
+> 设计取舍记一笔：最初把后两条也做成 ERROR，结果 13 个既有用例全被拦下 ——
+> 说明它们**不是证据**。现在只有「机器一定能判定」的问题才够格阻止确认。
+
+第二层是 LLM 剧本医生 `script_service.review_structure()`：按钩子 / 目标与阻力 /
+转折 / 高潮 / 收束 / 因果链 / 人物动机 逐项审，只报可执行的硬伤（最多 6 条），
+`severity=error` 的会阻止确认。评审失败一律降级记 warning；评审的 token 与剧本生成
+合并记在同一条 `script` 账里。
+
+确认被拦时：`POST /script/confirm` 返回 400 + 具体问题与建议，body 带
+`{"force": true}` 可强制继续（UI 先弹出原因再问你是否强制）。配置：
+`SCRIPT_STRICT=true`（严格模式开关）、`SCRIPT_LLM_REVIEW=true`（是否调剧本医生）。
+
+### 测试（v0.14 汇总）
+
+`test_voice_catalog.py` 14 例 + `test_video.py` 3 例 + `test_consistency.py` 6 例
+（含严格模式：重复场 ERROR、问句结尾只 WARNING、空场 ERROR、confirm 被拦 + force 放行）。
+全套 **444 passed**，ruff clean。

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import itertools
 import re
 
 from videogen.models.bible import StoryBible
@@ -36,8 +37,14 @@ def validate_script(
     bible: StoryBible,
     world_state: WorldState | None = None,
     target_duration_sec: int = 0,
+    *,
+    strict: bool = False,
 ) -> ConsistencyReport:
-    """检查剧本与故事圣经之间的一致性。"""
+    """检查剧本与故事圣经之间的一致性。
+
+    `strict=True`（`SCRIPT_STRICT`，默认开）时，**结构硬伤**会升级成 ERROR ——
+    ERROR 会让「确认剧本」被拒绝（可 force 跳过）。
+    """
     issues: list[ConsistencyIssue] = []
     known_names = bible.all_names()
     known_ids = {c.id for c in bible.characters}
@@ -46,14 +53,123 @@ def validate_script(
         issues.extend(_check_dialogue_speakers(scene, known_ids))
         issues.extend(_check_names_in_text(scene, known_names))
         issues.extend(_check_numbers(scene, bible))
-        issues.extend(_check_scene_content(scene))
+        issues.extend(_check_scene_content(scene, strict=strict))
 
     issues.extend(_check_timeline(script))
+    issues.extend(_check_structure(script, strict=strict))
     issues.extend(_check_duration(script, target_duration_sec))
     if world_state:
         issues.extend(_check_world_state_open_threads(world_state))
 
     return ConsistencyReport(stage="script", issues=issues)
+
+
+def has_errors(report: ConsistencyReport | None) -> list[ConsistencyIssue]:
+    """报告里 severity=error 的条目（确认阶段的拦截依据）。"""
+    if report is None:
+        return []
+    return [issue for issue in report.issues if issue.severity == IssueSeverity.ERROR]
+
+
+#: 结尾出现这些标记，说明「悬念/问题」还挂着没收
+_OPEN_END_MARKERS = ("？", "?", "未完", "待续", "究竟", "到底", "会如何", "悬念")
+
+
+def _check_structure(script: Script, *, strict: bool = False) -> list[ConsistencyIssue]:
+    """结构硬伤（确定性可判的部分）。
+
+    钩子/转折/高潮这类需要读故事才能判断的，交给 `script_service.review_structure`
+    的 LLM 评审；这里只抓「机器一定能看出来」的：
+
+    - 相邻场内容完全重复（= 这场不推进，纯注水）
+    - 结尾一场还挂着未闭合的问题/悬念标记（= 故事没落地）
+    - 场次之间没有任何冲突语汇（= 平铺直叙，缺少对抗）
+    """
+    issues: list[ConsistencyIssue] = []
+    scenes = script.scenes
+    if not scenes:
+        return issues
+
+    # 只有「精确证据」才够格拦确认（相邻场一模一样 = 一定没推进）；
+    # 「结尾带问号」「找不到冲突词」是提示级线索 —— 正常台词里问句很常见，
+    # 拿它当 ERROR 会把好剧本也拦住，所以永远是 WARNING
+    hard = IssueSeverity.ERROR if strict else IssueSeverity.WARNING
+
+    for previous, current in itertools.pairwise(scenes):
+        before = _scene_text(previous)
+        after = _scene_text(current)
+        if before and before == after:
+            issues.append(
+                ConsistencyIssue(
+                    severity=hard,
+                    scene_id=current.id,
+                    category="structure",
+                    message=f"场次 {current.id} 与上一场内容完全相同，剧情没有推进",
+                    suggestion="删掉重复场次，或写出新的信息/冲突/转折",
+                )
+            )
+
+    last = scenes[-1]
+    tail = _scene_text(last)
+    if any(marker in tail for marker in _OPEN_END_MARKERS):
+        issues.append(
+            ConsistencyIssue(
+                severity=IssueSeverity.WARNING,
+                scene_id=last.id,
+                category="structure",
+                message=f"结尾场次 {last.id} 仍以悬念/问题收尾，故事没有落地",
+                suggestion="补一个收束性的结尾（结果/代价/新常态），悬念留给下一季也要先收当前这条线",
+            )
+        )
+
+    if len(scenes) >= 3:
+        all_text = " ".join(_scene_text(scene) for scene in scenes)
+        if not any(word in all_text for word in _CONFLICT_WORDS):
+            issues.append(
+                ConsistencyIssue(
+                    severity=IssueSeverity.WARNING,
+                    category="structure",
+                    message="全剧找不到任何对抗/冲突语汇，故事可能平铺直叙",
+                    suggestion="至少给主角一个明确的目标与阻力（对手、期限、代价）",
+                )
+            )
+    return issues
+
+
+def _scene_text(scene: Scene) -> str:
+    """一场戏的可比文本（概述 + 台词 + 情绪）——用于「是否重复/是否推进」判断。"""
+    return " ".join(
+        str(part or "").strip()
+        for part in (
+            scene.summary,
+            scene.emotion,
+            " ".join(line.line for line in scene.dialogue),
+        )
+    ).strip()
+
+
+#: 冲突/对抗语汇（粗线索，只用来提示「可能没有戏」）
+_CONFLICT_WORDS = (
+    "拒绝",
+    "反对",
+    "阻止",
+    "争夺",
+    "抢",
+    "威胁",
+    "逼迫",
+    "背叛",
+    "揭穿",
+    "反击",
+    "报复",
+    "打压",
+    "竞争",
+    "对峙",
+    "冲突",
+    "吵",
+    "怒",
+    "恨",
+    "不甘",
+)
 
 
 def repair_storyboard(
@@ -266,11 +382,11 @@ def _check_names_in_text(scene: Scene, known_names: set[str]) -> list[Consistenc
     return issues
 
 
-def _check_scene_content(scene: Scene) -> list[ConsistencyIssue]:
+def _check_scene_content(scene: Scene, *, strict: bool = False) -> list[ConsistencyIssue]:
     if not scene.dialogue and not scene.summary:
         return [
             ConsistencyIssue(
-                severity=IssueSeverity.WARNING,
+                severity=IssueSeverity.ERROR if strict else IssueSeverity.WARNING,
                 scene_id=scene.id,
                 category="presence",
                 message="场景内容为空",

@@ -14,7 +14,7 @@ from videogen.models.bible import Character, StoryBible
 from videogen.models.project import Project, ProjectStatus
 from videogen.models.script import Scene, Script
 from videogen.models.storyboard import Shot, Storyboard
-from videogen.orchestrator.pipeline import Pipeline
+from videogen.orchestrator.pipeline import Pipeline, PipelineError
 from videogen.services import consistency_service, video_service
 from videogen.utils.ffmpeg import ffmpeg_available
 from videogen.utils.file_store import FileStore
@@ -203,6 +203,84 @@ async def test_mock_provider_tints_by_reference_image(tmp_path):
         )
     )
     assert clip_a.path.read_bytes() != clip_b.path.read_bytes()
+
+
+# ── 严格模式：结构硬伤拦确认 ─────────────────────────
+
+
+def _script(*scenes: Scene) -> Script:
+    return Script(title="t", scenes=list(scenes))
+
+
+def test_strict_mode_flags_duplicate_scene_as_error():
+    script = _script(
+        Scene(id="scene_1", heading="INT. 办公室 - 日", summary="林悦被裁员"),
+        Scene(id="scene_2", heading="INT. 办公室 - 日", summary="林悦被裁员"),  # 一字不差
+    )
+    bible = StoryBible(characters=[Character(id="char_1", name="林悦", role="主角")])
+
+    lenient = consistency_service.validate_script(script, bible)
+    strict = consistency_service.validate_script(script, bible, strict=True)
+
+    assert not consistency_service.has_errors(lenient)  # 宽松模式只提示
+    errors = consistency_service.has_errors(strict)
+    assert errors and any("没有推进" in issue.message for issue in errors)
+
+
+def test_strict_mode_keeps_question_ending_as_warning_only():
+    """结尾带问号**不能**拦确认 —— 正常台词里问句太多了，这是提示不是证据。"""
+    script = _script(
+        Scene(id="scene_1", heading="INT. - 日", summary="她决定反击"),
+        Scene(id="scene_2", heading="INT. - 夜", summary="她真的能翻盘吗？"),  # 结尾悬着
+    )
+    bible = StoryBible(characters=[Character(id="char_1", name="林悦", role="主角")])
+    report = consistency_service.validate_script(script, bible, strict=True)
+    assert not consistency_service.has_errors(report)
+    hints = [i for i in report.issues if i.category == "structure"]
+    assert hints and all(i.severity.value == "warning" for i in hints)
+
+
+def test_strict_mode_flags_empty_scene_as_error():
+    script = _script(
+        Scene(id="scene_1", heading="INT. - 日", summary="有内容"),
+        Scene(id="scene_2", heading="INT. - 日"),  # 空场
+    )
+    bible = StoryBible(characters=[Character(id="char_1", name="林悦", role="主角")])
+    report = consistency_service.validate_script(script, bible, strict=True)
+    assert any(i.severity.value == "error" for i in consistency_service.has_errors(report))
+    lenient = consistency_service.validate_script(script, bible)
+    assert not consistency_service.has_errors(lenient)
+
+
+@pytest.mark.asyncio
+async def test_confirm_script_is_blocked_by_structure_errors(store):
+    """严格模式下有 error 时「确认剧本」被拒；force=true 可以强制继续。"""
+    pipeline = Pipeline(store, llm_factory=lambda: FakeLLM())
+    project = Project(title="t", input_text="测试", target_duration_sec=30)
+    project.status = ProjectStatus.SCRIPT_REVIEW
+    store.save_project(project)
+    store.save_bible(
+        project.id,
+        StoryBible(characters=[Character(id="char_1", name="林悦", role="主角")]),
+    )
+    store.save_script(
+        project.id,
+        _script(
+            Scene(id="scene_1", heading="INT. - 日", summary="同一场"),
+            Scene(id="scene_2", heading="INT. - 日", summary="同一场"),
+        ),
+    )
+    bible = store.load_bible(project.id)
+    report = consistency_service.validate_script(
+        store.load_script(project.id), bible, strict=True
+    )
+    store.save_consistency(project.id, report)
+
+    with pytest.raises(PipelineError, match="结构校验"):
+        await pipeline.confirm_script(project.id)
+
+    project = await pipeline.confirm_script(project.id, force=True)
+    assert project.status == ProjectStatus.SCRIPT_CONFIRMED
 
 
 # ── 确定性修复：说话人不在画面里 ─────────────────────

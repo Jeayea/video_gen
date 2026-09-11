@@ -200,6 +200,12 @@ class ReferenceImageRequest(BaseModel):
     content_base64: str = Field(min_length=1)
 
 
+class ConfirmRequest(BaseModel):
+    """确认剧本/分镜。严格模式拦下时用 `force=true` 强制继续（跳过结构校验）。"""
+
+    force: bool = False
+
+
 class GenerateReferenceRequest(BaseModel):
     """AI 生成角色参考图（会真的调图片模型，按张计费）。"""
 
@@ -474,8 +480,9 @@ async def update_script(project_id: str, data: dict):
 
 
 @app.post("/api/projects/{project_id}/script/confirm")
-async def confirm_script(project_id: str):
-    project = await pipeline.confirm_script(project_id)
+async def confirm_script(project_id: str, req: ConfirmRequest | None = None):
+    """确认剧本。严格模式下有结构 error 会被拦（body `{"force": true}` 可强制）。"""
+    project = await pipeline.confirm_script(project_id, force=bool(req and req.force))
     return {"status": "ok", "project_status": project.status.value}
 
 
@@ -511,8 +518,9 @@ async def update_storyboard(project_id: str, data: dict):
 
 
 @app.post("/api/projects/{project_id}/storyboard/confirm")
-async def confirm_storyboard(project_id: str):
-    project = await pipeline.confirm_storyboard(project_id)
+async def confirm_storyboard(project_id: str, req: ConfirmRequest | None = None):
+    """确认分镜。严格模式下有结构 error 会被拦（body `{"force": true}` 可强制）。"""
+    project = await pipeline.confirm_storyboard(project_id, force=bool(req and req.force))
     return {"status": "ok", "project_status": project.status.value}
 
 

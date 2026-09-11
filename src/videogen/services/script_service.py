@@ -3,7 +3,10 @@ from __future__ import annotations
 import logging
 import re
 
+from pydantic import BaseModel, Field
+
 from videogen.models.bible import StoryBible
+from videogen.models.consistency import ConsistencyIssue, IssueSeverity
 from videogen.models.llm_io import OutlineResponse, SceneResponse
 from videogen.models.project import Project
 from videogen.models.script import (
@@ -189,6 +192,97 @@ async def generate_outline(llm: LLMProvider, project: Project, bible: StoryBible
 
 
 # ── 单场 ─────────────────────────────────────────────
+
+
+REVIEW_SYSTEM = """你是严格的剧本医生（story doctor）。只做一件事：找出这个剧本的故事层硬伤。
+
+逐项检查：
+1. 钩子：开场有没有抓住观众的疑问/危机？
+2. 目标与阻力：主角想要什么？谁/什么在阻止？够不够具体？
+3. 转折：中段有没有让局势**变了**的事件（而不是重复冲突）？
+4. 高潮：矛盾有没有在结尾前被推到最紧并解决？
+5. 收束：结尾有没有交代结果与代价（悬念可以留，但当前这条线要收）？
+6. 因果链：每个场景是不是**因为**上一场才发生？有没有为推进而硬拗的巧合？
+7. 人物动机：角色的关键选择是否符合人设与处境？
+
+要求：
+- 只报**可执行的硬伤**，不要报文风/节奏偏好，不要凑数
+- 每条必须能指出是哪一场（scene_id），没有硬伤就返回空数组
+- severity: "error" = 观众会觉得故事不成立/烂尾；"warning" = 明显薄弱但不致命
+- 最多 6 条，按严重程度排序
+
+只输出 JSON：
+{"issues": [{"severity": "error", "scene_id": "scene_2", "category": "structure",
+             "message": "问题是什么", "suggestion": "怎么改"}]}"""
+
+
+class StructureReview(BaseModel):
+    """LLM 结构评审的返回（宽松解析，模型多写字段也不炸）。"""
+
+    class Item(BaseModel):
+        severity: str = "warning"
+        scene_id: str = ""
+        category: str = "structure"
+        message: str = ""
+        suggestion: str = ""
+
+    issues: list[Item] = Field(default_factory=list)
+
+
+async def review_structure(
+    llm: LLMProvider, script: Script, bible: StoryBible
+) -> list[ConsistencyIssue]:
+    """让 LLM 当剧本医生做一遍结构评审，返回 ERROR/WARNING 级的结构问题。
+
+    这是「故事严谨」里**机器判不了**的那部分（钩子/转折/高潮/因果）。失败一律降级：
+    评审挂了只记 warning，绝不因为它把生成链路打死。
+    """
+    if not script.scenes:
+        return []
+    total = sum(scene.duration_sec for scene in script.scenes)
+    lines = [f"## 目标时长\n{total} 秒 / {len(script.scenes)} 场"]
+    lines.append("## 角色\n" + "；".join(
+        f"{c.id}={c.name}（{c.role}，{c.description[:40]}）" for c in bible.characters
+    ))
+    for scene in script.scenes:
+        dialogue = " / ".join(f"{line.speaker}：{line.line}" for line in scene.dialogue)
+        lines.append(
+            f"## {scene.id}｜{scene.heading}（{scene.duration_sec}s）\n"
+            f"概述：{scene.summary}\n情绪：{scene.emotion}\n台词：{dialogue}"
+        )
+    messages = [
+        LLMMessage(role="system", content=REVIEW_SYSTEM),
+        LLMMessage(role="user", content="\n".join(lines)),
+    ]
+    try:
+        result = await llm.chat_json(
+            messages, schema=StructureReview, temperature=0.2, max_tokens=2048
+        )
+    except Exception:
+        logger.warning("剧本结构评审失败（不影响生成）", exc_info=True)
+        return []
+
+    known = {scene.id for scene in script.scenes}
+    issues: list[ConsistencyIssue] = []
+    for item in result.issues[:6]:
+        message = " ".join(str(item.message or "").split())
+        if not message:
+            continue
+        severity = (
+            IssueSeverity.ERROR
+            if str(item.severity).strip().lower() == "error"
+            else IssueSeverity.WARNING
+        )
+        issues.append(
+            ConsistencyIssue(
+                severity=severity,
+                scene_id=item.scene_id if item.scene_id in known else "",
+                category="structure",
+                message=message,
+                suggestion=" ".join(str(item.suggestion or "").split())[:200],
+            )
+        )
+    return issues
 
 
 async def generate_scene(

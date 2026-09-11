@@ -347,8 +347,14 @@ class Pipeline:
 
             self._guard_budget(project_id, action="生成剧本")
             llm = self._llm(model)
+            review_issues: list = []
             try:
                 script, world_state = await self._run_script_generation(project, bible, llm)
+                # 结构评审：机器判不了的那部分（钩子/转折/高潮/因果）交给 LLM 当剧本医生。
+                # 放在 try 内是为了让 finally 里的记账把两次调用的 token 一起记进 script 阶段；
+                # review_structure 自己吞异常，评审失败不会连累剧本生成
+                if get_settings().script_llm_review:
+                    review_issues = await script_service.review_structure(llm, script, bible)
             except Exception as exc:
                 self._fail(project, "剧本生成")
                 raise PipelineError(f"剧本生成失败：{exc}") from exc
@@ -356,8 +362,21 @@ class Pipeline:
                 self._record_llm_cost(project_id, CostStage.SCRIPT, llm)
 
             report = consistency_service.validate_script(
-                script, bible, world_state, project.target_duration_sec
+                script,
+                bible,
+                world_state,
+                project.target_duration_sec,
+                strict=get_settings().script_strict,
             )
+            if review_issues:
+                report = report.model_copy(
+                    update={"issues": [*report.issues, *review_issues]}
+                )
+                logger.info(
+                    "剧本结构评审：%d 条（其中 error %d 条）",
+                    len(review_issues),
+                    sum(1 for i in review_issues if i.severity.value == "error"),
+                )
             self.store.save_consistency(project_id, report)
 
             project.status = ProjectStatus.SCRIPT_REVIEW
@@ -427,10 +446,28 @@ class Pipeline:
         self.store.save_script(project_id, script)
         return script, world_state
 
-    async def confirm_script(self, project_id: str) -> Project:
+    def _blocking_issues(self, project_id: str, settings: Settings) -> list:
+        """严格模式下的拦路问题（确认阶段用）。"""
+        if not settings.script_strict:
+            return []
+        return consistency_service.has_errors(self.store.load_consistency(project_id))
+
+    def _raise_if_blocked(self, project_id: str, action: str, force: bool) -> None:
+        blocking = self._blocking_issues(project_id, get_settings())
+        if force or not blocking:
+            return
+        head = "；".join(f"[{i.category}] {i.message}" for i in blocking[:3])
+        more = f"（另有 {len(blocking) - 3} 条）" if len(blocking) > 3 else ""
+        raise PipelineError(
+            f"{action}被结构校验拦下：{head}{more}。"
+            "先按建议修改（或重新生成），确认没问题可加 force=true 强制继续"
+        )
+
+    async def confirm_script(self, project_id: str, *, force: bool = False) -> Project:
         async with self._lock(project_id):
             project = self.get_project(project_id)
             self._require(project, CONFIRM_SCRIPT_STATUSES, "确认剧本")
+            self._raise_if_blocked(project_id, "确认剧本", force)
             project.status = ProjectStatus.SCRIPT_CONFIRMED
             self.store.save_project(project)
             return project
@@ -496,7 +533,11 @@ class Pipeline:
                 self.store.save_storyboard(project_id, storyboard)
                 logger.info("分镜自动修复 %d 处：%s", len(repairs), "；".join(repairs))
             script_report = consistency_service.validate_script(
-                script, bible, self.store.load_world_state(project_id), project.target_duration_sec
+                script,
+                bible,
+                self.store.load_world_state(project_id),
+                project.target_duration_sec,
+                strict=get_settings().script_strict,
             )
             issues = consistency_service.validate_storyboard(storyboard, script, bible)
             report = consistency_service.merge_storyboard_issues(script_report, issues)
@@ -563,10 +604,11 @@ class Pipeline:
         self.store.save_storyboard(project_id, storyboard)
         return storyboard
 
-    async def confirm_storyboard(self, project_id: str) -> Project:
+    async def confirm_storyboard(self, project_id: str, *, force: bool = False) -> Project:
         async with self._lock(project_id):
             project = self.get_project(project_id)
             self._require(project, CONFIRM_STORYBOARD_STATUSES, "确认分镜")
+            self._raise_if_blocked(project_id, "确认分镜", force)
             # 只表示「分镜已确认」。视频/配音/合成阶段尚未实现，不虚报 VIDEO_READY
             project.status = ProjectStatus.STORYBOARD_CONFIRMED
             self.store.save_project(project)
