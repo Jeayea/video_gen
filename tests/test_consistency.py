@@ -189,7 +189,7 @@ async def test_mock_provider_tints_by_reference_image(tmp_path):
             prompt="p",
             duration_sec=1,
             output_path=tmp_path / "a.mp4",
-            reference_image=ref_a,
+            reference_images=[ref_a],
         )
     )
     clip_b = await provider.generate(
@@ -198,7 +198,7 @@ async def test_mock_provider_tints_by_reference_image(tmp_path):
             prompt="p",
             duration_sec=1,
             output_path=tmp_path / "b.mp4",
-            reference_image=ref_b,
+            reference_images=[ref_b],
         )
     )
     assert clip_a.path.read_bytes() != clip_b.path.read_bytes()

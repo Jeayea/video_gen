@@ -158,6 +158,9 @@ def make_provider(recorder: Recorder, **kwargs) -> OpenRouterVideoProvider:
 
 
 def request_for(tmp_path: Path, **overrides) -> VideoRequest:
+    # 老写法 reference_image=... 兼容成列表（多角色镜头用 reference_images=[a, b]）
+    if "reference_image" in overrides:
+        overrides.setdefault("reference_images", [overrides.pop("reference_image")])
     data = {
         "shot_id": "scene_1_shot_1",
         "scene_id": "scene_1",
@@ -415,6 +418,66 @@ async def test_reference_falls_back_to_first_frame(tmp_path):
     frames = recorder.bodies[0]["frame_images"]
     assert frames[0]["frame_type"] == "first_frame"
     assert "input_references" not in recorder.bodies[0]
+
+
+@pytest.mark.asyncio
+async def test_multiple_references_are_all_sent(tmp_path):
+    """双人镜头：两个角色的参考图都要进 input_references（只锁一个等于没锁另一个）。"""
+    ref_a = tmp_path / "char_1.png"
+    ref_a.write_bytes(b"\x89PNG\r\n\x1a\nfake-a")
+    ref_b = tmp_path / "char_2.png"
+    ref_b.write_bytes(b"\x89PNG\r\n\x1a\nfake-b")
+    recorder = Recorder()
+    provider = make_provider(recorder)
+    provider.poll_interval_sec = 0.01
+
+    await provider.generate(request_for(tmp_path, reference_images=[ref_a, ref_b]))
+
+    refs = recorder.bodies[0]["input_references"]
+    assert len(refs) == 2
+    assert all(item["type"] == "image_url" for item in refs)
+    assert refs[0]["image_url"]["url"] != refs[1]["image_url"]["url"]
+
+
+@pytest.mark.asyncio
+async def test_multiple_references_degrade_one_then_none(tmp_path):
+    """模型拒绝多张参考图时：先退到只带第一张，再退到不带 —— 每级都不放弃出片。"""
+    ref_a = tmp_path / "char_1.png"
+    ref_a.write_bytes(b"fake-a")
+    ref_b = tmp_path / "char_2.png"
+    ref_b.write_bytes(b"fake-b")
+    seen: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/videos/models"):
+            return httpx.Response(200, json={"data": [HAILUO3]})
+        if path.endswith("/videos") and request.method == "POST":
+            body = json.loads(request.content)
+            count = len(body.get("input_references") or [])
+            seen.append(count)
+            if count > 1:  # 只接受单张
+                return httpx.Response(400, json={"error": {"message": "too many references"}})
+            return httpx.Response(
+                202,
+                json={"id": "job-1", "polling_url": "https://openrouter.ai/api/v1/videos/job-1"},
+            )
+        if path.endswith("/videos/job-1"):
+            return httpx.Response(
+                200, json={"status": "completed", "unsigned_urls": ["https://cdn/v.mp4"]}
+            )
+        return httpx.Response(200, content=VIDEO_BYTES)
+
+    provider = OpenRouterVideoProvider(
+        api_key="test-key",
+        model="minimax/hailuo-3",
+        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+    provider.poll_interval_sec = 0.01
+
+    clip = await provider.generate(request_for(tmp_path, reference_images=[ref_a, ref_b]))
+    assert clip.path.is_file()
+    assert seen == [2, 1], "应该先试 2 张、被拒后降级为 1 张"
 
 
 @pytest.mark.asyncio

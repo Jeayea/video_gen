@@ -146,7 +146,7 @@ async def _generate_one(
         return
 
     output = clips_dir / f"{shot.id}.mp4"
-    reference, shot_seed = resolve_reference(shot, bible, project_dir, provider, seed)
+    references, shot_seed = resolve_references(shot, bible, project_dir, provider, seed)
     request = VideoRequest(
         shot_id=shot.id,
         scene_id=shot.scene_id,
@@ -154,7 +154,7 @@ async def _generate_one(
         duration_sec=max(1, shot.duration_sec),
         aspect_ratio=project.aspect_ratio.value,
         output_path=output,
-        reference_image=reference,
+        reference_images=references,
         seed=shot_seed,
     )
 
@@ -233,6 +233,51 @@ def provider_switched(manifest: VideoManifest, provider: VideoProvider) -> bool:
     )
 
 
+def resolve_references(
+    shot: Shot,
+    bible: StoryBible | None,
+    project_dir: Path,
+    provider: VideoProvider,
+    default_seed: int = 0,
+) -> tuple[list[Path], int | None]:
+    """挑出这个镜头要用的参考图（可多张）与 seed（角色一致性）。
+
+    规则：provider 支持参考图时，**画面里每个配了参考图且文件还在的角色各带一张** ——
+    双人镜头必须同时锁住两个人；去重后按 `character_in_frame` 顺序返回。
+    seed 优先用第一个角色的，其次用全局 `VIDEO_SEED`。
+    一张都没有就返回 `([], None)`，绝不因为缺参考图就跳过生成。
+    """
+    if not provider.supports_reference_image or not bible:
+        return [], (default_seed or None)
+
+    root = Path(project_dir).resolve()
+    paths: list[Path] = []
+    # 角色自己的 seed 优先于全局 VIDEO_SEED（只在第一次遇到时取）
+    char_seed: int | None = None
+    for char_id in shot.character_in_frame or []:
+        character = bible.get_character(char_id)
+        if character is None or not character.reference_image:
+            continue
+        candidate = (Path(project_dir) / character.reference_image).resolve()
+        try:  # 参考图必须留在项目目录内
+            candidate.relative_to(root)
+        except ValueError:
+            logger.warning(
+                "角色 %s 的参考图越出项目目录，已忽略：%s", char_id, character.reference_image
+            )
+            continue
+        if not candidate.is_file():
+            logger.warning("角色 %s 的参考图不存在，已忽略：%s", char_id, candidate)
+            continue
+        if candidate not in paths:
+            paths.append(candidate)
+        if char_seed is None and character.seed is not None:
+            char_seed = character.seed
+
+    seed = char_seed if char_seed is not None else (default_seed or None)
+    return paths, seed
+
+
 def resolve_reference(
     shot: Shot,
     bible: StoryBible | None,
@@ -240,33 +285,9 @@ def resolve_reference(
     provider: VideoProvider,
     default_seed: int = 0,
 ) -> tuple[Path | None, int | None]:
-    """挑出这个镜头要用的参考图与 seed（角色一致性）。
-
-    规则：provider 支持参考图时，取「画面里第一个配了参考图、且文件还在」的角色；
-    seed 优先用角色自己的，其次用全局 `VIDEO_SEED`。没有就返回 `(None, None)`，
-    绝不因为缺参考图就跳过生成。
-    """
-    if not provider.supports_reference_image or not bible:
-        return None, (default_seed or None)
-
-    for char_id in shot.character_in_frame or []:
-        character = bible.get_character(char_id)
-        if character is None or not character.reference_image:
-            continue
-        candidate = (Path(project_dir) / character.reference_image).resolve()
-        try:  # 参考图必须留在项目目录内
-            candidate.relative_to(Path(project_dir).resolve())
-        except ValueError:
-            logger.warning(
-                "角色 %s 的参考图越出项目目录，已忽略：%s", char_id, character.reference_image
-            )
-            continue
-        if candidate.is_file():
-            seed = character.seed if character.seed is not None else (default_seed or None)
-            return candidate, seed
-        logger.warning("角色 %s 的参考图不存在，已忽略：%s", char_id, candidate)
-
-    return None, (default_seed or None)
+    """只取第一张参考图（老接口，给「只支持单图」的调用方用）。"""
+    paths, seed = resolve_references(shot, bible, project_dir, provider, default_seed)
+    return (paths[0] if paths else None), seed
 
 
 def build_prompt(shot: Shot, project: Project, bible: StoryBible | None = None) -> str:

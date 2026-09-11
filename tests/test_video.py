@@ -222,6 +222,46 @@ def test_appearance_anchor_skips_descriptions_already_in_the_prompt(store, ready
     assert prompt.count(character.visual_prompt.split(",")[0][:30]) == 1
 
 
+@pytest.mark.asyncio
+async def test_resolve_references_returns_every_in_frame_character(store, tmp_path, bible):
+    """双人镜头要同时锁两个人：去重、按 character_in_frame 顺序、越界/缺失文件跳过。"""
+    from videogen.models.storyboard import Shot
+    from videogen.providers.video.mock import MockVideoProvider
+
+    project_dir = store.ensure_project_dir("p1")
+    refs = store.refs_dir("p1")
+    (refs / "char_1.png").write_bytes(b"a")
+    (refs / "char_2.png").write_bytes(b"b")
+    characters = {c.id: c for c in bible.characters}
+    characters["char_1"] = characters["char_1"].model_copy(
+        update={"reference_image": "refs/char_1.png"}
+    )
+    characters["char_2"] = characters["char_2"].model_copy(
+        update={"reference_image": "refs/char_2.png"}
+    )
+    characters["char_3"] = characters["char_3"].model_copy(
+        update={"reference_image": "../outside.png"}  # 越界，必须被忽略
+    )
+    characters["char_4"] = characters["char_4"].model_copy(
+        update={"reference_image": "refs/missing.png"}  # 文件不存在，必须被忽略
+    )
+    bible.characters = [characters[c.id] for c in bible.characters]
+
+    provider = MockVideoProvider()
+    shot = Shot(
+        id="s1",
+        scene_id="scene_1",
+        shot_no=1,
+        duration_sec=3,
+        character_in_frame=["char_2", "char_3", "char_4", "char_1", "char_2"],
+    )
+    paths, _seed = video_service.resolve_references(shot, bible, project_dir, provider)
+    assert [p.name for p in paths] == ["char_2.png", "char_1.png"]  # 顺序 + 去重
+
+    single, _ = video_service.resolve_reference(shot, bible, project_dir, provider)
+    assert single is not None and single.name == "char_2.png"  # 老接口仍只取第一张
+
+
 def test_build_prompt_strips_llm_label_prefix(store, ready_project):
     """真实样本：分镜 LLM 把 `English prompt:` 也写进了 video_prompt。"""
     shot = store.load_storyboard(ready_project.id).shots[0]

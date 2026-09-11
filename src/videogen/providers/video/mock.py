@@ -62,10 +62,13 @@ class MockVideoProvider(VideoProvider):
         duration = max(1, int(request.duration_sec))
         key = request.shot_id
         reference_used = ""
-        if request.reference_image and Path(request.reference_image).is_file():
-            # 用参考图内容决定配色：换了参考图，画面颜色一定变
-            key = f"{request.shot_id}:{Path(request.reference_image).read_bytes()!r}"
-            reference_used = str(request.reference_image)
+        references = [Path(p) for p in (request.reference_images or [])]
+        references = [p for p in references if p.is_file()]
+        if references:
+            # 用参考图内容决定配色：换了参考图，画面颜色一定变（多张就都算进去）
+            digest = b"|".join(p.read_bytes() for p in references)
+            key = f"{request.shot_id}:{digest!r}"
+            reference_used = ",".join(str(p) for p in references)
         color = _PALETTE[_stable_index(key, len(_PALETTE))]
 
         if not ffmpeg_available():
@@ -140,7 +143,9 @@ class MockVideoProvider(VideoProvider):
                 {
                     "kind": "videogen.placeholder",
                     "shot_id": request.shot_id,
-                    "reference_image": str(request.reference_image or ""),
+                    "reference_images": [
+                        str(p) for p in (request.reference_images or [])
+                    ],
                     "seed": request.seed,
                     "scene_id": request.scene_id,
                     "prompt": request.prompt,

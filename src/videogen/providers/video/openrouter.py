@@ -312,26 +312,39 @@ class OpenRouterVideoProvider(VideoProvider):
         return payload
 
     def _reference_payload(
-        self, request: VideoRequest, caps: dict[str, Any]
+        self,
+        request: VideoRequest,
+        caps: dict[str, Any],
+        *,
+        limit: int | None = None,
     ) -> dict[str, Any]:
-        """角色一致性：优先 reference-to-video，其次 image-to-video（首帧）。"""
-        if not self.use_reference_images or not request.reference_image:
+        """角色一致性：优先 reference-to-video（可多张），其次 image-to-video（首帧）。
+
+        `limit` 用于降级重试时只带前 N 张（模型可能拒绝多张参考图）。
+        """
+        paths = [Path(p) for p in (request.reference_images or [])]
+        paths = [p for p in paths if p.is_file()]
+        if not self.use_reference_images or not paths:
             return {}
-        path = Path(request.reference_image)
-        if not path.is_file():
+        if limit is not None:
+            paths = paths[:limit]
+        if not paths:
             return {}
 
         skus = caps.get("pricing_skus") or {}
         supports_references = any("reference" in str(key).lower() for key in skus)
         frame_types = caps.get("supported_frame_images") or []
-        image = _image_url_payload(path)
+        images = [_image_url_payload(path) for path in paths]
 
         if supports_references:
-            return {"input_references": [image]}
+            return {"input_references": images}
         if "first_frame" in frame_types:
-            return {"frame_images": [{**image, "frame_type": "first_frame"}]}
+            # 首帧图只能一张：多角色镜头退化成「锁第一个角色」
+            return {"frame_images": [{**images[0], "frame_type": "first_frame"}]}
 
-        logger.warning("模型 %s 不支持参考图/首帧图，已忽略 %s", self.model, path.name)
+        logger.warning(
+            "模型 %s 不支持参考图/首帧图，已忽略 %d 张参考图", self.model, len(paths)
+        )
         return {}
 
     async def _submit(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -363,7 +376,16 @@ class OpenRouterVideoProvider(VideoProvider):
             if response.status_code == 400 and (
                 "input_references" in attempt_payload or "frame_images" in attempt_payload
             ):
-                # 参考图传不进去就退一步：先出片，别因为一致性把整条链路卡死
+                # 参考图传不进去就一级一级退：多张 → 只带第一张 → 完全不带。
+                # 每退一级都先出一版片子，绝不让「一致性」把整条链路卡死。
+                if len(attempt_payload.get("input_references") or []) > 1:
+                    logger.warning(
+                        "带 %d 张参考图提交被拒（%s），降级为只带第一张重试",
+                        len(attempt_payload["input_references"]),
+                        scrub_secrets(response.text[:160]),
+                    )
+                    attempt_payload["input_references"] = attempt_payload["input_references"][:1]
+                    continue
                 logger.warning(
                     "带参考图提交被拒（%s），改为不带参考图重试",
                     scrub_secrets(response.text[:160]),

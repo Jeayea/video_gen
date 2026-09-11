@@ -3,7 +3,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from pathlib import Path
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from videogen.models.video import MediaKind
 
@@ -50,11 +50,18 @@ class VideoRequest(BaseModel):
     duration_sec: int
     aspect_ratio: str = "9:16"
     output_path: Path
-    #: 角色一致性：参考图 + 固定 seed（provider 不支持时为空）
-    reference_image: Path | None = None
+    #: 角色一致性：画面里每个配了参考图的角色各一张（provider 不支持时为空）。
+    #: 双人镜头要同时锁住两个人，所以这里是**列表**而不是单张。
+    reference_images: list[Path] = Field(default_factory=list)
+    #: 固定 seed（provider 支持时才有用；H3 是 `seed: false`，带上会 400）
     seed: int | None = None
 
     model_config = {"arbitrary_types_allowed": True}
+
+    @property
+    def reference_image(self) -> Path | None:
+        """第一张参考图（老调用方/只支持单图的 provider 用这个）。"""
+        return self.reference_images[0] if self.reference_images else None
 
 
 class GeneratedClip(BaseModel):
