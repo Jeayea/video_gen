@@ -34,6 +34,9 @@ class VoiceDirection(BaseModel):
     rate: str = ""
     volume: str = ""
     pitch: str = ""
+    #: 自然语言念法（云端 TTS 用）：例如「压抑的哭腔，语速慢，句尾发颤」。
+    #: Edge 不认这种描述，只有云端 provider 会用它
+    instruction: str = ""
     note: str = ""
 
 
@@ -47,6 +50,8 @@ class ShotDraft(BaseModel):
     character_in_frame: StrList = Field(default_factory=list)
     mood: str = ""
     video_prompt: str = ""
+    #: 这一镜发生在哪个场景（故事圣经 settings 的 id）——背景一致性与丰富度的锚点
+    location: str = ""
     narration: str | None = None
     dialogue_text: str | None = None
     dialogue_speaker: str | None = None
@@ -72,6 +77,8 @@ class Shot(BaseModel):
     character_in_frame: StrList = Field(default_factory=list)
     mood: str = ""
     video_prompt: str = ""
+    #: 这一镜发生在哪个场景（故事圣经 settings 的 id），用于注入背景锚点
+    location: str = ""
     narration: str | None = None
     dialogue_text: str | None = None
     dialogue_speaker: str | None = None

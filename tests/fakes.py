@@ -59,6 +59,9 @@ class FakeLLM(LLMProvider):
         voice_text: str = "补写的旁白",
         voice_empty_shots: set[str] | None = None,
         voice_rate: str = "-10%",
+        voice_instruction: str = "压抑的哭腔，语速慢，句尾发颤",
+        story_chapters: int = 20,
+        chapter_scenes: int = 2,
     ):
         self.scene_duration_sec = scene_duration_sec
         self.scenes = scenes
@@ -75,6 +78,10 @@ class FakeLLM(LLMProvider):
         self.voice_text = voice_text
         self.voice_empty_shots = set(voice_empty_shots or ())
         self.voice_rate = voice_rate
+        self.voice_instruction = voice_instruction
+        #: 长篇大纲：骨架给几章 / 每章展开几场
+        self.story_chapters = story_chapters
+        self.chapter_scenes = chapter_scenes
         #: 配音文案调用里收到的图片总数（验证「真的把画面发过去了」）
         self.image_count = 0
         #: 收到过图片的调用次数
@@ -145,6 +152,10 @@ class FakeLLM(LLMProvider):
                     for i in range(1, self.scenes + 1)
                 ]
             }
+        if "长篇剧集的总编剧" in system:
+            return self._story_outline(system, user)
+        if "分场编剧" in system:
+            return self._chapter_scenes(user)
         if "专业分镜师" in system:
             scene_id = SCENE_ID_RE.search(user)
             sid = scene_id.group(1) if scene_id else "scene_1"
@@ -160,6 +171,65 @@ class FakeLLM(LLMProvider):
             return self._voice_script(messages)
         return {}
 
+    def _story_outline(self, system: str, user: str) -> dict:
+        """长篇大纲：骨架一次给全，正文按批扩写（id 从用户提示里照抄）。"""
+        if "你只写「骨架」" in system:
+            self._maybe_fail("story_spine")
+            # 真实模型会按提示里的章数写；假模型也照做，否则测不出「换了章数」
+            match = re.search(r"写 (\d+) 章的长篇剧集骨架", user)
+            count = int(match.group(1)) if match else self.story_chapters
+            return {
+                "title": "假长篇剧名",
+                "logline": "一个被裁掉的人，把整座城市裁回去",
+                "synopsis": "假梗概" * 40,
+                "theme": "不甘",
+                "chapters": [
+                    {
+                        "title": f"第 {i} 章",
+                        "brief": f"第 {i} 章的转折：局势变了第 {i} 次",
+                    }
+                    for i in range(1, count + 1)
+                ],
+            }
+        self._maybe_fail("story_expand")
+        ids = re.findall(r"^- \[(ch_\d+)\]", user, flags=re.MULTILINE)
+        if not ids:
+            ids = re.findall(r"\[(ch_\d+)\]", user)
+        return {
+            "chapters": [
+                {
+                    "id": chapter_id,
+                    "title": f"第 {chapter_id.split('_')[-1]} 章",
+                    "summary": f"{chapter_id} 的正文："
+                    + "谁想要什么被什么挡住，做了选择，付出代价。" * 3,
+                    "beats": [f"{chapter_id} 情节点 1", f"{chapter_id} 情节点 2"],
+                    "hook": f"{chapter_id} 章末钩子",
+                    "characters": ["char_1"],
+                    "locations": ["loc_1"],
+                    "scene_budget": self.chapter_scenes,
+                    "duration_budget_sec": self.chapter_scenes * 12,
+                }
+                for chapter_id in ids
+            ]
+        }
+
+    def _chapter_scenes(self, user: str) -> dict:
+        """把选中的章展开成场次（每章按配置给若干场）。"""
+        ids = re.findall(r"^## (ch_\d+)｜", user, flags=re.MULTILINE)
+        scenes = []
+        for chapter_id in ids:
+            for index in range(1, self.chapter_scenes + 1):
+                scenes.append(
+                    {
+                        "chapter_id": chapter_id,
+                        "title": f"{chapter_id} 第 {index} 场",
+                        "brief": f"{chapter_id} 第 {index} 场：地点+环境细节，人物目标与阻力",
+                        "environment": "冷白顶灯 / 玻璃隔断 / 桌上摊开的杂志",
+                        "duration_sec": 12,
+                    }
+                )
+        return {"scenes": scenes}
+
     def _voice_script(self, messages: list[LLMMessage]) -> dict:
         """按用户提示里列出的镜头 id 逐条给文案（可配置留空 / 语速建议）。"""
         user = message_text(messages[-1])
@@ -170,6 +240,8 @@ class FakeLLM(LLMProvider):
         mode = (
             "full"
             if "完整配音文案" in user
+            else "perform"
+            if "只给念法" in user
             else "polish"
             if "改写已有文案" in user
             else "narration"
@@ -183,9 +255,11 @@ class FakeLLM(LLMProvider):
                 continue
             lines.append(
                 {
+                    # perform 模式一个字都不改文案（只给念法）
+                    "text": "" if mode == "perform" else f"{self.voice_text}（{shot_id}）",
                     "shot_id": shot_id,
-                    "text": f"{self.voice_text}（{shot_id}）",
                     "rate": self.voice_rate if mode == "full" else "",
+                    "instruction": self.voice_instruction if mode in {"full", "perform"} else "",
                     "note": f"{mode} 模式生成",
                 }
             )

@@ -39,11 +39,14 @@ def validate_script(
     target_duration_sec: int = 0,
     *,
     strict: bool = False,
+    partial: bool = False,
 ) -> ConsistencyReport:
     """检查剧本与故事圣经之间的一致性。
 
-    `strict=True`（`SCRIPT_STRICT`，默认开）时，**结构硬伤**会升级成 ERROR ——
-    ERROR 会让「确认剧本」被拒绝（可 force 跳过）。
+    - `strict=True`（`SCRIPT_STRICT`，默认开）时，**结构硬伤**会升级成 ERROR ——
+      ERROR 会让「确认剧本」被拒绝（可 force 跳过）
+    - `partial=True` 表示「这只是长篇剧集里选中的几章」：此时**不能**因为结尾还悬着就报警，
+      因为后面还要继续展开别的章（否则选前两章必然被拦）
     """
     issues: list[ConsistencyIssue] = []
     known_names = bible.all_names()
@@ -56,7 +59,7 @@ def validate_script(
         issues.extend(_check_scene_content(scene, strict=strict))
 
     issues.extend(_check_timeline(script))
-    issues.extend(_check_structure(script, strict=strict))
+    issues.extend(_check_structure(script, strict=strict, partial=partial))
     issues.extend(_check_duration(script, target_duration_sec))
     if world_state:
         issues.extend(_check_world_state_open_threads(world_state))
@@ -75,7 +78,9 @@ def has_errors(report: ConsistencyReport | None) -> list[ConsistencyIssue]:
 _OPEN_END_MARKERS = ("？", "?", "未完", "待续", "究竟", "到底", "会如何", "悬念")
 
 
-def _check_structure(script: Script, *, strict: bool = False) -> list[ConsistencyIssue]:
+def _check_structure(
+    script: Script, *, strict: bool = False, partial: bool = False
+) -> list[ConsistencyIssue]:
     """结构硬伤（确定性可判的部分）。
 
     钩子/转折/高潮这类需要读故事才能判断的，交给 `script_service.review_structure`
@@ -111,7 +116,8 @@ def _check_structure(script: Script, *, strict: bool = False) -> list[Consistenc
 
     last = scenes[-1]
     tail = _scene_text(last)
-    if any(marker in tail for marker in _OPEN_END_MARKERS):
+    # 「结尾没落地」只在**整片**的情况下才成立：长篇剧集选了前几章时，悬念正是要留的
+    if not partial and any(marker in tail for marker in _OPEN_END_MARKERS):
         issues.append(
             ConsistencyIssue(
                 severity=IssueSeverity.WARNING,

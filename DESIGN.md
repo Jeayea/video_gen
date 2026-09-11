@@ -576,7 +576,7 @@ FFMPEG_AUTO_UPGRADE=true      # 主 ffmpeg 缺能力时自动换候选（如烧�
 
 ---
 
-## 10. 实现状态（v0.13，2026-09-11 更新）
+## 10. 实现状态（v0.15，2026-09-11 更新）
 
 ### 已落地
 
@@ -641,6 +641,39 @@ FFMPEG_AUTO_UPGRADE=true      # 主 ffmpeg 缺能力时自动换候选（如烧�
     之后每个镜头由 `input_references` 带给视频模型 —— 这是 H3 下**唯一**能锁住五官的手段
     （H3 `seed: false`）。记账新增 `CostStage.IMAGE`；预算不足直接 402
 
+- **Phase B（v0.14）**：
+  - **配音按人物选角**：`services/voice_catalog.py` 成为选角的唯一事实来源
+    （性别线索加权、身份词不参与判定、按定位/年龄/口音代价打分、撞音色才用念法区分、
+    年龄明显不符就换），选中的音色写回 `Character.voice_id`
+  - **表演与镜头进 prompt**：`camera`（景别×运镜）与 `mood`（中文情绪词映射表）翻成英文、
+    `VIDEO_PERFORMANCE_DIRECTIVE` 追加到每个镜头；分镜提示词同步收紧
+  - **剧本严谨两层**：`repair_storyboard()` 做确定性修复（说话人不在画面里 → 补进去），
+    `review_structure()` 让 LLM 当剧本医生审钩子/转折/高潮/因果/动机；
+    `SCRIPT_STRICT=true` 时 ERROR 会拦住「确认剧本 / 确认分镜」（可 `force`）
+
+- **Phase B（v0.15）**：
+  - **长篇剧集大纲 + 按章展开**：新增 `story_outline.json`（`StoryOutline` /
+    `StoryChapter`）与两阶段生成 —— 骨架一次给全（保证因果链完整）、正文按 3-4 章一批扩写
+    （避免被输出长度截断）；`POST /script/generate {"chapters":[...]}` 只展开选中的章，
+    已展开的章不重复生成，`target_duration_sec` 自动对齐到已展开章的预算之和。
+    只为「选中的章」烧视频额度 —— 这是长篇形态下的成本闸门
+  - **`partial` 语义**：只展开部分章时，结尾悬念不算硬伤
+    （`validate_script(partial=)` / `review_structure(partial=)`），避免「选前两章必然被拦」
+  - **云端 TTS**：`providers/tts/openrouter_audio.py`（`openai/gpt-audio-mini`）。
+    音频输出必须 `stream: true` 且只支持 `pcm16` → SSE 逐块收 base64，标准库封 WAV；
+    念法用自然语言（`VoiceDirection.instruction`），新增 `AUDIO_LLM_SCRIPT=perform`
+    （只给念法、一个字不改台词）。**模型会自己加戏**，所以有两道防线：
+    提示词写死「只念原文」+ 转写文本校验（不符就重试一次）+ 时长守卫（超限直接失败）。
+    云端选角把 Edge 音色名映射到同气质云端音色，换引擎自动重配
+  - **背景/环境**：`Shot.location` + `location_anchor()`（把场景 `visual_prompt` 注入
+    视频 prompt，同场景跨镜头一致）+ `VIDEO_BACKGROUND_DIRECTIVE`（禁止空墙）
+  - **口型对齐**：分两步 ——
+    ① `dialogue_directive()` 把这一镜的台词写进视频 prompt（`VIDEO_PROMPT_DIALOGUE`），
+    让模型的原生表演与我们的配音落在**同一句话**上（真实对照：不写台词时模型会编
+    「你怎么能这样对我」这种完全不同的句子）；
+    ② `utils/audio_align.py` 找出画面里人声的起点，合成时用 `adelay` 把配音延后到那一刻
+    （全片实测 10/15 个镜头需要，延后 0.08~1.20s），不重烧视频也不换音色
+
 ### 尚未实现（后续可做）
 
 - 多模型**对比留档**（同一阶段两个模型的产物并排对比）：目前只支持切换与记账
@@ -651,6 +684,9 @@ FFMPEG_AUTO_UPGRADE=true      # 主 ffmpeg 缺能力时自动换候选（如烧�
 - 任务/批量状态仅在进程内存里（项目状态已落盘，重启会自动回收）
 - 一个镜头多音轨混音
 - 视频**运动**信息进入文案生成：现在只抽静态帧，动作/运镜读不到
+- **逐帧口型对齐**：现在只能做到「让模型说同一句话」，需要精确对齐得接 lip-sync 后处理
+  （Wav2Lip / LatentSync 之类），或改用模型原生语音（代价是跨镜头音色一致性变弱）
+- **长篇大纲的人工编辑**：章节目前只能整体重出，不能单独改一章后只重跑那一章
 
 > §2.3 的目录结构是目标形态，当前实际结构见 [README.md](README.md#代码结构)；
 > 问题审计与修复记录见 [REVIEW.md](REVIEW.md) 与 [FIXES.md](FIXES.md)。

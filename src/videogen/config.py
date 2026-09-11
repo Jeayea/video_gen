@@ -51,13 +51,35 @@ class Settings(BaseSettings):
     )
     #: 追加到每个视频 prompt 的风格约束（英文；留空 = 不追加）
     video_style_prompt: str = ""
+    #: 追加到每个视频 prompt 的「背景丰富度」规范。真实样本里分镜只写一句
+    #: "in an office"，模型就把背景画成一面空墙 —— 这是「背景不够丰富」的直接原因
+    video_background_directive: str = (
+        "richly detailed lived-in environment, layered foreground midground background, "
+        "practical props and set dressing, visible textures and materials, "
+        "motivated directional lighting, atmospheric depth of field, "
+        "no empty blank walls, no plain studio void"
+    )
+    #: 是否把台词写进视频 prompt。视频模型会按同一句话演口型；不写它就自己编一段话
+    #: 在说（嘴按它自己的话动），我们再叠 TTS 上去 —— 口型必然对不上
+    video_prompt_dialogue: bool = True
     video_max_retries: int = 2
     video_retry_backoff_sec: float = 1.5
     video_fps: int = 24
     video_crf: int = 30
 
     # TTS（配音）
-    tts_provider: str = "edge"  # edge | mock
+    tts_provider: str = "edge"  # edge | openrouter | mock
+    #: 云端配音模型（`TTS_PROVIDER=openrouter` 时用）。gpt-audio-mini 支持用自然语言描述念法
+    openrouter_tts_model: str = "openai/gpt-audio-mini"
+    #: 云端配音的落盘格式。**只能是 wav**：流式接口只返回 pcm16，我们自己封 WAV 头
+    tts_audio_format: str = "wav"
+    #: 没有逐条念法时的兜底念法（只对云端 TTS 生效）
+    tts_default_instruction: str = (
+        "自然的中文口语，像真人对话，句间有呼吸和停顿，不要播音腔"
+    )
+    #: 云端 TTS 的时长守卫：实际时长超过「按原文估算时长 × 该倍数」就判定模型自己加戏。
+    #: 真实样本：一句「薇儿，为什么？」被某个音色念成 15.15 秒独白（还念出了括号提示）
+    tts_max_duration_ratio: float = 2.0
     #: 默认音色；角色音色由 voice_map 决定，这里是兜底
     tts_voice: str = "zh-CN-XiaoxiaoNeural"
     tts_voice_female: str = "zh-CN-XiaoxiaoNeural"
@@ -77,6 +99,9 @@ class Settings(BaseSettings):
     script_strict: bool = True
     #: 生成剧本后让 LLM 当一次剧本医生（结构/因果/动机），多花一次 LLM 调用（≈$0.001）
     script_llm_review: bool = True
+    #: 长篇剧集大纲：默认章数 / 单批扩写章数（一次写 20 章正文必被截断，所以要分批）
+    story_chapters: int = 20
+    story_chapter_chunk: int = 4
     tts_timeout_sec: float = 60.0
     #: 每句对白后面留的呼吸时间（秒），用于音画对齐
     audio_gap_sec: float = 0.25
@@ -120,6 +145,11 @@ class Settings(BaseSettings):
     #: 字幕距底部 = min(宽, 高) * 该比例
     compose_subtitle_margin_scale: float = 0.04
     #: 视频模型自带音轨怎么处理：off = 丢弃（人声最干净）；under = 压低垫在人声下面
+    #: 口型对齐：把配音延后到「画面里的人开口」的时刻（只用本地计算，不重烧视频）。
+    #: 真实测量：台词进 prompt 后模型说的同一句话比我们的配音晚 ~1.2 秒开口
+    compose_align_dub_to_mouth: bool = True
+    #: 口型对齐的最大延后量（秒）；超过就不对齐（避免把尾音挤出片段）
+    compose_mouth_align_max_sec: float = 1.5
     compose_ambient_mode: str = "off"
     #: 环境音相对人声的音量（dB）
     compose_ambient_gain_db: float = -20.0
@@ -223,7 +253,7 @@ class Settings(BaseSettings):
     def audio_script_mode(self) -> str:
         """配音文案模式，非法值一律当成 off（绝不让配置笔误偷偷花钱）。"""
         mode = (self.audio_llm_script or "off").strip().lower()
-        return mode if mode in {"off", "narration", "polish", "full"} else "off"
+        return mode if mode in {"off", "narration", "polish", "full", "perform"} else "off"
 
     @property
     def audio_frame_count(self) -> int:

@@ -8,12 +8,61 @@ from videogen.models.world_state import WorldStateDelta
 from videogen.utils.coerce import coerce_int
 
 __all__ = [
+    "ChapterOutlineResponse",
+    "ChaptersExpansionResponse",
     "OutlineResponse",
     "SceneResponse",
     "ShotsResponse",
+    "StorySpineResponse",
     "VoiceLineDraft",
     "VoiceScriptResponse",
 ]
+
+
+def _as_dict_list(value: object) -> object:
+    """把 None / 单个 dict / 列表统一成 list[dict]（LLM 输出的常见走形）。"""
+    if value is None:
+        return []
+    if isinstance(value, dict):
+        return [value]
+    return value
+
+
+class StorySpineResponse(BaseModel):
+    """长篇大纲「骨架」阶段的期望输出（只有一句话剧情，很轻）。"""
+
+    title: str = ""
+    logline: str = ""
+    synopsis: str = ""
+    theme: str = ""
+    chapters: list[dict] = Field(default_factory=list)
+
+    @field_validator("chapters", mode="before")
+    @classmethod
+    def _none_to_empty(cls, value: object) -> object:
+        return _as_dict_list(value)
+
+
+class ChaptersExpansionResponse(BaseModel):
+    """长篇大纲「逐章扩写」阶段的期望输出（一次一批章）。"""
+
+    chapters: list[dict] = Field(default_factory=list)
+
+    @field_validator("chapters", mode="before")
+    @classmethod
+    def _none_to_empty(cls, value: object) -> object:
+        return _as_dict_list(value)
+
+
+class ChapterOutlineResponse(BaseModel):
+    """把选中的章展开成「分场大纲」的期望输出。"""
+
+    scenes: list[dict] = Field(default_factory=list)
+
+    @field_validator("scenes", mode="before")
+    @classmethod
+    def _none_to_empty(cls, value: object) -> object:
+        return _as_dict_list(value)
 
 
 class OutlineResponse(BaseModel):
@@ -24,11 +73,7 @@ class OutlineResponse(BaseModel):
     @field_validator("scenes", mode="before")
     @classmethod
     def _none_to_empty(cls, value: object) -> object:
-        if value is None:
-            return []
-        if isinstance(value, dict):
-            return [value]
-        return value
+        return _as_dict_list(value)
 
 
 class SceneResponse(BaseModel):
@@ -84,6 +129,8 @@ class VoiceLineDraft(BaseModel):
     rate: str = ""
     volume: str = ""
     pitch: str = ""
+    #: 自然语言念法（云端 TTS 用）：情绪/语气/语速/停顿/气息
+    instruction: str = ""
     note: str = ""
 
 

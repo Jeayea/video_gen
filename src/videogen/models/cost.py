@@ -11,6 +11,8 @@ class CostStage(str, Enum):
 
     BIBLE = "bible"
     SCRIPT = "script"
+    #: 长篇剧集大纲（20+ 章的骨架与逐章正文）
+    STORY = "story"
     STORYBOARD = "storyboard"
     #: AI 生成角色参考图（角色一致性）
     IMAGE = "image"

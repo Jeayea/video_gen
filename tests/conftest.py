@@ -33,6 +33,8 @@ def fast_video_settings(monkeypatch):
     monkeypatch.setattr(settings, "tts_retry_backoff_sec", 0.0)
     monkeypatch.setattr(settings, "image_retry_backoff_sec", 0.0)
     monkeypatch.setattr(settings, "video_provider", "mock")
+    # 配音：开发者本地 .env 可能已经切到云端 TTS（真实付费），测试基线必须锁回 edge
+    monkeypatch.setattr(settings, "tts_provider", "edge")
     # 角色图同理：默认工厂绝不能真的去打图片模型
     monkeypatch.setattr(settings, "image_provider", "mock")
     monkeypatch.setattr(settings, "budget_usd", 0.0)
@@ -40,6 +42,9 @@ def fast_video_settings(monkeypatch):
     # 需要烧字幕的用例自己显式传 overrides
     monkeypatch.setattr(settings, "compose_subtitle_mode", "soft")
     monkeypatch.setattr(settings, "compose_ambient_mode", "off")
+    # 口型对齐会给每个片段多跑两次 ffmpeg（分析画面里的人几秒开口），
+    # 测试里默认关掉；专门测它的用例自己打开
+    monkeypatch.setattr(settings, "compose_align_dub_to_mouth", False)
     # 配音文案：默认关掉，防止本地 .env 打开后让无关用例多调 LLM / 抽帧
     monkeypatch.setattr(settings, "audio_llm_script", "off")
     monkeypatch.setattr(settings, "audio_llm_vision", False)
@@ -116,6 +121,31 @@ def bible() -> StoryBible:
         ],
         style=StyleGuide(genre="都市励志", tone="冷峻克制"),
     )
+
+
+def _casting_storyboard():
+    """选角测试用的（圣经, 分镜）：4 个不同性别/年龄的说话人 + 旁白。"""
+    from videogen.models.storyboard import Shot, Storyboard
+
+    bible = StoryBible(
+        characters=[
+            Character(id="char_1", name="林悦", age=20, role="主角"),
+            Character(id="char_2", name="李薇儿", age=22, role="反派"),
+            Character(id="char_3", name="张姐", age=38, role="导师"),
+            Character(id="char_4", name="赵总", age=45, role="配角"),
+        ],
+        style=StyleGuide(genre="都市励志"),
+    )
+    storyboard = Storyboard(
+        shots=[
+            Shot(id="s1", scene_id="sc1", shot_no=1, dialogue_text="a", dialogue_speaker="char_1"),
+            Shot(id="s2", scene_id="sc1", shot_no=2, dialogue_text="b", dialogue_speaker="char_2"),
+            Shot(id="s3", scene_id="sc1", shot_no=3, dialogue_text="c", dialogue_speaker="char_3"),
+            Shot(id="s4", scene_id="sc1", shot_no=4, dialogue_text="d", dialogue_speaker="char_4"),
+            Shot(id="s5", scene_id="sc1", shot_no=5, narration="n"),
+        ]
+    )
+    return bible, storyboard
 
 
 @pytest.fixture

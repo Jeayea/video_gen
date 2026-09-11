@@ -758,3 +758,168 @@ def test_srt_to_vtt_converts_existing_files():
 
 def test_build_vtt_without_cues_is_still_valid():
     assert subtitle_service.build_vtt([]) == "WEBVTT\n"
+
+
+# ── 口型对齐（把配音延后到画面开口时刻）────────────────────────
+
+
+def test_segment_filter_delays_voice_when_asked():
+    """口型对齐 = 给配音加 adelay；不加就保持原样（否则嘴还没动声音先到）。"""
+    from videogen.services.compose_service import _segment_filter
+
+    base = _segment_filter(1080, 1920, 5.0, 24, voice=True, ambient=False)
+    assert "adelay" not in base
+
+    delayed = _segment_filter(
+        1080, 1920, 5.0, 24, voice=True, ambient=False, voice_delay_ms=1220
+    )
+    assert "adelay=1220|1220" in delayed
+    # 延迟必须在 apad/atrim 之前：先延后，再用静音补满、裁到片段长度
+    assert delayed.index("adelay") < delayed.index("apad")
+
+
+def test_segment_filter_delay_also_applies_when_mixing_ambient():
+    from videogen.services.compose_service import _segment_filter
+
+    chain = _segment_filter(
+        1080, 1920, 5.0, 24, voice=True, ambient=True, voice_delay_ms=800
+    )
+    assert "adelay=800|800" in chain
+    assert "amix" in chain  # 环境音仍然混，只是人声被延后
+
+
+async def _make_voice_sample(path: Path, *, silence_sec: float, speech_sec: float) -> bool:
+    """造一段「先静音 X 秒、再出声 Y 秒」的音频（模拟画面里的人晚开口）。"""
+    from videogen.utils.ffmpeg import FFmpegError, ffmpeg_available, run_ffmpeg
+
+    if not ffmpeg_available():
+        return False
+    # 注意：`atrim=duration=0` 不等于「裁成 0 秒」，它会读成不裁剪；
+    # 而 anullsrc/sine 都是无限长的源 —— 静音为 0 时必须只用一路输入，否则 ffmpeg 永远不结束
+    if silence_sec > 0.01:
+        args = [
+            "-f", "lavfi", "-i", "anullsrc=r=24000:cl=mono",
+            "-f", "lavfi", "-i", "sine=frequency=440:r=24000",
+            "-filter_complex",
+            f"[0:a]atrim=duration={silence_sec}[a0];"
+            f"[1:a]atrim=duration={speech_sec}[a1];"
+            f"[a0][a1]concat=n=2:v=0:a=1[a]",
+            "-map", "[a]",
+        ]
+    else:
+        args = [
+            "-f", "lavfi", "-i", "sine=frequency=440:r=24000",
+            "-filter_complex",
+            f"[0:a]atrim=duration={speech_sec}[a]",
+            "-map", "[a]",
+        ]
+    try:
+        await run_ffmpeg(
+            ["-y", "-hide_banner", "-loglevel", "error", *args, "-c:a", "pcm_s16le", str(path)],
+            timeout_sec=60,
+        )
+    except FFmpegError:  # pragma: no cover - 环境问题
+        return False
+    return path.is_file()
+
+
+@pytest.mark.asyncio
+async def test_speech_span_finds_when_the_mouth_starts_moving(tmp_path):
+    """真实样本的形状：开头 1.22 秒没声音（嘴还没动），之后才开始说话。"""
+    from videogen.utils.audio_align import mouth_align_delay, speech_span
+
+    sample = tmp_path / "late.wav"
+    if not await _make_voice_sample(sample, silence_sec=1.22, speech_sec=1.0):
+        pytest.skip("需要 ffmpeg 才能分析音轨")
+
+    span = await speech_span(sample, tmp_path)
+    assert span is not None
+    assert abs(span[0] - 1.22) < 0.1
+    delay = await mouth_align_delay(sample, tmp_path, voice_sec=1.0, segment_sec=5.0)
+    assert abs(delay - 1.22) < 0.1
+
+
+@pytest.mark.asyncio
+async def test_speech_span_is_zero_when_speech_starts_immediately(tmp_path):
+    from videogen.utils.audio_align import mouth_align_delay, speech_span
+
+    sample = tmp_path / "now.wav"
+    if not await _make_voice_sample(sample, silence_sec=0.0, speech_sec=1.0):
+        pytest.skip("需要 ffmpeg 才能分析音轨")
+    span = await speech_span(sample, tmp_path)
+    assert span is not None and span[0] <= 0.05
+    assert await mouth_align_delay(sample, tmp_path, voice_sec=1.0, segment_sec=5.0) == 0.0
+
+
+@pytest.mark.asyncio
+async def test_mouth_align_delay_never_pushes_voice_past_the_segment(tmp_path):
+    """尾音会被切掉时宁可不延后（对齐不能以丢字为代价）。"""
+    from videogen.utils.audio_align import mouth_align_delay
+
+    sample = tmp_path / "late2.wav"
+    if not await _make_voice_sample(sample, silence_sec=1.22, speech_sec=1.0):
+        pytest.skip("需要 ffmpeg 才能分析音轨")
+    # 配音 4.4s + 延后 1.22s = 5.62s > 5s 片段 → 只能延后到刚好塞得下（0.55s）
+    delay = await mouth_align_delay(sample, tmp_path, voice_sec=4.4, segment_sec=5.0)
+    assert abs(delay - 0.55) < 0.05
+
+
+@pytest.mark.asyncio
+async def test_mouth_align_delay_respects_the_cap(tmp_path):
+    from videogen.utils.audio_align import mouth_align_delay
+
+    sample = tmp_path / "later.wav"
+    if not await _make_voice_sample(sample, silence_sec=2.5, speech_sec=1.0):
+        pytest.skip("需要 ffmpeg 才能分析音轨")
+    delay = await mouth_align_delay(
+        sample, tmp_path, voice_sec=1.0, segment_sec=8.0, max_delay_sec=1.0
+    )
+    assert delay == 1.0
+
+
+@requires_ffmpeg
+@pytest.mark.asyncio
+async def test_compose_mouth_alignment_is_wired_and_reported(store, settings):
+    """打开开关后：配音被延后（adelay 进滤镜），报告里写明有几个镜头被延后。"""
+    from videogen.utils.ffmpeg import FFmpegError, run_ffmpeg
+
+    settings.compose_align_dub_to_mouth = True
+    pipeline = real_pipeline(store)
+    project = await prepare_media(store, pipeline, small_project(store))
+
+    # 给第一个镜头的片段塞一段「1.2 秒后才开口」的音轨，模拟视频模型的原生语音
+    manifest = store.load_video_manifest(project.id)
+    project_dir = store.ensure_project_dir(project.id)
+    first = manifest.ready_clips[0]
+    clip_path = project_dir / first.path
+    delayed = project_dir / "clips" / "delayed.mp4"
+    try:
+        await run_ffmpeg(
+            [
+                "-y", "-hide_banner", "-loglevel", "error",
+                "-i", str(clip_path),
+                "-f", "lavfi", "-i", "anullsrc=r=24000:cl=mono",
+                "-f", "lavfi", "-i", "sine=frequency=440:r=24000",
+                "-filter_complex",
+                # 视频要够长，否则音频会被 -shortest 截掉（那样就测不出「晚开口」）
+                "[0:v]tpad=stop_mode=clone:stop_duration=3[v];"
+                "[1:a]atrim=duration=1.2[a0];[2:a]atrim=duration=1.0[a1];"
+                "[a0][a1]concat=n=2:v=0:a=1[a]",
+                "-map", "[v]", "-map", "[a]", "-t", "3",
+                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "30",
+                "-c:a", "aac", str(delayed),
+            ],
+            timeout_sec=120,
+        )
+    except FFmpegError as exc:  # pragma: no cover
+        pytest.skip(f"ffmpeg 无法构造测试片段：{str(exc)[:120]}")
+    first.path = "clips/delayed.mp4"
+    store.save_video_manifest(project.id, manifest)
+
+    job = await pipeline.start_compose(project.id)
+    finished = await wait_for_job(pipeline, job.id, timeout=180)
+    assert finished.status.value == "succeeded", finished.error
+    report = store.load_compose_report(project.id)
+    # 第一镜被延后（其余镜头的 mock 音轨是满的/没有音轨，不触发）
+    assert report.warnings, report.model_dump()
+    assert any("口型对齐" in w for w in report.warnings), report.warnings

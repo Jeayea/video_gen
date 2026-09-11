@@ -28,16 +28,36 @@ from videogen.models.storyboard import VoiceDirection
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "CLOUD_VOICES",
     "VOICE_CATALOG",
     "VoiceCasting",
     "VoiceProfile",
     "cast_voice_map",
     "catalog_rows",
+    "cloud_voice_for",
     "infer_gender",
+    "is_cloud_voice",
     "voice_gender",
 ]
 
 NARRATOR = "narrator"
+
+#: 云端 TTS（OpenRouter 的 openai/gpt-audio-mini）可用音色。
+#: 云端只有名字、没有中文音色表那种元数据，所以选角仍然用 Edge 那份带元数据的表打分，
+#: 最后把选中的音色**换成**同性别/同气质的云端音色（见 `cloud_voice_for`）。
+CLOUD_VOICES: dict[str, str] = {
+    "nova": "女声 · 温暖自然（云端）",
+    "shimmer": "女声 · 清亮柔和（云端）",
+    "coral": "女声 · 亲切明亮（云端）",
+    "sage": "女声 · 沉稳知性（云端）",
+    "alloy": "中性 · 平实（云端）",
+    "echo": "男声 · 清朗（云端）",
+    "onyx": "男声 · 低沉有力（云端）",
+    "ash": "男声 · 沉稳（云端）",
+    "verse": "男声 · 年轻自然（云端）",
+    "ballad": "男声 · 抒情（云端）",
+    "fable": "中性 · 叙述（云端）",
+}
 
 
 @dataclass(frozen=True)
@@ -53,6 +73,9 @@ class VoiceProfile:
     tags: tuple[str, ...]
     locale: str = "zh-CN"
     dialect: bool = False
+    #: 换成云端 TTS 时等价的音色名（同性别、气质接近）。
+    #: 通用普通话那 6 个音色各自映射到**不同**的云端音色，保证换引擎后仍然人人不同声
+    cloud: str = ""
 
     @property
     def age_mid(self) -> float:
@@ -70,6 +93,7 @@ VOICE_CATALOG: tuple[VoiceProfile, ...] = (
         age=(18, 30),
         timbre="温润、亲切",
         tags=("女主角", "主角", "少女", "配角"),
+        cloud="nova",
     ),
     VoiceProfile(
         id="zh-CN-XiaoyiNeural",
@@ -78,6 +102,7 @@ VOICE_CATALOG: tuple[VoiceProfile, ...] = (
         age=(16, 26),
         timbre="清亮、活泼",
         tags=("反派", "少女", "女主", "配角"),
+        cloud="shimmer",
     ),
     VoiceProfile(
         id="zh-CN-YunxiNeural",
@@ -86,6 +111,7 @@ VOICE_CATALOG: tuple[VoiceProfile, ...] = (
         age=(18, 30),
         timbre="清朗、阳光",
         tags=("男主角", "主角", "少年", "配角"),
+        cloud="echo",
     ),
     VoiceProfile(
         id="zh-CN-YunjianNeural",
@@ -94,6 +120,7 @@ VOICE_CATALOG: tuple[VoiceProfile, ...] = (
         age=(28, 45),
         timbre="有力、激情",
         tags=("旁白", "主角", "导师"),
+        cloud="onyx",
     ),
     VoiceProfile(
         id="zh-CN-YunyangNeural",
@@ -102,6 +129,7 @@ VOICE_CATALOG: tuple[VoiceProfile, ...] = (
         age=(28, 55),
         timbre="沉稳、权威",
         tags=("导师", "配角", "反派", "长辈"),
+        cloud="ash",
     ),
     VoiceProfile(
         id="zh-CN-YunxiaNeural",
@@ -110,6 +138,7 @@ VOICE_CATALOG: tuple[VoiceProfile, ...] = (
         age=(8, 16),
         timbre="少年、稚气",
         tags=("少年", "配角"),
+        cloud="verse",
     ),
     VoiceProfile(
         id="zh-CN-liaoning-XiaobeiNeural",
@@ -118,6 +147,7 @@ VOICE_CATALOG: tuple[VoiceProfile, ...] = (
         age=(20, 45),
         timbre="幽默、接地气",
         tags=("配角", "长辈"),
+        cloud="coral",
         dialect=True,
     ),
     VoiceProfile(
@@ -127,6 +157,7 @@ VOICE_CATALOG: tuple[VoiceProfile, ...] = (
         age=(18, 35),
         timbre="明亮、爽利",
         tags=("配角",),
+        cloud="sage",
         dialect=True,
     ),
     VoiceProfile(
@@ -320,8 +351,75 @@ def voice_gender(voice_id: str) -> str | None:
     return profile.gender if profile else None
 
 
-def catalog_rows() -> list[dict[str, object]]:
-    """给前端下拉用的音色表。"""
+#: 云端音色只有名字没有元数据 —— 所以仍用 Edge 那份带元数据的表选角，再把名字换过去。
+#: 换名字时同性别尽量不撞名；撞了就靠念法（自然语言）区分。
+_CLOUD_FALLBACK = {"female": "coral", "male": "ballad"}
+#: 云端音色的性别（前端按性别分组 / 校验用）
+_CLOUD_GENDER = {
+    "nova": "female",
+    "shimmer": "female",
+    "coral": "female",
+    "sage": "female",
+    "alloy": "female",
+    "echo": "male",
+    "onyx": "male",
+    "ash": "male",
+    "verse": "male",
+    "ballad": "male",
+    "fable": "male",
+}
+#: 这些 TTS_PROVIDER 值表示「用云端音色」
+CLOUD_TARGETS = frozenset({"openrouter", "openrouter-audio", "cloud"})
+
+
+def is_cloud_target(target: str) -> bool:
+    return str(target or "").strip().lower() in CLOUD_TARGETS
+
+
+def is_cloud_voice(voice_id: str) -> bool:
+    return str(voice_id or "").strip() in CLOUD_VOICES
+
+
+def cloud_voice_for(voice_id: str, *, gender: str = "") -> str:
+    """把音色名换成等价的云端音色名（已经是云端名就原样返回）。
+
+    认不出来时按性别兜底 —— 绝不能把 Edge 音色名直接发给云端接口（会 400）。
+    """
+    name = str(voice_id or "").strip()
+    if name in CLOUD_VOICES:
+        return name
+    profile = CATALOG_BY_ID.get(name)
+    if profile is not None and profile.cloud:
+        return profile.cloud
+    if profile is not None:
+        return _CLOUD_FALLBACK.get(profile.gender, "alloy")
+    return _CLOUD_FALLBACK.get(gender, "alloy")
+
+
+def _belongs_to_other_target(voice_id: str, *, cloud: bool) -> bool:
+    """音色名属于「另一种引擎」吗（换 provider 后必须重配，否则接口会 400）。"""
+    name = str(voice_id or "").strip()
+    if not name:
+        return False
+    return name in CATALOG_BY_ID if cloud else name in CLOUD_VOICES
+
+
+def catalog_rows(*, cloud: bool = False) -> list[dict[str, object]]:
+    """给前端下拉用的音色表（`cloud=True` 返回云端音色）。"""
+    if cloud:
+        return [
+            {
+                "id": name,
+                "label": label,
+                "gender": _CLOUD_GENDER.get(name, ""),
+                "age": [],
+                "timbre": label,
+                "tags": [],
+                "locale": "cloud",
+                "dialect": False,
+            }
+            for name, label in CLOUD_VOICES.items()
+        ]
     return [
         {
             "id": voice.id,
@@ -332,6 +430,7 @@ def catalog_rows() -> list[dict[str, object]]:
             "tags": list(voice.tags),
             "locale": voice.locale,
             "dialect": voice.dialect,
+            "cloud": voice.cloud,
         }
         for voice in VOICE_CATALOG
     ]
@@ -371,8 +470,17 @@ def _score(voice: VoiceProfile, character: Character | None, settings: Settings)
     return score
 
 
-def _reuse_delivery(voice: VoiceProfile, index: int) -> VoiceDirection:
-    """同一个音色被两个角色共用时，用音高/语速区分（第 1 次复用下移，第 2 次上移）。"""
+def _reuse_delivery(voice: VoiceProfile, index: int, *, cloud: bool = False) -> VoiceDirection:
+    """同一个音色被两个角色共用时做区分（第 1 次复用下移，第 2 次上移）。
+
+    云端 TTS 不认 pitch/rate 参数，改成把区分写进自然语言念法（`instruction`）。
+    """
+    if cloud:
+        notes = (
+            "与同音色角色区分：音调压低一些、语速放慢、更沉稳",
+            "与同音色角色区分：音调抬高一些、语速略快、更年轻",
+        )
+        return VoiceDirection(instruction=notes[index % len(notes)], note=notes[index % len(notes)])
     shifts = (
         VoiceDirection(pitch="-12Hz", rate="-6%", note="与同音色角色区分：音高下移、语速放慢"),
         VoiceDirection(pitch="+14Hz", rate="+6%", note="与同音色角色区分：音高上移、语速略快"),
@@ -413,6 +521,68 @@ def _best_unused(
     return best if _score(best, character, settings) - baseline >= 1.0 else None
 
 
+#: 云端音色的性别分组（按「像不像主角」排序：越靠前越通用）
+_CLOUD_BY_GENDER: dict[str, tuple[str, ...]] = {
+    "female": ("nova", "shimmer", "coral", "sage", "alloy"),
+    "male": ("echo", "onyx", "ash", "verse", "ballad", "fable"),
+}
+
+
+def _to_cloud_voices(
+    mapping: dict[str, str], genders: dict[str, str]
+) -> tuple[dict[str, str], dict[str, VoiceDirection], list[str]]:
+    """把音色名整体换成云端音色名，并尽量让每个人都不撞音色。
+
+    云端池比 Edge 大（女 5 / 男 6），所以 Edge 那边「同性别音色用尽只能复用」
+    的角色，到云端往往还能分到一个没人用的 —— 先换空闲的，真用完了才靠念法区分。
+    """
+    out: dict[str, str] = {}
+    delivery: dict[str, VoiceDirection] = {}
+    notes: list[str] = []
+    used: dict[str, str] = {}
+    reuse_index = 0
+
+    def gender_of(speaker: str, voice: str) -> str:
+        explicit = genders.get(speaker, "")
+        if explicit:
+            return explicit
+        profile = CATALOG_BY_ID.get(voice)
+        return profile.gender if profile else ""
+
+    # 第一轮：人工指定 / 上次已落盘的云端音色先占位，避免被下面「换空闲的」挤掉
+    for speaker, voice in mapping.items():
+        if is_cloud_voice(voice):
+            used.setdefault(voice, speaker)
+
+    for speaker, voice in mapping.items():
+        gender = gender_of(speaker, voice)
+        name = cloud_voice_for(voice, gender=gender)
+        if name in used and used[name] != speaker:
+            free = [
+                candidate
+                for candidate in _CLOUD_BY_GENDER.get(gender, ())
+                if candidate not in used
+            ]
+            if free:
+                notes.append(
+                    f"{speaker} 与 {used[name]} 都想用云端音色 {name}，已改用 {free[0]}"
+                )
+                name = free[0]
+            else:
+                direction = _reuse_delivery(
+                    CATALOG_BY_ID.get(voice, VOICE_CATALOG[0]), reuse_index, cloud=True
+                )
+                reuse_index += 1
+                delivery[speaker] = direction
+                notes.append(
+                    f"{speaker} 与 {used[name]} 在云端共用音色 {name}，"
+                    f"已用念法区分（{direction.note}）"
+                )
+        used.setdefault(name, speaker)
+        out[speaker] = name
+    return out, delivery, notes
+
+
 def _speakers_of(storyboard) -> list[str]:
     speakers: list[str] = []
     for shot in storyboard.shots:
@@ -430,13 +600,17 @@ def cast_voice_map(
     settings: Settings | None = None,
     *,
     existing: dict[str, str] | None = None,
+    target: str = "",
 ) -> VoiceCasting:
     """给每个说话人分配音色（确定性：同样的输入永远得到同样的选角）。
 
-    已有分配会保留，**除非它和推断出的性别冲突** —— 那种情况下必须重配，
-    否则「女角配男声」这种错误会跟着 `voice_map` 一直续跑下去。
+    - 已有分配会保留，**除非**它与推断性别冲突、或它属于另一种 TTS 引擎
+      （Edge 音色名发给云端接口会 400，反之亦然）
+    - `target` 是 TTS provider 名（例如 "edge" / "openrouter"）：云端目标会把
+      选中的音色名整体换成等价的云端音色（见 `cloud_voice_for`）
     """
     settings = settings or get_settings()
+    cloud = is_cloud_target(target)
     characters = {c.id: c for c in (bible.characters if bible else [])}
     speakers = _speakers_of(storyboard)
 
@@ -464,6 +638,12 @@ def cast_voice_map(
         pinned = str(getattr(character, "voice_id", "") or "").strip()
         previous = (existing or {}).get(speaker) or ""
         candidate = pinned or previous
+        if candidate and _belongs_to_other_target(candidate, cloud=cloud):
+            notes.append(
+                f"{name}（{speaker}）原有音色 {candidate} 不适用于当前 TTS 引擎"
+                f"（{'云端' if cloud else 'Edge'}），已重新选角"
+            )
+            candidate = ""
         if candidate:
             clash = bool(gender) and voice_gender(candidate) not in (None, gender)
             if clash:
@@ -535,5 +715,18 @@ def cast_voice_map(
         else:
             used[chosen.id] = speaker
         logger.info("选角：%s(%s) -> %s（%s）", speaker, name, chosen.id, reason)
+
+    if cloud and mapping:
+        mapping, reuse, cloud_notes = _to_cloud_voices(mapping, genders)
+        for speaker, direction in reuse.items():
+            current = delivery.get(speaker)
+            if current is None:
+                delivery[speaker] = direction
+            elif not current.instruction:
+                # 已有的 pitch/rate 是给 Edge 的，云端只认自然语言念法：补上而不是覆盖
+                delivery[speaker] = current.model_copy(
+                    update={"instruction": direction.instruction}
+                )
+        notes.extend(cloud_notes)
 
     return VoiceCasting(voice_map=mapping, delivery=delivery, notes=notes, genders=genders)

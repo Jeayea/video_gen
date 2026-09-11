@@ -28,6 +28,8 @@ class TTSRequest(BaseModel):
     rate: str = "+0%"
     volume: str = "+0%"
     pitch: str = "+0Hz"
+    #: 自然语言念法（云端 TTS 用）：例如「压抑的哭腔，语速慢，句尾发颤」。Edge 忽略
+    instruction: str = ""
     output_path: Path
 
     model_config = {"arbitrary_types_allowed": True}
@@ -41,6 +43,10 @@ class GeneratedAudio(BaseModel):
     #: 语音时长（秒）。provider 必须尽力给出真实值，拿不到就给 0 让上层告警
     duration_sec: float = 0.0
     voice: str = ""
+    #: provider 报的实际花费（USD）。0 = 免费（edge）/ 没报
+    usd: float = 0.0
+    #: provider 回读出来的文本（云端 TTS 会回 transcript，用于发现模型「自己改词」）
+    transcript: str = ""
 
 
 class TTSProvider(ABC):

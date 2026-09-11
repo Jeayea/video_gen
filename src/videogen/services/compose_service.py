@@ -13,8 +13,10 @@ from videogen.models.project import Project
 from videogen.models.storyboard import Storyboard
 from videogen.models.video import VideoManifest
 from videogen.services import subtitle_service
+from videogen.utils.audio_align import mouth_align_delay
 from videogen.utils.ffmpeg import (
     ffmpeg_capabilities,
+    probe_duration,
     probe_streams,
     resolve_ffmpeg,
     resolve_ffmpeg_for,
@@ -41,10 +43,19 @@ def _resolution(project: Project) -> tuple[int, int]:
     return width - width % 2, height - height % 2
 
 
-def _resample(label_in: str, label_out: str, duration: float, *, gain_db: float = 0.0) -> str:
+def _resample(
+    label_in: str,
+    label_out: str,
+    duration: float,
+    *,
+    gain_db: float = 0.0,
+    delay_ms: int = 0,
+) -> str:
+    """统一采样格式，并按需**延后人声**（口型对齐用）。"""
     gain = f"volume={gain_db:.1f}dB," if gain_db else ""
+    delay = f"adelay={delay_ms}|{delay_ms}," if delay_ms > 0 else ""
     return (
-        f"[{label_in}]aresample=44100,aformat=channel_layouts=stereo,{gain}"
+        f"[{label_in}]aresample=44100,aformat=channel_layouts=stereo,{gain}{delay}"
         f"apad,atrim=duration={duration:.3f},asetpts=PTS-STARTPTS[{label_out}]"
     )
 
@@ -58,6 +69,7 @@ def _segment_filter(
     voice: bool,
     ambient: bool,
     ambient_gain_db: float = -20.0,
+    voice_delay_ms: int = 0,
 ) -> str:
     """拼一条分段滤镜：视频统一规格，音频把「配音」和「模型自带环境音」混起来。
 
@@ -77,14 +89,14 @@ def _segment_filter(
     )
     chains = [video]
     if voice and ambient:
-        chains.append(_resample("1:a", "voice", duration))
+        chains.append(_resample("1:a", "voice", duration, delay_ms=voice_delay_ms))
         chains.append(_resample("0:a", "ambient", duration, gain_db=ambient_gain_db))
         chains.append(
             "[voice][ambient]amix=inputs=2:duration=longest:dropout_transition=0:"
             "normalize=0[a]"
         )
     elif voice:
-        chains.append(_resample("1:a", "a", duration))
+        chains.append(_resample("1:a", "a", duration, delay_ms=voice_delay_ms))
     elif ambient:
         chains.append(_resample("0:a", "a", duration, gain_db=ambient_gain_db))
     else:
@@ -105,6 +117,7 @@ async def render_segment(
     preset: str,
     ambient: bool = False,
     ambient_gain_db: float = -20.0,
+    voice_delay_ms: int = 0,
 ) -> None:
     """把一个镜头渲染成「视频 + 该镜头配音」的标准片段。
 
@@ -129,6 +142,7 @@ async def render_segment(
             voice=voice,
             ambient=ambient,
             ambient_gain_db=ambient_gain_db,
+            voice_delay_ms=voice_delay_ms,
         ),
         "-map",
         "[v]",
@@ -461,7 +475,7 @@ async def compose(
     output_dir.mkdir(parents=True, exist_ok=True)
     _notify(on_progress, 0, len(segments) + 2, "开始渲染分段")
 
-    await _render_all(
+    mouth_delays = await _render_all(
         segments,
         segments_dir,
         project_dir,
@@ -475,7 +489,19 @@ async def compose(
         on_progress=on_progress,
         ambient=ambient_effective == "under",
         ambient_gain_db=settings.compose_ambient_gain_db,
+        align_mouth=settings.compose_align_dub_to_mouth,
+        mouth_align_max_sec=settings.compose_mouth_align_max_sec,
     )
+    if mouth_delays:
+        logger.info(
+            "口型对齐：%d 个镜头的配音已延后到画面开口时刻（最大 %.2fs）",
+            len(mouth_delays),
+            max(mouth_delays.values()),
+        )
+        warnings.append(
+            f"口型对齐：{len(mouth_delays)} 个镜头的配音延后了 "
+            f"{min(mouth_delays.values()):.2f}~{max(mouth_delays.values()):.2f}s"
+        )
 
     segment_paths = [segments_dir / f"{s.shot_id}.mp4" for s in segments]
     _notify(on_progress, len(segments), len(segments) + 2, "拼接分段")
@@ -621,11 +647,14 @@ async def _render_all(
     on_progress: ProgressCallback,
     ambient: bool = False,
     ambient_gain_db: float = -20.0,
-) -> None:
+    align_mouth: bool = False,
+    mouth_align_max_sec: float = 1.5,
+) -> dict[str, float]:
     semaphore = asyncio.Semaphore(concurrency)
     done = 0
     lock = asyncio.Lock()
     probe_cache: dict[str, bool] = {}
+    delays: dict[str, float] = {}
 
     async def has_ambient(video_path: Path) -> bool:
         key = str(video_path)
@@ -641,8 +670,26 @@ async def _render_all(
             video_path = project_dir / segment.video_path
             audio_path = project_dir / segment.audio_path if segment.audio_path else None
             use_ambient = ambient and await has_ambient(video_path)
-            # 环境音开关变了要重新渲染：把它编码到"输入"里参与新鲜度判断
-            marker = segments_dir / f".ambient-{'on' if use_ambient else 'off'}"
+            # 口型对齐：画面里的人几秒开口，配音就延后几秒（只用本地计算，不重新烧视频）
+            delay_ms = 0
+            if align_mouth and audio_path is not None and await has_ambient(video_path):
+                voice_sec = await probe_duration(audio_path) or 0.0
+                delay = await mouth_align_delay(
+                    video_path,
+                    segments_dir,
+                    voice_sec=voice_sec,
+                    segment_sec=segment.duration_sec,
+                    max_delay_sec=mouth_align_max_sec,
+                )
+                if delay > 0:
+                    delay_ms = round(delay * 1000)
+                    async with lock:
+                        delays[segment.shot_id] = delay
+            # 环境音/口型对齐开关变了要重新渲染：编码到"输入"里参与新鲜度判断
+            marker = segments_dir / (
+                f".ambient-{'on' if use_ambient else 'off'}"
+                f".mouth-{'on' if delay_ms > 0 else 'off'}"
+            )
             if reuse and marker.exists() and _segment_is_fresh(output, [video_path, audio_path]):
                 logger.debug("复用已渲染分段：%s", output.name)
             else:
@@ -658,6 +705,7 @@ async def _render_all(
                     preset=preset,
                     ambient=use_ambient,
                     ambient_gain_db=ambient_gain_db,
+                    voice_delay_ms=delay_ms,
                 )
                 marker.touch()
             async with lock:
@@ -670,6 +718,7 @@ async def _render_all(
                 )
 
     await asyncio.gather(*(run_one(segment) for segment in segments))
+    return delays
 
 
 def _bind_video(

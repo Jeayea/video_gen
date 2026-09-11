@@ -10,12 +10,14 @@
 |------|------|------|
 | 项目 / 文件存储 | ✅ | `projects/{id}/*.json`，原子写 |
 | 故事圣经 Story Bible | ✅ | 角色 / 设定 / 关键事实 / 风格，LLM 生成 |
+| **长篇剧集大纲（20+ 章）** | ✅ | 先出全篇骨架（因果链 / 章末钩子 / 预算），再分批扩写正文；**按章选做**：只把勾选的章展开成剧本 |
 | 逐场剧本 + World State | ✅ | 逐场注入 bible + 前场摘要 + 世界状态，逐场落盘 |
 | 一致性校验 | ✅ | 人名/数字/时间线/时长 + 分镜层校验 |
 | 分镜 + 英文 video_prompt | ✅ | 每场 2-5 镜，时长自动对齐剧本 |
 | 分镜档位感知（少而长） | ✅ | 有真实 provider 时按最短计费档位决定每场几个镜头（H3 → 每镜 ≥5 秒），从源头避免浪费 |
 | 视频片段生成 | ✅ | `VideoProvider` 抽象：`mock`（免费占位片段）+ `openrouter`（**真实视频模型**，默认 MiniMax H3） |
-| 配音 TTS | ✅ | `TTSProvider` 抽象 + `EdgeTTSProvider`（真实中文配音）+ `MockTTSProvider`（离线） |
+| 配音 TTS | ✅ | `TTSProvider` 抽象：`edge`（免费，音色池小）/ `openrouter`（云端 gpt-audio-mini，**支持自然语言念法**）/ `mock` |
+| 每句念法（情绪表演） | ✅ | LLM 看画面逐镜写念法：`instruction`（云端自然语言）+ `rate/pitch`（Edge），`AUDIO_LLM_SCRIPT=perform` 可只给念法不改台词 |
 | 音画对齐 | ✅ | 配音比镜头长时按配音**拉长镜头**，合成时冻结末帧补足，不重烧视频额度 |
 | 配音文案（LLM 看画面写/改） | ✅ | `AUDIO_LLM_SCRIPT=off\|narration\|polish\|full`，把片段抽帧发给多模态 LLM 写旁白/改台词，结果写回分镜 |
 | BGM 曲库 | ✅ | 扫 `BGM_DIR` + `bgm.json` 元数据，按镜头情绪自动选曲 |
@@ -28,6 +30,8 @@
 | 批量生产 | ✅ | 一次提交多个主题自动跑完整链路（可指定跑到哪一步停） |
 | 多模型切换 | ✅ | 项目级或单次请求指定模型，候选列表 + 单价由配置给出 |
 | 角色一致性 | ✅ | 参考图走 `input_references`（真实模型）或取色（mock），seed 仅在模型支持时透传 |
+| 背景/场景一致性 | ✅ | `Shot.location` + 场景 `visual_prompt` 锚点注入 + `VIDEO_BACKGROUND_DIRECTIVE`（禁止空墙） |
+| 口型对齐（同一句话） | ✅ | 台词进视频 prompt（`VIDEO_PROMPT_DIALOGUE`），模型原生表演与我们的配音落在同一句上 |
 
 ## 快速开始
 
@@ -458,6 +462,47 @@ curl -s localhost:8001/api/projects/$PID/voices | python3 -m json.tool
 片子已经 `done` 之后想换音色：`POST /api/projects/{id}/audio/reopen` 退回配音阶段
 （成片会作废），改完重做配音再合成 —— 没有这个入口时状态机会直接拒绝重做配音。
 
+### 「声音太像 AI」的两个真实原因
+
+1. **所有台词的念法都是空的**。`voice_direction` 只在配音文案模式（`AUDIO_LLM_SCRIPT`）
+   里才会生成，而默认模式是 `off` —— 于是一整部戏的台词都用同一个语速/音高念出来，
+   没有情绪、没有停顿。这不是 TTS 的锅，是**没给表演指令**
+2. **Edge 的表达力上限就在那里**：`rate` / `pitch` 只能调「快慢高低」，
+   调不出「忍着哭」「冷笑」「心虚」，而且中文没有 SSML 风格（`mstts:express-as`）可用
+
+所以 v0.15 加了**云端配音**（`TTS_PROVIDER=openrouter`，用你已有的 OpenRouter key）：
+
+```bash
+# .env
+TTS_PROVIDER=openrouter
+OPENROUTER_TTS_MODEL=openai/gpt-audio-mini   # $2.4/M 音频 token，整片通常 < $0.05
+TTS_AUDIO_FORMAT=mp3
+AUDIO_LLM_SCRIPT=perform                     # 只给念法，不改台词
+AUDIO_LLM_VISION=true                        # 让模型看着画面给念法
+```
+
+- 请求走 `POST /chat/completions` + `modalities:["text","audio"]`，`audio.voice` 是
+  **云端音色名**（nova / shimmer / coral / sage / alloy / echo / onyx / ash / verse /
+  ballad / fable），与 Edge 的名字**完全不通用**
+- **念法用自然语言写**：`VoiceDirection.instruction`，例如
+  「压抑的哭腔，语速慢，句尾发颤，像在忍着不哭」。它作为系统提示里的表演要求发给模型 ——
+  这是 Edge 的 `rate/pitch` 做不到的那一层
+- 选角仍然用 Edge 那份**带元数据的音色表**（性别/年龄/音色性格）打分，再把选中的音色
+  **换成同气质的云端音色**；云端池更大（女 5 / 男 6），Edge 那边「音色用尽只能复用」的
+  角色到云端常常还能分到没人用的音色；换 provider 会把旧音色名自动重配（否则接口 400）
+- **成本按 provider 报的 `usage.cost` 记账**，不靠估算（`audio_manifest.clips[].provider_usd`）
+- 模型回读文本（`transcript`）会留痕：它自己改词/加解释时能查出来
+
+新增 `AUDIO_LLM_SCRIPT=perform` 模式：**一个字都不改台词**，只根据画面给每个镜头写念法。
+改台词和给念法是两件事，混在一起做容易把好台词改坏。
+
+```bash
+# 只要念法（不改台词、不动文案），仍需抽帧发给模型
+curl -s -X POST localhost:8001/api/projects/$PID/audio/generate \
+  -H 'Content-Type: application/json' \
+  -d '{"script_mode":"perform","use_vision":true}'
+```
+
 ## 表演与镜头：表情自然 / 动作流畅
 
 原来视频 prompt 里**丢了两个关键信息**，v0.14 补上：
@@ -471,6 +516,117 @@ curl -s localhost:8001/api/projects/$PID/voices | python3 -m json.tool
 
 分镜提示词也同步收紧：情绪镜头优先中景/近景（大特写会让模型把表情演成舞台剧）、
 一个镜头只写一个连续动作、表演用克制的词（subtle / restrained）。
+
+### 口型对不上：因为我们从来没告诉模型该说什么
+
+**根因**：视频 prompt 里**完全没有台词**。H3 自带音频（`generate_audio`），它会**自己编一段话**
+在说 —— 嘴按它编的那句话动；我们再把 TTS 配音叠上去，两段话的字都不一样，口型必然对不上。
+（更早的版本还会把它编的那段话当「环境音」以 -20dB 混进去，等于两个人在说话。）
+
+v0.15 的修法是把台词写进 prompt：
+
+```
+林悦 speaks this exact Mandarin line: "薇儿，为什么？" — natural lip-sync matched to the
+Mandarin speech, mouth movement and breathing follow the line, no on-screen text or captions
+```
+
+这样模型的原生表演与我们的配音落在**同一句话**上。默认开启（`VIDEO_PROMPT_DIALOGUE=true`），
+可以关掉回到「让模型自己编」。
+
+三种方案的真实对照（同一个镜头、同一句话，各 $0.65，共 $1.95；原生音轨抽出来做过转写）：
+
+| 方案 | 模型原生说出口的话 | 原生说话区间 | 我们的配音区间 | 口型 |
+|---|---|---|---|---|
+| ① 现状：prompt 无台词 + TTS 配音 | **「你怎么能这样对我」** | 2.76–3.98s | 0.02–1.34s | ❌ 模型在说**另一句话**，嘴 2.7 秒后才动 |
+| ② 台词进 prompt + TTS 配音 | 「为什么」 | 1.22–4.60s | 0.02–1.34s | ⚠️ 话对上了，开头仍错位 ≈1.2 秒 |
+| ③ 台词进 prompt + 模型原生语音 | 「薇儿，为什么」 | 0.98–3.72s | 同一轨 | ✅ 零错位，但音色由模型每镜头决定 |
+
+### 采用的方案：②+ 本地口型对齐（不换音色、不重烧视频）
+
+③ 的口型最好，但与「每个角色有自己的声音」冲突。所以最终落地的是 **②再加一层本地对齐**：
+合成时把配音**延后**到「画面里的人开口」的那一刻（`adelay`）。
+
+- 判据在 `utils/audio_align.py`：用**相对自身峰值的能量阈值**找说话起点。
+  不能用 ffmpeg `silencedetect` 的绝对 dB —— 实测片头底噪约 -45dB，
+  绝对阈值会把「还没说话」判成「已经在说」（真实样本里把 2.76s 的开口误判成 0）
+- 上限 `COMPOSE_MOUTH_ALIGN_MAX_SEC`（默认 1.5 秒），且必须满足
+  `起点 + 配音时长 ≤ 片段时长`：尾音会被切掉时宁可不对齐，也不能丢字
+- 全片 15 镜重合成实测：**10/15 需要对齐，延后 0.08~1.20 秒**，成片仍是 67.0 秒（没切掉任何尾音）
+
+```
+COMPOSE_ALIGN_DUB_TO_MOUTH=true    # 口型对齐（默认开）
+COMPOSE_MOUTH_ALIGN_MAX_SEC=1.5    # 最大延后量
+```
+
+**局限**：这是「起点对齐」，不是逐帧对齐 —— 一句话内部的节奏仍由 TTS 决定。
+样本与测量数据：`projects/<id>/ab_lipsync/`（`lipsync_compare.mp4` + 三份原始片段 + `measure.json`）。
+
+## 背景/环境：为什么画面里常常只有一面空墙
+
+**根因**：故事圣经里每个场景都有 `visual_prompt`（「A bustling modern office with glass
+partitions…」），但它**从来没进过视频 prompt** —— 分镜 LLM 只写一句
+`The office lighting is harsh and cold.`，模型于是把背景画成一面空墙。
+
+v0.15 补了三层：
+
+1. **`Shot.location`**：分镜必须标出这一镜发生在哪个场景（loc id），系统校验它真实存在
+2. **`location_anchor()`**：把该场景的 `visual_prompt` 作为 `setting: …` 注入视频 prompt；
+   同一场景的多个镜头背景因此保持一致（和角色外貌锚点同一套机制，已出现过的不重复写）
+3. **`VIDEO_BACKGROUND_DIRECTIVE`**（默认开）：每个镜头都追加「有层次、有陈设、有材质、
+   有方向光、有景深，禁止空墙/纯影棚」的统一要求
+
+分镜提示词也加了硬性要求：`environment` 必须写到**具体的可见物**，
+只写 `in an office` 的 prompt 视为不合格。长篇大纲展开时还会把章里的环境线索
+（`OutlineScene.environment`）与「这一场在整篇里的位置」一起带进分镜提示词。
+真实项目里这一层立刻见效：`scene_1` 的环境线索是
+「大学教学楼前，草坪修剪整齐，喷泉水花飞溅…阳光透过法国梧桐洒在红砖墙上」。
+
+## 长篇剧集大纲：先写全篇，再挑章拍
+
+**「剧情太简略、太平淡」的根因**：原来是「一个 45 秒短片 → 直接写 4 场 → 开拍」。
+4 场的体量装不下钩子、转折、高潮与代价，模型只能写套话式的推进；而且每一场都是**孤立生成**的，
+没有全篇因果链兜着，写出来自然是流水账。
+
+v0.15 把创作拆成两步：
+
+```
+① 长篇大纲（一次调用给骨架，再按 3-4 章一批写正文）
+   title / logline / synopsis / theme
+   + 20 章：标题 · 一句话剧情 · 300-500 字正文 · 4-8 个情节点 · 章末钩子
+            涉及角色/场景 · 建议场次 · 时长预算
+② 选章展开：勾选想拍的 1-N 章 → 只把这几章展开成「分场大纲」→ 逐场生成剧本
+```
+
+为什么要分两阶段：20 章一次写完必然被输出长度截断（模型会开始糊弄），
+所以**骨架一次给全**（保证因果链完整），**正文分批写细**（每批 3-4 章，写完即落盘，可中断续跑）。
+
+- **因果链强制**：提示词要求「每一章都是因为上一章的某个结果才发生」「阻力要逐章升级」
+  「至少 5 章要有不可逆的大翻转」；展开成场次时，全篇弧光与章内情节点都会进上下文
+- **只对选中的章花钱**：视频是按秒计费的（H3 $0.13/秒），1 章 ≈ 2-3 场 ≈ 25-35 秒 ≈ **$3.5-4.5**。
+  UI 上每个章卡片都标了场次/秒数，勾选后会实时算出「选中 N 章 ≈ X 秒 ≈ ≈$Y 视频费」
+- **追加语义**：已经展开过的章不会重复生成（重复点「生成」不花钱）；之后想续写第 3 章，
+  再加一章即可，前面的场次原样保留（新增场次会作废下游分镜与媒体）
+- 项目的 `target_duration_sec` 会**自动对齐**到「已展开章的预算之和」，
+  时长归一化、成本估算、结构校验都以它为准
+
+```bash
+# 1) 生成长篇大纲（20 章，只花 LLM 的钱 ≈$0.05）
+curl -s -X POST localhost:8001/api/projects/$PID/story-outline/generate \
+  -H 'Content-Type: application/json' -d '{"chapters":20}' | python3 -m json.tool
+
+# 2) 只看已生成的大纲
+curl -s localhost:8001/api/projects/$PID/story-outline | python3 -m json.tool
+
+# 3) 只把第 1、2 章展开成剧本（已展开的章会被跳过）
+curl -s -X POST localhost:8001/api/projects/$PID/script/generate \
+  -H 'Content-Type: application/json' -d '{"chapters":["ch_1","ch_2"]}'
+
+# 4) 想清空重来（会作废下游分镜与媒体）
+curl -s -X POST localhost:8001/api/projects/$PID/script/generate \
+  -H 'Content-Type: application/json' -d '{"chapters":["ch_1"],"force":true}'
+```
+
+没有长篇大纲的项目**保持老行为**（一次性分场大纲），所以老项目不受影响。
 
 ## 剧本严谨：两层检查 + 拦确认
 
@@ -511,7 +667,8 @@ LLM 评审失败一律降级（只记 warning），绝不会因为它把生成�
 | GET/PUT/DELETE | `/api/projects/{id}` | 详情 / 改标题比例时长 / 删除 |
 | POST | `/api/projects/{id}/bible/generate` | 生成故事圣经 |
 | GET/PUT | `/api/projects/{id}/bible` | 读取 / 全量覆盖（仅剧本确认前） |
-| POST | `/api/projects/{id}/script/generate` | 生成剧本（失败后重试即续跑） |
+| POST/GET | `/api/projects/{id}/story-outline/generate` · `/story-outline` | **长篇剧集大纲**（20+ 章骨架 + 逐章正文；只花 LLM） |
+| POST | `/api/projects/{id}/script/generate` | 生成剧本（body 可带 `chapters:["ch_1","ch_2"]` 只展开选中章；`force` 清空重来。失败后重试即续跑） |
 | GET/PUT | `/api/projects/{id}/script` | 读取 / 全量覆盖（仅确认前） |
 | POST | `/api/projects/{id}/script/confirm` · `/reopen` | 确认 / 退回剧本阶段 |
 | POST | `/api/projects/{id}/storyboard/generate` | 生成分镜（需先确认剧本） |
@@ -536,7 +693,7 @@ LLM 评审失败一律降级（只记 warning），绝不会因为它把生成�
 | POST | `/api/projects/{id}/compose/cancel` | 取消合成任务 |
 | GET | `/api/projects/{id}/final` · `/subtitles` · `/subtitles.vtt` | 下载成片 MP4 / 字幕 SRT / WebVTT（浏览器 `<track>` 预览用，老项目就地转换） |
 | GET | `/api/projects/{id}/preflight` | **成本前置**：镜头数 / 计费秒数 / 单价 / 预估 USD / 预算投影 / 省钱建议 |
-| GET | `/api/models` | 可选模型 / 单价 / 预算（前端下拉用） |
+| GET | `/api/models` | 可选模型 / 单价 / 预算 / **两套音色表**（Edge + 云端）/ 默认章数（前端下拉用） |
 | GET | `/api/projects/{id}/cost` | 成本账本：按阶段的花费、token、秒数、字符 + 预估 |
 | POST/GET/DELETE | `/api/projects/{id}/characters/{cid}/reference` | 角色参考图（base64 上传 / 下载 / 删除） |
 | GET | `/api/projects/{id}/characters/references/plan` | 角色图计划：缺几张 / 预估花费 / prompt 预览（**不调 API**） |
@@ -643,6 +800,16 @@ src/videogen/
     想让配角也严格锁死，可行方向是**把双人镜头拆成单人镜头**（分镜层面）
 19. **烧字幕是重编码**：`burn` 会让整片重新编码一遍（比 `soft` 慢、且视频流不再是无损 copy）；
     需要「随时刻换字幕/多语言」就别烧，用 `soft` + `.vtt` 预览
+20. **长篇大纲是 LLM 写的**：20 章的因果链仍可能有一两处硬拗 —— 骨架与实际场次都允许人工
+    编辑；「章数越多越像流水账」是模型能力的上限，本项目只能把结构约束写死
+21. **按章展开会作废下游**：新增场次后旧分镜与已生成的片段不再对应，会被清掉（重新花钱）；
+    所以建议**先选定要拍的章、再开始烧视频**，别出一半再回头加章
+22. **云端 TTS 的中文带一点非母语味道**：`openai/gpt-audio-mini` 的情绪表达力明显强于 Edge，
+    但发音不如 Edge 的中文神经音色「地道」；两者可以随时切换（换引擎会自动重配音色名，
+    `AUDIO_LLM_SCRIPT` 与念法都会保留）
+23. **口型不是逐帧对齐**：台词进 prompt 后原生表演与配音落在同一句话上，但两者节奏仍有差；
+    要逐帧完美只能改用模型原生语音（方案③，代价是跨镜头音色一致性弱），
+    或者接专门的 lip-sync 后处理（本项目没接）
 
 ## 安全
 

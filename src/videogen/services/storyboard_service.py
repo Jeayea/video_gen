@@ -40,6 +40,7 @@ STORYBOARD_SYSTEM = """你是一位专业分镜师。根据剧本场景生成分
   "character_in_frame": ["char_1"],
   "mood": "画面情绪（建议用英文情绪词：shocked / wronged / determined …）",
   "video_prompt": "subject + action + environment + lighting（全英文，不要写标签）",
+  "location": "loc_id（这一镜发生在哪个场景，必须是故事圣经里的场景 id）",
   "narration": null 或 "旁白文字",
   "dialogue_text": null 或 "台词文字",
   "dialogue_speaker": null 或 "char_id"
@@ -48,6 +49,12 @@ STORYBOARD_SYSTEM = """你是一位专业分镜师。根据剧本场景生成分
 要求：
 - video_prompt 必须全英文，面向 AI 视频生成模型
 - video_prompt 里禁止出现 char_1 / loc_1 这类内部 id，必须写成具体的外貌/场景描述
+- **背景必须写实、写满**：environment 部分要说清「有什么陈设/道具、什么材质、光从哪来、
+  前景与景深里有什么」，至少写到一个**具体的可见物**。
+  只写 "in an office" / "in a room" 这类泛称、或压根不提背景，模型就会把背景画成一面
+  空墙 —— 这种 prompt 一律不合格，必须重写成有层次的场景
+- location 必须填故事圣经场景列表里真实存在的 id：视频生成时会用它的环境描述做**背景锚点**，
+  跨镜头背景才不漂
 - character_in_frame 必须是故事圣经里已有的角色 id
 - 构图提示随 aspect_ratio 变化
 - 台词尽量对准角色镜头，**且说话人必须出现在 character_in_frame 里**（说话却不在画面里是穿帮）
@@ -72,7 +79,7 @@ def _format_brief_bible(bible: StoryBible) -> str:
     lines = ["角色（id 仅用于 character_in_frame / dialogue_speaker，不要写进 video_prompt）:"]
     for c in bible.characters:
         lines.append(f"  - id={c.id} 姓名={c.name} 外貌={c.visual_prompt or c.description}")
-    lines.append("场景:")
+    lines.append("场景（id 用于 location 字段；video_prompt 里要写成具体环境描述）:")
     for s in bible.settings:
         lines.append(f"  - id={s.id} 名称={s.name} 环境={s.visual_prompt or s.description}")
     return "\n".join(lines)
@@ -139,11 +146,16 @@ async def generate_shots_for_scene(
     scene: Scene,
     *,
     tier: DurationTier | None = None,
+    environment: str = "",
+    story_context: str = "",
 ) -> list[Shot]:
     """为一个场景生成镜头列表（id / shot_no / scene_id 由系统分配）。
 
     `tier` 是视频模型的计费档位：给了就把「本场几个镜头、每镜多少秒」写成硬约束，
     让模型一开始就产出「少而长」的分镜（事后合并只能补救，不如一开始就不浪费）。
+
+    `environment` 是长篇大纲展开时留下的环境线索（背景不够丰富的补丁之一）；
+    `story_context` 是这一场在整篇里的位置（章标题/情节点），避免分镜脱离全篇。
     """
     aspect_hint = _ASPECT_HINTS.get(project.aspect_ratio.value, _ASPECT_HINTS["9:16"])
     dialogue_text = "\n".join(f"  {d.speaker}: {d.line}" for d in scene.dialogue) or "（无对白）"
@@ -154,6 +166,12 @@ async def generate_shots_for_scene(
         else f"拆成 2-5 个镜头，所有镜头时长加起来必须正好等于 {scene.duration_sec} 秒"
     )
 
+    context_block = f"\n## 全篇位置\n{story_context}\n" if story_context else ""
+    env_block = (
+        f"\n## 本场环境线索（必须落在 video_prompt 的 environment 里）\n{environment}\n"
+        if environment
+        else ""
+    )
     tier_block = f"\n## 时长硬约束（视频模型计费档位）\n{constraints}\n" if constraints else ""
     user_prompt = f"""## 角色与场景参考
 {_format_brief_bible(bible)}
@@ -166,12 +184,12 @@ async def generate_shots_for_scene(
 时长: {scene.duration_sec} 秒
 对白:
 {dialogue_text}
-
-{tier_block}
+{context_block}{env_block}{tier_block}
 ## 要求
 - 画面比例: {project.aspect_ratio.value} → {aspect_hint}
 - {shot_count_rule}
 - video_prompt 必须是英文，且不得包含 char_N / loc_N 这类 id
+- 每个镜头都要填 location（场景 id），video_prompt 的背景要和该场景一致
 - 台词对应的镜头要标记 dialogue_text 和 dialogue_speaker（speaker 用角色 id）
 - 无对白的空镜/过渡镜 narration 可为 null
 
@@ -183,8 +201,12 @@ async def generate_shots_for_scene(
     ]
     response = await llm.chat_json(messages, schema=ShotsResponse, temperature=0.5, max_tokens=4096)
 
+    known_locs = {s.id for s in bible.settings}
     shots: list[Shot] = []
     for index, draft in enumerate(response.shots, start=1):
+        location = str(draft.location or "").strip()
+        if location and location not in known_locs:
+            location = ""
         shots.append(
             Shot(
                 id=f"{scene.id}_shot_{index}",
@@ -196,6 +218,7 @@ async def generate_shots_for_scene(
                 character_in_frame=draft.character_in_frame,
                 mood=draft.mood,
                 video_prompt=sanitize_video_prompt(draft.video_prompt, bible),
+                location=location,
                 narration=draft.narration,
                 dialogue_text=draft.dialogue_text,
                 dialogue_speaker=draft.dialogue_speaker,

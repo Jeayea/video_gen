@@ -7,6 +7,7 @@ import re
 import pytest
 
 from tests.fakes import AlwaysFailVideoProvider, FakeVideoProvider
+from videogen.models.bible import Setting
 from videogen.models.project import Project, ProjectStatus
 from videogen.models.video import ClipStatus, MediaKind, VideoManifest
 from videogen.orchestrator.pipeline import Pipeline, PipelineError
@@ -286,7 +287,68 @@ def test_build_prompt_translates_camera_and_mood_to_english(store, ready_project
     assert "medium shot" in prompt
     assert "slow dolly in" in prompt
     assert "shocked" in prompt and "crestfallen" in prompt
-    assert not re.search(r"[\u4e00-\u9fff]", prompt), prompt  # 英文 prompt 里不能有中文
+    # 唯一允许出现在英文 prompt 里的中文是**引号里的台词**（刻意给模型对口型用的）
+    outside_quotes = re.sub(r'"[^"]*"', "", prompt)
+    assert not re.search(r"[\u4e00-\u9fff]", outside_quotes), prompt
+
+
+def test_build_prompt_carries_the_spoken_line_for_lip_sync(store, ready_project, settings):
+    """口型对不上的根因：prompt 里没有台词，模型自己编一段话在说。
+
+    台词进 prompt 后，原生表演与我们的配音才落在同一句话上。
+    """
+    shot = store.load_storyboard(ready_project.id).shots[0]
+    shot.dialogue_text = "薇儿，为什么？"
+    shot.dialogue_speaker = ""
+    prompt = video_service.build_prompt(shot, ready_project)
+    assert "薇儿，为什么？" in prompt
+    assert "lip-sync" in prompt
+    assert "no on-screen text" in prompt
+
+    # 可以整体关掉（老行为：模型自己编话）
+    settings.video_prompt_dialogue = False
+    assert "薇儿，为什么？" not in video_service.build_prompt(shot, ready_project)
+
+
+def test_build_prompt_injects_location_background_anchor(store, ready_project, bible):
+    """背景不够丰富：场景的环境描述以前从来没进过 prompt（分镜只写 "in an office"）。"""
+    shot = store.load_storyboard(ready_project.id).shots[0]
+    shot.video_prompt = "a woman walks through an office"
+    bible.settings = [
+        Setting(
+            id="loc_1",
+            name="杂志社办公室",
+            visual_prompt="A bustling modern office with glass partitions",
+        )
+    ]
+    shot.location = "loc_1"
+    prompt = video_service.build_prompt(shot, ready_project, bible)
+    assert "A bustling modern office with glass partitions" in prompt
+    assert "setting:" in prompt
+
+    # 背景丰富度规范也必须在（空墙是模型偷懒的默认解）
+    assert "richly detailed lived-in environment" in prompt
+    assert "no empty blank walls" in prompt
+
+    # 没填 location 时不硬塞别的场景（宁可没有锚点，也不要张冠李戴）
+    shot.location = ""
+    assert "A bustling modern office" not in video_service.build_prompt(
+        shot, ready_project, bible
+    )
+
+
+def test_location_anchor_skips_description_already_in_prompt(store, ready_project, bible):
+    shot = store.load_storyboard(ready_project.id).shots[0]
+    bible.settings = [
+        Setting(
+            id="loc_1",
+            name="杂志社办公室",
+            visual_prompt="A bustling modern office with glass partitions",
+        )
+    ]
+    shot.location = "loc_1"
+    base = "a woman types at a desk, a bustling modern office with glass partitions"
+    assert video_service.location_anchor(shot, bible, base) == ""
 
 
 def test_build_prompt_appends_performance_and_style_directive(store, ready_project, settings):

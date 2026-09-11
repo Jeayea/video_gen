@@ -138,6 +138,25 @@ body {
 .tag-mini.warn { border-color: var(--yellow); color: var(--yellow); }
 .tag-mini.ok { border-color: var(--green); color: var(--green); }
 
+/* 长篇剧集大纲：章卡片（选章展开成剧本） */
+.story-outline { margin-bottom: 12px; }
+.story-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 6px; }
+.story-synopsis {
+  font-size: 12px; color: var(--text2); line-height: 1.7; margin-bottom: 10px;
+  max-height: 72px; overflow: auto; border-left: 2px solid var(--border); padding-left: 8px;
+}
+.chapter-list { max-height: 360px; overflow: auto; }
+.chapter-card {
+  border: 1px solid var(--border); border-radius: 8px;
+  padding: 8px 10px; margin-bottom: 6px; background: var(--bg);
+}
+.chapter-card.expanded { border-color: #14532d; }
+.chapter-pick { display: flex; align-items: center; gap: 8px; cursor: pointer; }
+.chapter-title { font-size: 13px; font-weight: 600; }
+.chapter-body { font-size: 12px; color: var(--text2); line-height: 1.7; margin-top: 6px; }
+.chapter-body ul { margin: 4px 0 0 18px; padding: 0; }
+.chapter-hook { color: var(--yellow); margin-top: 4px; }
+
 .script-content { font-size: 13px; line-height: 1.6; }
 .scene-block {
   border: 1px solid var(--border); border-radius: 8px;
@@ -390,6 +409,8 @@ function authHeaders() {
 
 let currentProjectId = null;
 let currentBible = null;
+let currentStoryOutline = null;
+let currentOutlineData = null;
 let currentScript = null;
 let currentStoryboard = null;
 let currentProject = null;
@@ -466,7 +487,8 @@ async function loadHealth() {
     if (typeof h.audio_script_vision === 'boolean') audioScriptVision = h.audio_script_vision;
     try {
       const models = await api('/api/models');
-      applyVoiceCatalog(models.voices);
+      modelInfo = models;
+      applyVoiceCatalog(models.voices, models.voices_cloud, models.tts_provider);
     } catch (e) { /* 拿不到就用兜底表 */ }
   } catch (e) {
     $('health').textContent = '';
@@ -546,6 +568,8 @@ async function renderProject(id) {
 
   // 先取数据再渲染，避免用到上一个项目残留的 currentScript/currentStoryboard
   currentBible = await safeGet(`/api/projects/${id}/bible`);
+  currentStoryOutline = await safeGet(`/api/projects/${id}/story-outline`);
+  currentOutlineData = await safeGet(`/api/projects/${id}/outline`);
   currentScript = await safeGet(`/api/projects/${id}/script`);
   currentStoryboard = await safeGet(`/api/projects/${id}/storyboard`);
   currentVideo = await safeGet(`/api/projects/${id}/video/status`);
@@ -553,7 +577,10 @@ async function renderProject(id) {
   currentCompose = await safeGet(`/api/projects/${id}/compose/status`);
   currentCost = await safeGet(`/api/projects/${id}/cost`);
   await loadPreflight('all');
-  if (!modelInfo) modelInfo = await safeGet('/api/models');
+  if (!modelInfo) {
+    modelInfo = await safeGet('/api/models');
+    if (modelInfo) applyVoiceCatalog(modelInfo.voices, modelInfo.voices_cloud, modelInfo.tts_provider);
+  }
   // 刷新页面后也能看到最近一次批量任务（进行中的继续轮询）
   if (!currentBatch || !currentBatch.is_active) {
     const batchList = await safeGet('/api/batches?limit=1');
@@ -615,6 +642,7 @@ async function renderProject(id) {
         ${scriptTotal !== null ? `<span class="tag-mini ${scriptTotal > p.target_duration_sec * 1.2 ? 'warn' : ''}">${scriptTotal}s / 目标 ${p.target_duration_sec}s</span>` : ''}
         ${currentScript && currentScript.duration_normalized ? '<span class="tag-mini warn">时长已自动归一化</span>' : ''}
       </h3>
+      <div id="story-panel"></div>
       <div id="script-view"><span style="color:var(--text2);font-size:12px">尚未生成</span></div>
       <div id="consistency-content"></div>
       <div class="json-editor" id="script-editor">
@@ -628,6 +656,8 @@ async function renderProject(id) {
       <div class="panel-actions">
         ${inStatus(p, ['draft','failed','script_review'])
           ? '<button class="btn btn-sm" onclick="doGenerateScript()" id="btn-script">生成剧本</button>' : ''}
+        ${inStatus(p, ['draft','failed','script_review']) && !currentStoryOutline
+          ? `<button class="btn btn-sm btn-outline" onclick="doGenerateStoryOutline()" id="btn-story">生成长篇大纲（${modelInfo && modelInfo.story_chapters ? modelInfo.story_chapters : 20} 章）</button>` : ''}
         <button class="btn btn-sm btn-outline" onclick="startEdit('script')" id="btn-script-edit" style="display:none">编辑 JSON</button>
         ${inStatus(p, ['script_review'])
           ? '<button class="btn btn-sm btn-green" onclick="doConfirmScript()">确认剧本 → 进入分镜</button>' : ''}
@@ -766,6 +796,7 @@ async function renderProject(id) {
               <option value="narration">narration · 补旁白</option>
               <option value="polish">polish · 改写已有文案</option>
               <option value="full">full · 补旁白 + 改写 + 念法</option>
+              <option value="perform">perform · 只给念法（不改台词）</option>
             </select>
           </label>
         </div>
@@ -780,6 +811,7 @@ async function renderProject(id) {
 
   main.innerHTML = html;
   renderBible();
+  renderStoryOutline();
   renderScript();
   renderStoryboard();
   renderVideo();
@@ -872,6 +904,125 @@ async function saveBible() {
 }
 
 // ── 剧本 ────────────────────────────────────────────────────────────
+
+// ── 长篇剧集大纲（20+ 章，选章展开成剧本）────────────────────
+// 剧情「太简略/太平淡」的根因是直接让模型写 4 场就开拍：没有全篇因果链，
+// 每场只能靠套话推进。这里先出完整骨架，再由人选章展开。
+
+const selectedChapters = new Set();
+
+function chapterExpectedSec(ch) {
+  return ch.duration_budget_sec || (ch.scene_budget || 3) * 12;
+}
+
+function renderStoryOutline() {
+  const el = $('story-panel');
+  if (!el) return;
+  const outline = currentStoryOutline;
+  const p = currentProject;
+  if (!outline) {
+    el.innerHTML = '';
+    return;
+  }
+  const done = new Set((currentScript ? currentScript.scenes.map(s => s.id) : []));
+  const outlineScenes = (currentOutlineData && currentOutlineData.scenes) || [];
+  const expanded = new Set(outlineScenes.map(s => s.chapter_id).filter(Boolean));
+  const secPerDollar = (modelInfo && modelInfo.prices && modelInfo.prices.video_per_second) || 0;
+  const picked = outline.chapters.filter(c => selectedChapters.has(c.id));
+  const pickedSec = picked.reduce((a, c) => a + chapterExpectedSec(c), 0);
+  const pickedNew = picked.filter(c => !expanded.has(c.id)).length;
+  const costHint = secPerDollar > 0
+    ? `≈$${(pickedSec * secPerDollar).toFixed(2)} 视频费`
+    : '视频费以「成本预估」为准';
+  const canEdit = ['draft', 'failed', 'script_review'].includes(p.status);
+
+  el.innerHTML = `
+    <div class="story-outline">
+      <div class="story-head">
+        <strong>${esc(outline.title || '长篇大纲')}</strong>
+        <span class="tag-mini">${outline.chapters.length} 章</span>
+        <span class="tag-mini">${expanded.size} 章已展开</span>
+        ${outline.logline ? `<span style="font-size:12px;color:var(--text2)">${esc(outline.logline)}</span>` : ''}
+      </div>
+      ${outline.synopsis ? `<div class="story-synopsis">${esc(outline.synopsis)}</div>` : ''}
+      <div class="chapter-list">
+        ${outline.chapters.map(c => `
+          <div class="chapter-card ${expanded.has(c.id) ? 'expanded' : ''}">
+            <label class="chapter-pick">
+              <input type="checkbox" ${selectedChapters.has(c.id) ? 'checked' : ''}
+                     ${canEdit ? '' : 'disabled'}
+                     onchange="toggleChapter('${c.id}', this.checked)">
+              <span class="chapter-title">${esc(c.id)} · ${esc(c.title)}</span>
+              ${expanded.has(c.id) ? '<span class="tag-mini ok">已展开</span>' : ''}
+              <span class="tag-mini">${c.scene_budget || 3} 场 / 约 ${chapterExpectedSec(c)}s</span>
+            </label>
+            <div class="chapter-body">
+              ${c.summary ? `<div>${esc(c.summary)}</div>` : `<div style="color:var(--text2)">${esc(c.brief)}</div>`}
+              ${(c.beats && c.beats.length) ? `<ul>${c.beats.map(b => `<li>${esc(b)}</li>`).join('')}</ul>` : ''}
+              ${c.hook ? `<div class="chapter-hook">章末钩子：${esc(c.hook)}</div>` : ''}
+            </div>
+          </div>
+        `).join('')}
+      </div>
+      <div class="panel-actions">
+        ${canEdit ? `
+          <button class="btn btn-sm btn-green" onclick="doGenerateChapters()"
+                  ${pickedNew ? '' : 'disabled'}>
+            生成选中章节的剧本（${pickedNew} 章 / 约 ${pickedSec}s / ${costHint}）
+          </button>
+          <button class="btn btn-sm btn-outline" onclick="selectAllChapters(false)">清空选择</button>
+          <button class="btn btn-sm btn-outline" onclick="selectUnexpandedChapters()">选中未展开的章</button>
+        ` : '<span class="hint">剧本已确认：如需继续加章，先退回剧本阶段</span>'}
+      </div>
+      ${(outline.chapters.some(c => !c.summary && !(c.beats || []).length))
+        ? `<div class="hint" style="color:var(--yellow)">有 ${outline.chapters.filter(c => !c.summary && !(c.beats || []).length).length} 章只有骨架（正文没写完，可重新生成大纲续写）</div>` : ''}
+    </div>
+  `;
+}
+
+function toggleChapter(id, checked) {
+  if (checked) selectedChapters.add(id); else selectedChapters.delete(id);
+  renderStoryOutline();
+}
+
+function selectAllChapters(checked) {
+  selectedChapters.clear();
+  if (checked && currentStoryOutline) {
+    currentStoryOutline.chapters.forEach(c => selectedChapters.add(c.id));
+  }
+  renderStoryOutline();
+}
+
+function selectUnexpandedChapters() {
+  selectedChapters.clear();
+  const expanded = new Set(((currentOutlineData && currentOutlineData.scenes) || [])
+    .map(s => s.chapter_id).filter(Boolean));
+  (currentStoryOutline ? currentStoryOutline.chapters : [])
+    .filter(c => !expanded.has(c.id))
+    .forEach(c => selectedChapters.add(c.id));
+  renderStoryOutline();
+}
+
+function doGenerateStoryOutline() {
+  const n = (modelInfo && modelInfo.story_chapters) || 20;
+  if (!confirm(`生成长篇大纲：${n} 章骨架 + 逐章正文（多次 LLM 调用，约 $0.05，不花视频费）。继续？`)) return;
+  withBusy(`生成长篇大纲中（${n} 章，约 1-3 分钟）...`, () =>
+    api(`/api/projects/${currentProjectId}/story-outline/generate`, {
+      method: 'POST', body: JSON.stringify({ chapters: n, model: currentModel() }),
+    }));
+}
+
+function doGenerateChapters() {
+  const ids = [...selectedChapters];
+  if (!ids.length) return alert('先勾选要拍的章节');
+  const picked = currentStoryOutline.chapters.filter(c => ids.includes(c.id));
+  const sec = picked.reduce((a, c) => a + chapterExpectedSec(c), 0);
+  if (!confirm(`把 ${ids.length} 章展开成剧本（约 ${sec} 秒成片）。\n\n注意：这会作废已生成的分镜与媒体（片段要重跑才对应）。继续？`)) return;
+  withBusy(`展开 ${ids.length} 章为剧本（逐场生成，约 1-3 分钟）...`, () =>
+    api(`/api/projects/${currentProjectId}/script/generate`, {
+      method: 'POST', body: JSON.stringify({ chapters: ids, model: currentModel() }),
+    }));
+}
 
 function renderScript() {
   try {
@@ -1378,6 +1529,15 @@ function doCancelVideo() {
 // ── 配音 ────────────────────────────────────────────────────────────
 
 // 音色表由服务端下发（/api/models 的 voices），这里只是断网时的兜底
+let CLOUD_VOICES = [
+  ['nova', 'nova · 女声（云端）'], ['shimmer', 'shimmer · 女声（云端）'],
+  ['coral', 'coral · 女声（云端）'], ['sage', 'sage · 女声（云端）'],
+  ['alloy', 'alloy · 中性（云端）'], ['echo', 'echo · 男声（云端）'],
+  ['onyx', 'onyx · 男声（云端）'], ['ash', 'ash · 男声（云端）'],
+  ['verse', 'verse · 男声（云端）'], ['ballad', 'ballad · 男声（云端）'],
+  ['fable', 'fable · 中性（云端）'],
+];
+let TTS_PROVIDER = 'edge';
 let EDGE_VOICES = [
   ['zh-CN-XiaoxiaoNeural', '晓晓 · 女声'],
   ['zh-CN-XiaoyiNeural', '晓伊 · 女声'],
@@ -1389,9 +1549,19 @@ let EDGE_VOICES = [
   ['zh-CN-shaanxi-XiaoniNeural', '晓妮 · 陕西女声'],
 ];
 
-function applyVoiceCatalog(voices) {
-  if (!Array.isArray(voices) || !voices.length) return;
-  EDGE_VOICES = voices.map(v => [v.id, v.label]);
+function applyVoiceCatalog(voices, cloudVoices, provider) {
+  if (Array.isArray(voices) && voices.length) {
+    EDGE_VOICES = voices.map(v => [v.id, v.label]);
+  }
+  if (Array.isArray(cloudVoices) && cloudVoices.length) {
+    CLOUD_VOICES = cloudVoices.map(v => [v.id, v.label]);
+  }
+  if (provider) TTS_PROVIDER = provider;
+}
+
+//: 当前生效的音色表：云端 TTS 与 Edge 的音色名完全不通用
+function activeVoices() {
+  return TTS_PROVIDER === 'openrouter' ? CLOUD_VOICES : EDGE_VOICES;
 }
 
 function stopAudioPolling() {
@@ -1500,8 +1670,8 @@ function renderAudio() {
     const voiceRows = speakers.map(sp => {
       const sample = clips.find(c => c.speaker === sp) || {};
       const value = voiceMap[sp] || sample.voice || '';
-      const known = EDGE_VOICES.some(v => v[0] === value);
-      const options = EDGE_VOICES
+      const known = activeVoices().some(v => v[0] === value);
+      const options = activeVoices()
         .map(([id, label]) => `<option value="${id}"${id === value ? ' selected' : ''}>${esc(label)}</option>`)
         .join('') + (known || !value ? '' : `<option value="${esc(value)}" selected>${esc(value)}（当前）</option>`);
       return `<div class="voice-row">

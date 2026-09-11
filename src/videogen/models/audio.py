@@ -51,10 +51,14 @@ class AudioClip(BaseModel):
     rate: str = ""
     volume: str = ""
     pitch: str = ""
+    #: 自然语言念法（云端 TTS 用；Edge 忽略）。例：「压抑的哭腔，语速慢，句尾发颤」
+    instruction: str = ""
     #: 这条文案的来源："llm:narration" / "llm:polish" / "llm:full"，空 = 分镜原文
     script_source: str = ""
     #: LLM 给的写这句的理由（排查/人工核对用，不参与合成）
     note: str = ""
+    #: provider 报的实际花费（云端 TTS 会报；Edge 免费 = 0）
+    provider_usd: float = 0.0
     #: 这条配音的花费是否已经记进账本（重新合成时会清掉，与视频片段同一套规则）
     cost_recorded: bool = False
     status: ClipStatus = ClipStatus.PENDING

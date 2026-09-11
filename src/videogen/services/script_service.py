@@ -2,23 +2,38 @@ from __future__ import annotations
 
 import logging
 import re
+from collections.abc import Callable
 
 from pydantic import BaseModel, Field
 
 from videogen.models.bible import StoryBible
 from videogen.models.consistency import ConsistencyIssue, IssueSeverity
-from videogen.models.llm_io import OutlineResponse, SceneResponse
+from videogen.models.llm_io import (
+    ChapterOutlineResponse,
+    ChaptersExpansionResponse,
+    OutlineResponse,
+    SceneResponse,
+    StorySpineResponse,
+)
 from videogen.models.project import Project
 from videogen.models.script import (
+    DEFAULT_CHAPTER_CHUNK,
+    DEFAULT_CHAPTER_DURATION_SEC,
+    DEFAULT_CHAPTER_SCENES,
+    DEFAULT_SCENE_DURATION_SEC,
+    DEFAULT_STORY_CHAPTERS,
     MIN_SCENE_DURATION_SEC,
     DialogueLine,
     OutlineScene,
     Scene,
     Script,
     ScriptOutline,
+    StoryChapter,
+    StoryOutline,
 )
 from videogen.models.world_state import WorldState
 from videogen.providers.llm.base import LLMMessage, LLMProvider
+from videogen.utils.coerce import coerce_int, ensure_str_list
 from videogen.utils.duration import apply_duration_budget, deviation_ratio, scale_durations
 
 logger = logging.getLogger(__name__)
@@ -96,6 +111,9 @@ def _format_bible(bible: StoryBible) -> str:
     parts.append("\n## 场景设定")
     for s in bible.settings:
         parts.append(f"- [{s.id}] {s.name}: {s.description}")
+        if s.visual_prompt:
+            # 环境视觉描述必须往下传：背景不够丰富，根因就是这一层信息在中途丢了
+            parts.append(f"  环境视觉: {s.visual_prompt}")
     parts.append("\n## 关键事实")
     for f in bible.facts:
         parts.append(f"- [{f.id}] ({f.type}) {f.content}")
@@ -139,7 +157,11 @@ def _format_world_state(ws: WorldState) -> str:
 
 
 async def generate_outline(llm: LLMProvider, project: Project, bible: StoryBible) -> ScriptOutline:
-    """生成分场大纲，并把时长预算按场次均分写进大纲。"""
+    """生成分场大纲，并把时长预算按场次均分写进大纲。
+
+    这是**单章/短剧**路径（一次成型、只覆盖 project.target_duration_sec）。
+    长篇剧集走 `generate_story_outline` + `expand_chapters`。
+    """
     count = scene_count_for(project.target_duration_sec)
     budget = apply_duration_budget(project.target_duration_sec, count, MIN_SCENE_DURATION_SEC)
 
@@ -191,6 +213,371 @@ async def generate_outline(llm: LLMProvider, project: Project, bible: StoryBible
     return outline
 
 
+# ── 长篇剧集大纲（20+ 章）─────────────────────────────
+
+STORY_SPINE_SYSTEM = """你是长篇剧集的总编剧。你只写「骨架」：不写台词，不写分场。
+
+硬要求：
+1. 只使用给定故事圣经里已有的角色/场景，不允许新增角色
+2. 全篇必须是一条**因果链**：每一章都是因为上一章的某个结果才发生
+3. 主角必须有明确、可被阻碍的具体目标；阻力要逐章升级（换手段、换代价，不是重复同一种冲突）
+4. 每一章都要有**局势变化**（关系翻转 / 信息揭露 / 代价兑现 / 目标转移），
+   禁止「又发生了一次类似的挫折」这种平铺
+5. 必须交代钩子（开场悬念）与收束（结局与代价）；不要写成流水账式日常
+6. 章与章之间情绪节奏要起伏：高压章之后给一个喘息章，再推向更大的危机
+
+只输出 JSON：
+{"title": "剧名", "logline": "一句话卖点（≤50字）", "synopsis": "全篇梗概 300-500 字，写清起承转合",
+ "theme": "主题（≤20字）",
+ "chapters": [{"title": "章标题", "brief": "这一章发生了什么（30-60字，含转折）"}]}"""
+
+CHAPTER_EXPAND_SYSTEM = """你是长篇剧集的总编剧。现在把已经定稿的**章节骨架**扩写成正文级内容。
+
+硬要求：
+1. 不得改变骨架里已定的事件顺序与因果关系；只能补充细节
+2. summary 要写清「谁想要什么 → 被什么挡住 → 做了什么选择 → 结果与代价」，
+   不要写「她很努力，最后成功了」这类没有具体动作的概括
+3. beats 是 4-8 个**按顺序**的情节点，每个都要有具体动作/对象（例如「赵总把名片推回去」），
+   不要写抽象情绪（例如「她很难过」）
+4. hook 是章末钩子：一个让观众必须看下一章的具体悬念
+5. characters / locations 只能填故事圣经里已有的 id
+6. scene_budget 按本章信息量给 2-4 场；duration_budget_sec 按每场约 12 秒估算
+
+只输出 JSON：
+{"chapters": [{"id": "ch_1", "title": "...", "summary": "300-500字", "beats": ["...", "..."],
+  "hook": "...", "characters": ["char_1"], "locations": ["loc_1"],
+  "scene_budget": 3, "duration_budget_sec": 36}]}"""
+
+CHAPTER_SCENE_SYSTEM = """你是分场编剧。把指定的**章**展开成可直接拍摄的分场大纲（不写台词）。
+
+每一场必须包含：
+1. 具体地点（用故事圣经里的 loc id 对应的场景）+ 该场环境里的**可见细节**
+   （陈设、道具、光线、天气、人群），不要只写「在办公室」
+2. 人物的具体动作与目标（他要拿到/阻止/证明什么）
+3. 冲突或信息变化（这场结束时局势和开场不一样）
+4. 环境细节要服务情绪（例如冷白顶灯下的空会议室）
+
+禁止：把一章写成多场同质重复；禁止没有冲突的过场；禁止一句概述带过整章
+
+只输出 JSON：
+{"scenes": [{"title": "场标题",
+  "brief": "3-5句：地点+环境细节 / 谁要什么 / 阻力是什么 / 这场结束时局势怎么变了",
+  "environment": "这场环境的关键视觉元素（给分镜与视频模型用，写成名词短语）",
+  "duration_sec": 12}]}"""
+
+
+def _format_chapter_index(outline: StoryOutline) -> str:
+    lines = []
+    for chapter in outline.chapters:
+        mark = "（已扩写）" if chapter.expanded_ready else ""
+        lines.append(f"- [{chapter.id}] {chapter.title}：{chapter.brief}{mark}")
+    return "\n".join(lines) or "（无）"
+
+
+async def generate_story_outline(
+    llm: LLMProvider,
+    project: Project,
+    bible: StoryBible,
+    *,
+    chapters: int = DEFAULT_STORY_CHAPTERS,
+    chunk_size: int = DEFAULT_CHAPTER_CHUNK,
+    existing: StoryOutline | None = None,
+    force_spine: bool = False,
+    on_progress: Callable[[StoryOutline], None] | None = None,
+) -> StoryOutline:
+    """生成长篇剧集大纲：先出骨架，再分批扩写正文（每批落盘、可中断续跑）。
+
+    分两阶段的原因：20 章一次写完必然被输出长度截断（模型会开始糊弄），
+    所以骨架一次给全（保证因果链完整），正文按 3-4 章一批写细。
+    """
+    outline = existing or StoryOutline()
+    if not outline.chapters or force_spine:
+        spine = await _generate_story_spine(llm, project, bible, chapters=chapters)
+        # 重出骨架时保留「章 id + 标题」都还对得上的旧正文，其余丢弃
+        keep = {c.id: c for c in outline.chapters}
+        outline.title = spine.title
+        outline.logline = spine.logline
+        outline.synopsis = spine.synopsis
+        outline.theme = spine.theme
+        outline.chapters = []
+        for chapter in spine.chapters:
+            old = keep.get(chapter.id)
+            if old is not None and old.title == chapter.title and old.expanded_ready:
+                chapter.summary = old.summary
+                chapter.beats = list(old.beats)
+                chapter.hook = old.hook
+                chapter.characters = list(old.characters)
+                chapter.locations = list(old.locations)
+                chapter.scene_budget = old.scene_budget
+                chapter.duration_budget_sec = old.duration_budget_sec
+            outline.chapters.append(chapter)
+        if on_progress:
+            on_progress(outline)
+
+    pending = [c for c in outline.chapters if not c.expanded_ready]
+    step = max(1, chunk_size)
+    for start in range(0, len(pending), step):
+        batch = pending[start : start + step]
+        await _expand_chapters(llm, project, bible, outline, {c.id for c in batch})
+        if on_progress:
+            on_progress(outline)
+        logger.info(
+            "长篇大纲扩写 %s：%d/%d 章",
+            project.id,
+            sum(1 for c in outline.chapters if c.expanded_ready),
+            len(outline.chapters),
+        )
+    outline.target_duration_sec = outline.total_duration_sec
+    return outline
+
+
+async def _generate_story_spine(
+    llm: LLMProvider, project: Project, bible: StoryBible, *, chapters: int
+) -> StoryOutline:
+    user_prompt = f"""请为下面这个项目写 {chapters} 章的长篇剧集骨架。
+
+## 故事圣经
+{_format_bible(bible)}
+
+## 用户输入（{project.input_mode.value}）
+{project.input_text}
+
+## 篇幅约束
+- 共 {chapters} 章，每章一句话剧情（brief）
+- 分幕：前 1/4 建置与钩子，中段 1/2 升级与翻转，最后 1/4 高潮与收束
+- 每章都要有局势变化，至少 5 章要有**大翻转**（身份/关系/信息/代价层面的不可逆变化）
+
+只输出 JSON。"""
+    messages = [
+        LLMMessage(role="system", content=STORY_SPINE_SYSTEM),
+        LLMMessage(role="user", content=user_prompt),
+    ]
+    response = await llm.chat_json(
+        messages, schema=StorySpineResponse, temperature=0.8, max_tokens=4096
+    )
+    raw = [c for c in response.chapters if isinstance(c, dict)]
+    if not raw:
+        raise ValueError("长篇大纲生成失败：LLM 未返回章节列表")
+
+    outline = StoryOutline(
+        title=str(response.title or project.title or ""),
+        logline=str(response.logline or ""),
+        synopsis=str(response.synopsis or ""),
+        theme=str(response.theme or ""),
+    )
+    for i, item in enumerate(raw, start=1):
+        outline.chapters.append(
+            StoryChapter(
+                id=f"ch_{i}",
+                title=str(item.get("title") or f"第 {i} 章"),
+                brief=str(item.get("brief") or item.get("summary") or ""),
+            )
+        )
+    logger.info("长篇骨架完成 %s：%d 章", project.id, len(outline.chapters))
+    return outline
+
+
+async def _expand_chapters(
+    llm: LLMProvider,
+    project: Project,
+    bible: StoryBible,
+    outline: StoryOutline,
+    chapter_ids: set[str],
+) -> None:
+    """把一批章扩写成正文（summary/beats/hook/characters/locations/预算）。"""
+    targets = [c for c in outline.chapters if c.id in chapter_ids]
+    if not targets:
+        return
+    index = [f"- [{c.id}] {c.title}：{c.brief}" for c in targets]
+    user_prompt = f"""## 故事圣经
+{_format_bible(bible)}
+
+## 全篇
+标题: {outline.title}
+一句话卖点: {outline.logline}
+梗概: {outline.synopsis}
+主题: {outline.theme}
+
+## 全篇章节骨架（作为上下文，不要改写）
+{_format_chapter_index(outline)}
+
+## 本批要扩写的章
+{chr(10).join(index)}
+
+请只输出本批 {len(targets)} 章的正文 JSON，id 必须与上面给出的 id 完全一致。"""
+    messages = [
+        LLMMessage(role="system", content=CHAPTER_EXPAND_SYSTEM),
+        LLMMessage(role="user", content=user_prompt),
+    ]
+    response = await llm.chat_json(
+        messages, schema=ChaptersExpansionResponse, temperature=0.7, max_tokens=8192
+    )
+    by_id: dict[str, dict] = {}
+    for item in response.chapters:
+        if not isinstance(item, dict):
+            continue
+        key = str(item.get("id") or "").strip()
+        if key:
+            by_id[key] = item
+    # 模型偶尔漏 id：按顺序兜底认领
+    missing = [c for c in targets if c.id not in by_id]
+    loose = [
+        item
+        for item in response.chapters
+        if isinstance(item, dict) and not str(item.get("id") or "").strip()
+    ]
+    for chapter, item in zip(missing, loose, strict=False):
+        by_id[chapter.id] = item
+
+    known_chars = {c.id for c in bible.characters}
+    known_locs = {s.id for s in bible.settings}
+    for chapter in targets:
+        item = by_id.get(chapter.id)
+        if not item:
+            logger.warning("章 %s 扩写缺失，保留骨架", chapter.id)
+            continue
+        chapter.title = str(item.get("title") or chapter.title)
+        chapter.summary = str(item.get("summary") or item.get("brief") or chapter.brief)
+        chapter.beats = [str(b) for b in ensure_str_list(item.get("beats")) if str(b).strip()]
+        chapter.hook = str(item.get("hook") or "")
+        chapter.characters = [
+            c
+            for c in ensure_str_list(item.get("characters"))
+            if not known_chars or c in known_chars
+        ]
+        chapter.locations = [
+            loc
+            for loc in ensure_str_list(item.get("locations"))
+            if not known_locs or loc in known_locs
+        ]
+        chapter.scene_budget = max(
+            1, coerce_int(item.get("scene_budget"), DEFAULT_CHAPTER_SCENES)
+        )
+        chapter.duration_budget_sec = max(
+            MIN_SCENE_DURATION_SEC,
+            coerce_int(item.get("duration_budget_sec"), chapter.scene_budget * 12),
+        )
+
+
+async def expand_chapters(
+    llm: LLMProvider,
+    project: Project,
+    bible: StoryBible,
+    story_outline: StoryOutline,
+    chapter_ids: list[str],
+    *,
+    start_index: int = 0,
+) -> ScriptOutline:
+    """把选中的章展开成「分场大纲」（id 由系统分配，续接已有场次编号）。"""
+    wanted = [story_outline.get_chapter(cid) for cid in chapter_ids]
+    chapters = [c for c in wanted if c is not None]
+    if not chapters:
+        raise ValueError("没有可展开的章：请先在长篇大纲里选择要拍的章节")
+
+    lines: list[str] = []
+    for chapter in chapters:
+        detail = [f"## {chapter.id}｜{chapter.title}"]
+        if chapter.summary:
+            detail.append(f"正文: {chapter.summary}")
+        if chapter.beats:
+            beats = "\n".join(f"  {i}. {b}" for i, b in enumerate(chapter.beats, 1))
+            detail.append("情节点:\n" + beats)
+        if chapter.hook:
+            detail.append(f"章末钩子: {chapter.hook}")
+        if chapter.locations:
+            detail.append(f"可用场景: {', '.join(chapter.locations)}")
+        if chapter.characters:
+            detail.append(f"在场角色: {', '.join(chapter.characters)}")
+        detail.append(
+            f"请展开成 {chapter.scene_budget} 场，合计约 {chapter.duration_budget_sec} 秒"
+        )
+        lines.append("\n".join(detail))
+
+    user_prompt = f"""## 故事圣经
+{_format_bible(bible)}
+
+## 全篇
+标题: {story_outline.title}
+一句话卖点: {story_outline.logline}
+梗概: {story_outline.synopsis}
+主题: {story_outline.theme}
+
+## 全篇章节（保证展开的场次与全篇弧光一致）
+{_format_chapter_index(story_outline)}
+
+## 要展开的章
+{(chr(10) * 2).join(lines)}
+
+请逐章展开成分场大纲。场次数量与每场时长按上面给出的预算；
+environment 必须具体到可见细节（不要写「办公室」这种泛称）。只输出 JSON。"""
+
+    messages = [
+        LLMMessage(role="system", content=CHAPTER_SCENE_SYSTEM),
+        LLMMessage(role="user", content=user_prompt),
+    ]
+    response = await llm.chat_json(
+        messages, schema=ChapterOutlineResponse, temperature=0.7, max_tokens=8192
+    )
+    raw = [s for s in response.scenes if isinstance(s, dict)]
+    if not raw:
+        raise ValueError("章展开失败：LLM 未返回场次列表")
+
+    wanted_ids = {c.id for c in chapters}
+    # 模型有时不回 chapter_id：按各章的场次预算顺序认领（保证每章都有场）
+    claim: list[str] = []
+    for chapter in chapters:
+        claim.extend([chapter.id] * max(1, chapter.scene_budget))
+
+    outline = ScriptOutline()
+    next_no = start_index
+    for i, item in enumerate(raw):
+        cid = str(item.get("chapter_id") or "").strip()
+        if cid not in wanted_ids:
+            cid = claim[i] if i < len(claim) else chapters[-1].id
+        next_no += 1
+        chapter = story_outline.get_chapter(cid)
+        budget = (
+            apply_duration_budget(
+                chapter.duration_budget_sec or DEFAULT_CHAPTER_DURATION_SEC,
+                max(1, chapter.scene_budget),
+                MIN_SCENE_DURATION_SEC,
+            )
+            if chapter
+            else DEFAULT_SCENE_DURATION_SEC
+        )
+        outline.scenes.append(
+            OutlineScene(
+                id=f"scene_{next_no}",
+                title=str(item.get("title") or f"第 {next_no} 场"),
+                brief=str(item.get("brief") or item.get("summary") or ""),
+                duration_budget_sec=max(
+                    MIN_SCENE_DURATION_SEC, coerce_int(item.get("duration_sec"), budget)
+                ),
+                chapter_id=cid,
+                environment=str(item.get("environment") or ""),
+            )
+        )
+    outline.target_duration_sec = sum(s.duration_budget_sec for s in outline.scenes)
+    logger.info(
+        "章展开完成 %s：%d 章 -> %d 场 / %ds",
+        project.id,
+        len(chapters),
+        len(outline.scenes),
+        outline.target_duration_sec,
+    )
+    return outline
+
+
+def chapter_total_duration(story_outline: StoryOutline, chapter_ids: list[str]) -> int:
+    """选中章的成片时长预算（成本可见用）。"""
+    total = 0
+    for cid in chapter_ids:
+        chapter = story_outline.get_chapter(cid)
+        if chapter is not None:
+            total += chapter.duration_budget_sec or DEFAULT_CHAPTER_DURATION_SEC
+    return total
+
+
 # ── 单场 ─────────────────────────────────────────────
 
 
@@ -229,18 +616,30 @@ class StructureReview(BaseModel):
     issues: list[Item] = Field(default_factory=list)
 
 
+#: 选中的章只是全篇的一部分时，追加给剧本医生的说明
+_PARTIAL_NOTE = """## 重要：这一段不是全篇
+这是长篇剧集里**选中的一段**（后面还有未展开的章）。因此：
+- **不要**因为结尾留悬念/未收束而报问题 —— 那是有意留的钩子
+- **不要**要求在本段内解决全篇矛盾；只评估这一段的内部逻辑（因果、动机、场景合理性）
+- 与「全篇尚未展开」有关的问题一律不要报；只报这一段自己站不住的地方"""
+
+
 async def review_structure(
-    llm: LLMProvider, script: Script, bible: StoryBible
+    llm: LLMProvider, script: Script, bible: StoryBible, *, partial: bool = False
 ) -> list[ConsistencyIssue]:
     """让 LLM 当剧本医生做一遍结构评审，返回 ERROR/WARNING 级的结构问题。
 
     这是「故事严谨」里**机器判不了**的那部分（钩子/转折/高潮/因果）。失败一律降级：
     评审挂了只记 warning，绝不因为它把生成链路打死。
+
+    `partial=True`：只展开了长篇剧集里的几章，结尾的悬念是有意留的，不能算硬伤。
     """
     if not script.scenes:
         return []
     total = sum(scene.duration_sec for scene in script.scenes)
     lines = [f"## 目标时长\n{total} 秒 / {len(script.scenes)} 场"]
+    if partial:
+        lines.append(_PARTIAL_NOTE)
     lines.append("## 角色\n" + "；".join(
         f"{c.id}={c.name}（{c.role}，{c.description[:40]}）" for c in bible.characters
     ))

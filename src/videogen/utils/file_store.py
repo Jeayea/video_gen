@@ -22,7 +22,7 @@ from videogen.models.project import (
     Project,
     ProjectStatus,
 )
-from videogen.models.script import Script, ScriptOutline
+from videogen.models.script import Script, ScriptOutline, StoryOutline
 from videogen.models.storyboard import Storyboard
 from videogen.models.video import VideoManifest
 from videogen.models.world_state import WorldState
@@ -151,6 +151,13 @@ class FileStore:
 
     def load_outline(self, project_id: str) -> ScriptOutline | None:
         return self._load(project_id, "outline", ScriptOutline)
+
+    # --- Story Outline（长篇剧集大纲，20+ 章）---
+    def save_story_outline(self, project_id: str, outline: StoryOutline) -> None:
+        self._save(project_id, "story_outline", outline)
+
+    def load_story_outline(self, project_id: str) -> StoryOutline | None:
+        return self._load(project_id, "story_outline", StoryOutline)
 
     # --- Script ---
     def save_script(self, project_id: str, script: Script) -> None:

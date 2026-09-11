@@ -239,7 +239,7 @@ class BatchRequest(BaseModel):
     stop_after: str = "compose"
     model: str = ""
     #: 配音文案模式（留空 = 用 .env 的 AUDIO_LLM_SCRIPT）
-    audio_script_mode: str = Field(default="", pattern="^(|off|narration|polish|full)$")
+    audio_script_mode: str = Field(default="", pattern="^(|off|narration|polish|full|perform)$")
     concurrency: int = Field(default=1, ge=1, le=4)
 
 
@@ -249,7 +249,9 @@ class AudioGenerateRequest(BaseModel):
     voices: dict[str, str] = Field(default_factory=dict)
     #: off = 用分镜原文案；narration = 只给没台词的镜头补旁白；
     #: polish = 只改写已有文案；full = 补旁白 + 改写 + 念法建议
-    script_mode: str | None = Field(default=None, pattern="^(off|narration|polish|full)$")
+    script_mode: str | None = Field(
+        default=None, pattern="^(off|narration|polish|full|perform)$"
+    )
     #: 是否把视频抽帧发给模型（None = 用配置）
     use_vision: bool | None = None
     #: 对已经生成过同模式文案的镜头再跑一次（None = 用配置，默认跳过不重复花钱）
@@ -294,12 +296,18 @@ async def list_models():
         "batch_max_items": settings.batch_max_items,
         "seed": settings.video_seed,
         "voices": voice_catalog.catalog_rows(),
+        # 云端 TTS 有自己的音色表（名字与 Edge 完全不同，不能混用）
+        "voices_cloud": voice_catalog.catalog_rows(cloud=True),
+        "tts_provider": settings.tts_provider,
+        "tts_cloud": voice_catalog.is_cloud_target(settings.tts_provider),
+        "tts_model": settings.openrouter_tts_model,
         "voice_defaults": {
             "female": settings.tts_voice_female,
             "male": settings.tts_voice_male,
             "narrator": settings.tts_voice_narrator,
         },
         "voice_allow_accent": settings.tts_allow_accent_voices,
+        "story_chapters": settings.story_chapters,
     }
 
 
@@ -315,10 +323,14 @@ async def project_voices(project_id: str):
     if storyboard is None:
         raise HTTPException(400, "分镜不存在，先生成分镜再选角")
     manifest = store.load_audio_manifest(project_id)
+    cloud = voice_catalog.is_cloud_target(settings.tts_provider)
     casting = voice_catalog.cast_voice_map(
-        storyboard, bible, existing=(manifest.voice_map if manifest else None)
+        storyboard,
+        bible,
+        existing=(manifest.voice_map if manifest else None),
+        target=settings.tts_provider,
     )
-    rows = {row["id"]: row["label"] for row in voice_catalog.catalog_rows()}
+    rows = {row["id"]: row["label"] for row in voice_catalog.catalog_rows(cloud=cloud)}
     names = {c.id: c.name for c in (bible.characters if bible else [])}
     return {
         "voice_map": casting.voice_map,
@@ -341,6 +353,8 @@ async def project_voices(project_id: str):
             for speaker, voice in casting.voice_map.items()
         ],
         "project_status": project.status.value,
+        "tts_provider": settings.tts_provider,
+        "cloud": cloud,
     }
 
 
@@ -455,12 +469,61 @@ async def update_bible(project_id: str, data: dict):
     return bible.model_dump()
 
 
+# ── 长篇剧集大纲 Routes ─────────────────────────────────────
+
+
+class StoryOutlineRequest(BaseModel):
+    """生成长篇大纲（20+ 章骨架 + 逐章正文）。"""
+
+    #: 章数（留空 = 用配置 STORY_CHAPTERS）
+    chapters: int | None = Field(default=None, gt=0, le=200)
+    #: 重出骨架（会丢弃标题对不上的旧正文）
+    force: bool = False
+    model: str = ""
+
+
+@app.post("/api/projects/{project_id}/story-outline/generate")
+async def generate_story_outline(project_id: str, req: StoryOutlineRequest | None = None):
+    """生成长篇剧集大纲。只调 LLM（很便宜），不烧视频额度。"""
+    body = req or StoryOutlineRequest()
+    outline = await pipeline.generate_story_outline(
+        project_id,
+        chapters=body.chapters,
+        force=body.force,
+        model=_model_of(project_id, GenerateRequest(model=body.model)),
+    )
+    return outline.model_dump()
+
+
+@app.get("/api/projects/{project_id}/story-outline")
+async def get_story_outline(project_id: str):
+    outline = pipeline.get_story_outline(project_id)
+    if not outline:
+        raise HTTPException(404, "长篇大纲不存在")
+    return outline.model_dump()
+
+
 # ── Script Routes ───────────────────────────────────────────
 
 
+class ScriptGenerateRequest(GenerateRequest):
+    """生成剧本：可选「只展开这几章」。"""
+
+    #: 要展开的章 id（留空 = 全部章）。已经展开过的章不会重复生成
+    chapters: list[str] | None = None
+    #: 清空重来（会作废下游分镜与已生成的媒体）
+    force: bool = False
+
+
 @app.post("/api/projects/{project_id}/script/generate")
-async def generate_script(project_id: str, req: GenerateRequest | None = None):
-    script = await pipeline.generate_script(project_id, model=_model_of(project_id, req))
+async def generate_script(project_id: str, req: ScriptGenerateRequest | None = None):
+    body = req or ScriptGenerateRequest()
+    script = await pipeline.generate_script(
+        project_id,
+        model=_model_of(project_id, body),
+        chapters=body.chapters,
+        force=body.force,
+    )
     return script.model_dump()
 
 

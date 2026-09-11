@@ -415,9 +415,20 @@ def build_prompt(
     mood = mood_directive(shot.mood)
     if mood:
         parts.append(f"emotion: {mood}")
+    location = location_anchor(shot, bible, base)
+    if location:
+        parts.append(location)
     anchor = appearance_anchor(shot, bible, base)
     if anchor:
         parts.append(anchor)
+    if settings.video_prompt_dialogue:
+        spoken = dialogue_directive(shot, bible)
+        if spoken:
+            parts.append(spoken)
+    # 背景丰富度：分镜只写 "in an office" 时模型会画空墙，这段是统一的最低要求
+    background = " ".join(str(settings.video_background_directive or "").split())
+    if background:
+        parts.append(background)
     # 表演 + 连贯性 + 风格：真实样本里模型会把哭戏演成舞台剧、长 prompt 下画面变形，
     # 这段是每个镜头统一的最低要求（可在 .env 关掉/改写）
     directive = " ".join(str(settings.video_performance_directive or "").split())
@@ -452,6 +463,55 @@ def _strip_prompt_label(text: str) -> str:
 
 #: 每个角色的外貌描述最多带这么多字符，避免 prompt 被圣经挤爆
 _APPEARANCE_MAX_CHARS = 180
+
+
+def location_anchor(shot: Shot, bible: StoryBible | None, base: str = "") -> str:
+    """这一镜的**背景锚点**：注入故事圣经里该场景的环境描述。
+
+    背景不够丰富的根因是这一层从来没进过 prompt —— 分镜 LLM 只写一句
+    "in an office"，模型就把背景画成一面空墙。这里把场景的视觉描述补上，
+    顺带让同一场景的多个镜头背景保持一致。
+    """
+    if not bible:
+        return ""
+    loc_id = str(getattr(shot, "location", "") or "").strip()
+    if not loc_id:
+        return ""
+    setting = next((s for s in bible.settings if s.id == loc_id), None)
+    if setting is None:
+        return ""
+    look = " ".join(str(setting.visual_prompt or setting.description or "").split())
+    if not look:
+        return ""
+    head = look.split(",")[0].strip().lower()
+    if head and head in base.lower():
+        return ""
+    return f"setting: {look[:_APPEARANCE_MAX_CHARS]}"
+
+
+def dialogue_directive(shot: Shot, bible: StoryBible | None = None) -> str:
+    """把这一镜的台词交给视频模型，让它按同一句话演口型。
+
+    不写台词时，模型会**自己编一段话**在说 —— 嘴按它编的话动，我们再叠 TTS，
+    口型必然对不上。写上台词（并禁止字幕）后，原生表演与我们的配音才在同一句话上。
+    """
+    text = " ".join(str(shot.dialogue_text or "").split())
+    if not text:
+        return ""
+    who = ""
+    if bible is not None and shot.dialogue_speaker:
+        character = bible.get_character(shot.dialogue_speaker)
+        if character is not None:
+            who = str(character.name or "")
+    lead = (
+        f"{who} speaks this exact Mandarin line"
+        if who
+        else "the character speaks this exact Mandarin line"
+    )
+    return (
+        f'{lead}: "{text}" — natural lip-sync matched to the Mandarin speech, '
+        "mouth movement and breathing follow the line, no on-screen text or captions"
+    )
 
 
 def appearance_anchor(shot: Shot, bible: StoryBible | None, base: str = "") -> str:

@@ -43,7 +43,7 @@ __all__ = [
 ]
 
 #: 支持的文案模式：off 不调 LLM，其余会花 LLM 额度
-MODES = ("off", "narration", "polish", "full")
+MODES = ("off", "narration", "polish", "full", "perform")
 
 #: 单张抽帧的最大字节数：太大既费 token 又可能被 provider 拒收
 MAX_FRAME_BYTES = 1_500_000
@@ -69,11 +69,14 @@ AUDIO_SCRIPT_SYSTEM = """你是一位短剧配音导演，负责根据**真实�
    - 改写模式下 `text` 写空字符串表示「保留原文案，不用改」
 5. 旁白要服务于剧情推进，一句话说清一个信息点；对白要符合该角色的人设与当前情绪
 6. 单句不超过给定字数上限；宁短勿长，配音时长要和镜头时长匹配
-7. 需要念法建议时给出 `rate` / `volume` / `pitch`（例如 "-10%"、"+5%"、"-20Hz"），
+7. 需要念法建议时给出 `rate` / `volume` / `pitch`（Edge 用，例如 "-10%"、"+5%"、"-20Hz"），
    不需要就给空字符串
+8. **`instruction` 是给云端 TTS 的自然语言念法**（20-50 字，中文）：
+   写清「情绪 + 语气 + 语速 + 停顿/气息」，例如「压抑的哭腔，语速慢，句尾发颤，像在忍着不哭」。
+   不要写成抽象评价（「很好」「有感情」），要能被配音演员直接照做
 
 只输出 JSON：{"lines": [{"shot_id": "...", "text": "...", "rate": "", "volume": "",
-"pitch": "", "note": "一句话说明为什么这么写"}]}"""
+"pitch": "", "instruction": "", "note": "一句话说明为什么这么写"}]}"""
 
 _MODE_TASK = {
     "narration": (
@@ -90,7 +93,15 @@ _MODE_TASK = {
         "## 任务：完整配音文案\n"
         "下面列出的镜头里有缺文案的（补旁白），也有已有文案的（改得更口语更贴画面）。"
         "缺文案的镜头必须给文案；已有文案的镜头，原文够好可以留空表示不用改。"
-        "同时为每条文案给出念法建议（rate / volume / pitch）。"
+        "同时为每条文案给出念法建议（rate / volume / pitch）与云端念法 instruction。"
+    ),
+    "perform": (
+        "## 任务：只给念法（不改文案）\n"
+        "下面列出的镜头都已有台词或旁白。**一个字都不要改**：`text` 必须一律填空字符串。"
+        "你的工作是根据画面与情绪，为每个镜头写出该怎么说 —— "
+        "`instruction` 写自然语言念法（情绪/语气/语速/停顿/气息，20-50 字），"
+        "`rate`/`pitch` 可选（给 Edge 用），`note` 一句话说明依据。"
+        "要读出角色的年龄、处境与当下情绪的差别，不要每个镜头都用同一种念法。"
     ),
 }
 
@@ -253,6 +264,9 @@ def _needs_script(shot: Shot, mode: str, *, force: bool = False) -> bool:
         # 强制重跑：把之前由本模式补的旁白也重新写一遍
         return force and shot.voice_script_source == "llm:narration"
     if mode == "polish":
+        return has_dialogue or has_narration
+    if mode == "perform":
+        # 已经有文案的镜头才需要念法；没文案的镜头留给 narration/full 模式
         return has_dialogue or has_narration
     return True  # full：全都要过一遍
 
@@ -492,7 +506,7 @@ def _build_user_prompt(
         f"- 单句不超过 {max_chars} 个字符（汉字按 1 个算）",
         f"- 本次收到 {frames} 张画面抽帧（可能为 0 = 只能靠文字）",
         '- 输出 JSON：{"lines": [{"shot_id": "...", "text": "...", "rate": "", "volume": "",'
-        ' "pitch": "", "note": ""}]}',
+        ' "pitch": "", "instruction": "", "note": ""}]}',
     ]
     return "\n".join(lines)
 
@@ -519,6 +533,14 @@ def _apply_drafts(
             logger.debug("配音文案返回了未知镜头 id: %r（忽略）", shot_id)
             continue
         seen.add(shot_id)
+        direction = delivery_from_draft(draft)
+        if mode == "perform":
+            # 只给念法：文案一个字都不动（避免「改文案」顺手把台词改坏）
+            if direction is not None:
+                shot.voice_direction = direction
+                shot.voice_script_source = "llm:perform"
+                applied.append(shot_id)
+            continue
         text = clean_spoken_text(draft.text)
         if not text:
             continue  # 留白 / 不用改：保持原样
@@ -533,7 +555,6 @@ def _apply_drafts(
         else:
             shot.narration = text
         shot.voice_script_source = f"llm:{mode}"
-        direction = delivery_from_draft(draft)
         if direction is not None:
             shot.voice_direction = direction
         applied.append(shot_id)
@@ -592,10 +613,13 @@ def delivery_from_draft(draft: VoiceLineDraft | None) -> VoiceDirection | None:
     rate = coerce_delivery(draft.rate, kind="rate")
     volume = coerce_delivery(draft.volume, kind="volume")
     pitch = coerce_delivery(draft.pitch, kind="pitch")
+    instruction = " ".join(str(draft.instruction or "").split())[:200]
     note = (draft.note or "").strip()[:200]
-    if not (rate or volume or pitch or note):
+    if not (rate or volume or pitch or instruction or note):
         return None
-    return VoiceDirection(rate=rate, volume=volume, pitch=pitch, note=note)
+    return VoiceDirection(
+        rate=rate, volume=volume, pitch=pitch, instruction=instruction, note=note
+    )
 
 
 # ── 成本预估 ──────────────────────────────────────────

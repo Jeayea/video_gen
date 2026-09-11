@@ -12,7 +12,13 @@ from videogen.models.compose import ComposeReport
 from videogen.models.consistency import ConsistencyReport
 from videogen.models.cost import CostReport, CostStage
 from videogen.models.project import Project, ProjectStatus
-from videogen.models.script import Script, ScriptOutline
+from videogen.models.script import (
+    DEFAULT_CHAPTER_DURATION_SEC,
+    OutlineScene,
+    Script,
+    ScriptOutline,
+    StoryOutline,
+)
 from videogen.models.storyboard import DurationTier, Shot, Storyboard
 from videogen.models.video import VideoManifest
 from videogen.models.world_state import WorldState
@@ -45,6 +51,25 @@ from videogen.utils.text import count_speech_chars
 logger = logging.getLogger(__name__)
 
 
+def _chapter_context(story: StoryOutline | None, entry: OutlineScene | None) -> str:
+    """这一场在整篇里的位置（章标题/情节点/钩子），防止分镜脱离全篇弧光。"""
+    if story is None or entry is None or not entry.chapter_id:
+        return ""
+    chapter = story.get_chapter(entry.chapter_id)
+    if chapter is None:
+        return ""
+    lines = [f"所属章: [{chapter.id}] {chapter.title}"]
+    if story.logline:
+        lines.append(f"全篇卖点: {story.logline}")
+    if chapter.summary:
+        lines.append(f"章正文: {chapter.summary}")
+    if chapter.beats:
+        lines.append("章内情节点: " + " / ".join(chapter.beats))
+    if chapter.hook:
+        lines.append(f"章末钩子: {chapter.hook}")
+    return "\n".join(lines)
+
+
 def _pending_shots(storyboard: Storyboard, manifest: VideoManifest | None) -> list[Shot]:
     """还需要生成的镜头（续跑时跳过已经就绪的）。"""
     if not manifest:
@@ -69,6 +94,8 @@ GENERATE_SCRIPT_STATUSES = {
     ProjectStatus.FAILED,
     ProjectStatus.SCRIPT_REVIEW,
 }
+#: 长篇大纲入口：与剧本同权限（退回剧本阶段后可重出/续写大纲）
+GENERATE_STORY_STATUSES = set(GENERATE_SCRIPT_STATUSES)
 CONFIRM_SCRIPT_STATUSES = {ProjectStatus.SCRIPT_REVIEW}
 REOPEN_SCRIPT_STATUSES = {
     ProjectStatus.SCRIPT_CONFIRMED,
@@ -334,9 +361,80 @@ class Pipeline:
             self._revalidate(project, bible, self.store.load_script(project_id))
             return bible
 
+    # ── 长篇剧集大纲 ──────────────────────────────────────
+
+    async def generate_story_outline(
+        self,
+        project_id: str,
+        *,
+        chapters: int | None = None,
+        force: bool = False,
+        model: str = "",
+    ) -> StoryOutline:
+        """生成长篇剧集大纲（20+ 章骨架 + 逐章正文）。
+
+        `force=True` 重出骨架（会丢弃对不上的旧正文）；否则在同一份大纲上续写缺失的章。
+        """
+        async with self._lock(project_id):
+            project = self.get_project(project_id)
+            self._require(project, GENERATE_STORY_STATUSES, "生成长篇大纲（需先退回剧本阶段）")
+            bible = self.store.load_bible(project_id)
+            if not bible:
+                raise PipelineError("故事圣经不存在，请先生成圣经")
+
+            settings = get_settings()
+            self._guard_budget(project_id, action="生成长篇大纲")
+            llm = self._llm(model)
+            existing = None if force else self.store.load_story_outline(project_id)
+            try:
+                outline = await script_service.generate_story_outline(
+                    llm,
+                    project,
+                    bible,
+                    chapters=chapters or settings.story_chapters,
+                    chunk_size=settings.story_chapter_chunk,
+                    existing=existing,
+                    force_spine=force,
+                    # 每批扩写完就落盘：中途失败也不会丢掉已花钱写好的章
+                    on_progress=lambda partial: self.store.save_story_outline(
+                        project_id, partial
+                    ),
+                )
+            except Exception as exc:
+                self._fail(project, "长篇大纲生成")
+                raise PipelineError(f"长篇大纲生成失败：{exc}") from exc
+            finally:
+                self._record_llm_cost(project_id, CostStage.STORY, llm)
+
+            outline.target_duration_sec = outline.total_duration_sec
+            self.store.save_story_outline(project_id, outline)
+            logger.info(
+                "长篇大纲完成 %s：%d 章 / 约 %ds",
+                project_id,
+                len(outline.chapters),
+                outline.total_duration_sec,
+            )
+            return outline
+
+    def get_story_outline(self, project_id: str) -> StoryOutline | None:
+        return self.store.load_story_outline(project_id)
+
     # ── 剧本 ──────────────────────────────────────────────
 
-    async def generate_script(self, project_id: str, model: str = "") -> Script:
+    async def generate_script(
+        self,
+        project_id: str,
+        model: str = "",
+        *,
+        chapters: list[str] | None = None,
+        force: bool = False,
+    ) -> Script:
+        """生成剧本。
+
+        - 有长篇大纲时：只把**选中的章**展开成场次（`chapters=None` = 全部章），
+          已经展开过的章不会重复生成；`force=True` 清空重来
+        - 没有长篇大纲时：保持老行为（一次性分场大纲 + 全量重生成）
+        """
         async with self._lock(project_id):
             project = self.get_project(project_id)
             self._require(project, GENERATE_SCRIPT_STATUSES, "生成剧本（需先退回剧本阶段）")
@@ -349,12 +447,16 @@ class Pipeline:
             llm = self._llm(model)
             review_issues: list = []
             try:
-                script, world_state = await self._run_script_generation(project, bible, llm)
+                script, world_state = await self._run_script_generation(
+                    project, bible, llm, chapters=chapters, force=force
+                )
                 # 结构评审：机器判不了的那部分（钩子/转折/高潮/因果）交给 LLM 当剧本医生。
                 # 放在 try 内是为了让 finally 里的记账把两次调用的 token 一起记进 script 阶段；
                 # review_structure 自己吞异常，评审失败不会连累剧本生成
                 if get_settings().script_llm_review:
-                    review_issues = await script_service.review_structure(llm, script, bible)
+                    review_issues = await script_service.review_structure(
+                        llm, script, bible, partial=self._is_partial_arc(project_id)
+                    )
             except Exception as exc:
                 self._fail(project, "剧本生成")
                 raise PipelineError(f"剧本生成失败：{exc}") from exc
@@ -367,6 +469,7 @@ class Pipeline:
                 world_state,
                 project.target_duration_sec,
                 strict=get_settings().script_strict,
+                partial=self._is_partial_arc(project_id),
             )
             if review_issues:
                 report = report.model_copy(
@@ -392,34 +495,52 @@ class Pipeline:
             return script
 
     async def _run_script_generation(
-        self, project: Project, bible: StoryBible, llm: LLMProvider
+        self,
+        project: Project,
+        bible: StoryBible,
+        llm: LLMProvider,
+        *,
+        chapters: list[str] | None = None,
+        force: bool = False,
     ) -> tuple[Script, WorldState]:
-        """逐场生成剧本，每场生成后立即落盘，失败可续跑。"""
+        """逐场生成剧本，每场生成后立即落盘，失败可续跑。
+
+        两种入口共用后半段（逐场生成 + 时长归一化 + logline）：
+        - **长篇大纲路径**：把选中的章展开成分场大纲，追加到已有场次后面
+        - **老路径**：一次性生成分场大纲，全量重来
+        """
         project_id = project.id
         resuming = project.status == ProjectStatus.FAILED
-        outline: ScriptOutline | None = self.store.load_outline(project_id) if resuming else None
+        story = self.store.load_story_outline(project_id)
 
-        if outline is None:
-            outline = await script_service.generate_outline(llm, project, bible)
-            self.store.save_outline(project_id, outline)
-            script = Script(title=bible.style.genre or project.title, logline="")
-            world_state = WorldState()
-            # 重新生成剧本会让旧分镜和所有下游媒体失效
-            self.store.remove_artifact(project_id, "storyboard")
-            self._invalidate_media(project_id)
-            self.store.save_script(project_id, script)
-            self.store.save_world_state(project_id, world_state)
+        outline: ScriptOutline | None = None
+        if story and story.chapters:
+            outline, script, world_state = await self._expand_selected_chapters(
+                project, bible, llm, story, chapters=chapters, force=force
+            )
         else:
-            script = self.store.load_script(project_id) or Script(
-                title=bible.style.genre or project.title, logline=""
-            )
-            world_state = self.store.load_world_state(project_id) or WorldState()
-            logger.info(
-                "续跑剧本 %s：已完成 %d/%d 场",
-                project_id,
-                len(script.scenes),
-                len(outline.scenes),
-            )
+            outline = self.store.load_outline(project_id) if resuming else None
+            if outline is None:
+                outline = await script_service.generate_outline(llm, project, bible)
+                self.store.save_outline(project_id, outline)
+                script = Script(title=bible.style.genre or project.title, logline="")
+                world_state = WorldState()
+                # 重新生成剧本会让旧分镜和所有下游媒体失效
+                self.store.remove_artifact(project_id, "storyboard")
+                self._invalidate_media(project_id)
+                self.store.save_script(project_id, script)
+                self.store.save_world_state(project_id, world_state)
+            else:
+                script = self.store.load_script(project_id) or Script(
+                    title=bible.style.genre or project.title, logline=""
+                )
+                world_state = self.store.load_world_state(project_id) or WorldState()
+                logger.info(
+                    "续跑剧本 %s：已完成 %d/%d 场",
+                    project_id,
+                    len(script.scenes),
+                    len(outline.scenes),
+                )
 
         done = script.scene_ids()
         for outline_scene in outline.scenes:
@@ -445,6 +566,102 @@ class Pipeline:
         script.title = script.title or project.title
         self.store.save_script(project_id, script)
         return script, world_state
+
+    async def _expand_selected_chapters(
+        self,
+        project: Project,
+        bible: StoryBible,
+        llm: LLMProvider,
+        story: StoryOutline,
+        *,
+        chapters: list[str] | None,
+        force: bool,
+    ) -> tuple[ScriptOutline, Script, WorldState]:
+        """把选中的章展开成场次（追加语义），并把项目目标时长对齐到已展开的章。"""
+        project_id = project.id
+        wanted = [c for c in (chapters or [c.id for c in story.chapters]) if c]
+        selected = [cid for cid in wanted if story.get_chapter(cid) is not None]
+        if not selected:
+            raise PipelineError("没有可展开的章：请在长篇大纲里选择要拍的章节")
+
+        if force:
+            outline = ScriptOutline()
+            script = Script(title=story.title or bible.style.genre or project.title, logline="")
+            world_state = WorldState()
+            self.store.remove_artifact(project_id, "storyboard")
+            self._invalidate_media(project_id)
+        else:
+            outline = self.store.load_outline(project_id) or ScriptOutline()
+            script = self.store.load_script(project_id) or Script(
+                title=story.title or bible.style.genre or project.title, logline=""
+            )
+            world_state = self.store.load_world_state(project_id) or WorldState()
+
+        existing = outline.chapter_ids()
+        todo = [cid for cid in selected if cid not in existing]
+        for cid in todo:
+            # 一次展开一章：多章挤在一个 prompt 里时模型会漏写后面的章
+            extra = await script_service.expand_chapters(
+                llm,
+                project,
+                bible,
+                story,
+                [cid],
+                start_index=len(outline.scenes),
+            )
+            outline.scenes.extend(extra.scenes)
+            if extra.scenes:
+                script.title = script.title or story.title
+            self.store.save_outline(project_id, outline)
+            self.store.save_script(project_id, script)
+
+        if todo:
+            # 追加了场次：旧分镜/媒体与新剧本不再对应
+            self.store.remove_artifact(project_id, "storyboard")
+            self._invalidate_media(project_id)
+
+        # 目标时长 = 已展开章的预算之和：时长归一化、成本估算、结构校验都以它为准
+        expanded = [c for c in story.chapters if c.id in outline.chapter_ids()]
+        total = sum(
+            c.duration_budget_sec or DEFAULT_CHAPTER_DURATION_SEC for c in expanded
+        )
+        if total > 0 and total != project.target_duration_sec:
+            logger.info(
+                "项目目标时长按已展开章对齐：%ds -> %ds（%d 章 / %d 场）",
+                project.target_duration_sec,
+                total,
+                len(expanded),
+                len(outline.scenes),
+            )
+            project.target_duration_sec = total
+            self.store.save_project(project)
+
+        outline.target_duration_sec = project.target_duration_sec
+        self.store.save_outline(project_id, outline)
+        self.store.save_script(project_id, script)
+        self.store.save_world_state(project_id, world_state)
+        logger.info(
+            "章展开 %s：选中 %d 章（新增 %d）-> 累计 %d 场 / %ds",
+            project_id,
+            len(selected),
+            len(todo),
+            len(outline.scenes),
+            project.target_duration_sec,
+        )
+        return outline, script, world_state
+
+    def _is_partial_arc(self, project_id: str) -> bool:
+        """当前剧本是否只是长篇剧集里的一段（还有章没展开）。
+
+        partial 会影响两件事：结尾悬念不算硬伤、LLM 剧本医生不要求本段收束全篇。
+        """
+        story = self.store.load_story_outline(project_id)
+        if story is None or not story.chapters:
+            return False
+        outline = self.store.load_outline(project_id)
+        if outline is None:
+            return True
+        return len(outline.chapter_ids()) < len(story.chapters)
 
     def _blocking_issues(self, project_id: str, settings: Settings) -> list:
         """严格模式下的拦路问题（确认阶段用）。"""
@@ -538,6 +755,7 @@ class Pipeline:
                 self.store.load_world_state(project_id),
                 project.target_duration_sec,
                 strict=get_settings().script_strict,
+                partial=self._is_partial_arc(project_id),
             )
             issues = consistency_service.validate_storyboard(storyboard, script, bible)
             report = consistency_service.merge_storyboard_issues(script_report, issues)
@@ -586,11 +804,21 @@ class Pipeline:
             )
 
         covered = storyboard.scene_ids() if resuming else set()
+        outline = self.store.load_outline(project_id)
+        story = self.store.load_story_outline(project_id)
+        by_scene = {s.id: s for s in (outline.scenes if outline else [])}
         for scene in script.scenes:
             if scene.id in covered:
                 continue
+            entry = by_scene.get(scene.id)
             shots = await storyboard_service.generate_shots_for_scene(
-                llm, project, bible, scene, tier=tier
+                llm,
+                project,
+                bible,
+                scene,
+                tier=tier,
+                environment=entry.environment if entry else "",
+                story_context=_chapter_context(story, entry),
             )
             storyboard.shots.extend(shots)
             self.store.save_storyboard(project_id, storyboard)
@@ -1222,6 +1450,7 @@ class Pipeline:
             # （否则「文案被 LLM 改写后重新合成」这种同 id 重跑会漏记）
             unrecorded = [c for c in manifest.ready_clips if not c.cost_recorded]
             if unrecorded:
+                reported = sum(max(0.0, c.provider_usd) for c in unrecorded)
                 cost_service.record(
                     self.store,
                     project_id,
@@ -1229,6 +1458,8 @@ class Pipeline:
                         manifest.provider,
                         sum(count_speech_chars(c.text) for c in unrecorded),
                         len(unrecorded),
+                        # 云端 TTS 会报实际花费；全为 0（Edge 免费）时按字符单价估算
+                        actual_usd=reported if reported > 0 else None,
                     ),
                 )
                 for clip in unrecorded:
@@ -1677,7 +1908,12 @@ class Pipeline:
             report = ConsistencyReport(stage="script")
         else:
             report = consistency_service.validate_script(
-                script, bible, self.store.load_world_state(project.id), project.target_duration_sec
+                script,
+                bible,
+                self.store.load_world_state(project.id),
+                project.target_duration_sec,
+                strict=get_settings().script_strict,
+                partial=self._is_partial_arc(project.id),
             )
             storyboard = self.store.load_storyboard(project.id)
             if storyboard and storyboard.shots:

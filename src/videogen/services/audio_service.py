@@ -41,9 +41,20 @@ def plan_voices(
     settings: Settings | None = None,
     *,
     existing: dict[str, str] | None = None,
+    target: str = "",
 ) -> voice_catalog.VoiceCasting:
-    """给每个说话人选角（音色 + 为区分而复用的念法 + 说明）。"""
-    return voice_catalog.cast_voice_map(storyboard, bible, settings, existing=existing)
+    """给每个说话人选角（音色 + 为区分而复用的念法 + 说明）。
+
+    `target` 是 TTS provider 名：云端引擎会把音色名换成云端音色表里的名字。
+    """
+    settings = settings or get_settings()
+    return voice_catalog.cast_voice_map(
+        storyboard,
+        bible,
+        settings,
+        existing=existing,
+        target=target or settings.tts_provider,
+    )
 
 
 def build_voice_map(
@@ -95,7 +106,9 @@ async def synthesize_all(
     manifest = existing or AudioManifest()
     manifest.provider = provider.name
     manifest.concurrency = max(1, concurrency)
-    casting = plan_voices(storyboard, bible, settings, existing=manifest.voice_map)
+    casting = plan_voices(
+        storyboard, bible, settings, existing=manifest.voice_map, target=provider.name
+    )
     manifest.voice_map = casting.voice_map
     if casting.delivery:
         # 音色池用尽时靠念法区分：只补没有显式念法的角色，重跑不覆盖已有设置
@@ -131,7 +144,8 @@ async def synthesize_all(
             current.rate or "",
             current.volume or "",
             current.pitch or "",
-        ) != (clip.rate or "", clip.volume or "", clip.pitch or "")
+            current.instruction or "",
+        ) != (clip.rate or "", clip.volume or "", clip.pitch or "", clip.instruction or "")
         if (
             current.status == ClipStatus.READY
             and not voice_changed
@@ -161,6 +175,7 @@ async def synthesize_all(
         current.rate = clip.rate
         current.volume = clip.volume
         current.pitch = clip.pitch
+        current.instruction = clip.instruction
         current.note = clip.note
         current.script_source = clip.script_source
         manifest.upsert(current)
@@ -235,6 +250,7 @@ def _collect_lines(
                     rate=direction.rate if direction else "",
                     volume=direction.volume if direction else "",
                     pitch=direction.pitch if direction else "",
+                    instruction=direction.instruction if direction else "",
                     note=direction.note if direction else "",
                     script_source=shot.voice_script_source,
                 )
@@ -252,6 +268,7 @@ def _collect_lines(
                     rate=direction.rate if direction else "",
                     volume=direction.volume if direction else "",
                     pitch=direction.pitch if direction else "",
+                    instruction=direction.instruction if direction else "",
                     note=direction.note if direction else "",
                     script_source=shot.voice_script_source,
                 )
@@ -280,6 +297,9 @@ async def _synthesize_one(
         rate=clip.rate or settings.tts_rate,
         volume=clip.volume or settings.tts_volume,
         pitch=clip.pitch or settings.tts_pitch,
+        # 云端 TTS 用自然语言念法；没有逐条建议时用兜底（去播音腔）
+        instruction=clip.instruction
+        or (settings.tts_default_instruction if provider.name == "openrouter" else ""),
         output_path=output,
     )
 
@@ -320,7 +340,11 @@ async def _synthesize_one(
         clip.media_kind = generated.media_kind
         clip.duration_sec = round(generated.duration_sec, 3)
         clip.voice = generated.voice or clip.voice
+        clip.provider_usd = round(max(0.0, generated.usd), 6)
         clip.error = ""
+        if generated.transcript:
+            # 云端 TTS 会回读文本：模型自己改词/加解释时留痕，人工能查
+            logger.debug("配音 %s 回读：%s", clip.id, generated.transcript[:80])
         if clip.duration_sec <= 0:
             clip.duration_sec = 0.0
             manifest.warnings.append(f"配音 {clip.id} 没拿到时长，音画对齐会跳过这一条")

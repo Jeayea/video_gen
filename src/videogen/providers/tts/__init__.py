@@ -9,11 +9,13 @@ from videogen.providers.tts.base import (
 )
 from videogen.providers.tts.edge import EdgeTTSProvider
 from videogen.providers.tts.mock import MockTTSProvider
+from videogen.providers.tts.openrouter_audio import OpenRouterTTSProvider
 
 __all__ = [
     "EdgeTTSProvider",
     "GeneratedAudio",
     "MockTTSProvider",
+    "OpenRouterTTSProvider",
     "TTSProvider",
     "TTSProviderError",
     "TTSRequest",
@@ -29,4 +31,9 @@ def get_tts_provider() -> TTSProvider:
         return EdgeTTSProvider(timeout_sec=settings.tts_timeout_sec)
     if name == "mock":
         return MockTTSProvider()
+    if name in {"openrouter", "openrouter-audio", "cloud"}:
+        return OpenRouterTTSProvider(
+            timeout_sec=settings.tts_timeout_sec,
+            model=settings.openrouter_tts_model,
+        )
     raise TTSProviderError(f"未知的 TTS_PROVIDER：{name}")

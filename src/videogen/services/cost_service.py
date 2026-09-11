@@ -149,17 +149,29 @@ def video_entry(
 
 
 def audio_entry(
-    provider: str, chars: int, calls: int, prices: PriceTable | None = None
+    provider: str,
+    chars: int,
+    calls: int,
+    prices: PriceTable | None = None,
+    *,
+    actual_usd: float | None = None,
+    model: str = "",
 ) -> CostEntry:
+    """记一条配音花费。
+
+    `actual_usd` 非空时以 provider 报的实际扣费为准（云端 TTS 会报 `usage.cost`）；
+    否则按字符单价估算（Edge 免费 = 0）。
+    """
     prices = prices or PriceTable.from_settings()
+    usd = prices.tts_usd(chars) if actual_usd is None else max(0.0, actual_usd)
     return CostEntry(
         stage=CostStage.AUDIO,
         provider=provider,
-        model="",
+        model=model,
         calls=calls,
         units=float(chars),
         unit_kind="char",
-        usd=prices.tts_usd(chars),
+        usd=round(usd, 6),
     )
 
 

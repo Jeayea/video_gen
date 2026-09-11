@@ -810,3 +810,88 @@ def test_merge_shots_endpoint_preview_then_apply(client):
         f"/api/projects/{pid}/storyboard/merge-shots", json={"min_sec": 0}
     )
     assert bad.status_code == 422  # 0 秒没有意义，别让它悄悄什么都不做
+
+
+# ── 长篇剧集大纲 + 按章生成 ─────────────────────────────────
+
+
+def test_models_exposes_cloud_voices(client):
+    """前端要按当前引擎切音色表：Edge 与云端的音色名完全不通用。"""
+    body = client.get("/api/models").json()
+    assert body["voices"] and body["voices_cloud"]
+    assert {row["id"] for row in body["voices_cloud"]} >= {"nova", "onyx"}
+    assert "tts_provider" in body and "tts_cloud" in body
+    assert body["story_chapters"] >= 1
+
+
+def test_story_outline_and_chapter_script_flow(client):
+    """长篇大纲 -> 选章展开成剧本（UI 的第 2 阶段新流程）。"""
+    project = create_project(client)
+    pid = project["id"]
+    client.post(f"/api/projects/{pid}/bible/generate")
+
+    # 还没生成时是 404（前端据此决定显示「生成长篇大纲」按钮）
+    assert client.get(f"/api/projects/{pid}/story-outline").status_code == 404
+
+    resp = client.post(f"/api/projects/{pid}/story-outline/generate", json={"chapters": 6})
+    assert resp.status_code == 200, resp.text
+    outline = resp.json()
+    assert len(outline["chapters"]) == 6
+    assert outline["logline"]
+
+    assert client.get(f"/api/projects/{pid}/story-outline").status_code == 200
+
+    # 只展开选中的 2 章
+    resp = client.post(
+        f"/api/projects/{pid}/script/generate", json={"chapters": ["ch_1", "ch_2"]}
+    )
+    assert resp.status_code == 200, resp.text
+    scenes = resp.json()["scenes"]
+    assert scenes
+
+    # 展开结果里保留了章归属与环境线索（背景丰富度靠它）
+    outline_rows = client.get(f"/api/projects/{pid}/outline").json()["scenes"]
+    assert {row["chapter_id"] for row in outline_rows} == {"ch_1", "ch_2"}
+    assert all(row["environment"] for row in outline_rows)
+
+    # 无效章 id -> 400（不静默生成别的章）
+    bad = client.post(f"/api/projects/{pid}/script/generate", json={"chapters": ["ch_9"]})
+    assert bad.status_code == 400
+    assert "没有可展开的章" in bad.json()["detail"]
+
+
+def test_story_outline_requires_draft(client):
+    """剧本已确认的项目不能偷偷重写大纲（要显式退回剧本阶段）。"""
+    project = create_project(client)
+    pid = project["id"]
+    client.post(f"/api/projects/{pid}/bible/generate")
+    client.post(f"/api/projects/{pid}/script/generate")
+    client.post(f"/api/projects/{pid}/script/confirm")
+    resp = client.post(f"/api/projects/{pid}/story-outline/generate", json={"chapters": 3})
+    assert resp.status_code == 400
+
+
+def test_audio_generate_accepts_perform_mode(client):
+    """`perform`（只给念法、不改台词）必须能通过接口校验，否则云端配音的最佳搭档用不了。"""
+    from tests.conftest import build_confirmed_project
+
+    project = create_project(client)
+    pid = project["id"]
+    client.post(f"/api/projects/{pid}/bible/generate")
+    client.post(f"/api/projects/{pid}/script/generate")
+    client.post(f"/api/projects/{pid}/script/confirm")
+    client.post(f"/api/projects/{pid}/storyboard/generate")
+    client.post(f"/api/projects/{pid}/storyboard/confirm")
+    client.post(f"/api/projects/{pid}/video/generate")
+
+    from tests.conftest import wait_for_job
+
+    status = client.get(f"/api/projects/{pid}/video/status").json()
+    wait_for_job(client.videogen_pipeline, status["job"]["id"])
+
+    resp = client.post(
+        f"/api/projects/{pid}/audio/generate",
+        json={"script_mode": "perform", "use_vision": False},
+    )
+    assert resp.status_code == 202, resp.text
+    assert build_confirmed_project  # 保持导入（其它用例共用）
