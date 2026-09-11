@@ -116,10 +116,13 @@ def test_voice_map_is_gendered_and_stable(store, video_ready_project):
     )
     voices = audio_service.build_voice_map(storyboard, bible)
 
-    # 林晚（女白领）/ 赵明远（反派）拿到不同性别音色，旁白单独一个
-    assert voices["char_1"].endswith("XiaoxiaoNeural")
-    assert voices["char_2"].endswith("YunxiNeural")
-    assert voices["narrator"].endswith("YunjianNeural")
+    # 女角色必须是女声、男角色必须是男声，且两个角色不能撞音色
+    from videogen.services import voice_catalog
+
+    assert voice_catalog.voice_gender(voices["char_1"]) == "female"
+    assert voice_catalog.voice_gender(voices["char_2"]) == "male"
+    assert voices["char_1"] != voices["char_2"]
+    assert voices["narrator"].endswith("YunjianNeural")  # 旁白单独一个
 
     # 已有分配必须原样保留（重跑不能换人声音）
     again = audio_service.build_voice_map(storyboard, bible, existing=voices)

@@ -5,6 +5,7 @@ from enum import Enum
 
 from pydantic import BaseModel, Field
 
+from videogen.models.storyboard import VoiceDirection
 from videogen.models.video import ClipStatus, MediaKind
 
 
@@ -84,6 +85,9 @@ class AudioManifest(BaseModel):
     bgm: BgmTrack | None = None
     #: 说话人 -> 音色，落盘保证重跑时音色一致
     voice_map: dict[str, str] = Field(default_factory=dict)
+    #: 说话人 -> 该角色的默认念法（音高/语速）。音色池不够用时会用它把
+    #: 共用同一音色的两个角色区分开；镜头自己的 voice_direction 优先于它
+    voice_delivery: dict[str, VoiceDirection] = Field(default_factory=dict)
     #: 音画对齐结果（镜头时长被拉长的记录）
     adjustments: list[DurationAdjustment] = Field(default_factory=list)
     #: 配音文案模式：off / narration / polish / full（最近一轮）

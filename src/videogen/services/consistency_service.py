@@ -56,6 +56,31 @@ def validate_script(
     return ConsistencyReport(stage="script", issues=issues)
 
 
+def repair_storyboard(
+    storyboard: Storyboard, script: Script, bible: StoryBible
+) -> tuple[Storyboard, list[str]]:
+    """确定性修复分镜里**不需要创作者决策**的问题，返回 `(修好的分镜, 修复记录)`。
+
+    目前只修一条，但它同时影响三件事（画面、配音、参考图）：
+
+    - **说话人不在画面里** → 把说话人补进 `character_in_frame`。
+      不改的话：这个镜头不会带该角色的参考图（脸会漂）、外貌锚点也不会写上他，
+      而且「人不在画面却在说话」本身就是穿帮。
+
+    不修任何需要人判断的东西（比如缺 video_prompt、悬念没闭合），那些留给人工/重新生成。
+    """
+    fixed: list[str] = []
+    known = {c.id for c in bible.characters}
+    for shot in storyboard.shots:
+        speaker = (shot.dialogue_speaker or "").strip()
+        if not speaker or speaker in shot.character_in_frame or speaker not in known:
+            continue  # 说话人不存在时交给校验报 ERROR，不能猜
+        before = list(shot.character_in_frame)
+        shot.character_in_frame = [*before, speaker]
+        fixed.append(f"镜头 {shot.id}：把说话人 {speaker} 补进画面角色（原为 {before}）")
+    return storyboard, fixed
+
+
 def validate_storyboard(
     storyboard: Storyboard,
     script: Script,

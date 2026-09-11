@@ -38,8 +38,8 @@ STORYBOARD_SYSTEM = """你是一位专业分镜师。根据剧本场景生成分
   "camera": "景别 · 运镜（如：中景 · 固定 / 近景 · 推）",
   "visual_description": "中文画面描述",
   "character_in_frame": ["char_1"],
-  "mood": "画面情绪",
-  "video_prompt": "English prompt: subject + action + environment + lighting + style",
+  "mood": "画面情绪（建议用英文情绪词：shocked / wronged / determined …）",
+  "video_prompt": "subject + action + environment + lighting（全英文，不要写标签）",
   "narration": null 或 "旁白文字",
   "dialogue_text": null 或 "台词文字",
   "dialogue_speaker": null 或 "char_id"
@@ -50,7 +50,12 @@ STORYBOARD_SYSTEM = """你是一位专业分镜师。根据剧本场景生成分
 - video_prompt 里禁止出现 char_1 / loc_1 这类内部 id，必须写成具体的外貌/场景描述
 - character_in_frame 必须是故事圣经里已有的角色 id
 - 构图提示随 aspect_ratio 变化
-- 台词尽量对准角色镜头
+- 台词尽量对准角色镜头，**且说话人必须出现在 character_in_frame 里**（说话却不在画面里是穿帮）
+- camera 必须同时写清景别与运镜（如「近景 · 缓推」）；一个镜头里只写**一个连续动作**，
+  不要在一句 video_prompt 里塞多个画面切换
+- 情绪强烈的镜头优先用中景/近景：大特写会让模型把表情演成夸张的舞台剧
+- video_prompt 里描述表演要用克制的词（subtle / restrained / natural），不要写夸张副词
+  （hysterically / dramatically / exaggeratedly）
 - 只输出 JSON: {"shots": [...]}"""
 
 _ASPECT_HINTS = {

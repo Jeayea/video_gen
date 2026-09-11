@@ -464,6 +464,10 @@ async function loadHealth() {
       audioScriptMode = h.audio_script_mode;
     }
     if (typeof h.audio_script_vision === 'boolean') audioScriptVision = h.audio_script_vision;
+    try {
+      const models = await api('/api/models');
+      applyVoiceCatalog(models.voices);
+    } catch (e) { /* 拿不到就用兜底表 */ }
   } catch (e) {
     $('health').textContent = '';
   }
@@ -1373,16 +1377,22 @@ function doCancelVideo() {
 
 // ── 配音 ────────────────────────────────────────────────────────────
 
-const EDGE_VOICES = [
+// 音色表由服务端下发（/api/models 的 voices），这里只是断网时的兜底
+let EDGE_VOICES = [
   ['zh-CN-XiaoxiaoNeural', '晓晓 · 女声'],
   ['zh-CN-XiaoyiNeural', '晓伊 · 女声'],
   ['zh-CN-YunxiNeural', '云希 · 男声'],
   ['zh-CN-YunjianNeural', '云健 · 男声（旁白）'],
-  ['zh-CN-YunyangNeural', '云扬 · 男声（播报）'],
+  ['zh-CN-YunyangNeural', '云扬 · 男声（沉稳）'],
   ['zh-CN-YunxiaNeural', '云夏 · 少年'],
   ['zh-CN-liaoning-XiaobeiNeural', '晓北 · 东北女声'],
   ['zh-CN-shaanxi-XiaoniNeural', '晓妮 · 陕西女声'],
 ];
+
+function applyVoiceCatalog(voices) {
+  if (!Array.isArray(voices) || !voices.length) return;
+  EDGE_VOICES = voices.map(v => [v.id, v.label]);
+}
 
 function stopAudioPolling() {
   if (audioPollTimer) { clearTimeout(audioPollTimer); audioPollTimer = null; }
@@ -1500,8 +1510,12 @@ function renderAudio() {
       </div>`;
     }).join('');
 
+    const castingNotes = (a.warnings || []).filter(w => /选角|音色/.test(w));
     body.innerHTML = `
       <div class="voice-map" id="audio-voices">${voiceRows}</div>
+      ${castingNotes.length
+        ? `<div class="hint" style="margin-bottom:8px">${castingNotes.map(esc).join('<br>')}</div>`
+        : ''}
       <div class="clip-grid">${clips.map(c => {
         const playable = c.status === 'ready' && c.media_kind === 'audio';
         const statusClass = c.status === 'failed' ? 'warn' : c.status === 'ready' ? 'ok' : '';

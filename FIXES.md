@@ -775,3 +775,78 @@ scene_4_shot_4: 旧=另一个人 → 新=同一张脸 + 后期造型（桂冠/�
   → 断言成片里**不再有** subtitle 流
 - `test_burn_degrades_when_libass_is_missing`：**任何**候选都没有 libass → 降级 soft + 告警
 - `test_batch_isolation`：一个角色生成失败，其它角色照样拿到图
+
+## v0.14 — 配音符合人物 + 表情自然/动作流畅 + 剧本严谨
+
+> 用户提的四条质量要求：**配音要符合人物、每个人物有自己的声音**、**表情自然**、
+> **动作流畅**、**故事/剧本严谨**。
+
+### 1. 配音：4 个角色只用到 2 个音色，女反派被配了男声
+
+真实产物（`audio_manifest.json`）查出来的现状：
+
+```
+林悦(20岁女主)   -> zh-CN-XiaoxiaoNeural
+张姐(38岁导师)   -> zh-CN-XiaoxiaoNeural   ← 和女主同一个声音
+李薇儿(22岁女反派) -> zh-CN-YunxiNeural      ← 女角配了男声！
+赵总(45岁男)     -> zh-CN-YunxiNeural       ← 和上面撞车
+```
+
+根因：`_MALE_HINTS` 里混进了 **「反派」这种身份词**，而性别判定又是「先判男声」——
+李薇儿 `role=反派` 直接命中男声分支（她的 `visual_prompt` 里 "young woman" 其实也命中了女声词，
+但排在后面）。加上 `_fallback_voices` 只有 3 个配置值，撞音色是必然。
+
+修法：新增 `services/voice_catalog.py`
+
+- Edge zh 音色全表（14 个，含性别/年龄区间/音色性格/方言标记，元数据来自 `edge_tts.list_voices()`）
+- 性别判定改成**加权计分**：显式性别词权重 2、亲属称谓权重 1，**身份词不参与**；
+  打平才算「不知道」
+- 选角打分：性别 → 角色定位 → 年龄 → 口音代价；**先在同性别空闲音色里挑**
+- 池子用尽 → 复用最合适的音色 + `voice_delivery`（音高/语速）区分 + 留下可读说明
+- **年龄明显不匹配且有空闲更合适音色时重配**（45 岁主编不能挂「清朗少年感」）
+- 选中的音色写回 `Character.voice_id`，重跑不换人；人工写死的 `voice_id` 优先
+- 新增 `GET /api/projects/{id}/voices`（**不花钱的选角预览**）与
+  `POST /api/projects/{id}/audio/reopen`（成片后换音色重做配音；原来状态机会拒绝）
+
+真实项目重配结果（Edge TTS 免费，15/15 成功）：
+
+```
+林悦   zh-CN-XiaoxiaoNeural（温润知性）
+李薇儿 zh-CN-XiaoyiNeural（清亮张扬）    ← 从男声纠正为女声
+张姐   zh-CN-XiaoxiaoNeural + pitch -12Hz / rate -6%  ← 池子只有 2 个通用女声
+赵总   zh-CN-YunyangNeural（沉稳权威）   ← 从「少年感」纠正
+旁白   zh-CN-YunjianNeural
+```
+
+试听样音落盘在 `projects/<id>/voice_sampler.mp3`（一人一句，18.4s）。
+
+### 2. 表情自然 / 动作流畅：prompt 里丢了两个字段
+
+| 分镜字段 | 原来的命运 |
+|---|---|
+| `camera`（"近景 · 推"） | **根本没进 prompt** —— 运镜信息全丢，模型只能自己猜 |
+| `mood`（"委屈，不甘"） | 中文直接拼进英文 prompt，模型基本读不懂（还有被画进画面的风险） |
+
+修法：`build_prompt` 新增 ——
+
+- `camera_directive()`：景别（大特写…远景/过肩）× 运镜（固定/推/拉/摇/移/跟/升降/手持）→ 英文
+- `mood_directive()`：中文情绪词映射表（30+ 词）；**没收录的中文词直接丢弃**，绝不塞进英文 prompt
+- `VIDEO_PERFORMANCE_DIRECTIVE`（可配）：克制的微表情、自然眨眼呼吸、平滑连续运动、稳定构图、
+  单镜到底不切、不许变形、避免夸张舞台腔 —— 追加到**每个**镜头
+- `VIDEO_STYLE_PROMPT`（可配）：英文风格约束
+- 分镜提示词同步收紧：情绪镜头优先中景/近景、一镜只写一个连续动作、表演用克制词
+- 顺带修掉 `English prompt:` 标签泄漏的**根因**：分镜 schema 示例里就写着
+  `"video_prompt": "English prompt: ..."`，LLM 照抄 —— 示例已改，`build_prompt` 仍保留防御性剥离
+
+### 3. 剧本严谨：能确定性修的就别让人看
+
+`repair_storyboard()` 在分镜生成后、校验前跑：**说话人不在画面里 → 补进
+`character_in_frame`**（真实项目 15 个镜头里 3 个中招）。这一条同时修三件事：参考图、
+外貌锚点、穿帮。需要创作者决策的问题（缺 video_prompt、悬念未闭合）照旧报给人。
+
+### 测试
+
+新增 `tests/test_voice_catalog.py`（14 例：性别判定不被身份词带偏、每人不同音色、
+复用+念法、性别冲突重配、年龄不匹配重配、音色池空则保留、方言默认禁用、确定性、
+未知说话人兜底），`test_video.py` 补 3 例（camera/mood 英文化、表演规范、未收录词丢弃），
+`test_consistency.py` 补 2 例（修复 presence、不猜未知说话人）。全套 **440 passed**，ruff clean。

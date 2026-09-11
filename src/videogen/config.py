@@ -41,6 +41,16 @@ class Settings(BaseSettings):
     #: 单个镜头的时长上限（秒）。0 = 用模型最长档位（H3 = 15 秒）
     video_max_shot_sec: float = 0.0
     video_concurrency: int = 3
+    #: 追加到每个视频 prompt 的「表演与连贯性」规范。真实样本里模型会把哭戏演成舞台剧
+    #: （眉毛挤成一团、身体僵硬），也会在长 prompt 下变形；这段是统一的最低要求
+    video_performance_directive: str = (
+        "natural subtle expressions and micro-expressions, relaxed body language, "
+        "natural blinking and breathing, smooth continuous motion, stable framing, "
+        "single continuous take with no cuts, no morphing or warping, "
+        "avoid exaggerated theatrical acting"
+    )
+    #: 追加到每个视频 prompt 的风格约束（英文；留空 = 不追加）
+    video_style_prompt: str = ""
     video_max_retries: int = 2
     video_retry_backoff_sec: float = 1.5
     video_fps: int = 24
@@ -59,6 +69,9 @@ class Settings(BaseSettings):
     tts_concurrency: int = 3
     tts_max_retries: int = 2
     tts_retry_backoff_sec: float = 1.5
+    #: 允许给角色选方言音色（例如东北话/陕西话）。默认不允许：同一部戏里混口音很出戏，
+    #: 宁可「复用通用音色 + 音高区分」也不给主角上方言
+    tts_allow_accent_voices: bool = False
     tts_timeout_sec: float = 60.0
     #: 每句对白后面留的呼吸时间（秒），用于音画对齐
     audio_gap_sec: float = 0.25

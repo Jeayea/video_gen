@@ -12,9 +12,10 @@ from tests.fakes import FakeLLM, FakeVideoProvider
 from videogen.config import get_settings
 from videogen.models.bible import Character, StoryBible
 from videogen.models.project import Project, ProjectStatus
+from videogen.models.script import Scene, Script
 from videogen.models.storyboard import Shot, Storyboard
 from videogen.orchestrator.pipeline import Pipeline
-from videogen.services import video_service
+from videogen.services import consistency_service, video_service
 from videogen.utils.ffmpeg import ffmpeg_available
 from videogen.utils.file_store import FileStore
 
@@ -202,6 +203,81 @@ async def test_mock_provider_tints_by_reference_image(tmp_path):
         )
     )
     assert clip_a.path.read_bytes() != clip_b.path.read_bytes()
+
+
+# ── 确定性修复：说话人不在画面里 ─────────────────────
+
+
+def test_repair_storyboard_adds_speaker_to_frame():
+    """说话人不在画面里 = 穿帮，而且会让该镜头拿不到这个角色的参考图/外貌锚点。
+
+    这条不需要创作者决策，属于可以确定性修的：直接补进 character_in_frame。
+    """
+    bible = StoryBible(
+        characters=[
+            Character(id="char_1", name="林悦", role="主角", description="女白领"),
+            Character(id="char_2", name="李薇儿", role="反派", description="当红女模特"),
+        ]
+    )
+    script = Script(title="t", scenes=[Scene(id="scene_1", heading="INT. 办公室 - 日")])
+    storyboard = Storyboard(
+        shots=[
+            Shot(
+                id="scene_1_shot_1",
+                scene_id="scene_1",
+                shot_no=1,
+                duration_sec=3,
+                video_prompt="a woman turns around",
+                character_in_frame=["char_1"],
+                dialogue_text="为什么？",
+                dialogue_speaker="char_2",
+            ),
+            Shot(
+                id="scene_1_shot_2",
+                scene_id="scene_1",
+                shot_no=2,
+                duration_sec=3,
+                video_prompt="a woman smiles",
+                character_in_frame=["char_1"],
+                dialogue_text="走吧。",
+                dialogue_speaker="char_1",  # 已经在画面里，不该被动
+            ),
+        ]
+    )
+
+    fixed, notes = consistency_service.repair_storyboard(storyboard, script, bible)
+
+    assert len(notes) == 1 and "char_2" in notes[0]
+    assert fixed.shots[0].character_in_frame == ["char_1", "char_2"]
+    assert fixed.shots[1].character_in_frame == ["char_1"]
+    # 修完之后校验里不该再有 presence 警告
+    issues = consistency_service.validate_storyboard(fixed, script, bible)
+    assert not [i for i in issues if i.category == "presence"]
+
+
+def test_repair_storyboard_leaves_unknown_speaker_alone():
+    """说话人本身就不在圣经里 —— 不能猜，交给校验报 ERROR。"""
+    bible = StoryBible(characters=[Character(id="char_1", name="甲", role="主角")])
+    script = Script(title="t", scenes=[Scene(id="scene_1", heading="INT. - 日")])
+    storyboard = Storyboard(
+        shots=[
+            Shot(
+                id="scene_1_shot_1",
+                scene_id="scene_1",
+                shot_no=1,
+                duration_sec=3,
+                video_prompt="x",
+                character_in_frame=["char_1"],
+                dialogue_text="台词",
+                dialogue_speaker="char_ghost",
+            )
+        ]
+    )
+    fixed, notes = consistency_service.repair_storyboard(storyboard, script, bible)
+    assert notes == []
+    assert fixed.shots[0].character_in_frame == ["char_1"]
+    issues = consistency_service.validate_storyboard(fixed, script, bible)
+    assert any(i.severity.value == "error" for i in issues)
 
 
 # ── 多模型切换 ────────────────────────────────────────

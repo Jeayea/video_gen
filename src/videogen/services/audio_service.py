@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
-import re
 from collections.abc import Callable
 from pathlib import Path
 
@@ -21,6 +20,7 @@ from videogen.models.storyboard import Shot, Storyboard
 from videogen.models.video import ClipStatus, MediaKind
 from videogen.providers.bgm.base import BgmLibrary
 from videogen.providers.tts.base import TTSProvider, TTSProviderError, TTSRequest
+from videogen.services import voice_catalog
 from videogen.utils.redact import scrub_secrets
 from videogen.utils.text import clean_spoken_text
 
@@ -33,47 +33,17 @@ DEFAULT_RETRY_BACKOFF_SEC = 1.5
 
 #: 音色判定关键词：角色 role / 描述 / 名字里出现这些就判为男声。
 #: 英文关键词必须按整词匹配 —— 否则 "woman" 里的 "man" 会把女主判成男声。
-_MALE_HINTS = (
-    "男",
-    "父",
-    "爸",
-    "哥",
-    "叔",
-    "爷",
-    "少年",
-    "反派",
-    "总裁",
-    "老板",
-    "丈夫",
-    "兄",
-    "male",
-    "man",
-    "boy",
-    "father",
-    "brother",
-    "suit",
-    "beard",
-)
-_FEMALE_HINTS = (
-    "女",
-    "母",
-    "妈",
-    "姐",
-    "妹",
-    "奶奶",
-    "女主",
-    "少女",
-    "妻子",
-    "夫人",
-    "闺蜜",
-    "female",
-    "woman",
-    "girl",
-    "mother",
-    "sister",
-    "dress",
-    "long hair",
-)
+
+
+def plan_voices(
+    storyboard: Storyboard,
+    bible: StoryBible | None,
+    settings: Settings | None = None,
+    *,
+    existing: dict[str, str] | None = None,
+) -> voice_catalog.VoiceCasting:
+    """给每个说话人选角（音色 + 为区分而复用的念法 + 说明）。"""
+    return voice_catalog.cast_voice_map(storyboard, bible, settings, existing=existing)
 
 
 def build_voice_map(
@@ -83,83 +53,12 @@ def build_voice_map(
     *,
     existing: dict[str, str] | None = None,
 ) -> dict[str, str]:
-    """给每个说话人分配音色。
+    """给每个说话人分配音色（只返回映射；完整选角结果用 `plan_voices`）。
 
-    优先级：已有分配（续跑保持一致）> 关键词判定男女声 > 按出场顺序在候选音色里轮转。
-    结果会落盘到 `audio_manifest.voice_map`，重跑不会换人声音。
+    真正的规则在 `voice_catalog.cast_voice_map`：按**性别/定位/年龄**打分、
+    保证不撞音色、撞了就靠念法区分。这里保留旧签名，方便老的调用方与测试。
     """
-    settings = settings or get_settings()
-    mapping: dict[str, str] = dict(existing or {})
-
-    speakers: list[str] = []
-    for shot in storyboard.shots:
-        speaker = _speaker_of(shot)
-        if speaker and speaker not in speakers:
-            speakers.append(speaker)
-
-    if NARRATOR in speakers and NARRATOR not in mapping:
-        mapping[NARRATOR] = settings.tts_voice_narrator
-
-    characters = {c.id: c for c in (bible.characters if bible else [])}
-    fallback = _fallback_voices(settings)
-
-    index = 0
-    for speaker in speakers:
-        if mapping.get(speaker):
-            continue
-        character = characters.get(speaker)
-        if speaker == NARRATOR:
-            mapping[speaker] = settings.tts_voice_narrator
-            continue
-        voice, label = _guess_voice(character, settings)
-        if voice is None:
-            voice = fallback[index % len(fallback)]
-            label = f"候选音色轮转（{index % len(fallback)}）"
-        index += 1
-        mapping[speaker] = voice
-        logger.info("音色分配：%s(%s) -> %s（%s）", speaker, _name_of(character), voice, label)
-
-    return mapping
-
-
-def _fallback_voices(settings: Settings) -> list[str]:
-    voices = [settings.tts_voice_female, settings.tts_voice_male, settings.tts_voice]
-    seen: list[str] = []
-    for voice in voices:
-        if voice and voice not in seen:
-            seen.append(voice)
-    return seen or ["zh-CN-XiaoxiaoNeural"]
-
-
-def _guess_voice(character, settings: Settings) -> tuple[str | None, str]:
-    if character is None:
-        return None, ""
-    haystack = " ".join(
-        str(part).lower()
-        for part in (
-            getattr(character, "role", ""),
-            getattr(character, "description", ""),
-            getattr(character, "visual_prompt", ""),
-            getattr(character, "name", ""),
-            " ".join(getattr(character, "personality", []) or []),
-        )
-    )
-    if _hits(haystack, _MALE_HINTS):
-        return settings.tts_voice_male, "关键词判定：男声"
-    if _hits(haystack, _FEMALE_HINTS):
-        return settings.tts_voice_female, "关键词判定：女声"
-    return None, ""
-
-
-def _hits(haystack: str, hints: tuple[str, ...]) -> bool:
-    """中文关键词用包含判断，英文关键词按整词判断（woman ≠ man）。"""
-    for hint in hints:
-        if hint.isascii():
-            if re.search(rf"(?<![a-z]){re.escape(hint)}(?![a-z])", haystack):
-                return True
-        elif hint in haystack:
-            return True
-    return False
+    return plan_voices(storyboard, bible, settings, existing=existing).voice_map
 
 
 def _speaker_of(shot: Shot) -> str:
@@ -196,7 +95,16 @@ async def synthesize_all(
     manifest = existing or AudioManifest()
     manifest.provider = provider.name
     manifest.concurrency = max(1, concurrency)
-    manifest.voice_map = build_voice_map(storyboard, bible, settings, existing=manifest.voice_map)
+    casting = plan_voices(storyboard, bible, settings, existing=manifest.voice_map)
+    manifest.voice_map = casting.voice_map
+    if casting.delivery:
+        # 音色池用尽时靠念法区分：只补没有显式念法的角色，重跑不覆盖已有设置
+        for speaker, direction in casting.delivery.items():
+            manifest.voice_delivery.setdefault(speaker, direction)
+    for note in casting.notes:
+        if note not in manifest.warnings:
+            manifest.warnings.append(note)
+        logger.warning("配音选角：%s", note)
     for speaker, voice in (voice_overrides or {}).items():
         if voice:
             manifest.voice_map[speaker] = voice
@@ -305,7 +213,10 @@ def _collect_lines(
     for shot in storyboard.shots:
         dialogue = clean_spoken_text(shot.dialogue_text)
         narration = clean_spoken_text(shot.narration)
-        direction = shot.voice_direction
+        # 念法优先级：镜头自己的（LLM 按画面给的）> 角色默认念法（选角时为区分音色）
+        direction = shot.voice_direction or manifest.voice_delivery.get(
+            (shot.dialogue_speaker or "").strip()
+        ) or (manifest.voice_delivery.get(NARRATOR) if not shot.dialogue_text else None)
         if dialogue:
             if narration:
                 manifest.warnings.append(

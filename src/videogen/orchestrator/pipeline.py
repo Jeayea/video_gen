@@ -85,6 +85,12 @@ GENERATE_STORYBOARD_STATUSES = {
     ProjectStatus.FAILED,
 }
 CONFIRM_STORYBOARD_STATUSES = {ProjectStatus.STORYBOARD_REVIEW}
+#: 退回配音阶段：换音色 / 换念法 / 改台词后重做配音（成片会一起作废）
+REOPEN_AUDIO_STATUSES = {
+    ProjectStatus.AUDIO_READY,
+    ProjectStatus.DONE,
+}
+
 REOPEN_STORYBOARD_STATUSES = {
     ProjectStatus.STORYBOARD_CONFIRMED,
     ProjectStatus.VIDEO_READY,
@@ -482,6 +488,13 @@ class Pipeline:
             finally:
                 self._record_llm_cost(project_id, CostStage.STORYBOARD, llm)
 
+            # 先做确定性修复（说话人不在画面里 → 补进去），再校验：修完就不该再报这条
+            storyboard, repairs = consistency_service.repair_storyboard(
+                storyboard, script, bible
+            )
+            if repairs:
+                self.store.save_storyboard(project_id, storyboard)
+                logger.info("分镜自动修复 %d 处：%s", len(repairs), "；".join(repairs))
             script_report = consistency_service.validate_script(
                 script, bible, self.store.load_world_state(project_id), project.target_duration_sec
             )
@@ -556,6 +569,19 @@ class Pipeline:
             self._require(project, CONFIRM_STORYBOARD_STATUSES, "确认分镜")
             # 只表示「分镜已确认」。视频/配音/合成阶段尚未实现，不虚报 VIDEO_READY
             project.status = ProjectStatus.STORYBOARD_CONFIRMED
+            self.store.save_project(project)
+            return project
+
+    async def reopen_audio(self, project_id: str) -> Project:
+        """退回配音阶段（成片作废）。
+
+        场景：片子已经 DONE，但想把某个角色的音色/念法换掉再重做配音 ——
+        没有这个入口时状态机不允许重新生成配音，用户只能重建项目。
+        """
+        async with self._lock(project_id):
+            project = self.get_project(project_id)
+            self._require(project, REOPEN_AUDIO_STATUSES, "退回配音阶段")
+            project.status = ProjectStatus.VIDEO_READY
             self.store.save_project(project)
             return project
 
@@ -1136,6 +1162,19 @@ class Pipeline:
                 raise
             finally:
                 await provider.aclose()
+
+            # 选角结果写回圣经：角色卡片上能看到/改到自己的音色，重跑也不会换人
+            if bible is not None and manifest.voice_map:
+                touched = False
+                for index, character in enumerate(bible.characters):
+                    voice = manifest.voice_map.get(character.id, "")
+                    if voice and character.voice_id != voice:
+                        bible.characters[index] = character.model_copy(
+                            update={"voice_id": voice}
+                        )
+                        touched = True
+                if touched:
+                    self.store.save_bible(project_id, bible)
 
             # 与视频同一套规则：按条目上的「已记账」标记记，而不是和上次清单做集合差
             # （否则「文案被 LLM 改写后重新合成」这种同 id 重跑会漏记）

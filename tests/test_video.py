@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 
 import pytest
 
@@ -272,6 +273,41 @@ def test_build_prompt_strips_llm_label_prefix(store, ready_project):
 
     shot.video_prompt = "Prompt: 英文提示词： A man turns around"
     assert video_service.build_prompt(shot, ready_project).startswith("A man turns around")
+
+
+def test_build_prompt_translates_camera_and_mood_to_english(store, ready_project):
+    """`camera`/`mood` 是中文：前者原来**根本没进 prompt**（运镜信息全丢），
+    后者被直接拼进英文 prompt（模型读不懂，还有被画进画面的风险）。"""
+    shot = store.load_storyboard(ready_project.id).shots[0]
+    shot.camera = "中景 · 缓推"
+    shot.mood = "震惊，失落"
+    prompt = video_service.build_prompt(shot, ready_project)
+
+    assert "medium shot" in prompt
+    assert "slow dolly in" in prompt
+    assert "shocked" in prompt and "crestfallen" in prompt
+    assert not re.search(r"[\u4e00-\u9fff]", prompt), prompt  # 英文 prompt 里不能有中文
+
+
+def test_build_prompt_appends_performance_and_style_directive(store, ready_project, settings):
+    """表情自然/动作流畅是靠这段统一规范兜的（可在 .env 覆盖）。"""
+    shot = store.load_storyboard(ready_project.id).shots[0]
+    prompt = video_service.build_prompt(shot, ready_project)
+    assert "subtle expressions" in prompt
+    assert "no cuts" in prompt
+    assert "no morphing" in prompt
+
+    settings.video_style_prompt = "cinematic realism, muted colors"
+    styled = video_service.build_prompt(shot, ready_project)
+    assert "cinematic realism" in styled
+
+
+def test_camera_and_mood_directives_drop_unknown_tokens():
+    assert video_service.camera_directive("") == ""
+    assert video_service.camera_directive("看不懂的景别") == ""
+    # 没收录的中文情绪词直接丢弃，绝不把中文塞进英文 prompt
+    assert video_service.mood_directive("玄之又玄") == ""
+    assert video_service.mood_directive("determined") == "determined"
 
 
 def test_appearance_anchor_is_empty_without_bible(store, ready_project):

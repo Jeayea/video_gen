@@ -7,6 +7,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
+from videogen.config import Settings, get_settings
 from videogen.models.bible import StoryBible
 from videogen.models.project import Project
 from videogen.models.storyboard import Shot, Storyboard
@@ -290,7 +291,111 @@ def resolve_reference(
     return (paths[0] if paths else None), seed
 
 
-def build_prompt(shot: Shot, project: Project, bible: StoryBible | None = None) -> str:
+#: 分镜里的 `camera` 是中文（"特写 · 固定"、"近景 · 推"）。**它原来根本没进 prompt** ——
+#: 运镜信息 100% 丢失，模型只能自己猜，动作自然容易飘。
+_SHOT_SIZE_EN = (
+    ("大特写", "extreme close-up"),
+    ("特写", "close-up"),
+    ("中近景", "medium close-up"),
+    ("近景", "medium close-up"),
+    ("中景", "medium shot"),
+    ("全景", "wide shot"),
+    ("远景", "extreme wide shot"),
+    ("过肩", "over-the-shoulder shot"),
+)
+_CAMERA_MOVE_EN = (
+    ("固定", "static camera"),
+    ("推", "slow dolly in"),
+    ("拉", "slow dolly out"),
+    ("摇", "slow pan"),
+    ("移", "slow tracking move"),
+    ("跟", "smooth follow"),
+    ("升", "slow crane up"),
+    ("降", "slow crane down"),
+    ("手持", "subtle handheld camera"),
+)
+
+
+def camera_directive(camera: str) -> str:
+    """把中文景别/运镜翻成英文镜头指令（找不到就返回空，不猜）。"""
+    text = " ".join(str(camera or "").split())
+    if not text:
+        return ""
+    parts: list[str] = []
+    for token, english in _SHOT_SIZE_EN:
+        if token in text:
+            parts.append(english)
+            break
+    for token, english in _CAMERA_MOVE_EN:
+        if token in text:
+            parts.append(english)
+            break
+    return ", ".join(parts)
+
+
+#: 中文情绪词 → 英文。原来 `mood` 是中文，直接被拼进英文 prompt：
+#: 模型基本读不懂（等于没给），而且图片模型的前车之鉴是**中文会被画进画面**。
+_MOOD_EN = {
+    "震惊": "shocked",
+    "惊讶": "surprised",
+    "失落": "crestfallen",
+    "沮丧": "dejected",
+    "嘲讽": "mocking",
+    "讽刺": "sarcastic",
+    "受伤": "hurt",
+    "委屈": "wronged",
+    "不甘": "resentful",
+    "愤怒": "angry",
+    "生气": "angry",
+    "冷漠": "cold",
+    "轻蔑": "contemptuous",
+    "紧张": "tense",
+    "焦虑": "anxious",
+    "恐惧": "fearful",
+    "悲伤": "sad",
+    "痛苦": "painful",
+    "喜悦": "joyful",
+    "欣慰": "relieved",
+    "坚定": "determined",
+    "自信": "confident",
+    "温柔": "gentle",
+    "复杂": "complicated",
+    "期待": "hopeful",
+    "迷茫": "lost",
+    "释然": "at peace",
+    "得意": "smug",
+    "羡慕": "envious",
+    "疑惑": "puzzled",
+}
+
+
+def mood_directive(mood: str) -> str:
+    """把中文情绪翻成英文；一个词都翻不出来就丢弃（**绝不把中文塞进英文 prompt**）。"""
+    text = " ".join(str(mood or "").split())
+    if not text:
+        return ""
+    if text.isascii():
+        return text
+    found: list[str] = []
+    for chunk in re.split(r"[，,、/|;；\s]+", text):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        english = _MOOD_EN.get(chunk)
+        if english is None:
+            english = next((en for cn, en in _MOOD_EN.items() if cn in chunk), None)
+        if english and english not in found:
+            found.append(english)
+    return ", ".join(found)
+
+
+def build_prompt(
+    shot: Shot,
+    project: Project,
+    bible: StoryBible | None = None,
+    *,
+    settings: Settings | None = None,
+) -> str:
     """组装给视频模型的 prompt（video_prompt 已在分镜阶段转成纯英文）。
 
     给了 `bible` 就额外拼一段**在场角色的圣经外貌**：视频模型每个镜头都是独立生成的，
@@ -300,14 +405,27 @@ def build_prompt(shot: Shot, project: Project, bible: StoryBible | None = None) 
     base = _strip_prompt_label(shot.video_prompt or shot.visual_description or "")
     if not base:
         base = "cinematic shot"
+    settings = settings or get_settings()
     parts = [base]
     if not _mentions(base, project.aspect_ratio.value):
         parts.append(f"aspect ratio {project.aspect_ratio.value}")
-    if shot.mood:
-        parts.append(f"mood: {shot.mood}")
+    camera = camera_directive(shot.camera)
+    if camera:
+        parts.append(camera)
+    mood = mood_directive(shot.mood)
+    if mood:
+        parts.append(f"emotion: {mood}")
     anchor = appearance_anchor(shot, bible, base)
     if anchor:
         parts.append(anchor)
+    # 表演 + 连贯性 + 风格：真实样本里模型会把哭戏演成舞台剧、长 prompt 下画面变形，
+    # 这段是每个镜头统一的最低要求（可在 .env 关掉/改写）
+    directive = " ".join(str(settings.video_performance_directive or "").split())
+    if directive:
+        parts.append(directive)
+    style = " ".join(str(settings.video_style_prompt or "").split())
+    if style:
+        parts.append(style)
     parts.append(f"{max(1, shot.duration_sec)} seconds")
     return ", ".join(parts)
 

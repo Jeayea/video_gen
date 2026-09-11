@@ -21,7 +21,11 @@ from videogen.providers.image.base import ImageProviderError
 from videogen.providers.llm.base import LLMError
 from videogen.providers.tts.base import TTSProviderError
 from videogen.providers.video.base import VideoProviderError
-from videogen.services import character_image_service, subtitle_service
+from videogen.services import (
+    character_image_service,
+    subtitle_service,
+    voice_catalog,
+)
 from videogen.services.character_image_service import CharacterImageError
 from videogen.services.cost_service import BudgetExceeded, PriceTable
 from videogen.utils.ffmpeg import (
@@ -274,7 +278,7 @@ def _model_of(project_id: str, req: GenerateRequest | None) -> str:
 
 @app.get("/api/models")
 async def list_models():
-    """可选模型 + 单价（前端下拉用）。"""
+    """可选模型 + 单价 + 可选音色（前端下拉用）。"""
     prices = PriceTable.from_settings()
     return {
         "default": settings.openrouter_model,
@@ -283,6 +287,54 @@ async def list_models():
         "budget_usd": settings.budget_usd,
         "batch_max_items": settings.batch_max_items,
         "seed": settings.video_seed,
+        "voices": voice_catalog.catalog_rows(),
+        "voice_defaults": {
+            "female": settings.tts_voice_female,
+            "male": settings.tts_voice_male,
+            "narrator": settings.tts_voice_narrator,
+        },
+        "voice_allow_accent": settings.tts_allow_accent_voices,
+    }
+
+
+@app.get("/api/projects/{project_id}/voices")
+async def project_voices(project_id: str):
+    """这个项目的选角：每个说话人用什么音色、为什么、有没有撞音色。
+
+    **不调 TTS、不花钱** —— 只跑一遍确定性选角，给 UI 显示与人工调整用。
+    """
+    project = pipeline.get_project(project_id)
+    storyboard = store.load_storyboard(project_id)
+    bible = store.load_bible(project_id)
+    if storyboard is None:
+        raise HTTPException(400, "分镜不存在，先生成分镜再选角")
+    manifest = store.load_audio_manifest(project_id)
+    casting = voice_catalog.cast_voice_map(
+        storyboard, bible, existing=(manifest.voice_map if manifest else None)
+    )
+    rows = {row["id"]: row["label"] for row in voice_catalog.catalog_rows()}
+    names = {c.id: c.name for c in (bible.characters if bible else [])}
+    return {
+        "voice_map": casting.voice_map,
+        "delivery": {sp: d.model_dump() for sp, d in casting.delivery.items()},
+        "genders": casting.genders,
+        "notes": casting.notes,
+        "characters": [
+            {
+                "id": speaker,
+                "name": names.get(speaker, "旁白" if speaker == "narrator" else speaker),
+                "voice": voice,
+                "voice_label": rows.get(voice, voice),
+                "gender": casting.genders.get(speaker, ""),
+                "delivery": (
+                    casting.delivery[speaker].model_dump()
+                    if speaker in casting.delivery
+                    else None
+                ),
+            }
+            for speaker, voice in casting.voice_map.items()
+        ],
+        "project_status": project.status.value,
     }
 
 
@@ -462,6 +514,13 @@ async def update_storyboard(project_id: str, data: dict):
 async def confirm_storyboard(project_id: str):
     project = await pipeline.confirm_storyboard(project_id)
     return {"status": "ok", "project_status": project.status.value}
+
+
+@app.post("/api/projects/{project_id}/audio/reopen")
+async def reopen_audio(project_id: str):
+    """退回配音阶段：换音色/念法后重做配音（成片会作废）。"""
+    project = await pipeline.reopen_audio(project_id)
+    return {"status": project.status.value}
 
 
 @app.post("/api/projects/{project_id}/storyboard/reopen")
