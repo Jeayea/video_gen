@@ -259,3 +259,40 @@ pytest -q              → 71 passed
 
 - H3 的片段自带音轨，但合成时只取视频轨（对白用 TTS 保证清晰）。想保留环境音当底噪需要新增混音选项
 - 取消只是停止轮询，**服务端任务可能仍在跑并计费**（异步视频 API 的固有行为）
+
+
+---
+
+## v0.8 — 环境音混音 + 测试与付费服务隔离
+
+### 新增：环境音混音（`COMPOSE_AMBIENT_MODE`）
+
+真实视频模型（H3 等）会自带音轨，之前合成时被整条丢掉。现在可选：
+
+| 模式 | 行为 |
+|------|------|
+| `off`（默认） | 丢弃模型音轨，对白人声最干净 —— 行为与之前完全一致 |
+| `under` | 把模型音轨压到 `COMPOSE_AMBIENT_GAIN_DB`（默认 -20dB），再和人声 `amix`（`normalize=0`，人声音量不被拉低） |
+
+- 镜头没有台词时，环境音就是它唯一的音轨（不会变成静音）
+- **先探测再混**：用 `ffprobe` 确认片段真的有音轨；探不到（没装 ffprobe / 片段本身无音轨）
+  就只告警并退回 `off` —— 绝不拼一条 ffmpeg 必然报错的滤镜图
+- 切换开关会让分段重新渲染（渲染新鲜度里带了环境音开关的标记），否则会复用纯人声的旧分段
+- 报告里记录 `ambient_mode` / `ambient_mode_effective` / `ambient_gain_db`；UI 与 API 都可覆盖
+
+### 修复：测试不再受开发者 `.env` 影响
+
+`.env` 里把 `VIDEO_PROVIDER` 切成 `openrouter` 之后，测试开始失败 —— 因为
+`test_video_provider_factory` 假设默认是 mock、健康检查断言了 `mock`。
+更危险的是：只要哪个测试用了默认工厂去生成视频，就会**真的调付费接口**。
+
+现在 `conftest` 的 autouse fixture 强制 `video_provider=mock`、`budget_usd=0`、退避归零，
+测试与付费服务彻底隔离；需要真实 provider 的用例自己用 `httpx.MockTransport` 打桩。
+
+### 验证
+
+- `ruff check src tests` 全绿；`pytest -q` **281 passed**
+- 新增 `tests/test_ambient.py`（15 例）：滤镜拼装的四种组合（纯人声 / 纯环境音 / 混音 / 静音）
+  与 `normalize=0`、可用性判定（无 ffprobe 降级、片段无音轨降级、off 模式不探测）、
+  真实 ffmpeg 混音产物（仍是 1 路视频 + 1 路音频）、
+  以及「off → under 必须改变成片字节」（证明分段真的重渲染了）

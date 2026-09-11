@@ -948,6 +948,8 @@ class Pipeline:
                     "compose_preset",
                     "compose_subtitle_font",
                     "compose_subtitle_font_scale",
+                    "compose_ambient_mode",
+                    "compose_ambient_gain_db",
                     "bgm_id",
                     "bgm_gain_db",
                     "bgm_enabled",

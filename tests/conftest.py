@@ -13,10 +13,19 @@ from videogen.utils.file_store import FileStore
 
 @pytest.fixture(autouse=True)
 def fast_video_settings(monkeypatch):
-    """测试里不要真的等退避时间。"""
+    """所有测试共用的安全/加速基线。
+
+    关键点：**测试绝不能碰真实付费服务**。开发者本地 `.env` 可能已经切到
+    `VIDEO_PROVIDER=openrouter`（甚至设了预算），如果测试跟着用默认工厂就会真的提交
+    付费任务 —— 所以这里强制把 provider 拉回 mock、预算清零、退避归零。
+    需要真实 provider 的测试自己显式构造/猴补参数（例如 test_video_openrouter.py
+    用 httpx.MockTransport 打桩）。
+    """
     settings = get_settings()
     monkeypatch.setattr(settings, "video_retry_backoff_sec", 0.0)
     monkeypatch.setattr(settings, "tts_retry_backoff_sec", 0.0)
+    monkeypatch.setattr(settings, "video_provider", "mock")
+    monkeypatch.setattr(settings, "budget_usd", 0.0)
     return settings
 
 

@@ -36,6 +36,10 @@ class ComposeReport(BaseModel):
     segments: list[ComposeSegment] = Field(default_factory=list)
     bgm_id: str = ""
     bgm_path: str = ""
+    #: 环境音（视频模型自带音轨）的处理方式与实际生效值
+    ambient_mode: str = "off"
+    ambient_mode_effective: str = "off"
+    ambient_gain_db: float = 0.0
     bgm_gain_db: float = 0.0
     video_provider: str = ""
     tts_provider: str = ""
@@ -50,6 +54,7 @@ class ComposeReport(BaseModel):
             "subtitle_mode": self.subtitle_mode_effective or self.subtitle_mode,
             "subtitles": bool(self.subtitles_path),
             "bgm": self.bgm_id,
+            "ambient": self.ambient_mode_effective,
             "warnings": len(self.warnings),
         }
 

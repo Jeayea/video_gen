@@ -518,7 +518,7 @@ def test_generate_accepts_model_override(client):
     report = client.get(f"/api/projects/{pid}/cost").json()
     assert report["summary"]["entries"] == 1
     assert report["stages"]["bible"]["tokens"] > 0
-    assert report["budget_usd"] == 0.0
+    assert report["budget_usd"] == main.settings.budget_usd
 
 
 def test_reference_image_flow(client):

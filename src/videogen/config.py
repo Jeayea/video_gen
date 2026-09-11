@@ -78,6 +78,10 @@ class Settings(BaseSettings):
     compose_subtitle_font_scale: float = 0.05
     #: 字幕距底部 = min(宽, 高) * 该比例
     compose_subtitle_margin_scale: float = 0.04
+    #: 视频模型自带音轨怎么处理：off = 丢弃（人声最干净）；under = 压低垫在人声下面
+    compose_ambient_mode: str = "off"
+    #: 环境音相对人声的音量（dB）
+    compose_ambient_gain_db: float = -20.0
     #: 保留中间分段文件（排查用）
     compose_keep_segments: bool = False
 
@@ -143,6 +147,11 @@ class Settings(BaseSettings):
         if self.openrouter_model and self.openrouter_model not in seen:
             seen.insert(0, self.openrouter_model)
         return seen
+
+    @property
+    def ambient_mode(self) -> str:
+        mode = (self.compose_ambient_mode or "off").strip().lower()
+        return mode if mode in {"off", "under"} else "off"
 
     @property
     def subtitle_mode(self) -> str:

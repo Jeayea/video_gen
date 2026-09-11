@@ -305,7 +305,7 @@ body {
 
 <div class="header">
   <h1>videogen</h1>
-  <span class="badge">v0.7</span>
+  <span class="badge">v0.8</span>
   <span style="flex:1"></span>
   <span id="health" style="font-size:12px;color:var(--text2)"></span>
   <span id="global-status" style="font-size:12px;color:var(--text2)"></span>
@@ -1428,6 +1428,7 @@ function renderCompose() {
       </div>
       <div class="hint" style="margin-top:8px">
         时长 ${report.duration_sec}s · 字幕模式 ${esc(report.subtitle_mode_effective || report.subtitle_mode)}
+        · 环境音 ${esc(report.ambient_mode_effective || 'off')}
         ${report.bgm_id ? ` · BGM ${esc(report.bgm_id)}（${report.bgm_gain_db}dB）` : ' · 无 BGM'}
         · 视频 ${esc(report.video_provider)} / 配音 ${esc(report.tts_provider)}
       </div>
@@ -1452,11 +1453,26 @@ function renderCompose() {
         <input id="compose-bgm-gain" type="number" min="-40" max="0" step="1" value="-20" />
       </label>
     </div>
+    <div class="row">
+      <label>环境音（模型自带音轨）
+        <select id="compose-ambient">
+          <option value="off">off · 丢弃（人声最干净）</option>
+          <option value="under">under · 压低垫在人声下面</option>
+        </select>
+      </label>
+      <label>环境音音量 dB
+        <input id="compose-ambient-gain" type="number" min="-40" max="0" step="1" value="-20" />
+      </label>
+    </div>
   `;
   const modeSel = $('compose-subtitle-mode');
   if (modeSel) modeSel.value = (report && report.subtitle_mode) || 'soft';
   const bgmInput = $('compose-bgm-id');
   if (bgmInput && report && report.bgm_id) bgmInput.value = report.bgm_id;
+  const ambientSel = $('compose-ambient');
+  if (ambientSel) ambientSel.value = (report && report.ambient_mode) || 'off';
+  const ambientGain = $('compose-ambient-gain');
+  if (ambientGain && report && report.ambient_gain_db) ambientGain.value = report.ambient_gain_db;
 
   const wrap = $('compose-progress');
   if (active) {
@@ -1512,9 +1528,12 @@ function doCompose() {
   const mode = $('compose-subtitle-mode') ? $('compose-subtitle-mode').value : 'soft';
   const bgmId = $('compose-bgm-id') ? $('compose-bgm-id').value.trim() : '';
   const gainRaw = $('compose-bgm-gain') ? $('compose-bgm-gain').value : '';
-  const body = { subtitle_mode: mode };
+  const ambientMode = $('compose-ambient') ? $('compose-ambient').value : 'off';
+  const ambientGainRaw = $('compose-ambient-gain') ? $('compose-ambient-gain').value : '';
+  const body = { subtitle_mode: mode, ambient_mode: ambientMode };
   if (bgmId) body.bgm_id = bgmId;
   if (gainRaw !== '') body.bgm_gain_db = Number(gainRaw);
+  if (ambientGainRaw !== '') body.ambient_gain_db = Number(ambientGainRaw);
   stopComposePolling();
   withBusy('提交合成任务...', () =>
     api(`/api/projects/${currentProjectId}/compose`, {

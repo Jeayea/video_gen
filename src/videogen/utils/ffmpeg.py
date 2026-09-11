@@ -16,6 +16,7 @@ __all__ = [
     "ffmpeg_capabilities",
     "ffprobe_available",
     "probe_duration",
+    "probe_streams",
     "reset_ffmpeg_cache",
     "resolve_ffmpeg",
     "resolve_ffprobe",
@@ -256,6 +257,38 @@ async def probe_duration(path: Path, *, timeout_sec: float = 30.0) -> float | No
     except (ValueError, IndexError):
         return None
     return value if value > 0 else None
+
+
+async def probe_streams(path: Path, *, timeout_sec: float = 30.0) -> set[str] | None:
+    """列出媒体里的流类型（`{"video", "audio"}`）。
+
+    返回 `None` 表示**探测不了**（没有 ffprobe）—— 调用方必须显式处理，
+    不能猜「有没有音轨」，否则会拼出一条 ffmpeg 直接报错的滤镜图。
+    """
+    exe = resolve_ffprobe()
+    if not exe or not Path(path).is_file():
+        return None
+    try:
+        code, out = await _capture(
+            exe,
+            [
+                "-v",
+                "error",
+                "-show_entries",
+                "stream=codec_type",
+                "-of",
+                "default=nw=1:nk=1",
+                str(path),
+            ],
+            timeout_sec=timeout_sec,
+        )
+    except Exception:
+        logger.debug("ffprobe 读取流信息失败: %s", path, exc_info=True)
+        return None
+    if code != 0:
+        return None
+    kinds = {line.strip().lower() for line in out.splitlines() if line.strip()}
+    return kinds or None
 
 
 _NO_FFMPEG = (

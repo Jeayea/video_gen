@@ -34,6 +34,10 @@ python -m videogen.tools.demo_bgm   # 可选：生成 4 首演示 BGM 到 ./asse
 ./run.sh                      # 默认 http://127.0.0.1:8000
 ```
 
+**配音（TTS）不需要任何配置**：默认 `TTS_PROVIDER=edge`（微软 Edge-TTS，免费、**不用 key**、
+只要能联网），音色按角色性别自动分配；`TTS_PROVIDER=mock` 则用本地 ffmpeg 生成占位音、完全离线。
+想换成付费 TTS 需要自己实现一个 `TTSProvider`（目前只有 edge / mock 两个实现）。
+
 ffmpeg 解析顺序是 `FFMPEG_PATH` → `PATH` → `imageio-ffmpeg`（`media` 额外依赖，自带便携二进制）。
 **三者都没有时视频阶段仍可运行，但只会产出明确标记的占位文件（`media_kind=placeholder`），
 绝不假装成功；配音同样降级为占位文件，合成会直接拒绝。**
@@ -135,6 +139,21 @@ BUDGET_USD=12                              # 强烈建议先设预算（见下�
 > 单个视频任务跑几分钟是常态；`VIDEO_CONCURRENCY` 控制同时提交几个（默认 3）。
 > **取消只是停止轮询，服务端任务可能仍在跑并计费** —— 这是异步视频 API 的固有行为。
 
+## 声音设计（对白 / 环境音 / BGM 三层）
+
+一段成片的声音由三层叠出来，都可以单独关掉：
+
+| 层 | 来源 | 开关 |
+|----|------|------|
+| 对白 | Edge-TTS（`audio/<shot>.mp3`） | `TTS_PROVIDER=edge\|mock` |
+| 环境音 | **视频模型自带的音轨**（H3 等会生成） | `COMPOSE_AMBIENT_MODE=off\|under`，音量 `COMPOSE_AMBIENT_GAIN_DB=-20` |
+| BGM | 本地曲库按情绪匹配 | `BGM_ENABLED` / `BGM_ID` / `BGM_GAIN_DB` |
+
+`COMPOSE_AMBIENT_MODE=under` 时，把模型音轨压到 `-20 dB` 再和人声 `amix`（`normalize=0`，
+人声音量不被拉低）；某个镜头没有台词时，环境音就是它唯一的音轨。前提是**探测到片段真的有音轨**
+—— 这需要 `ffprobe`（`brew install ffmpeg` 会带），探不到就只告警并退回 `off`，不会硬拼一条
+ffmpeg 会报错的滤镜图。切换这个开关会让分段重新渲染。
+
 ## API
 
 | 方法 | 路径 | 说明 |
@@ -163,7 +182,7 @@ BUDGET_USD=12                              # 强烈建议先设预算（见下�
 | GET | `/api/projects/{id}/audio/status` · `/audio/manifest` | 配音进度 / 清单（含音色表、对齐记录） |
 | POST | `/api/projects/{id}/audio/cancel` | 取消配音任务 |
 | GET | `/api/projects/{id}/audio/{clip_id}` | 试听某条配音 |
-| POST | `/api/projects/{id}/compose` | **提交合成任务**（202 + job；body 可覆盖字幕模式/BGM/画质） |
+| POST | `/api/projects/{id}/compose` | **提交合成任务**（202 + job；body 可覆盖字幕模式/环境音/BGM/画质） |
 | GET | `/api/projects/{id}/compose/status` | 合成进度 + 成片报告 |
 | POST | `/api/projects/{id}/compose/cancel` | 取消合成任务 |
 | GET | `/api/projects/{id}/final` · `/subtitles` | 下载成片 MP4 / 字幕 SRT |
@@ -216,6 +235,8 @@ src/videogen/
   成本账本会记下每个阶段用的是哪个模型
 - **批量生产的边界**：批量**跳过人工确认门控**（这是它的意义），所以它复用同一套
   `run_chain`（文本 → 视频 → 配音 → 合成），单条失败不影响其它条目，失败条目保留项目便于接管
+- **声音分层不打架**：对白 / 环境音 / BGM 三层各自有音量与开关，环境音必须**先探测到音轨**
+  才混（没有 ffprobe 就明确降级并告警，不猜）
 - **字幕时间轴与成片一致**：SRT 按分段时长累加生成，每条字幕只覆盖「说话的那几秒」，
   默认字号 = `min(宽,高) × 5%`（竖屏 1080 宽 ≈ 54px）
 

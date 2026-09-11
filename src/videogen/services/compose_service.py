@@ -15,6 +15,7 @@ from videogen.models.video import VideoManifest
 from videogen.services import subtitle_service
 from videogen.utils.ffmpeg import (
     ffmpeg_capabilities,
+    probe_streams,
     resolve_ffmpeg,
     run_ffmpeg,
 )
@@ -39,7 +40,32 @@ def _resolution(project: Project) -> tuple[int, int]:
     return width - width % 2, height - height % 2
 
 
-def _segment_filter(width: int, height: int, duration: float, fps: int, has_audio: bool) -> str:
+def _resample(label_in: str, label_out: str, duration: float, *, gain_db: float = 0.0) -> str:
+    gain = f"volume={gain_db:.1f}dB," if gain_db else ""
+    return (
+        f"[{label_in}]aresample=44100,aformat=channel_layouts=stereo,{gain}"
+        f"apad,atrim=duration={duration:.3f},asetpts=PTS-STARTPTS[{label_out}]"
+    )
+
+
+def _segment_filter(
+    width: int,
+    height: int,
+    duration: float,
+    fps: int,
+    *,
+    voice: bool,
+    ambient: bool,
+    ambient_gain_db: float = -20.0,
+) -> str:
+    """拼一条分段滤镜：视频统一规格，音频把「配音」和「模型自带环境音」混起来。
+
+    三种组合：
+    - 只有配音：`[1:a] -> [a]`
+    - 只有环境音（这个镜头没有台词）：`[0:a]` 压低后直接当音轨
+    - 两者都有：环境音压到 `ambient_gain_db`，再和人声 `amix`（`normalize=0`
+      保证人声音量不被拉低）
+    """
     video = (
         f"[0:v]scale={width}:{height}:force_original_aspect_ratio=decrease,"
         f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,"
@@ -48,14 +74,21 @@ def _segment_filter(width: int, height: int, duration: float, fps: int, has_audi
         f"tpad=stop_mode=clone:stop_duration={duration:.3f},"
         f"trim=duration={duration:.3f},setpts=PTS-STARTPTS[v]"
     )
-    if has_audio:
-        audio = (
-            f"[1:a]aresample=44100,aformat=channel_layouts=stereo,"
-            f"apad,atrim=duration={duration:.3f},asetpts=PTS-STARTPTS[a]"
+    chains = [video]
+    if voice and ambient:
+        chains.append(_resample("1:a", "voice", duration))
+        chains.append(_resample("0:a", "ambient", duration, gain_db=ambient_gain_db))
+        chains.append(
+            "[voice][ambient]amix=inputs=2:duration=longest:dropout_transition=0:"
+            "normalize=0[a]"
         )
+    elif voice:
+        chains.append(_resample("1:a", "a", duration))
+    elif ambient:
+        chains.append(_resample("0:a", "a", duration, gain_db=ambient_gain_db))
     else:
-        audio = f"[1:a]atrim=duration={duration:.3f},asetpts=PTS-STARTPTS[a]"
-    return f"{video};{audio}"
+        chains.append(f"[1:a]atrim=duration={duration:.3f},asetpts=PTS-STARTPTS[a]")
+    return ";".join(chains)
 
 
 async def render_segment(
@@ -69,6 +102,8 @@ async def render_segment(
     fps: int,
     crf: int,
     preset: str,
+    ambient: bool = False,
+    ambient_gain_db: float = -20.0,
 ) -> None:
     """把一个镜头渲染成「视频 + 该镜头配音」的标准片段。
 
@@ -76,16 +111,24 @@ async def render_segment(
     """
     duration = max(0.2, float(segment.duration_sec))
     args = ["-y", "-hide_banner", "-loglevel", "error", "-i", str(video_path)]
-    has_audio = audio_path is not None and Path(audio_path).is_file()
-    if has_audio:
+    voice = audio_path is not None and Path(audio_path).is_file()
+    if voice:
         args += ["-i", str(audio_path)]
-    else:
-        # 没有配音也要有音轨，否则 concat 时各段流不一致
+    elif not ambient:
+        # 既没配音也不用环境音时，也要有音轨，否则 concat 时各段流不一致
         args += ["-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100"]
 
     args += [
         "-filter_complex",
-        _segment_filter(width, height, duration, fps, has_audio),
+        _segment_filter(
+            width,
+            height,
+            duration,
+            fps,
+            voice=voice,
+            ambient=ambient,
+            ambient_gain_db=ambient_gain_db,
+        ),
         "-map",
         "[v]",
         "-map",
@@ -391,6 +434,11 @@ async def compose(
     if settings.subtitle_mode != SubtitleMode.NONE and "mov_text" not in caps:
         warnings.append("当前 ffmpeg 不支持 mov_text，字幕只导出 .srt 侧挂文件")
 
+    ambient_mode = settings.ambient_mode
+    ambient_effective = await _resolve_ambient_mode(
+        segments, project_dir, ambient_mode, warnings
+    )
+
     segments_dir.mkdir(parents=True, exist_ok=True)
     output_dir.mkdir(parents=True, exist_ok=True)
     _notify(on_progress, 0, len(segments) + 2, "开始渲染分段")
@@ -407,6 +455,8 @@ async def compose(
         concurrency=max(1, settings.compose_concurrency),
         reuse=reuse_segments,
         on_progress=on_progress,
+        ambient=ambient_effective == "under",
+        ambient_gain_db=settings.compose_ambient_gain_db,
     )
 
     segment_paths = [segments_dir / f"{s.shot_id}.mp4" for s in segments]
@@ -472,6 +522,9 @@ async def compose(
         bgm_id=bgm.id if bgm else "",
         bgm_path=str(bgm.path) if bgm else "",
         bgm_gain_db=bgm.gain_db if bgm and bgm.gain_db is not None else settings.bgm_gain_db,
+        ambient_mode=ambient_mode,
+        ambient_mode_effective=ambient_effective,
+        ambient_gain_db=settings.compose_ambient_gain_db,
         video_provider=video_manifest.provider,
         tts_provider=audio_manifest.provider if audio_manifest else "",
         ffmpeg=resolve_ffmpeg() or "",
@@ -489,6 +542,41 @@ async def compose(
     return report
 
 
+async def _resolve_ambient_mode(
+    segments: list[ComposeSegment],
+    project_dir: Path,
+    requested: str,
+    warnings: list[str],
+) -> str:
+    """确认环境音到底能不能用：需要 ffprobe 探到片段里真的有音轨。"""
+    if requested != "under":
+        return "off"
+
+    with_audio = 0
+    unknown = False
+    for segment in segments:
+        if not segment.video_path:
+            continue
+        streams = await probe_streams(project_dir / segment.video_path)
+        if streams is None:
+            unknown = True
+            break
+        if "audio" in streams:
+            with_audio += 1
+
+    if unknown:
+        warnings.append(
+            "没有可用的 ffprobe，无法确认片段是否自带音轨，本次环境音不混"
+            "（装 ffmpeg 或设 FFPROBE_PATH 后可用）"
+        )
+        return "off"
+    if not with_audio:
+        warnings.append("所选片段都没有自带音轨，本次环境音不混")
+        return "off"
+    logger.info("环境音混音已开启：%d/%d 个片段自带音轨", with_audio, len(segments))
+    return "under"
+
+
 async def _render_all(
     segments: list[ComposeSegment],
     segments_dir: Path,
@@ -502,10 +590,20 @@ async def _render_all(
     concurrency: int,
     reuse: bool,
     on_progress: ProgressCallback,
+    ambient: bool = False,
+    ambient_gain_db: float = -20.0,
 ) -> None:
     semaphore = asyncio.Semaphore(concurrency)
     done = 0
     lock = asyncio.Lock()
+    probe_cache: dict[str, bool] = {}
+
+    async def has_ambient(video_path: Path) -> bool:
+        key = str(video_path)
+        if key not in probe_cache:
+            streams = await probe_streams(video_path)
+            probe_cache[key] = bool(streams and "audio" in streams)
+        return probe_cache[key]
 
     async def run_one(segment: ComposeSegment) -> None:
         nonlocal done
@@ -513,7 +611,10 @@ async def _render_all(
             output = segments_dir / f"{segment.shot_id}.mp4"
             video_path = project_dir / segment.video_path
             audio_path = project_dir / segment.audio_path if segment.audio_path else None
-            if reuse and _segment_is_fresh(output, [video_path, audio_path]):
+            use_ambient = ambient and await has_ambient(video_path)
+            # 环境音开关变了要重新渲染：把它编码到"输入"里参与新鲜度判断
+            marker = segments_dir / f".ambient-{'on' if use_ambient else 'off'}"
+            if reuse and marker.exists() and _segment_is_fresh(output, [video_path, audio_path]):
                 logger.debug("复用已渲染分段：%s", output.name)
             else:
                 await render_segment(
@@ -526,7 +627,10 @@ async def _render_all(
                     fps=fps,
                     crf=crf,
                     preset=preset,
+                    ambient=use_ambient,
+                    ambient_gain_db=ambient_gain_db,
                 )
+                marker.touch()
             async with lock:
                 done += 1
                 _notify(

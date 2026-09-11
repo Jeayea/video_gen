@@ -222,6 +222,9 @@ class ComposeRequest(BaseModel):
     bgm_gain_db: float | None = Field(default=None, ge=-60, le=0)
     crf: int | None = Field(default=None, ge=0, le=51)
     subtitle_font_scale: float | None = Field(default=None, gt=0, le=0.2)
+    #: 视频模型自带音轨：off = 丢弃；under = 压低垫在人声下面
+    ambient_mode: str | None = Field(default=None, pattern="^(off|under)$")
+    ambient_gain_db: float | None = Field(default=None, ge=-60, le=0)
 
 
 def _model_of(project_id: str, req: GenerateRequest | None) -> str:
@@ -569,6 +572,10 @@ async def compose_project(project_id: str, req: ComposeRequest | None = None):
             overrides["compose_crf"] = req.crf
         if req.subtitle_font_scale is not None:
             overrides["compose_subtitle_font_scale"] = req.subtitle_font_scale
+        if req.ambient_mode is not None:
+            overrides["compose_ambient_mode"] = req.ambient_mode
+        if req.ambient_gain_db is not None:
+            overrides["compose_ambient_gain_db"] = req.ambient_gain_db
     job = await pipeline.start_compose(project_id, overrides=overrides)
     return {"job": job.to_public()}
 
