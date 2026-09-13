@@ -923,3 +923,79 @@ async def test_compose_mouth_alignment_is_wired_and_reported(store, settings):
     # 第一镜被延后（其余镜头的 mock 音轨是满的/没有音轨，不触发）
     assert report.warnings, report.model_dump()
     assert any("口型对齐" in w for w in report.warnings), report.warnings
+
+
+# ── 逐帧口型（用 ffmpeg 当假引擎，验证接线而不是模型质量）──────────
+
+
+@requires_ffmpeg
+@pytest.mark.asyncio
+async def test_compose_uses_lipsynced_video_when_engine_set(store, monkeypatch):
+    """开了逐帧口型：分段渲染必须用重画后的画面，并落一份口型报告。"""
+    settings = get_settings()
+    monkeypatch.setattr(settings, "lipsync_engine", "cli")
+    monkeypatch.setattr(
+        settings,
+        "lipsync_cmd",
+        "ffmpeg -y -hide_banner -loglevel error -i {video} -i {audio} "
+        "-map 0:v:0 -an -c:v libx264 -preset ultrafast -pix_fmt yuv420p {out}",
+    )
+    monkeypatch.setattr(settings, "lipsync_measure", False)
+    monkeypatch.setattr(settings, "compose_align_dub_to_mouth", True)
+
+    pipeline = real_pipeline(store)
+    project = await prepare_media(
+        store, pipeline, small_project(store, dialogue="这个项目是我做的。")
+    )
+    job = await pipeline.start_compose(project.id)
+    finished = await wait_for_job(pipeline, job.id, timeout=180)
+    assert finished.status.value == "succeeded", finished.error
+
+    report = store.load_compose_report(project.id)
+    project_dir = store.ensure_project_dir(project.id)
+    assert any("逐帧口型" in item for item in report.warnings), report.warnings
+    # 做过口型的镜头不再叠「把配音整体延后」（否则嘴和声音会错开）
+    assert not any("口型对齐：" in item for item in report.warnings), report.warnings
+    assert (project_dir / "output" / "lipsync_report.json").is_file()
+
+
+@requires_ffmpeg
+@pytest.mark.asyncio
+async def test_compose_warns_and_continues_when_lipsync_engine_fails(store, monkeypatch):
+    settings = get_settings()
+    monkeypatch.setattr(settings, "lipsync_engine", "cli")
+    monkeypatch.setattr(settings, "lipsync_cmd", "/bin/sh -c 'exit 9' {video} {audio} {out}")
+
+    pipeline = real_pipeline(store)
+    project = await prepare_media(store, pipeline, small_project(store))
+    job = await pipeline.start_compose(project.id)
+    finished = await wait_for_job(pipeline, job.id, timeout=180)
+    # 可选后处理失败绝不能把合成打死
+    assert finished.status.value == "succeeded", finished.error
+    report = store.load_compose_report(project.id)
+    assert any("逐帧口型跳过" in item for item in report.warnings), report.warnings
+    assert (store.ensure_project_dir(project.id) / report.output_path).is_file()
+
+
+@requires_ffmpeg
+@pytest.mark.asyncio
+async def test_compose_skips_lipsync_for_narration_only_shots(store, monkeypatch):
+    """旁白镜头不该让画面里的人跟着旁白动嘴。"""
+    settings = get_settings()
+    monkeypatch.setattr(settings, "lipsync_engine", "cli")
+    monkeypatch.setattr(
+        settings,
+        "lipsync_cmd",
+        "ffmpeg -y -hide_banner -loglevel error -i {video} -i {audio} "
+        "-map 0:v:0 -an -c:v libx264 -preset ultrafast -pix_fmt yuv420p {out}",
+    )
+    monkeypatch.setattr(settings, "lipsync_measure", False)
+
+    pipeline = real_pipeline(store)
+    # 分镜里没有台词（只有画面）→ 这类镜头不该做口型
+    project = await prepare_media(store, pipeline, small_project(store, dialogue=""))
+    job = await pipeline.start_compose(project.id)
+    finished = await wait_for_job(pipeline, job.id, timeout=180)
+    assert finished.status.value == "succeeded", finished.error
+    report = store.load_compose_report(project.id)
+    assert not any("逐帧口型" in item for item in report.warnings), report.warnings

@@ -23,6 +23,7 @@ from videogen.providers.tts.base import TTSProviderError
 from videogen.providers.video.base import VideoProviderError
 from videogen.services import (
     character_image_service,
+    lipsync_service,
     subtitle_service,
     voice_catalog,
 )
@@ -308,6 +309,12 @@ async def list_models():
         },
         "voice_allow_accent": settings.tts_allow_accent_voices,
         "story_chapters": settings.story_chapters,
+        # 逐帧口型（可选后处理）：引擎不可用时给出原因，UI 要能提前告诉用户
+        "lipsync_engine": settings.lipsync,
+        "lipsync_scope": settings.lipsync_scope_mode,
+        "lipsync_ready": settings.lipsync_enabled
+        and not lipsync_service.engine_problem(settings),
+        "lipsync_problem": lipsync_service.engine_problem(settings),
     }
 
 

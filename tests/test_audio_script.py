@@ -14,6 +14,7 @@ from tests.conftest import build_confirmed_project, wait_for_job
 from tests.fakes import FakeBgmLibrary, FakeLLM, FakeTTSProvider, FakeVideoProvider
 from videogen.config import get_settings
 from videogen.models.cost import CostStage
+from videogen.models.project import Project as ProjectModel
 from videogen.models.project import ProjectStatus
 from videogen.models.storyboard import Shot, Storyboard
 from videogen.models.video import ClipStatus, MediaKind, VideoClip, VideoManifest
@@ -508,3 +509,71 @@ async def test_off_mode_never_calls_llm(store, make_media_pipeline):
     manifest = store.load_audio_manifest(project.id)
     assert manifest.script_mode == "off"
     assert manifest.script_lines == 0
+
+
+# ── 画面运动信息进配音文案 ─────────────────────────────
+
+
+def test_build_user_prompt_includes_motion_block():
+    project = ProjectModel(id="p1", title="测试剧", target_duration_sec=60)
+    shots = [
+        Shot(id="s1", scene_id="sc1", shot_no=1, duration_sec=3, dialogue_text="别走"),
+        Shot(id="s2", scene_id="sc1", shot_no=2, duration_sec=3, dialogue_text="我走了"),
+    ]
+    prompt = audio_script_service._build_user_prompt(
+        project=project,
+        bible=None,
+        scene=None,
+        shots=shots,
+        mode="perform",
+        max_chars=60,
+        frames=0,
+        scene_totals=(2, 2),
+        motions={"s1": "画面运动（本地实测）：\n- 整体画面：整段剧烈（峰值 1.20s）"},
+    )
+    assert "画面运动（本地实测）" in prompt
+    assert "峰值 1.20s" in prompt
+    # 没给运动的镜头不该凭空出现这一块（任务说明里提到「画面运动实测」不算）
+    assert prompt.count("画面运动（本地实测）") == 1
+
+
+def test_system_prompt_requires_motion_aware_delivery():
+    assert "画面运动实测" in audio_script_service.AUDIO_SCRIPT_SYSTEM
+    assert "画面运动实测" in audio_script_service._MODE_TASK["perform"]
+
+
+@requires_ffmpeg
+@pytest.mark.asyncio
+async def test_collect_motions_caches_and_describes(tmp_path):
+    clip = tmp_path / "clip.mp4"
+    await run_ffmpeg(
+        [
+            "-hide_banner", "-loglevel", "error",
+            "-f", "lavfi", "-i", "testsrc2=s=320x320:d=2:r=12",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-y", str(clip),
+        ],
+        timeout_sec=60,
+    )
+    shot = Shot(id="s1", scene_id="sc1", shot_no=1, duration_sec=2)
+    frames_dir = tmp_path / "frames"
+    motions, note = await audio_script_service._collect_motions(
+        [shot], {"s1": clip}, frames_dir, enabled=True, fps=6.0
+    )
+    assert note == ""
+    assert "画面运动" in motions["s1"]
+    cache = frames_dir / "s1.motion.json"
+    assert cache.is_file()
+    # 第二次走缓存（把片段改新会失效，这里只验证命中）
+    again, _ = await audio_script_service._collect_motions(
+        [shot], {"s1": clip}, frames_dir, enabled=True, fps=6.0
+    )
+    assert again == motions
+
+
+@pytest.mark.asyncio
+async def test_collect_motions_can_be_disabled(tmp_path):
+    shot = Shot(id="s1", scene_id="sc1", shot_no=1, duration_sec=2)
+    motions, note = await audio_script_service._collect_motions(
+        [shot], {}, tmp_path, enabled=False
+    )
+    assert motions == {} and note == ""

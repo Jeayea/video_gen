@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import shutil
 from collections.abc import Callable
@@ -12,8 +13,9 @@ from videogen.models.compose import ComposeReport, ComposeSegment, SubtitleMode
 from videogen.models.project import Project
 from videogen.models.storyboard import Storyboard
 from videogen.models.video import VideoManifest
-from videogen.services import subtitle_service
+from videogen.services import lipsync_service, subtitle_service
 from videogen.utils.audio_align import mouth_align_delay
+from videogen.utils.av_sync import check_av_sync, format_sync_warning
 from videogen.utils.ffmpeg import (
     ffmpeg_capabilities,
     probe_duration,
@@ -475,6 +477,30 @@ async def compose(
     output_dir.mkdir(parents=True, exist_ok=True)
     _notify(on_progress, 0, len(segments) + 2, "开始渲染分段")
 
+    # 逐帧口型（可选）：先把画面里的嘴按配音重画一遍，再走常规分段渲染。
+    # 做过口型的镜头**不再**做「把配音整体延后」——嘴已经跟着配音走了，再延后反而错开。
+    synced: dict[str, Path] = {}
+    lipsync_outcomes: list[lipsync_service.LipsyncOutcome] = []
+    if settings.lipsync_enabled:
+        synced, lipsync_outcomes = await _lipsync_all(
+            segments,
+            storyboard,
+            output_dir / "lipsynced",
+            project_dir,
+            settings,
+            on_progress=on_progress,
+            reuse=reuse_segments,
+        )
+        ok_count = sum(1 for item in lipsync_outcomes if item.ok)
+        if ok_count:
+            warnings.append(
+                f"逐帧口型：{ok_count}/{len(lipsync_outcomes)} 个镜头已按配音重画嘴部"
+                f"（引擎 {settings.lipsync}，本地计算，不额外花钱）"
+            )
+        for item in lipsync_outcomes:
+            if not item.ok and item.note:
+                warnings.append(f"逐帧口型跳过 {item.shot_id}：{item.note}")
+
     mouth_delays = await _render_all(
         segments,
         segments_dir,
@@ -491,7 +517,10 @@ async def compose(
         ambient_gain_db=settings.compose_ambient_gain_db,
         align_mouth=settings.compose_align_dub_to_mouth,
         mouth_align_max_sec=settings.compose_mouth_align_max_sec,
+        synced=synced,
     )
+    if lipsync_outcomes:
+        _write_lipsync_report(output_dir, lipsync_outcomes)
     if mouth_delays:
         logger.info(
             "口型对齐：%d 个镜头的配音已延后到画面开口时刻（最大 %.2fs）",
@@ -560,6 +589,14 @@ async def compose(
 
     if not final.exists() or final.stat().st_size == 0:
         raise ComposeError("ffmpeg 未产出有效成片文件")
+
+    # 成片自检：音轨时长必须和视频基本相等。拼接丢掉音频空洞时（mp4 音轨表达不了
+    # 空洞 → 后面所有声音整体提前）这个差值会等于空洞之和，一眼可见。
+    sync = await check_av_sync(final)
+    sync_note = format_sync_warning(sync, "成片")
+    if sync_note:
+        logger.warning("%s", sync_note)
+        warnings.append(sync_note)
 
     _cleanup(base, concat_file, segments_dir if not settings.compose_keep_segments else None)
 
@@ -649,7 +686,9 @@ async def _render_all(
     ambient_gain_db: float = -20.0,
     align_mouth: bool = False,
     mouth_align_max_sec: float = 1.5,
+    synced: dict[str, Path] | None = None,
 ) -> dict[str, float]:
+    synced = synced or {}
     semaphore = asyncio.Semaphore(concurrency)
     done = 0
     lock = asyncio.Lock()
@@ -668,11 +707,21 @@ async def _render_all(
         async with semaphore:
             output = segments_dir / f"{segment.shot_id}.mp4"
             video_path = project_dir / segment.video_path
+            # 做过逐帧口型的镜头用重画后的画面（音轨已接回，环境音链路照旧）
+            lipsynced = synced.get(segment.shot_id)
+            if lipsynced is not None and lipsynced.is_file():
+                video_path = lipsynced
             audio_path = project_dir / segment.audio_path if segment.audio_path else None
             use_ambient = ambient and await has_ambient(video_path)
-            # 口型对齐：画面里的人几秒开口，配音就延后几秒（只用本地计算，不重新烧视频）
+            # 口型对齐：画面里的人几秒开口，配音就延后几秒（只用本地计算，不重新烧视频）。
+            # 逐帧口型已经让嘴跟着配音走了，再叠加延后会把嘴和声音错开。
             delay_ms = 0
-            if align_mouth and audio_path is not None and await has_ambient(video_path):
+            if (
+                lipsynced is None
+                and align_mouth
+                and audio_path is not None
+                and await has_ambient(video_path)
+            ):
                 voice_sec = await probe_duration(audio_path) or 0.0
                 delay = await mouth_align_delay(
                     video_path,
@@ -689,6 +738,7 @@ async def _render_all(
             marker = segments_dir / (
                 f".ambient-{'on' if use_ambient else 'off'}"
                 f".mouth-{'on' if delay_ms > 0 else 'off'}"
+                f".lipsync-{'on' if lipsynced is not None else 'off'}"
             )
             if reuse and marker.exists() and _segment_is_fresh(output, [video_path, audio_path]):
                 logger.debug("复用已渲染分段：%s", output.name)
@@ -719,6 +769,112 @@ async def _render_all(
 
     await asyncio.gather(*(run_one(segment) for segment in segments))
     return delays
+
+
+async def _lipsync_all(
+    segments: list[ComposeSegment],
+    storyboard: Storyboard,
+    lipsync_dir: Path,
+    project_dir: Path,
+    settings: Settings,
+    *,
+    on_progress: ProgressCallback = None,
+    reuse: bool = True,
+) -> tuple[dict[str, Path], list[lipsync_service.LipsyncOutcome]]:
+    """给需要口型的镜头逐个做逐帧口型，返回 shot_id -> 新画面路径 与逐镜结果。
+
+    产物落在 `output/lipsynced/`（**不进** compose 的临时目录清理），这样重跑合成
+    可以直接复用、也方便人工逐个核对「嘴是不是真的改了」。
+    """
+    lipsync_dir.mkdir(parents=True, exist_ok=True)
+    shots = {shot.id: shot for shot in storyboard.shots}
+    problem = lipsync_service.engine_problem(settings)
+    if problem:
+        logger.warning("逐帧口型不可用：%s", problem)
+        return {}, [lipsync_service.LipsyncOutcome(shot_id="—", note=problem)]
+
+    scope = settings.lipsync_scope_mode
+    targets: list[ComposeSegment] = []
+    for segment in segments:
+        if not segment.audio_path:
+            continue
+        if not lipsync_service.shot_eligible(shots.get(segment.shot_id), scope=scope):
+            continue
+        if settings.lipsync_max_sec > 0 and segment.duration_sec > settings.lipsync_max_sec:
+            continue
+        targets.append(segment)
+    if not targets:
+        return {}, []
+
+    synced: dict[str, Path] = {}
+    outcomes: list[lipsync_service.LipsyncOutcome] = []
+    for index, segment in enumerate(targets, start=1):
+        _notify(
+            on_progress, index - 1, len(segments) + 2, f"逐帧口型 {index}/{len(targets)}"
+        )
+        video_path = project_dir / segment.video_path
+        audio_path = project_dir / segment.audio_path
+        output = lipsync_dir / f"{segment.shot_id}.synced.mp4"
+        if reuse and output.is_file() and output.stat().st_size > 0 and _is_newer(
+            output, [video_path, audio_path]
+        ):
+            synced[segment.shot_id] = output
+            outcomes.append(
+                lipsync_service.LipsyncOutcome(
+                    shot_id=segment.shot_id,
+                    ok=True,
+                    engine=settings.lipsync,
+                    output=output,
+                    note="复用已有的口型结果",
+                )
+            )
+            continue
+        outcome = await lipsync_service.sync_shot(
+            video_path,
+            audio_path,
+            output,
+            shot_id=segment.shot_id,
+            settings=settings,
+        )
+        outcomes.append(outcome)
+        if outcome.ok and outcome.output is not None:
+            synced[segment.shot_id] = outcome.output
+    return synced, outcomes
+
+
+def _is_newer(output: Path, inputs: list[Path]) -> bool:
+    """输出不比任何输入旧（含相等，避免同一秒内的产物被判成过期）。"""
+    try:
+        stamp = output.stat().st_mtime
+    except OSError:
+        return False
+    for path in inputs:
+        try:
+            if path.is_file() and path.stat().st_mtime > stamp:
+                return False
+        except OSError:
+            return False
+    return True
+
+
+def _write_lipsync_report(output_dir: Path, outcomes: list[lipsync_service.LipsyncOutcome]):
+    """把逐帧口型的结果落盘（哪个镜头做了什么、改写区间、耗时）。"""
+    payload = {
+        "engine_ok": sum(1 for item in outcomes if item.ok),
+        "engine_total": len(outcomes),
+        "measure_note": (
+            "dub_span = 配音本身的说话区间；rewrite_span = 相对原片段「嘴部被改写」的"
+            "时段（只说明哪里真的改过，**不是**同步误差指标。便宜的像素统计量量不准"
+            "嘴的开合，详见 tools/lipsync/README.md 的实测记录）"
+        ),
+        "shots": [item.summary() for item in outcomes],
+    }
+    try:
+        (output_dir / "lipsync_report.json").write_text(
+            json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8"
+        )
+    except OSError:
+        logger.debug("口型报告落盘失败", exc_info=True)
 
 
 def _bind_video(

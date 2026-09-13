@@ -22,6 +22,7 @@ from videogen.providers.llm.base import (
 )
 from videogen.services.cost_service import PriceTable
 from videogen.utils import ffmpeg as ffmpeg_utils
+from videogen.utils import motion as motion_utils
 from videogen.utils.redact import scrub_secrets
 from videogen.utils.text import clean_spoken_text
 
@@ -74,6 +75,8 @@ AUDIO_SCRIPT_SYSTEM = """你是一位短剧配音导演，负责根据**真实�
 8. **`instruction` 是给云端 TTS 的自然语言念法**（20-50 字，中文）：
    写清「情绪 + 语气 + 语速 + 停顿/气息」，例如「压抑的哭腔，语速慢，句尾发颤，像在忍着不哭」。
    不要写成抽象评价（「很好」「有感情」），要能被配音演员直接照做
+9. 给了「画面运动实测」时，念法要**跟着画面节奏走**：动作最猛的时段给最重的语气和更快的语速，
+   静止段放慢放轻、留出气息。不要照抄运动说明，要把它翻译成「这句话该怎么说」
 
 只输出 JSON：{"lines": [{"shot_id": "...", "text": "...", "rate": "", "volume": "",
 "pitch": "", "instruction": "", "note": "一句话说明为什么这么写"}]}"""
@@ -102,6 +105,7 @@ _MODE_TASK = {
         "`instruction` 写自然语言念法（情绪/语气/语速/停顿/气息，20-50 字），"
         "`rate`/`pitch` 可选（给 Edge 用），`note` 一句话说明依据。"
         "要读出角色的年龄、处境与当下情绪的差别，不要每个镜头都用同一种念法。"
+        "有画面运动实测的镜头，念法要和画面节奏对上（动作最猛处最重，静止段放轻）。"
     ),
 }
 
@@ -113,6 +117,8 @@ class VoiceScriptOutcome:
     mode: str = "off"
     model: str = ""
     frames: int = 0
+    #: 有多少个镜头带上了「画面运动实测」
+    motion_shots: int = 0
     #: 真正被写/改的镜头 id（按处理顺序）
     applied: list[str] = field(default_factory=list)
     #: 被跳过的镜头数（已有同模式文案 / 本轮无需改）
@@ -186,6 +192,17 @@ async def apply_voice_script(
             outcome.warnings.append(frame_note)
         outcome.frames += len(frames)
 
+        motions, motion_note = await _collect_motions(
+            shots,
+            clips,
+            frames_dir,
+            enabled=settings.audio_llm_motion,
+            fps=settings.audio_motion_rate,
+        )
+        if motion_note:
+            outcome.warnings.append(motion_note)
+        outcome.motion_shots += len(motions)
+
         try:
             drafts = await _ask_model(
                 llm,
@@ -194,6 +211,7 @@ async def apply_voice_script(
                 scene=scene,
                 shots=shots,
                 frames=frames,
+                motions=motions,
                 mode=mode,
                 max_chars=settings.audio_llm_max_chars,
                 scene_totals=(len(shots), clips_total),
@@ -330,6 +348,45 @@ async def _collect_frames(
     return frames, "；".join(notes)
 
 
+async def _collect_motions(
+    shots: list[Shot],
+    clips: dict[str, Path],
+    frames_dir: Path,
+    *,
+    enabled: bool,
+    fps: float = 6.0,
+) -> tuple[dict[str, str], str]:
+    """给每个镜头算「画面运动实测」（纯本地，免费），返回 shot_id -> 说明文字。
+
+    这是「运动信息进配音文案」的来源：静态抽帧只能告诉模型画面里是谁、在哪，
+    说不出一句话里**哪一段动得最猛**。运动曲线补上这一块，念法才能跟画面同节奏。
+    """
+    if not enabled:
+        return {}, ""
+    if not ffmpeg_utils.ffmpeg_available():
+        return {}, "配音文案：本机没有 ffmpeg，算不了画面运动，本次念法只看静态画面"
+    result: dict[str, str] = {}
+    missing = 0
+    for shot in shots:
+        clip = clips.get(shot.id)
+        if clip is None:
+            missing += 1
+            continue
+        cache = frames_dir / f"{shot.id}.motion.json"
+        analysis = motion_utils.load_cached_motion(cache, clip)
+        if analysis is None:
+            analysis = await motion_utils.analyze_clip(clip, fps=fps)
+            if analysis is None:
+                missing += 1
+                continue
+            motion_utils.save_motion(cache, clip, analysis)
+        result[shot.id] = analysis.describe()
+    note = ""
+    if missing:
+        note = f"配音文案：{missing} 个镜头算不出画面运动（没有可用片段），这些镜头只看静态画面"
+    return result, note
+
+
 async def extract_frames(
     clip: Path,
     out_dir: Path,
@@ -417,6 +474,7 @@ async def _ask_model(
     mode: str,
     max_chars: int,
     scene_totals: tuple[int, int],
+    motions: dict[str, str] | None = None,
 ) -> list[VoiceLineDraft]:
     header = _build_user_prompt(
         project=project,
@@ -427,6 +485,7 @@ async def _ask_model(
         max_chars=max_chars,
         frames=len(frames),
         scene_totals=scene_totals,
+        motions=motions or {},
     )
     user = image_message("user", header, frames) if frames else text_message("user", header)
     messages: list[LLMMessage] = [text_message("system", AUDIO_SCRIPT_SYSTEM), user]
@@ -451,6 +510,7 @@ def _build_user_prompt(
     max_chars: int,
     frames: int,
     scene_totals: tuple[int, int],
+    motions: dict[str, str] | None = None,
 ) -> str:
     scene_count, clip_count = scene_totals
     lines: list[str] = [
@@ -481,6 +541,7 @@ def _build_user_prompt(
             lines.append("剧本对白：")
             lines.extend(f"  - {d.speaker}: {d.line}" for d in scene.dialogue)
 
+    motions = motions or {}
     lines += ["", "## 本场分镜（需要处理的镜头）"]
     for shot in shots:
         existing = clean_spoken_text(shot.dialogue_text) or clean_spoken_text(shot.narration)
@@ -498,6 +559,10 @@ def _build_user_prompt(
             + (f"·说话人 {speaker}" if speaker else "")
             + f"）：{existing or '（无）'}",
         ]
+        motion = motions.get(shot.id)
+        if motion:
+            # 逐行缩进，避免和镜头块的其他字段混在一起
+            lines.append("画面运动\n   " + motion.replace("\n", "\n   "))
 
     lines += [
         "",

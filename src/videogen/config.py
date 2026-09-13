@@ -124,6 +124,10 @@ class Settings(BaseSettings):
     audio_llm_max_chars: int = 60
     #: 对已经生成过文案的镜头再跑一次（默认跳过，避免重复花钱）
     audio_llm_force: bool = False
+    #: 把「画面运动实测」（本地算，免费）也喂给配音导演：动得最猛的时段给最重的语气
+    audio_llm_motion: bool = True
+    #: 运动实测的采样帧率
+    audio_motion_fps: int = 6
 
     # BGM
     bgm_enabled: bool = True
@@ -155,6 +159,30 @@ class Settings(BaseSettings):
     compose_ambient_gain_db: float = -20.0
     #: 保留中间分段文件（排查用）
     compose_keep_segments: bool = False
+
+    # 逐帧口型（可选后处理）：把画面里的嘴按配音逐帧重画
+    #: none = 不做；wav2lip-onnx = 内置 Wav2Lip（独立 .venv-lipsync）；
+    #: cli = 任意外部命令（LatentSync / MuseTalk 等，走 lipsync_cmd 模板）
+    lipsync_engine: str = "none"
+    #: dialogue = 只处理「说话人在画面里」的镜头（推荐）；all = 所有有配音的镜头
+    lipsync_scope: str = "dialogue"
+    #: 跑口型脚本的解释器（内置引擎用；默认指向 tools/lipsync/install.sh 建的独立环境）
+    lipsync_python: str = ".venv-lipsync/bin/python"
+    #: 模型目录（默认 assets/lipsync，已被 .gitignore 排除）
+    lipsync_model_dir: str = "assets/lipsync"
+    lipsync_model: str = "wav2lip_gan.onnx"
+    lipsync_detector: str = "face_detection_yunet_2023mar.onnx"
+    #: cli 引擎的命令模板，必须含 {video} {audio} {out} 三个占位符
+    lipsync_cmd: str = ""
+    #: 追加给内置引擎的额外参数（空格分隔），例如 --crop-mode face --paste-top 0.55
+    lipsync_extra_args: str = ""
+    #: 单个镜头的超时（秒）
+    lipsync_timeout_sec: float = 900.0
+    #: >0 时只对时长不超过它的镜头做逐帧口型（控时间；0 = 不限）
+    lipsync_max_sec: float = 0.0
+    #: 是否顺带量「配音区间 / 嘴部改写区间」写进报告
+    lipsync_measure: bool = True
+    lipsync_concurrency: int = 1
 
     # 成本与预算（单价都可配，第三方价格会变）
     #: 0 = 不限制；单位 USD
@@ -262,6 +290,25 @@ class Settings(BaseSettings):
     @property
     def audio_frame_width(self) -> int:
         return min(1600, max(160, int(self.audio_llm_frame_width or 640)))
+
+    @property
+    def audio_motion_rate(self) -> float:
+        return min(12.0, max(2.0, float(self.audio_motion_fps or 6)))
+
+    @property
+    def lipsync(self) -> str:
+        """逐帧口型引擎，非法值一律当成 none（绝不因为配置笔误偷偷改画面）。"""
+        engine = (self.lipsync_engine or "none").strip().lower()
+        return engine if engine in {"none", "wav2lip-onnx", "cli"} else "none"
+
+    @property
+    def lipsync_scope_mode(self) -> str:
+        scope = (self.lipsync_scope or "dialogue").strip().lower()
+        return scope if scope in {"dialogue", "all"} else "dialogue"
+
+    @property
+    def lipsync_enabled(self) -> bool:
+        return self.lipsync != "none"
 
 
 _settings: Settings | None = None

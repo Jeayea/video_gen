@@ -12,3 +12,7 @@ projects/
 *.mp4
 *.mp3
 *.wav
+
+# 逐帧口型的独立环境与模型权重（用 tools/lipsync/install.sh 装，别进仓库）
+.venv-lipsync/
+assets/lipsync/

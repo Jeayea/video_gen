@@ -32,6 +32,8 @@
 | 角色一致性 | ✅ | 参考图走 `input_references`（真实模型）或取色（mock），seed 仅在模型支持时透传 |
 | 背景/场景一致性 | ✅ | `Shot.location` + 场景 `visual_prompt` 锚点注入 + `VIDEO_BACKGROUND_DIRECTIVE`（禁止空墙） |
 | 口型对齐（同一句话） | ✅ | 台词进视频 prompt（`VIDEO_PROMPT_DIALOGUE`），模型原生表演与我们的配音落在同一句上 |
+| 逐帧口型（按配音重画嘴部） | ✅ | 可选后处理 `LIPSYNC_ENGINE=wav2lip-onnx`：独立环境、本地 CPU、$0；换引擎（LatentSync 等）只需填 `LIPSYNC_CMD` |
+| 画面运动信息进念法 | ✅ | 本地实测运动曲线（纯标准库、免费）交给配音导演：「动作最猛处最重，静止段放轻」 |
 
 ## 快速开始
 
@@ -284,12 +286,32 @@ curl -X POST localhost:8000/api/projects/<id>/storyboard/merge-shots \
 | `narration` | 只给「没台词也没旁白」的镜头补旁白 | 一次 LLM 调用/场 |
 | `polish` | 只把已有台词/旁白改得更口语、更贴画面 | 一次 LLM 调用/场 |
 | `full` | 补旁白 + 改写 + 念法建议（`rate`/`volume`/`pitch`） | 一次 LLM 调用/场 |
+| `perform` | **一个字都不改文案**，只给逐句念法（云端 TTS 用自然语言） | 一次 LLM 调用/场 |
+
+除了抽帧，还会把**画面运动实测**一起发过去（`AUDIO_LLM_MOTION=true`，本地计算、免费）：
+
+```
+画面运动（本地实测：6fps 采样 64×64 灰度，相邻帧平均变化，共 31 帧 / 5.00s）：
+- 整体画面：整段轻微（平均强度 0.0281，峰值 1.67s）；起伏：1.00–1.83s 强烈起伏（平时的 2.5 倍）
+- 说话人区域（画面下半部中央）：1.17–1.83s 强烈起伏（平时的 2.4 倍）
+- 念法建议：动作最猛在 1.17–1.83s（强烈起伏），这段把音量和语速顶上去，让声音跟着动作走
+```
+
+为什么要加它：**静态抽帧只知道画面里是谁、在哪，说不出「一句话里哪一段动得最猛」**，
+于是念法从头到尾一个速度、和画面节奏对不上。运动曲线补上这一块，念法才能同节奏。
+
+判读分两级（阈值是在 8 个真实片段上量出来的）：**整段活跃度**用曲线均值分档
+（真实片段实测 0.008~0.090，对应 几乎静止 / 轻微 / 明显 / 剧烈），
+**起伏窗口**以中位数为基线找 `≥1.6×` 的连续窗口（真实片段峰均比 1.36~4.07）。
+只看相对峰值是不够的 —— 说话的人整段都在动、峰均比只有 1.5，按相对峰值分档会把一整段
+全标成「剧烈运动」，等于没说。
 
 ```bash
 # .env：让 LLM 给所有没台词的镜头补旁白（关掉抽帧更便宜）
 AUDIO_LLM_SCRIPT=narration
 AUDIO_LLM_VISION=true
 AUDIO_LLM_FRAMES_PER_SHOT=1
+AUDIO_LLM_MOTION=true     # 画面运动实测进念法（纯本地，免费）
 ```
 
 实现要点（都是些踩过的坑）：
@@ -559,7 +581,51 @@ COMPOSE_MOUTH_ALIGN_MAX_SEC=1.5    # 最大延后量
 ```
 
 **局限**：这是「起点对齐」，不是逐帧对齐 —— 一句话内部的节奏仍由 TTS 决定。
-样本与测量数据：`projects/<id>/ab_lipsync/`（`lipsync_compare.mp4` + 三份原始片段 + `measure.json`）。
+样本与测量数据：`projects/<id>/ab_lipsync/`（`lipsync_compare.mp4` + 四份原始片段 + `measure.json`）。
+
+### 逐帧口型：按配音把嘴逐帧重画（v0.16）
+
+起点对齐解决不了「一句话内部的节奏」，所以要**逐帧重画**。落地方式是可选后处理：
+引擎跑在**独立环境**（主环境一个依赖都不加），按镜头调用。
+
+```
+LIPSYNC_ENGINE=wav2lip-onnx      # none（默认）| wav2lip-onnx | cli
+LIPSYNC_SCOPE=dialogue           # 只做「说话人就在画面里」的镜头（推荐）
+```
+
+- **内置引擎**：Wav2Lip 的 ONNX 版，`onnxruntime + numpy + opencv`（约 120MB，
+  **不需要 torch**），Apple Silicon 的 CPU 上 5 秒 1440×2560 的镜头约 5 秒。
+  装在 `.venv-lipsync`，用 `tools/lipsync/install.sh` 一键装 + 自检。
+- **cli 引擎**：填一个带 `{video} {audio} {out}` 的命令模板就能换成 LatentSync /
+  MuseTalk 这类要 CUDA 的引擎，其余不用改。
+- **镜头筛选**：默认只做「有台词**且**说话人就在画面里」的镜头 —— 旁白镜头里那个人
+  本来就不该跟着旁白动嘴，说话人不在画面里（过肩/听者反应）替他动嘴更是穿帮。
+- **与起点对齐互斥**：做过逐帧口型的镜头**不再**把配音整体延后，否则嘴和声音会错开。
+- 产物落 `output/lipsynced/`（重跑可复用），逐镜统计落 `output/lipsync_report.json`。
+
+整片实测（`projects/e8e40d3d9d29`，11 个有台词的镜头）：
+
+```
+成功 11/11 个镜头     人脸检出率 100%     逐镜 4.7~6.2 秒，整片 62.5 秒（本地 CPU，$0）
+成片 67.0 秒，音画差 +0.04 秒
+```
+
+**三个必须知道的坑**（写代码时都踩过，详见 `tools/lipsync/README.md`）：
+
+1. Wav2Lip 的 6 通道输入必须是「**下半张脸抹掉 + 原图**」。两路都给原图时，模型会直接从
+   输入里「抄」出嘴 —— 输出与输入最大差异只有 **0.011**，口型**静默失效**却毫无报错。
+   现在脚本会统计 `mean_patch_change`，低于 0.01 直接判失败。
+2. 用 `Path.resolve()` 转绝对路径会**跟随软链**：venv 的 `bin/python` 是软链，
+   解析后就变成系统解释器、venv 被绕过（`No module named 'cv2'`）。改用 `os.path.abspath`。
+3. 配音比画面短时不能「重复最后一帧 mel」（原版做法），否则嘴会停在最后一个口型上张着不动。
+   这里补 0（静音 mel）→ 说完就闭嘴。
+
+**局限**：模型只输出 96×96 的嘴，放大回 1440 宽偏软（已用「只贴改过的嘴唇 + 皮肤保留
+原分辨率 + 高频细节叠回」缓解）；头姿/眼神/身体仍是原片段的节奏；要更清楚得接
+GFPGAN/CodeFormer 或换 LatentSync。自动判据也试过：四种便宜的像素统计量连
+「模型原生语音」这个基准都只有 r≈0.5、最佳滞后 0.1~0.25 秒，量不准嘴的开合，
+所以没有做成通过/不通过，只保留引擎自检 + 人工看帧。
+
 
 ## 背景/环境：为什么画面里常常只有一面空墙
 
@@ -715,7 +781,8 @@ src/videogen/
 ├── models/                   # 数据模型（容错校验器、llm_io schema、video / audio / compose）
 ├── services/                 # bible / script / storyboard / consistency / video / audio
 │                             #   / audio_script（LLM 看画面写配音文案）/ subtitle（SRT 时间轴）
-│                             #   / compose（FFmpeg 合成）/ cost（记账）
+│                             #   / lipsync（逐帧口型，可插拔引擎）/ compose（FFmpeg 合成）
+│                             #   / cost（记账）
 ├── providers/llm/            # LLMProvider 抽象 + OpenRouter 实现（JSON 修复 + schema 重试）
 ├── providers/video/          # VideoProvider 抽象 + MockVideoProvider（ffmpeg 占位视频）
 ├── providers/tts/            # TTSProvider 抽象 + EdgeTTSProvider + MockTTSProvider
@@ -726,6 +793,15 @@ src/videogen/
 │   └── jobs.py               # 进程内后台任务队列（进度/取消/互斥/裁剪）
 ├── tools/demo_bgm.py         # 生成演示用免版权 BGM（ffmpeg 合成）
 └── utils/                    # file_store / coerce / duration / ffmpeg / text / redact
+                              #   / motion（画面运动实测）/ audio_align（口型起点对齐）
+                              #   / lip_sync（口型诊断测量）/ av_sync（音画时长自检）
+
+tools/lipsync/                # 逐帧口型的独立环境与脚本（不进主环境依赖）
+├── install.sh                # 建 .venv-lipsync + 下载权重 + 自检
+├── wav2lip_onnx.py           # Wav2Lip ONNX 推理（不需要 torch）
+├── wav2lip_mel.py            # 音频前端（纯 numpy，可独立验证）
+├── check_mel.py              # 与真 librosa 逐格对比（验证 mel 实现）
+└── build_compare.py          # 拼方案对比片（每个部件音画严格等长）
 ```
 
 ## 设计要点
@@ -807,9 +883,19 @@ src/videogen/
 22. **云端 TTS 的中文带一点非母语味道**：`openai/gpt-audio-mini` 的情绪表达力明显强于 Edge，
     但发音不如 Edge 的中文神经音色「地道」；两者可以随时切换（换引擎会自动重配音色名，
     `AUDIO_LLM_SCRIPT` 与念法都会保留）
-23. **口型不是逐帧对齐**：台词进 prompt 后原生表演与配音落在同一句话上，但两者节奏仍有差；
-    要逐帧完美只能改用模型原生语音（方案③，代价是跨镜头音色一致性弱），
-    或者接专门的 lip-sync 后处理（本项目没接）
+23. **逐帧口型只改嘴**：头姿、眼神、身体动作仍是原片段的节奏；原片段整个人在演另一句话的
+    时候，光靠重画嘴救不回来（所以「台词进 prompt」这一层仍然必要）。嘴只有 96×96，
+    特写放大回 1440 宽偏软，要更清楚得接 GFPGAN/CodeFormer 或换 LatentSync（要 CUDA）
+24. **逐帧口型不做「不说话的人」**：默认只处理「有台词且说话人在画面里」的镜头。
+    旁白镜头不动嘴（画面里的人本来就不该跟着旁白说），说话人不在画面里（过肩/听者）
+    也不动嘴 —— 替他动嘴是穿帮。要全做就 `LIPSYNC_SCOPE=all`
+25. **口型质量没有自动判据**：试过四种便宜的像素统计量，连「模型原生语音」这个基准都只有
+    r≈0.5、最佳滞后 0.1~0.25 秒，量不准嘴的开合。所以只保留引擎自检
+    （`mean_patch_change`，能抓住「静默失效」）+ `output/lipsync_report.json` 里的
+    改写时段 + **人工看帧**。要做成自动判据得另上 SyncNet 或人脸关键点
+26. **`concat -c copy` 会吃掉音频空洞**：每个部件的音轨时长必须严格等于画面时长，
+    否则 mp4 表达不了空洞、后面所有音频整体提前（真实事故：对比片漂移 7.154 秒，
+    听感就是「语音和视频是分开的」）。成片现在会自动做这项检查并写进报告
 
 ## 安全
 

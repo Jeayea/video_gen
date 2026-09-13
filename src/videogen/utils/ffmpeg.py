@@ -19,12 +19,14 @@ __all__ = [
     "ffmpeg_capabilities_for",
     "ffprobe_available",
     "probe_duration",
+    "probe_stream_durations",
     "probe_streams",
     "reset_ffmpeg_cache",
     "resolve_ffmpeg",
     "resolve_ffmpeg_for",
     "resolve_ffprobe",
     "run_ffmpeg",
+    "run_ffmpeg_bytes",
     "run_ffmpeg_capture",
 ]
 
@@ -294,6 +296,46 @@ async def run_ffmpeg_capture(
     return out
 
 
+async def run_ffmpeg_bytes(
+    args: list[str],
+    *,
+    timeout_sec: float = 120.0,
+    cwd: Path | None = None,
+    exe: str | None = None,
+) -> bytes:
+    """异步执行 ffmpeg 并返回**原始 stdout 字节**（例如 `-f rawvideo -`）。
+
+    单独开一个函数而不是复用 `run_ffmpeg_capture()`：那个把 stdout/stderr 合并后
+    再按 utf-8 解码，像素数据会被彻底破坏。这里 stdout 只收字节，stderr 单独收。
+    """
+    executable = exe or resolve_ffmpeg()
+    if not executable:
+        raise FFmpegError(_NO_FFMPEG)
+
+    process = await asyncio.create_subprocess_exec(
+        executable,
+        *args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=str(cwd) if cwd else None,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout_sec)
+    except TimeoutError as exc:
+        process.kill()
+        await process.wait()
+        raise FFmpegError(f"ffmpeg 执行超时（{timeout_sec:.0f}s）") from exc
+    except asyncio.CancelledError:
+        process.kill()
+        await process.wait()
+        raise
+
+    if process.returncode != 0:
+        tail = (stderr or b"").decode("utf-8", "replace").strip().splitlines()[-3:]
+        raise FFmpegError(f"ffmpeg 退出码 {process.returncode}：{' | '.join(tail)[:300]}")
+    return stdout or b""
+
+
 async def describe_media(path: Path, *, timeout_sec: float = 30.0) -> str:
     """返回 `ffmpeg -i` 的探测输出（时长/流信息），用于诊断与验证。
 
@@ -370,6 +412,54 @@ async def probe_streams(path: Path, *, timeout_sec: float = 30.0) -> set[str] | 
         return None
     kinds = {line.strip().lower() for line in out.splitlines() if line.strip()}
     return kinds or None
+
+
+async def probe_stream_durations(
+    path: Path, *, timeout_sec: float = 30.0
+) -> dict[str, float] | None:
+    """按流类型读时长，返回 `{"video": 41.83, "audio": 34.68}`。
+
+    同类流有多条时取**最长**的那条（音频多轨时以主音轨为准）。
+
+    返回 `None` 表示探测不了（没有 ffprobe）；某一类缺失就是字典里没这个 key ——
+    两者都要求调用方显式区分「没有音轨」和「测不出来」。
+    """
+    exe = resolve_ffprobe()
+    if not exe or not Path(path).is_file():
+        return None
+    try:
+        code, out = await _capture(
+            exe,
+            [
+                "-v",
+                "error",
+                "-show_entries",
+                "stream=codec_type,duration",
+                "-of",
+                "csv=p=0",
+                str(path),
+            ],
+            timeout_sec=timeout_sec,
+        )
+    except Exception:
+        logger.debug("ffprobe 读取流时长失败: %s", path, exc_info=True)
+        return None
+    if code != 0:
+        return None
+
+    durations: dict[str, float] = {}
+    for line in out.splitlines():
+        parts = line.strip().split(",")
+        if len(parts) < 2:
+            continue
+        kind = parts[0].strip().lower()
+        try:
+            value = float(parts[1])
+        except ValueError:
+            continue  # 有些容器写 N/A，交给调用方当「测不出来」
+        if value > 0:
+            durations[kind] = max(durations.get(kind, 0.0), value)
+    return durations or None
 
 
 _NO_FFMPEG = (
