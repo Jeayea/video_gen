@@ -1114,6 +1114,9 @@ def test_compose_endpoint_maps_music_overrides(media_client, monkeypatch):
             "bgm_gain_db": -18,
             "bgm_duck": False,
             "bgm_force": True,
+            "audio_normalize": False,
+            "compose_loudness_normalize": False,
+            "compose_keep_segments": True,
         },
     )
     assert resp.status_code == 202, resp.text
@@ -1125,6 +1128,9 @@ def test_compose_endpoint_maps_music_overrides(media_client, monkeypatch):
     assert overrides["bgm_gain_db"] == -18
     assert overrides["bgm_duck"] is False
     assert overrides["bgm_force"] is True
+    assert overrides["audio_normalize"] is False
+    assert overrides["compose_loudness_normalize"] is False
+    assert overrides["compose_keep_segments"] is True
 
 
 def test_compose_request_accepts_music_overrides():

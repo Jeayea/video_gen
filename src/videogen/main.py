@@ -303,6 +303,11 @@ class ComposeRequest(BaseModel):
     #: 人声闪避开关与「忽略缓存重新生成」
     bgm_duck: bool | None = None
     bgm_force: bool | None = None
+    #: 本次是否做逐条配音响度归一 / 成片响度归一（不写回配置）
+    audio_normalize: bool | None = None
+    compose_loudness_normalize: bool | None = None
+    #: 保留中间分段（排查用，默认关）
+    compose_keep_segments: bool | None = None
     crf: int | None = Field(default=None, ge=0, le=51)
     subtitle_font_scale: float | None = Field(default=None, gt=0, le=0.2)
     #: 视频模型自带音轨：off = 丢弃；under = 压低垫在人声下面
@@ -879,6 +884,12 @@ async def compose_project(project_id: str, req: ComposeRequest | None = None):
             overrides["bgm_duck"] = req.bgm_duck
         if req.bgm_force is not None:
             overrides["bgm_force"] = req.bgm_force
+        if req.audio_normalize is not None:
+            overrides["audio_normalize"] = req.audio_normalize
+        if req.compose_loudness_normalize is not None:
+            overrides["compose_loudness_normalize"] = req.compose_loudness_normalize
+        if req.compose_keep_segments is not None:
+            overrides["compose_keep_segments"] = req.compose_keep_segments
     job = await pipeline.start_compose(project_id, overrides=overrides)
     return {"job": job.to_public()}
 

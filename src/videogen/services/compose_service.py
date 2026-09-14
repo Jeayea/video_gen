@@ -14,6 +14,7 @@ from videogen.models.project import Project
 from videogen.models.storyboard import Storyboard
 from videogen.models.video import VideoManifest
 from videogen.services import lipsync_service, subtitle_service
+from videogen.utils import loudness as loudness_utils
 from videogen.utils.audio_align import mouth_align_delay
 from videogen.utils.av_sync import check_av_sync, format_sync_warning
 from videogen.utils.ffmpeg import (
@@ -72,6 +73,7 @@ def _segment_filter(
     ambient: bool,
     ambient_gain_db: float = -20.0,
     voice_delay_ms: int = 0,
+    voice_gain_db: float = 0.0,
 ) -> str:
     """拼一条分段滤镜：视频统一规格，音频把「配音」和「模型自带环境音」混起来。
 
@@ -91,14 +93,20 @@ def _segment_filter(
     )
     chains = [video]
     if voice and ambient:
-        chains.append(_resample("1:a", "voice", duration, delay_ms=voice_delay_ms))
+        chains.append(
+            _resample(
+                "1:a", "voice", duration, gain_db=voice_gain_db, delay_ms=voice_delay_ms
+            )
+        )
         chains.append(_resample("0:a", "ambient", duration, gain_db=ambient_gain_db))
         chains.append(
             "[voice][ambient]amix=inputs=2:duration=longest:dropout_transition=0:"
             "normalize=0[a]"
         )
     elif voice:
-        chains.append(_resample("1:a", "a", duration, delay_ms=voice_delay_ms))
+        chains.append(
+            _resample("1:a", "a", duration, gain_db=voice_gain_db, delay_ms=voice_delay_ms)
+        )
     elif ambient:
         chains.append(_resample("0:a", "a", duration, gain_db=ambient_gain_db))
     else:
@@ -120,10 +128,12 @@ async def render_segment(
     ambient: bool = False,
     ambient_gain_db: float = -20.0,
     voice_delay_ms: int = 0,
+    voice_gain_db: float = 0.0,
 ) -> None:
     """把一个镜头渲染成「视频 + 该镜头配音」的标准片段。
 
     统一分辨率/帧率/采样率/声道，这样后续 concat 可以纯 stream copy。
+    `voice_gain_db` 是这条配音的响度修正（逐条对齐，见 utils/loudness.py）。
     """
     duration = max(0.2, float(segment.duration_sec))
     args = ["-y", "-hide_banner", "-loglevel", "error", "-i", str(video_path)]
@@ -145,6 +155,7 @@ async def render_segment(
             ambient=ambient,
             ambient_gain_db=ambient_gain_db,
             voice_delay_ms=voice_delay_ms,
+            voice_gain_db=voice_gain_db,
         ),
         "-map",
         "[v]",
@@ -234,8 +245,14 @@ async def _finish(
     duck_threshold_db: float = -30.0,
     duck_attack_ms: float = 25.0,
     duck_release_ms: float = 420.0,
+    loudness_normalize: bool = False,
+    target_lufs: float = -16.0,
+    true_peak_db: float = -1.5,
 ) -> SubtitleMode:
-    """最后一道工序：混 BGM（可带人声闪避）+ 挂字幕。返回真正生效的字幕模式。
+    """最后一道工序：混 BGM（可带人声闪避）+ 成片响度归一 + 挂字幕。
+
+    响度归一放在**最后**：它调的是整条混音的增益，各层之间的比例不变
+    （逐条配音的音量对齐在前面分段渲染时就做完了）。
 
     `exe` 只用于**烧字幕**那一趟：主 ffmpeg 没有 libass 时，调用方会传一个
     带 libass 的候选（`resolve_ffmpeg_for({"subtitles"})`）；软字幕/无字幕
@@ -267,6 +284,18 @@ async def _finish(
         if bgm_path
         else ""
     )
+    # 成片响度归一：把「这条片子整体多响」也定死，交付到平台不会时大时小
+    normalize = (
+        _final_loudness_filter(target_lufs, true_peak_db) if loudness_normalize else ""
+    )
+    audio_filter = ""
+    if bgm_path and normalize:
+        audio_filter = f"{mix};[a]{normalize}[aout]"
+    elif bgm_path:
+        audio_filter = mix
+    elif normalize:
+        audio_filter = f"[0:a]{normalize}[aout]"
+    audio_label = "[aout]" if normalize else "[a]"
 
     if burn:
         # 烧字幕必须重编码视频；顺带把 BGM 混进去，少走一遍
@@ -278,15 +307,15 @@ async def _finish(
             font_scale=font_scale,
             margin_scale=margin_scale,
         )
-        if bgm_path:
-            args += _bgm_input(bgm_path, loop=bgm_loop)
+        if audio_filter:
+            args += _bgm_input(bgm_path, loop=bgm_loop) if bgm_path else []
             args += [
                 "-filter_complex",
-                f"[0:v]{burn_filter}[v];{mix}",
+                f"[0:v]{burn_filter}[v];{audio_filter}",
                 "-map",
                 "[v]",
                 "-map",
-                "[a]",
+                audio_label,
             ]
         else:
             args += ["-vf", burn_filter, "-map", "0:v", "-map", "0:a?"]
@@ -322,14 +351,14 @@ async def _finish(
     if soft:
         args += ["-i", subtitle_file.name]
 
-    if bgm_path:
+    if audio_filter:
         args += [
             "-filter_complex",
-            mix,
+            audio_filter,
             "-map",
             "0:v",
             "-map",
-            "[a]",
+            audio_label,
             "-c:v",
             "copy",
             "-c:a",
@@ -353,6 +382,20 @@ async def _finish(
     args += ["-t", f"{duration:.3f}", "-movflags", "+faststart", output.name]
     await run_ffmpeg(args, timeout_sec=FINISH_TIMEOUT_SEC, cwd=cwd)
     return effective
+
+
+def _final_loudness_filter(target_lufs: float, true_peak_db: float) -> str:
+    """成片整体响度归一：loudnorm 到目标 LUFS + 真峰值限幅。
+
+    单遍 `loudnorm` 是**动态**的（慢速 AGC），对 60 秒以上的成片是合适的；
+    LRA 给 11 是为了别把有意的强弱起伏压成一条直线。
+    后面再跟一个 `alimiter` 兜底：loudnorm 单遍的真峰值控制只是近似。
+    """
+    limit = min(1.0, max(0.1, 10 ** (true_peak_db / 20.0)))
+    return (
+        f"loudnorm=I={target_lufs:g}:TP={true_peak_db:g}:LRA=11,"
+        f"alimiter=limit={limit:.4f}:level=disabled"
+    )
 
 
 def _bgm_input(bgm_path: Path, *, loop: bool) -> list[str]:
@@ -562,7 +605,8 @@ async def compose(
             if not item.ok and item.note:
                 warnings.append(f"逐帧口型跳过 {item.shot_id}：{item.note}")
 
-    mouth_delays = await _render_all(
+    voice_gains: dict[str, float] = {}
+    mouth_delays, voice_gains = await _render_all(
         segments,
         segments_dir,
         project_dir,
@@ -579,7 +623,16 @@ async def compose(
         align_mouth=settings.compose_align_dub_to_mouth,
         mouth_align_max_sec=settings.compose_mouth_align_max_sec,
         synced=synced,
+        normalize_voice=settings.audio_normalize,
+        target_lufs=settings.audio_target,
+        max_gain_db=settings.audio_max_gain_db,
     )
+    if voice_gains:
+        notes = sorted(voice_gains.values())
+        warnings.append(
+            f"逐条配音响度归一：{len(voice_gains)} 条，增益 {notes[0]:+.1f}~{notes[-1]:+.1f}dB"
+            f"（目标 {settings.audio_target:g} LUFS）"
+        )
     if lipsync_outcomes:
         _write_lipsync_report(output_dir, lipsync_outcomes)
     if mouth_delays:
@@ -662,6 +715,9 @@ async def compose(
         duck_threshold_db=settings.bgm_duck_threshold_db,
         duck_attack_ms=settings.bgm_duck_attack_ms,
         duck_release_ms=settings.bgm_duck_release_ms,
+        loudness_normalize=settings.compose_loudness_normalize,
+        target_lufs=settings.target_lufs,
+        true_peak_db=settings.true_peak_db,
     )
     if bgm_path and bgm is not None:
         engine_label = {
@@ -682,6 +738,18 @@ async def compose(
     # 成片自检：音轨时长必须和视频基本相等。拼接丢掉音频空洞时（mp4 音轨表达不了
     # 空洞 → 后面所有声音整体提前）这个差值会等于空洞之和，一眼可见。
     sync = await check_av_sync(final)
+    # 顺带量一遍成片响度：响度归一如果没生效（或把片子压小了），这里必须看得见
+    final_loudness = await loudness_utils.measure(final)
+    if settings.compose_loudness_normalize and final_loudness.ok:
+        delta = (final_loudness.integrated or 0.0) - settings.target_lufs
+        if abs(delta) > 1.5:
+            note = (
+                f"成片响度 {final_loudness.integrated:.1f} LUFS 与目标 "
+                f"{settings.target_lufs:g} LUFS 差 {delta:+.1f}dB"
+                "（loudnorm 单遍在极短或动态很大的片子上会有偏差）"
+            )
+            logger.warning("%s", note)
+            warnings.append(note)
     sync_note = format_sync_warning(sync, "成片")
     if sync_note:
         logger.warning("%s", sync_note)
@@ -708,6 +776,13 @@ async def compose(
         ambient_mode=ambient_mode,
         ambient_mode_effective=ambient_effective,
         ambient_gain_db=settings.compose_ambient_gain_db,
+        audio_normalize=settings.audio_normalize,
+        audio_target_lufs=settings.audio_target,
+        voice_gains=voice_gains,
+        loudness_normalize=settings.compose_loudness_normalize,
+        target_lufs=settings.target_lufs,
+        final_lufs=final_loudness.integrated,
+        final_true_peak_db=final_loudness.true_peak,
         video_provider=video_manifest.provider,
         tts_provider=audio_manifest.provider if audio_manifest else "",
         ffmpeg=resolve_ffmpeg() or "",
@@ -779,13 +854,19 @@ async def _render_all(
     align_mouth: bool = False,
     mouth_align_max_sec: float = 1.5,
     synced: dict[str, Path] | None = None,
-) -> dict[str, float]:
+    normalize_voice: bool = False,
+    target_lufs: float = -20.0,
+    max_gain_db: float = 6.0,
+) -> tuple[dict[str, float], dict[str, float]]:
+    """渲染所有分段，返回（口型延后记录, 逐条配音的响度增益）。"""
     synced = synced or {}
     semaphore = asyncio.Semaphore(concurrency)
     done = 0
     lock = asyncio.Lock()
     probe_cache: dict[str, bool] = {}
     delays: dict[str, float] = {}
+    gains: dict[str, float] = {}
+    lufs_cache: dict[str, float | None] = {}
 
     async def has_ambient(video_path: Path) -> bool:
         key = str(video_path)
@@ -793,6 +874,29 @@ async def _render_all(
             streams = await probe_streams(video_path)
             probe_cache[key] = bool(streams and "audio" in streams)
         return probe_cache[key]
+
+    async def voice_gain(segment: ComposeSegment) -> float:
+        """这条配音该补多少 dB（逐条响度对齐 + 念法里的音量意图）。
+
+        实测动机：同一部片子里不同音色的配音可以差 7.9dB，观众听感就是
+        「这句突然变小了」。这里只量一个数、算一个**有上限的**定值增益 ——
+        不用动态 loudnorm（2 秒的台词跑动态归一会上下来回飘）。
+        """
+        if not normalize_voice or not segment.audio_path:
+            return 0.0
+        key = segment.audio_path
+        if key not in lufs_cache:
+            info = await loudness_utils.measure(project_dir / key)
+            lufs_cache[key] = info.integrated
+            if info.error:
+                logger.warning("配音响度测不出来（%s）：%s", key, info.error)
+        gain = loudness_utils.gain_for(
+            lufs_cache[key],
+            target=target_lufs,
+            max_db=max_gain_db,
+            intent_db=loudness_utils.volume_to_db(segment.volume),
+        )
+        return gain
 
     async def run_one(segment: ComposeSegment) -> None:
         nonlocal done
@@ -804,6 +908,7 @@ async def _render_all(
             if lipsynced is not None and lipsynced.is_file():
                 video_path = lipsynced
             audio_path = project_dir / segment.audio_path if segment.audio_path else None
+            gain_db = await voice_gain(segment)
             use_ambient = ambient and await has_ambient(video_path)
             # 口型对齐：画面里的人几秒开口，配音就延后几秒（只用本地计算，不重新烧视频）。
             # 逐帧口型已经让嘴跟着配音走了，再叠加延后会把嘴和声音错开。
@@ -826,13 +931,22 @@ async def _render_all(
                     delay_ms = round(delay * 1000)
                     async with lock:
                         delays[segment.shot_id] = delay
-            # 环境音/口型对齐开关变了要重新渲染：编码到"输入"里参与新鲜度判断
-            marker = segments_dir / (
-                f".ambient-{'on' if use_ambient else 'off'}"
-                f".mouth-{'on' if delay_ms > 0 else 'off'}"
-                f".lipsync-{'on' if lipsynced is not None else 'off'}"
+            # 渲染参数变了必须重渲（环境音/口型对齐/逐帧口型/响度修正都会改变音轨内容）。
+            # 这里把参数**写进一个固定名字的标记文件**再比对内容，而不是塞进文件名：
+            # 文件名方案会被上一轮的旧标记骗过 —— 旧标记还在、分段文件却已经被
+            # 「另一套参数」重渲过（真实事故：关掉响度归一的对比跑复用到了归一后的分段）。
+            marker = segments_dir / f"{segment.shot_id}.params"
+            params = (
+                f"ambient={'on' if use_ambient else 'off'}"
+                f" mouth={'on' if delay_ms > 0 else 'off'}"
+                f" lipsync={'on' if lipsynced is not None else 'off'}"
+                f" gain={gain_db:+.1f}"
             )
-            if reuse and marker.exists() and _segment_is_fresh(output, [video_path, audio_path]):
+            if (
+                reuse
+                and _params_match(marker, params)
+                and _segment_is_fresh(output, [video_path, audio_path])
+            ):
                 logger.debug("复用已渲染分段：%s", output.name)
             else:
                 await render_segment(
@@ -848,9 +962,13 @@ async def _render_all(
                     ambient=use_ambient,
                     ambient_gain_db=ambient_gain_db,
                     voice_delay_ms=delay_ms,
+                    voice_gain_db=gain_db,
                 )
-                marker.touch()
+                marker.write_text(params, encoding="utf-8")
             async with lock:
+                segment.gain_db = gain_db
+                if gain_db:
+                    gains[segment.shot_id] = gain_db
                 done += 1
                 _notify(
                     on_progress,
@@ -860,7 +978,7 @@ async def _render_all(
                 )
 
     await asyncio.gather(*(run_one(segment) for segment in segments))
-    return delays
+    return delays, gains
 
 
 async def _lipsync_all(
@@ -984,6 +1102,16 @@ def _bind_video(
         return False
     segment.video_path = clip.path
     return True
+
+
+def _params_match(marker: Path, params: str) -> bool:
+    """分段是不是用这套参数渲的（比对标记文件内容）。"""
+    try:
+        if not marker.is_file():
+            return False
+        return marker.read_text(encoding="utf-8").strip() == params.strip()
+    except OSError:  # pragma: no cover - 读不到就当不匹配，重渲一次
+        return False
 
 
 def _segment_is_fresh(output: Path, inputs: list[Path | None]) -> bool:

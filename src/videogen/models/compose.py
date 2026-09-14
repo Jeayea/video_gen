@@ -22,6 +22,11 @@ class ComposeSegment(BaseModel):
     video_path: str = ""
     audio_path: str | None = None
     text: str = ""
+    #: 逐句念法里的音量（如 "+5%" / "-20%"）。响度归一前会把它从文件里「减掉」，
+    #: 所以归一之后要按 dB 加回来 —— 对齐的是基准音量，不是表演
+    volume: str = ""
+    #: 这条配音在合成时实际补了多少 dB（响度归一的结果，写进报告）
+    gain_db: float = 0.0
 
 
 class ComposeReport(BaseModel):
@@ -44,6 +49,15 @@ class ComposeReport(BaseModel):
     bgm_plan_path: str = ""
     #: 人声闪避是否真的生效（ffmpeg 缺 sidechaincompress 时会退回固定音量）
     bgm_duck: bool = False
+    #: 逐条配音响度归一：开关、目标、每条的增益（shot_id -> dB）
+    audio_normalize: bool = False
+    audio_target_lufs: float = -20.0
+    voice_gains: dict[str, float] = Field(default_factory=dict)
+    #: 成片整体响度归一：开关、目标、渲染后实测的集成响度/真峰值
+    loudness_normalize: bool = False
+    target_lufs: float = -16.0
+    final_lufs: float | None = None
+    final_true_peak_db: float | None = None
     #: 环境音（视频模型自带音轨）的处理方式与实际生效值
     ambient_mode: str = "off"
     ambient_mode_effective: str = "off"
@@ -67,6 +81,13 @@ class ComposeReport(BaseModel):
             "bgm": self.bgm_id,
             "bgm_engine": self.bgm_engine,
             "bgm_duck": self.bgm_duck,
+            "audio_normalize": self.audio_normalize,
+            "voice_gain_db": (
+                round(max(abs(v) for v in self.voice_gains.values()), 2)
+                if self.voice_gains
+                else 0.0
+            ),
+            "final_lufs": self.final_lufs,
             "ambient": self.ambient_mode_effective,
             "warnings": len(self.warnings),
         }

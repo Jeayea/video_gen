@@ -25,6 +25,7 @@ from videogen.utils.ffmpeg import (
     ffmpeg_capabilities_for,
     probe_streams,
     resolve_ffmpeg,
+    run_ffmpeg,
 )
 
 requires_ffmpeg = pytest.mark.skipif(
@@ -534,6 +535,179 @@ async def test_compose_subtitle_modes(store):
     job = await pipeline.start_compose(project.id, overrides={"compose_subtitle_mode": "soft"})
     await wait_for_job(pipeline, job.id, timeout=120)
     assert store.load_compose_report(project.id).subtitle_mode_effective == SubtitleMode.SOFT
+
+
+# ── 响度（EBU R128）────────────────────────────────────
+
+
+def test_params_match_compares_content(tmp_path):
+    """复用判据要比**内容**：只有文件名相同、内容不同，必须判为不匹配。"""
+    marker = tmp_path / "scene_1_shot_1.params"
+    assert not compose_service._params_match(marker, "gain=+0.0")
+    marker.write_text("ambient=off mouth=off lipsync=on gain=+6.0", encoding="utf-8")
+    assert compose_service._params_match(marker, "ambient=off mouth=off lipsync=on gain=+6.0")
+    assert not compose_service._params_match(marker, "ambient=off mouth=off lipsync=on gain=+0.0")
+    # 行尾空白不算差异
+    marker.write_text("  ambient=off  \n", encoding="utf-8")
+    assert compose_service._params_match(marker, "ambient=off")
+
+
+@requires_ffmpeg
+@pytest.mark.asyncio
+async def test_changing_loudness_settings_rerenders_segments(store, settings):
+    """回归：关掉逐条归一之后必须重渲分段，不能复用上一轮归一后的分段。
+
+    真实事故：标记原来只是文件名，旧标记还在、分段却已被另一套参数重渲过，
+    于是「关闭归一」的对比跑复用到了归一后的分段（12/15 条量出来都是 -20.1）。
+    """
+    settings.audio_normalize = True
+    pipeline = real_pipeline(store)
+    project = await prepare_media(store, pipeline, small_project(store, shots=2))
+
+    job = await pipeline.start_compose(project.id, overrides={"compose_keep_segments": True})
+    await wait_for_job(pipeline, job.id, timeout=180)
+    segments = sorted(store.segments_dir(project.id).glob("*.mp4"))
+    assert segments
+    normalized = {path.name: path.stat().st_mtime_ns for path in segments}
+    marker = store.segments_dir(project.id) / f"{segments[0].stem}.params"
+    assert marker.is_file()
+    assert "gain=" in marker.read_text(encoding="utf-8")
+
+    job = await pipeline.start_compose(
+        project.id, overrides={"audio_normalize": False, "compose_keep_segments": True}
+    )
+    await wait_for_job(pipeline, job.id, timeout=180)
+    for path in sorted(store.segments_dir(project.id).glob("*.mp4")):
+        assert path.stat().st_mtime_ns != normalized[path.name], f"{path.name} 被错误复用"
+
+
+def test_final_loudness_filter_targets_and_limits():
+    chain = compose_service._final_loudness_filter(-16.0, -1.5)
+    assert "loudnorm=I=-16:TP=-1.5:LRA=11" in chain
+    assert "alimiter=limit=0.8414" in chain  # -1.5dBFS → 线性
+
+
+def test_loudness_filter_is_appended_to_the_mix():
+    """成片响度归一是**最后一层**：混完 BGM 之后再整体归一。"""
+    seen: dict = {}
+
+    async def fake_run(args, *, timeout_sec=0.0, cwd=None, exe=None):
+        seen["args"] = args
+
+    import videogen.services.compose_service as module
+
+    original = module.run_ffmpeg
+    module.run_ffmpeg = fake_run
+    try:
+        asyncio.run(
+            compose_service._finish(
+                Path("base.mp4"),
+                Path("final.mp4"),
+                cwd=Path("."),
+                duration=10.0,
+                bgm_path=None,
+                bgm_gain_db=-20.0,
+                fade_sec=1.5,
+                subtitle_file=None,
+                mode=SubtitleMode.NONE,
+                caps=set(),
+                crf=23,
+                preset="veryfast",
+                loudness_normalize=True,
+                target_lufs=-16.0,
+                true_peak_db=-1.5,
+            )
+        )
+    finally:
+        module.run_ffmpeg = original
+    args = seen["args"]
+    chain = args[args.index("-filter_complex") + 1]
+    assert chain.startswith("[0:a]loudnorm=I=-16")
+    assert args[args.index("-map") + 1] == "0:v"
+    assert "[aout]" in args
+    # 归一必须重编码音频：`-c:v copy` 可以有（视频流不动），但音频不能 copy
+    assert "-c:a" in args and args[args.index("-c:a") + 1] == "aac"
+
+
+@requires_ffmpeg
+@pytest.mark.asyncio
+async def test_compose_normalizes_voice_and_final_loudness(store, settings):
+    """端到端：逐条配音被拉到同一响度，成片响度落在目标附近。"""
+    settings.audio_normalize = True
+    settings.audio_target_lufs = -20.0
+    settings.compose_loudness_normalize = True
+    settings.compose_target_lufs = -16.0
+    pipeline = real_pipeline(store)
+    project = await prepare_media(store, pipeline, small_project(store, shots=3))
+
+    job = await pipeline.start_compose(project.id)
+    finished = await wait_for_job(pipeline, job.id, timeout=180)
+    assert finished.status.value == "succeeded", finished.error
+    report = store.load_compose_report(project.id)
+
+    assert report.audio_normalize is True
+    assert report.loudness_normalize is True
+    assert report.voice_gains, "应该记下每条配音补了多少 dB"
+    assert any("逐条配音响度归一" in w for w in report.warnings)
+    assert report.final_lufs is not None
+    # 成片响度应该被拉到目标附近（loudnorm 单遍允许有偏差）
+    assert abs(report.final_lufs - settings.compose_target_lufs) < 2.0
+    assert report.final_true_peak_db is None or report.final_true_peak_db <= 0.0
+
+
+@requires_ffmpeg
+@pytest.mark.asyncio
+async def test_compose_can_turn_loudness_normalization_off(store, settings):
+    settings.audio_normalize = False
+    settings.compose_loudness_normalize = False
+    pipeline = real_pipeline(store)
+    project = await prepare_media(store, pipeline, small_project(store, shots=2))
+
+    job = await pipeline.start_compose(project.id)
+    finished = await wait_for_job(pipeline, job.id, timeout=180)
+    assert finished.status.value == "succeeded", finished.error
+    report = store.load_compose_report(project.id)
+    assert report.audio_normalize is False
+    assert report.loudness_normalize is False
+    assert report.voice_gains == {}
+    assert not any("响度" in w for w in report.warnings)
+
+
+@requires_ffmpeg
+@pytest.mark.asyncio
+async def test_voice_gain_is_applied_and_recorded(store, settings, tmp_path):
+    """故意做一条小声 6dB 的配音：归一应该给它 +6dB 左右，并写进报告。"""
+    settings.audio_normalize = True
+    settings.audio_target_lufs = -20.0
+    # 假配音本身很轻（-30 LUFS 量级），上限给小了会两条都顶到天花板，看不出差异
+    settings.audio_normalize_max_db = 20.0
+    pipeline = real_pipeline(store)
+    project = small_project(store, shots=2)
+    await prepare_media(store, pipeline, project)
+
+    manifest = store.load_audio_manifest(project.id)
+    target_clip = manifest.clips[0]
+    quiet = tmp_path / "quiet.mp3"
+    source = store.ensure_project_dir(project.id) / target_clip.path
+    await run_ffmpeg(
+        ["-y", "-hide_banner", "-loglevel", "error", "-i", str(source),
+         "-af", "volume=-6dB", str(quiet)],
+        timeout_sec=60,
+    )
+    target_clip.path = str(quiet)
+    target_clip.duration_sec = target_clip.duration_sec
+    store.save_audio_manifest(project.id, manifest)
+
+    job = await pipeline.start_compose(project.id)
+    finished = await wait_for_job(pipeline, job.id, timeout=180)
+    assert finished.status.value == "succeeded", finished.error
+    report = store.load_compose_report(project.id)
+    gains = report.voice_gains
+    assert target_clip.shot_id in gains
+    # 这条比其他条小声 6dB，增益就应该明显更大
+    others = [value for key, value in gains.items() if key != target_clip.shot_id]
+    assert others
+    assert gains[target_clip.shot_id] - max(others) > 3.0
 
 
 # ── 配乐混音滤镜（纯函数）──────────────────────────────

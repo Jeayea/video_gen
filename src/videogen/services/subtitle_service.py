@@ -35,6 +35,7 @@ def build_segments(
                 duration_sec=float(max(1, shot.duration_sec)),
                 audio_path=audio_clip.path if audio_clip else None,
                 text=text,
+                volume=(audio_clip.volume if audio_clip else "") or "",
             )
         )
     return segments

@@ -584,7 +584,7 @@ FFMPEG_AUTO_UPGRADE=true      # 主 ffmpeg 缺能力时自动换候选（如烧�
 
 ---
 
-## 10. 实现状态（v0.19，2026-09-14 更新）
+## 10. 实现状态（v0.20，2026-09-14 更新）
 
 ### 已落地
 
@@ -714,6 +714,11 @@ FFMPEG_AUTO_UPGRADE=true      # 主 ffmpeg 缺能力时自动换候选（如烧�
   配乐谱 `MusicPlan` 是结构化产物（段落/调式/BPM/配器/重音/说话窗口/人话说明），
   `POST/GET /api/projects/{id}/music` 可生成、试听、导出外部模型提示词；UI 面板显示
   段落表 + 音频播放器 + 引擎/情绪/音量/闪避开关
+- **响度对齐（v0.20）**：逐条配音先量 EBU R128 集成响度，再补一个**有上限的**定值增益
+  （`AUDIO_NORMALIZE` / `AUDIO_TARGET_LUFS=-20` / `AUDIO_NORMALIZE_MAX_DB=10`）；
+  成片整体 `loudnorm` 到 `COMPOSE_TARGET_LUFS`（默认 -16 LUFS）+ 真峰值限幅，
+  并在交付前量一遍写进报告。实测极差 15.10dB → 2.50dB、成片 -21.9 → -16.2 LUFS。
+  另外修掉分段复用标记的 bug（参数原来只写在文件名里，会拿错内容）。
 - **人声闪避（v0.19）**：合成时 `sidechaincompress` 用人声当 side chain（`BGM_DUCK`，
   可逐次覆盖）；`tools/music/measure_ducking.py` 逐窗口实测
   （真实项目：说话段音乐 -9.2dB、静音段 +0.1dB、人声不变）

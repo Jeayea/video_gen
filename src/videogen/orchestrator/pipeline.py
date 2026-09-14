@@ -1686,6 +1686,9 @@ class Pipeline:
                     "bgm_duck",
                     "bgm_force",
                     "music_note",
+                    "audio_normalize",
+                    "compose_loudness_normalize",
+                    "compose_keep_segments",
                 }
                 clean = {k: v for k, v in overrides.items() if k in allowed and v is not None}
                 if clean:

@@ -107,6 +107,15 @@ class Settings(BaseSettings):
     tts_timeout_sec: float = 60.0
     #: 每句对白后面留的呼吸时间（秒），用于音画对齐
     audio_gap_sec: float = 0.25
+    #: 逐条配音响度归一（EBU R128）：逐条配音是独立生成的，音色不同、响度天然不一致
+    #: （真实项目实测极差 7.9dB）。开启后在合成时按条补一个**有上限的**定值增益
+    audio_normalize: bool = True
+    #: 配音的目标集成响度（LUFS）
+    audio_target_lufs: float = -20.0
+    #: 单条最多修正多少 dB。超过这个范围的差异通常是有意的表演（耳语/嘶吼），不该拉平。
+    #: 10dB 是实测定下来的：真实项目里最安静的那个音色比主角低 15dB，
+    #: 6dB 的上限修完还差 6dB（能听出来），10dB 只剩 2dB（听不出来）
+    audio_normalize_max_db: float = 10.0
     #: 配音比镜头长时的最大容忍倍率，超过只告警不裁音频
     audio_align_max_ratio: float = 2.0
 
@@ -175,6 +184,12 @@ class Settings(BaseSettings):
     # 合成
     #: soft=mp4 内嵌 mov_text 字幕轨（不需要 libass）| burn=烧进画面 | none=只导出 srt
     compose_subtitle_mode: str = "soft"
+    #: 成片整体响度归一（EBU R128）：把「这条片子整体多响」也定死
+    #: （真实成片实测：不加是 -21.9 LUFS，短剧平台普遍按 -14~-16 LUFS 播放）
+    compose_loudness_normalize: bool = True
+    compose_target_lufs: float = -16.0
+    #: 真峰值上限（dBTP）
+    compose_true_peak_db: float = -1.5
     compose_crf: int = 23
     compose_preset: str = "veryfast"
     compose_concurrency: int = 2
@@ -323,6 +338,23 @@ class Settings(BaseSettings):
         if self.openrouter_model and self.openrouter_model not in seen:
             seen.insert(0, self.openrouter_model)
         return seen
+
+    @property
+    def audio_target(self) -> float:
+        """配音目标响度（限幅在 -30..-10，别让笔误把配音变成蚊子叫或爆音）。"""
+        return min(-10.0, max(-30.0, float(self.audio_target_lufs)))
+
+    @property
+    def audio_max_gain_db(self) -> float:
+        return min(30.0, max(0.0, float(self.audio_normalize_max_db)))
+
+    @property
+    def target_lufs(self) -> float:
+        return min(-8.0, max(-30.0, float(self.compose_target_lufs)))
+
+    @property
+    def true_peak_db(self) -> float:
+        return min(0.0, max(-6.0, float(self.compose_true_peak_db)))
 
     @property
     def ambient_mode(self) -> str:
