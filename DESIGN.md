@@ -584,7 +584,7 @@ FFMPEG_AUTO_UPGRADE=true      # 主 ffmpeg 缺能力时自动换候选（如烧�
 
 ---
 
-## 10. 实现状态（v0.20，2026-09-14 更新）
+## 10. 实现状态（v0.21，2026-09-14 更新）
 
 ### 已落地
 
@@ -714,6 +714,14 @@ FFMPEG_AUTO_UPGRADE=true      # 主 ffmpeg 缺能力时自动换候选（如烧�
   配乐谱 `MusicPlan` 是结构化产物（段落/调式/BPM/配器/重音/说话窗口/人话说明），
   `POST/GET /api/projects/{id}/music` 可生成、试听、导出外部模型提示词；UI 面板显示
   段落表 + 音频播放器 + 引擎/情绪/音量/闪避开关
+- **健壮性与并发修正（v0.21，外部 review 核对后修复）**：
+  `FileStore._load` 坏文件隔离（一个坏 `meta.json` 不再让 `/api/projects` 500）；
+  项目锁只包状态迁移（长任务期间改标题/删项目/开始合成不再挂住），并发仍由 job 互斥 +
+  状态机保护；LLM provider 复用 `httpx.AsyncClient` 并由编排层按阶段 `aclose()`；
+  `_repair_json` 只在字符串外替换中文标点（不再改写台词）；
+  鉴权改为「写接口只认请求头 + 只读产物允许 `?token=`（`<video>`/`<a download>` 带不了头）」；
+  测试里未 await 的 `wait_for_job` 修掉（`-W error::RuntimeWarning` 全绿）；
+  新增密钥护栏用例（跟踪文件里出现真实形态 key 即失败）。
 - **响度对齐（v0.20）**：逐条配音先量 EBU R128 集成响度，再补一个**有上限的**定值增益
   （`AUDIO_NORMALIZE` / `AUDIO_TARGET_LUFS=-20` / `AUDIO_NORMALIZE_MAX_DB=10`）；
   成片整体 `loudnorm` 到 `COMPOSE_TARGET_LUFS`（默认 -16 LUFS）+ 真峰值限幅，

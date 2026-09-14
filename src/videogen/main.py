@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import secrets
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -63,7 +64,13 @@ async def lifespan(app: FastAPI):
     if not settings.has_llm_key:
         logger.warning("未检测到 LLM API Key，生成类接口会失败（请在 .env 配置）")
     if settings.api_token:
-        logger.info("API Token 校验已开启")
+        logger.info("API Token 校验已开启（写接口只认 X-API-Token 头，产物下载可用 ?token=）")
+    elif _bind_host() not in {"127.0.0.1", "localhost", "::1"}:
+        logger.warning(
+            "服务绑在 %s 上却没有设置 API_TOKEN：所有接口（含写接口）对局域网完全开放，"
+            "请设置 API_TOKEN 或把 HOST 改回 127.0.0.1",
+            _bind_host(),
+        )
     logger.info(
         "视频 provider=%s concurrency=%d ffmpeg=%s",
         settings.video_provider,
@@ -128,12 +135,42 @@ if settings.static_path.is_dir():
 # ── 鉴权（可选）────────────────────────────────────────────
 
 
+def _bind_host() -> str:
+    """服务绑在哪个地址上（`run.sh` 把 HOST 传给 uvicorn，这里读同一个变量）。
+
+    配置里没有这一项：监听地址是启动参数，不是应用配置。
+    """
+    return (os.environ.get("HOST") or os.environ.get("UVICORN_HOST") or "127.0.0.1").strip()
+
+
+#: 只能用 URL 传 token 的产物地址 —— `<img>` / `<video>` / `<a download>` 带不了请求头。
+#: 这些路径都是**只读**的产物下载，不接受任何写操作。
+_URL_TOKEN_SUFFIXES = ("/final", "/subtitles", "/subtitles.vtt", "/music/audio")
+_URL_TOKEN_FRAGMENTS = ("/clips/", "/reference")
+
+
+def url_token_allowed(path: str) -> bool:
+    """这个路径允许用 `?token=` 鉴权吗？
+
+    默认**只认请求头**（query string 会进 access log、浏览器历史和 Referer）。
+    只有「浏览器自己发起的产物读取」例外：HTML 里没法给 `<video src>` 加请求头，
+    所以这几个只读路径同时接受 `?token=`。写接口一律只认请求头。
+    """
+    if not path.startswith("/api/"):
+        return False
+    if path.endswith(_URL_TOKEN_SUFFIXES):
+        return True
+    return any(fragment in path for fragment in _URL_TOKEN_FRAGMENTS)
+
+
 @app.middleware("http")
 async def api_token_middleware(request: Request, call_next):
     token = settings.api_token.strip()
     path = request.url.path
     if token and path.startswith("/api") and path != "/api/health":
-        supplied = request.headers.get("x-api-token") or request.query_params.get("token") or ""
+        supplied = request.headers.get("x-api-token") or ""
+        if not supplied and url_token_allowed(path):
+            supplied = request.query_params.get("token") or ""
         if not secrets.compare_digest(supplied, token):
             return JSONResponse({"detail": "缺少或错误的 API Token"}, status_code=401)
     return await call_next(request)

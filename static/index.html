@@ -434,6 +434,14 @@ function authHeaders() {
   return token ? { 'X-API-Token': token } : {};
 }
 
+// `<img>` / `<video>` / `<a download>` 带不了请求头，只能把 token 放进 URL。
+// 服务端只对**只读产物**路径接受 ?token=（写接口只认请求头）。
+function withToken(url) {
+  const token = localStorage.getItem('videogen_token');
+  if (!token) return url;
+  return `${url}${url.includes('?') ? '&' : '?'}token=${encodeURIComponent(token)}`;
+}
+
 let currentProjectId = null;
 let currentBible = null;
 let currentStoryOutline = null;
@@ -910,7 +918,7 @@ function renderBible() {
       const hasRef = !!(c.reference_image);
       const thumb = hasRef
         ? `<img class="ref-thumb" alt="${esc(c.name)} 参考图"
-                src="/api/projects/${currentProjectId}/characters/${encodeURIComponent(c.id)}/reference?t=${Date.now()}" />`
+                src="${withToken(`/api/projects/${currentProjectId}/characters/${encodeURIComponent(c.id)}/reference?t=${Date.now()}`)}" />`
         : '<span class="ref-thumb empty">无图</span>';
       return `<div class="char-tag" title="${esc(c.reference_image || '未设置参考图')}">
         ${thumb}
@@ -1410,7 +1418,7 @@ function renderVideo() {
             ${c.media_kind === 'placeholder' ? '<span class="tag-mini warn">占位文件</span>' : ''}
           </div>
           ${playable
-            ? `<video controls preload="metadata" src="/api/projects/${currentProjectId}/clips/${encodeURIComponent(c.shot_id)}"></video>`
+            ? `<video controls preload="metadata" src="${withToken(`/api/projects/${currentProjectId}/clips/${encodeURIComponent(c.shot_id)}`)}"></video>`
             : `<div style="font-size:11px;color:var(--text2)">${
                 c.media_kind === 'placeholder' ? '未检测到 ffmpeg，仅写了占位文件' : '等待生成…'}</div>`}
           ${c.prompt ? `<div class="clip-prompt">${esc(c.prompt)}</div>` : ''}
@@ -1881,16 +1889,16 @@ function renderCompose() {
   } else {
     const trackSrc = report.subtitles_path
       ? `<track id="compose-track" kind="subtitles" srclang="zh" label="中文" default
-               src="/api/projects/${currentProjectId}/subtitles.vtt">`
+               src="${withToken(`/api/projects/${currentProjectId}/subtitles.vtt`)}">`
       : '';
     body.innerHTML = `
       <video id="compose-video" controls preload="metadata"
              style="width:100%;max-width:320px;border-radius:8px;background:#000"
-             src="/api/projects/${currentProjectId}/final">${trackSrc}</video>
+             src="${withToken(`/api/projects/${currentProjectId}/final`)}">${trackSrc}</video>
       <div class="panel-actions">
-        <a class="btn btn-sm" href="/api/projects/${currentProjectId}/final" download>下载成片 MP4</a>
+        <a class="btn btn-sm" href="${withToken(`/api/projects/${currentProjectId}/final`)}" download>下载成片 MP4</a>
         ${report.subtitles_path
-          ? `<a class="btn btn-sm btn-outline" href="/api/projects/${currentProjectId}/subtitles" download>下载字幕 SRT</a>` : ''}
+          ? `<a class="btn btn-sm btn-outline" href="${withToken(`/api/projects/${currentProjectId}/subtitles`)}" download>下载字幕 SRT</a>` : ''}
       </div>
       ${report.subtitles_path ? `
       <label style="display:flex;gap:6px;align-items:center;font-size:12px;margin-top:6px">
@@ -2083,7 +2091,7 @@ function renderMusic() {
       : '无';
     body.innerHTML = `
       ${m.audio_url ? `<audio controls preload="none" style="width:100%;max-width:420px;margin-bottom:6px"
-             src="${m.audio_url}"></audio>` : ''}
+             src="${withToken(m.audio_url)}"></audio>` : ''}
       <div class="hint">
         ${track ? `${esc(track.title || track.id)} · ${track.duration_sec || '?'}s · 音量 ${gain}dB ·
           ${track.loop === false ? '整片长度不循环' : '循环铺满'} · ${esc(track.license || '')}` : ''}
@@ -2147,7 +2155,7 @@ function renderMusic() {
     canCompose || (currentStoryboard && currentStoryboard.shots) ? '' : ' disabled'}>${
     track || plan ? '重新生成配乐' : '生成配乐'}</button>`);
   if (plan && m.audio_url) {
-    buttons.push(`<a class="btn btn-sm btn-outline" href="${m.audio_url}" download>下载音乐 WAV</a>`);
+    buttons.push(`<a class="btn btn-sm btn-outline" href="${withToken(m.audio_url)}" download>下载音乐 WAV</a>`);
   }
   if (plan) {
     buttons.push('<button class="btn btn-sm btn-outline" onclick="doShowMusicPrompt()">看外部模型提示词</button>');

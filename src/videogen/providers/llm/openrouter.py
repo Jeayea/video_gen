@@ -22,15 +22,44 @@ __all__ = ["OpenRouterProvider", "scrub_secrets"]
 
 
 class OpenRouterProvider(LLMProvider):
-    def __init__(self, api_key: str | None = None, model: str | None = None):
+    def __init__(
+        self,
+        api_key: str | None = None,
+        model: str | None = None,
+        *,
+        base_url: str | None = None,
+        timeout_sec: float | None = None,
+        max_retries: int | None = None,
+        client: httpx.AsyncClient | None = None,
+    ):
         settings = get_settings()
         self.api_key = (api_key or settings.openrouter_api_key).strip()
         self.model = model or settings.openrouter_model
-        self.base_url = settings.openrouter_base_url.rstrip("/")
-        self.timeout_sec = settings.llm_timeout_sec
-        self.max_retries = settings.llm_max_retries
+        self.base_url = (base_url or settings.openrouter_base_url).rstrip("/")
+        self.timeout_sec = settings.llm_timeout_sec if timeout_sec is None else timeout_sec
+        self.max_retries = settings.llm_max_retries if max_retries is None else max_retries
+        # 复用连接：每次 chat 都新建 AsyncClient 要重新握手 TLS，
+        # 而分镜/配音文案是**成批**调用（一场一次、十几场），延迟和超时都会被放大。
+        # 与 video/tts/image provider 保持同一套「实例持有 client + aclose」模式。
+        self._client: httpx.AsyncClient | None = client
+        #: 外部注入的 client 不归自己关（测试用 MockTransport 注入）
+        self._owns_client = client is None
         if not self.api_key:
             raise LLMError("未配置 LLM API Key（请检查 .env 中的 OPENROUTER_API_KEY）")
+
+    async def _http(self) -> httpx.AsyncClient:
+        if self._client is None:
+            self._client = httpx.AsyncClient(timeout=httpx.Timeout(self.timeout_sec))
+        return self._client
+
+    async def aclose(self) -> None:
+        client, self._client = self._client, None
+        if client is None or not self._owns_client:
+            return
+        try:
+            await client.aclose()
+        except RuntimeError:  # 事件循环已经关了（测试里常见），不影响正确性
+            logger.debug("关闭 httpx 客户端时事件循环已结束", exc_info=True)
 
     # ── 对外接口 ──────────────────────────────────────────
 
@@ -124,12 +153,12 @@ class OpenRouterProvider(LLMProvider):
         json_fallback_used = False
         while True:
             try:
-                async with httpx.AsyncClient(timeout=self.timeout_sec) as client:
-                    resp = await client.post(
-                        f"{self.base_url}/chat/completions",
-                        json=payload,
-                        headers=self._headers(),
-                    )
+                client = await self._http()
+                resp = await client.post(
+                    f"{self.base_url}/chat/completions",
+                    json=payload,
+                    headers=self._headers(),
+                )
             except httpx.HTTPError as exc:
                 if attempt < self.max_retries:
                     await self._backoff(attempt)
@@ -191,7 +220,16 @@ class OpenRouterProvider(LLMProvider):
         """同一个 provider 配置下换模型（用于多模型对比）。"""
         if not model or model == self.model:
             return self
-        return OpenRouterProvider(api_key=self.api_key, model=model)
+        # 共享同一个 client（同一个 base_url/密钥，连接池没必要重建）；
+        # 共享的 client 不归子实例所有，避免「换模型顺手把父实例的连接关了」
+        return OpenRouterProvider(
+            api_key=self.api_key,
+            model=model,
+            base_url=self.base_url,
+            timeout_sec=self.timeout_sec,
+            max_retries=self.max_retries,
+            client=self._client,
+        )
 
     def _record_usage(self, data: dict[str, Any]) -> None:
         raw = data.get("usage") or {}
@@ -315,12 +353,45 @@ def _balanced_json_slice(text: str) -> str | None:
     return None
 
 
+def _map_outside_strings(text: str, mapping: dict[str, str]) -> str:
+    """只在**字符串字面量之外**做字符替换（字符串里的是内容，不能动）。"""
+    out: list[str] = []
+    in_string = False
+    escaped = False
+    for ch in text:
+        if in_string:
+            out.append(ch)
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+            out.append(ch)
+            continue
+        out.append(mapping.get(ch, ch))
+    return "".join(out)
+
+
 def _repair_json(text: str) -> str:
-    """最后一搏的修复：中文标点、智能引号、尾逗号。"""
+    """最后一搏的修复：中文标点、智能引号、尾逗号。
+
+    历史坑：早期版本无脑 `replace("，", ",")`，注释还写着「中文逗号只可能出现在
+    非字符串语境」—— 对一个中文剧本产品来说这句话是错的：台词里全是「，」「：」。
+    repair 只在 JSON 已坏时才跑，但一跑就会**静默改写对白标点**
+    （模型偶尔吐中文引号 → 触发 repair → 台词里的逗号全变英文逗号）。
+    现在中文逗号/冒号只在字符串外替换。
+
+    智能引号是例外：它们**就是**被误用的字符串定界符，必须整篇替换，
+    否则引号根本配不平。
+    """
     repaired = text.strip()
     repaired = repaired.replace("“", '"').replace("”", '"')
     repaired = repaired.replace("‘", "'").replace("’", "'")
-    # 中文逗号/冒号只可能出现在非字符串语境，作为兜底替换（必须先于尾逗号清理）
-    repaired = repaired.replace("，", ",").replace("：", ":")
+    repaired = _map_outside_strings(repaired, {"，": ",", "：": ":"})
+    # 尾逗号清理（`,\s*}` / `,\s*]` 只可能出现在结构里）
     repaired = re.sub(r",(\s*[}\]])", r"\1", repaired)
     return repaired

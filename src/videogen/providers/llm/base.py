@@ -125,6 +125,14 @@ class LLMProvider(ABC):
         """换模型（不支持切换的实现原样返回）。"""
         return self
 
+    async def aclose(self) -> None:
+        """释放 provider 持有的连接资源（默认没有，子类按需实现）。
+
+        编排层在每个阶段结束后调用它 —— 与 video/tts provider 同一套生命周期，
+        这样「复用连接」不会变成「泄漏连接」。
+        """
+        return None
+
     @abstractmethod
     async def chat(
         self,

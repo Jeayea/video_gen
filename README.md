@@ -1098,7 +1098,11 @@ tools/lipsync/                # 逐帧口型的独立环境与脚本（不进主
 6. **合成是串行 CPU 活**：分段渲染并发受 `COMPOSE_CONCURRENCY` 限制，长片会占满 CPU
 7. **真实视频模型的固有约束**：最短 5 秒（H3）、不支持 seed、取消不退款；
    真实画面质量取决于 prompt，本项目只负责把参数与流程接对
-8. UI 没有鉴权登录页，`API_TOKEN` 通过 `?token=` 或 `localStorage` 传递
+8. UI 没有鉴权登录页：`API_TOKEN` 设了之后，**写接口只认 `X-API-Token` 请求头**，
+   `?token=` 只对只读产物地址（`/final`、`/subtitles*`、`/music/audio`、`/clips/`、
+   `/characters/*/reference`）有效 —— `<video src>` / `<a download>` 带不了请求头，
+   只能把 token 放进 URL（会进 access log，所以别在共享环境里用）。页面用
+   `?token=xxx` 打开一次即存进 `localStorage`，之后的产物地址由前端自动补 token
 9. **配音文案会改写分镜文本**：`narration` / `polish` / `full` 直接写进分镜（原文留在
    `voice_script_original`），属于「人工确认后的产物被程序改动」——不想要就别开这个开关
 10. **抽帧是按镜头抽的静态图**：模型看到的是画面而不是运动，动作/运镜类信息它读不到
@@ -1184,6 +1188,9 @@ tools/lipsync/                # 逐帧口型的独立环境与脚本（不进主
 
 ## 安全
 
-- `.env` 不要提交，也不要贴到任何地方；泄漏后请立即到 OpenRouter 轮换
+- `.env` 不要提交，也不要贴到任何地方；泄漏后请立即到 OpenRouter 轮换。
+  `tests/test_secrets.py` 会扫描**所有被 git 跟踪的文件**，发现真实形态的 key
+  （`sk-or-v1-` + 32 位以上十六进制）就失败 —— 防的是 `git add -A` 这类误伤
+- 工作区里的 `projects/`（媒体产物，实测几百 MB）和 `.env` 都不要放进分享包
 - 所有对外异常/日志都经过 `scrub_secrets()` 脱敏，密钥不会进入日志、前端或报告
 - 服务默认只监听 `127.0.0.1`；对外暴露时请设置 `API_TOKEN`

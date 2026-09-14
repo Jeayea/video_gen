@@ -1307,3 +1307,45 @@ ash（赵总）-22.9、**coral（张姐）-29.4**。同一音色内部很稳（�
 ebur128 输出解析（含静音与脏数据）、真实测量、归一效果），
 `tests/test_compose.py` 新增 5 个（成片响度滤镜、归一接在混音之后、端到端响度落在目标附近、
 关掉开关的行为、故意做小声 6dB 的配音应拿到更大增益）。
+
+## v0.21 · 代码 review 的修复（逐条核对）
+
+外部 review 提了 7 个问题和 8 条债务。逐条**复现/核对**之后：6 条确认并修掉、
+1 条部分确认（按更实际的方案修）、3 条不成立或已存在。下面按 review 的编号写。
+
+### 确认并修复
+
+| 编号 | 问题 | 复现 | 修法 |
+|------|------|------|------|
+| B (P0) | `FileStore._load` 无兜底 | ✅ 一个坏 `meta.json` 让 `list_projects()` 抛 `ValidationError` → `/api/projects` 500，其余项目全看不见 | 捕获 `OSError/ValueError`（pydantic 的 `ValidationError` 是 `ValueError` 子类）→ 隔离成 `<名字>.json.bad` + 告警「修好改回即可恢复」→ 返回 `None` |
+| C (P0) | 项目锁贯穿整个媒体任务 | ✅ 写用例复现：视频任务卡在生成时，`update_project` 3s 超时都拿不到锁（真实症状：生成期间改标题/删项目/开始合成的请求全部挂住） | 锁只包「读状态 → 落状态」；`generate_clips` / `synthesize_all` 放在锁外，进度回调只做一次原子落盘（同步、不会被其它协程打断）；取消路径与最终状态用短锁重新取 |
+| D (P1) | LLM 每次请求新建 `httpx.AsyncClient` | ✅ 每次 `chat` 都 `async with` 新建（video/tts/image 都是实例持有） | provider 持有 client（可注入、有 `_owns_client`）+ `aclose()`；`with_model` 共享同一 client；编排层五个阶段结束后 `await llm.aclose()`（与 video 同一套生命周期，防泄漏） |
+| E (P1) | `_repair_json` 无脑替换中文逗号/冒号 | ✅ 注释「中文逗号只可能出现在非字符串语境」对中文剧本产品是错的：`{"text": "你别走，好吗"}` 修完变成 `"你别走,好吗"` | 新增 `_map_outside_strings()`：只在字符串字面量**之外**替换（智能引号仍整篇替换，它们本身就是被误用的定界符） |
+| F (P1) | `?token=` 查询串鉴权 | ⚠️ 部分确认 | 写接口/JSON 接口**只认 `X-API-Token` 头**；只读产物路径仍接受 `?token=` —— 因为 `<video src>` / `<a download>` / `<img>` 根本带不了请求头，一律只认头会让「开了 token 就看不到成片、下不了文件」（这个坑今天就存在：UI 从来没给这些地址加过 token）。顺带把前端补成 `withToken(url)`，并给「绑 0.0.0.0 又没设 token」加启动告警 |
+| G (P1) | 测试里 `wait_for_job` 未 await | ✅ pytest 有 `RuntimeWarning: coroutine never awaited`；靠 mock 跑得快才碰巧过 | 改用已有的同步 `wait_video_job()`；现在 `pytest -W error::RuntimeWarning` 全绿 |
+
+另外补了 review 提到的 P2 里两条：`ProjectStatus` 上「Phase 2+ 预留（没有任何入口会写入）」
+的过时注释（媒体链路 v0.4 就全落地了）、以及一条**密钥护栏**用例
+（`tests/test_secrets.py`：扫描所有 git 跟踪文件，出现真实形态的 `sk-or-v1-` 就失败；
+并断言 `.env` 始终被忽略且未被跟踪）。
+
+### 核对后**不成立**的
+
+| 编号 | review 的说法 | 实际情况 |
+|------|---------------|----------|
+| A | 「工作区 `.env` 有真实 key，建议轮换」 | 事实成立（key 确实在 `.env` 里，73 字符真实形态），但**从来没有进过 git**：`.gitignore:8` 忽略、`git log -S "sk-or-v1-"` 命中的 3 个提交全是 `tests/` 里的 `sk-or-v1-DUMMY…` 占位串（形态短、非十六进制）。所以「轮换」是运维建议，不是代码缺陷；仓库侧加了护栏用例。**建议仍然有效：对外分享前只带 `.env.example`** |
+| P2 | `_locks` 永不清理 | ❌ 已有清理：`delete_project` 里 `self._locks.pop(project_id, None)`（pipeline.py:2017） |
+| P2 | 「`main.py` 双读配置」 | ❌ `get_settings()` 是带缓存的单例，模块级那次只是给中间件/启动日志用，行为一致（review 自己也标注了「读者容易误会」） |
+
+剩下的 P2 是**已知债务、不打算现在做**：`pipeline.py` 2018 行（按 stage 拆分收益有限、
+风险不小，状态机集中在一处反而好读）、`static/index.html` 2592 行单页 UI、
+Job/Batch 状态仅在内存（多 worker 场景，README 已写明）、依赖锁文件（当前只有
+`pyproject.toml` 的下界约束）。
+
+### 测试
+
+新增 `tests/test_file_store.py`（5）、`tests/test_llm_openrouter.py`（8）、
+`tests/test_secrets.py`（2），`tests/test_state_machine.py` 加 3 个锁粒度/生命周期用例
+（含「短操作不能被长任务挡住」和「视频在跑时不能开始合成」的正反两面），
+`tests/test_api.py` 修掉未 await 的 flaky 调用并加 token 策略用例。
+合计 **661 个用例通过**，`pytest -W error::RuntimeWarning` 全绿（`ruff check src tests tools` 干净）。

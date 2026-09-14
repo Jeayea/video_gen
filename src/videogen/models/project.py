@@ -28,7 +28,9 @@ class ProjectStatus(str, Enum):
         DRAFT → SCRIPT_REVIEW → SCRIPT_CONFIRMED
               → STORYBOARD_REVIEW → STORYBOARD_CONFIRMED
 
-    媒体链路（Phase 2+ 预留）：VIDEO_* / AUDIO_* / COMPOSING / DONE
+    媒体链路（已实现）：
+        … → STORYBOARD_CONFIRMED → VIDEO_GENERATING → VIDEO_READY
+           → AUDIO_GENERATING → AUDIO_READY → COMPOSING → DONE
     """
 
     DRAFT = "draft"
@@ -37,7 +39,7 @@ class ProjectStatus(str, Enum):
     STORYBOARD_REVIEW = "storyboard_review"
     STORYBOARD_CONFIRMED = "storyboard_confirmed"
 
-    # ── Phase 2+ 预留（目前没有任何入口会写入）──
+    # ── 媒体链路（v0.4 起全部落地：视频/配音/合成都是后台任务）──
     VIDEO_GENERATING = "video_generating"
     VIDEO_READY = "video_ready"
     AUDIO_GENERATING = "audio_generating"

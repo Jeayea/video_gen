@@ -353,6 +353,9 @@ class Pipeline:
                 raise PipelineError(f"故事圣经生成失败：{exc}") from exc
             finally:
                 self._record_llm_cost(project_id, CostStage.BIBLE, llm)
+                # 与 video provider 同一套生命周期：阶段结束就放掉连接，
+                # 免得「复用连接」变成「泄漏连接」
+                await llm.aclose()
 
             self.store.save_bible(project_id, bible)
             # 圣经变了，旧的一致性报告和下游媒体全部作废
@@ -417,6 +420,7 @@ class Pipeline:
                 raise PipelineError(f"长篇大纲生成失败：{exc}") from exc
             finally:
                 self._record_llm_cost(project_id, CostStage.STORY, llm)
+                await llm.aclose()
 
             outline.target_duration_sec = outline.total_duration_sec
             self.store.save_story_outline(project_id, outline)
@@ -474,6 +478,7 @@ class Pipeline:
                 raise PipelineError(f"剧本生成失败：{exc}") from exc
             finally:
                 self._record_llm_cost(project_id, CostStage.SCRIPT, llm)
+                await llm.aclose()
 
             report = consistency_service.validate_script(
                 script,
@@ -753,6 +758,7 @@ class Pipeline:
                 raise PipelineError(f"分镜生成失败：{exc}") from exc
             finally:
                 self._record_llm_cost(project_id, CostStage.STORYBOARD, llm)
+                await llm.aclose()
 
             # 先做确定性修复（说话人不在画面里 → 补进去），再校验：修完就不该再报这条
             storyboard, repairs = consistency_service.repair_storyboard(
@@ -1090,62 +1096,77 @@ class Pipeline:
             raise PipelineError(f"该项目已有{label}任务在运行（job={running.id}）")
 
     async def _run_video_job(self, ctx: JobContext, project_id: str) -> None:
+        """生成视频片段。
+
+        **项目锁只包「读状态 → 改状态」**，不包几分钟的生成过程：早期版本把整段
+        `generate_clips` 放在锁里，于是生成期间「改标题 / 删项目 / 开始合成」
+        这些请求全部挂住（真实症状：HTTP 请求几分钟不返回）。
+        并发保护仍然靠 job 互斥（`_reject_if_if_running`）+ 状态机校验，
+        manifest 的写入本身是原子的，不需要长时间持锁。
+        """
         async with self._lock(project_id):
             project = self.get_project(project_id)
             storyboard = self.store.load_storyboard(project_id) or Storyboard()
             provider = self._video()
             project_dir = self.store.ensure_project_dir(project_id)
             clips_dir = self.store.clips_dir(project_id)
+            bible = self.store.load_bible(project_id)
             settings = get_settings()
-
-            def on_progress(manifest: VideoManifest) -> None:
-                self.store.save_video_manifest(project_id, manifest)
-                done = len(manifest.ready_clips) + len(manifest.failed_clips)
-                ctx.set_progress(
-                    done=done,
-                    total=len(manifest.clips),
-                    message=f"片段 {done}/{len(manifest.clips)}（成功 {len(manifest.ready_clips)}，"
-                    f"失败 {len(manifest.failed_clips)}）",
-                )
-
             existing = self.store.load_video_manifest(project_id)
             # 用「上一次的生成时间」判断这一轮是否真的重跑过片段（换 provider 也算重跑）
             before_generated = {
                 c.shot_id: c.generated_at for c in (existing.clips if existing else [])
             }
-            try:
-                # 单价要在 provider 关闭前问（真实 provider 会去查自己的价目表）
-                price_per_second = await provider.price_per_second()
-            except Exception:
-                logger.warning("读取视频单价失败，记账用配置单价", exc_info=True)
-                price_per_second = None
-            try:
-                manifest = await video_service.generate_clips(
-                    project,
-                    storyboard,
-                    provider,
-                    clips_dir,
-                    project_dir,
-                    concurrency=settings.video_concurrency,
-                    max_retries=settings.video_max_retries,
-                    retry_backoff_sec=settings.video_retry_backoff_sec,
-                    existing=existing,
-                    bible=self.store.load_bible(project_id),
-                    seed=settings.video_seed,
-                    on_progress=on_progress,
-                )
-            except asyncio.CancelledError:
-                # 取消：保留已生成片段，状态退回可重试的位置
+
+        def on_progress(manifest: VideoManifest) -> None:
+            # 进度回调是同步的（在事件循环里直接跑完，不会被其它协程打断），
+            # 里面只有一次原子落盘，因此不需要项目锁
+            self.store.save_video_manifest(project_id, manifest)
+            done = len(manifest.ready_clips) + len(manifest.failed_clips)
+            ctx.set_progress(
+                done=done,
+                total=len(manifest.clips),
+                message=f"片段 {done}/{len(manifest.clips)}（成功 {len(manifest.ready_clips)}，"
+                f"失败 {len(manifest.failed_clips)}）",
+            )
+
+        try:
+            # 单价要在 provider 关闭前问（真实 provider 会去查自己的价目表）
+            price_per_second = await provider.price_per_second()
+        except Exception:
+            logger.warning("读取视频单价失败，记账用配置单价", exc_info=True)
+            price_per_second = None
+        try:
+            manifest = await video_service.generate_clips(
+                project,
+                storyboard,
+                provider,
+                clips_dir,
+                project_dir,
+                concurrency=settings.video_concurrency,
+                max_retries=settings.video_max_retries,
+                retry_backoff_sec=settings.video_retry_backoff_sec,
+                existing=existing,
+                bible=bible,
+                seed=settings.video_seed,
+                on_progress=on_progress,
+            )
+        except asyncio.CancelledError:
+            # 取消：保留已生成片段，状态退回可重试的位置
+            async with self._lock(project_id):
                 self.store.purge_media(project_id, compose=True)
                 self._settle_video_status(
-                    project,
+                    self.get_project(project_id),
                     self.store.load_video_manifest(project_id),
                     self.store.load_audio_manifest(project_id),
                 )
-                raise
-            finally:
-                await provider.aclose()
+            raise
+        finally:
+            await provider.aclose()
 
+        async with self._lock(project_id):
+            # 状态可能在生成期间被别处改过（例如用户改了标题），这里重新读一份再落状态
+            project = self.get_project(project_id)
             recorded = self._record_video_cost(
                 project_id, manifest, price_per_second=price_per_second, settings=settings
             )
@@ -1166,17 +1187,17 @@ class Pipeline:
             self._settle_video_status(
                 project, manifest, self.store.load_audio_manifest(project_id)
             )
-            ctx.set_progress(
-                done=len(manifest.clips),
-                total=len(manifest.clips),
-                message=(
-                    f"完成：成功 {len(manifest.ready_clips)}，失败 {len(manifest.failed_clips)}"
-                ),
+        ctx.set_progress(
+            done=len(manifest.clips),
+            total=len(manifest.clips),
+            message=(
+                f"完成：成功 {len(manifest.ready_clips)}，失败 {len(manifest.failed_clips)}"
+            ),
+        )
+        if not manifest.ready_clips:
+            raise PipelineError(
+                f"全部 {len(manifest.clips)} 个片段生成失败，请检查 provider 配置 / ffmpeg"
             )
-            if not manifest.ready_clips:
-                raise PipelineError(
-                    f"全部 {len(manifest.clips)} 个片段生成失败，请检查 provider 配置 / ffmpeg"
-                )
 
     def _record_video_cost(
         self,
@@ -1371,6 +1392,12 @@ class Pipeline:
         use_vision: bool | None = None,
         force_script: bool | None = None,
     ) -> None:
+        """生成配音（可选：先让 LLM 看画面写/改文案）。
+
+        项目锁只包「读状态 → 落状态」，几分钟的 TTS 生成放在锁外 ——
+        理由同 `_run_video_job`：早期版本整段持锁，配音期间改标题等请求会全部挂住。
+        并发仍然靠 job 互斥（同项目同类型任务只允许一个）保护。
+        """
         async with self._lock(project_id):
             project = self.get_project(project_id)
             storyboard = self.store.load_storyboard(project_id) or Storyboard()
@@ -1387,64 +1414,69 @@ class Pipeline:
             existing_audio = self.store.load_audio_manifest(project_id) or AudioManifest()
             existing_audio.script_mode = mode
 
-            def on_progress(manifest: AudioManifest) -> None:
-                self.store.save_audio_manifest(project_id, manifest)
-                done = len(manifest.ready_clips) + len(manifest.failed_clips)
-                total = len(manifest.clips)
-                ctx.set_progress(
-                    done=done,
-                    total=total,
-                    message=(
-                        f"配音 {done}/{total}（成功 {len(manifest.ready_clips)}，"
-                        f"失败 {len(manifest.failed_clips)}）"
-                    )
-                    if total
-                    else "配音文案准备中…",
+        def on_progress(manifest: AudioManifest) -> None:
+            # 同步回调 + 原子落盘，不需要持项目锁（同 _run_video_job）
+            self.store.save_audio_manifest(project_id, manifest)
+            done = len(manifest.ready_clips) + len(manifest.failed_clips)
+            total = len(manifest.clips)
+            ctx.set_progress(
+                done=done,
+                total=total,
+                message=(
+                    f"配音 {done}/{total}（成功 {len(manifest.ready_clips)}，"
+                    f"失败 {len(manifest.failed_clips)}）"
                 )
-
-            # ── 可选：让 LLM 看着真实画面写/改配音文案 ──
-            await self._apply_voice_script(
-                ctx,
-                project,
-                storyboard,
-                script,
-                bible,
-                video,
-                project_dir=project_dir,
-                settings=settings,
-                mode=mode,
-                use_vision=use_vision,
-                force=force_script,
-                manifest=existing_audio,
-                on_progress=on_progress,
+                if total
+                else "配音文案准备中…",
             )
 
-            try:
-                manifest = await audio_service.synthesize_all(
-                    project,
-                    storyboard,
-                    bible,
-                    provider,
-                    audio_dir,
-                    project_dir,
-                    settings=settings,
-                    concurrency=settings.tts_concurrency,
-                    max_retries=settings.tts_max_retries,
-                    retry_backoff_sec=settings.tts_retry_backoff_sec,
-                    existing=existing_audio,
-                    voice_overrides=voice_overrides,
-                    on_progress=on_progress,
-                )
-            except asyncio.CancelledError:
+        # ── 可选：让 LLM 看着真实画面写/改配音文案 ──
+        await self._apply_voice_script(
+            ctx,
+            project,
+            storyboard,
+            script,
+            bible,
+            video,
+            project_dir=project_dir,
+            settings=settings,
+            mode=mode,
+            use_vision=use_vision,
+            force=force_script,
+            manifest=existing_audio,
+            on_progress=on_progress,
+        )
+
+        try:
+            manifest = await audio_service.synthesize_all(
+                project,
+                storyboard,
+                bible,
+                provider,
+                audio_dir,
+                project_dir,
+                settings=settings,
+                concurrency=settings.tts_concurrency,
+                max_retries=settings.tts_max_retries,
+                retry_backoff_sec=settings.tts_retry_backoff_sec,
+                existing=existing_audio,
+                voice_overrides=voice_overrides,
+                on_progress=on_progress,
+            )
+        except asyncio.CancelledError:
+            async with self._lock(project_id):
                 self._settle_audio_status(
-                    project,
+                    self.get_project(project_id),
                     self.store.load_audio_manifest(project_id),
                     self.store.load_video_manifest(project_id),
                 )
-                raise
-            finally:
-                await provider.aclose()
+            raise
+        finally:
+            await provider.aclose()
 
+        async with self._lock(project_id):
+            # 状态可能在生成期间被别处改过，重新读一份再落
+            project = self.get_project(project_id)
             # 选角结果写回圣经：角色卡片上能看到/改到自己的音色，重跑也不会换人
             if bible is not None and manifest.voice_map:
                 touched = False
@@ -1495,16 +1527,18 @@ class Pipeline:
             self.store.save_audio_manifest(project_id, manifest)
             # 镜头时长可能被拉长 -> 旧成片作废
             self.store.purge_media(project_id, compose=True)
-            self._settle_audio_status(project, manifest, self.store.load_video_manifest(project_id))
-
-            failed, ready = len(manifest.failed_clips), len(manifest.ready_clips)
-            ctx.set_progress(
-                done=len(manifest.clips),
-                total=len(manifest.clips),
-                message=f"完成：成功 {ready}，失败 {failed}",
+            self._settle_audio_status(
+                project, manifest, self.store.load_video_manifest(project_id)
             )
-            if failed and not ready:
-                raise PipelineError(f"全部 {failed} 条配音生成失败，请检查 TTS 配置 / 网络")
+
+        failed, ready = len(manifest.failed_clips), len(manifest.ready_clips)
+        ctx.set_progress(
+            done=len(manifest.clips),
+            total=len(manifest.clips),
+            message=f"完成：成功 {ready}，失败 {failed}",
+        )
+        if failed and not ready:
+            raise PipelineError(f"全部 {failed} 条配音生成失败，请检查 TTS 配置 / 网络")
 
     async def _apply_voice_script(
         self,
@@ -1557,6 +1591,7 @@ class Pipeline:
             return
         finally:
             self._record_llm_cost(project.id, CostStage.AUDIO, llm)
+            await llm.aclose()
 
         manifest.script_mode = outcome.mode
         manifest.script_model = outcome.model

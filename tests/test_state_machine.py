@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import time
 
 import pytest
 
+from tests.conftest import wait_for_job
 from tests.fakes import FakeLLM
 from videogen.models.project import Project, ProjectStatus
+from videogen.models.video import VideoManifest
 from videogen.models.world_state import WorldState
+from videogen.orchestrator import pipeline as pipeline_module
 from videogen.orchestrator.pipeline import PipelineError
 from videogen.utils.file_store import FileStore
 
@@ -83,6 +88,117 @@ async def test_full_text_pipeline(pipeline, store, fake_llm):
 
 
 @pytest.mark.asyncio
+async def test_project_lock_is_released_during_long_generation(
+    pipeline, store, ready_project, monkeypatch
+):
+    """长任务（视频生成几分钟）**不能**一直占着项目锁。
+
+    真实症状：生成视频期间改标题 / 删项目 / 重新合成会整段挂住，
+    HTTP 请求一直不返回。这里用「假装生成卡住」把窗口拉长，
+    然后要求一个短操作能立刻完成。
+    """
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def fake_generate(*args, **kwargs):
+        started.set()
+        await release.wait()
+        return VideoManifest(provider="mock")
+
+    monkeypatch.setattr(pipeline_module.video_service, "generate_clips", fake_generate)
+
+    job = await pipeline.start_video_generation(ready_project.id)
+    try:
+        await asyncio.wait_for(started.wait(), timeout=10)
+        began = time.monotonic()
+        updated = await asyncio.wait_for(
+            pipeline.update_project(ready_project.id, {"title": "生成视频期间改标题"}),
+            timeout=3,
+        )
+        elapsed = time.monotonic() - began
+        assert updated.title == "生成视频期间改标题"
+        assert elapsed < 1.0, f"短操作被长任务挡住了 {elapsed:.2f}s"
+    finally:
+        # 无论断言是否失败都要放行，否则后台任务永远挂着、整个测试会话卡住
+        release.set()
+        await wait_for_job(pipeline, job.id)
+
+
+async def test_project_lock_is_released_during_audio_generation(
+    pipeline, store, ready_project, monkeypatch
+):
+    """配音任务同样不能长时间占着项目锁（TTS 也要几分钟）。"""
+    from videogen.models.audio import AudioManifest
+    from videogen.orchestrator import pipeline as module
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def fake_synthesize(*args, **kwargs):
+        started.set()
+        await release.wait()
+        return AudioManifest(provider="mock")
+
+    monkeypatch.setattr(module.audio_service, "synthesize_all", fake_synthesize)
+
+    # 配音要求「视频已就绪」
+    video_job = await pipeline.start_video_generation(ready_project.id)
+    await wait_for_job(pipeline, video_job.id)
+
+    job = await pipeline.start_audio_generation(ready_project.id)
+    try:
+        await asyncio.wait_for(started.wait(), timeout=10)
+        began = time.monotonic()
+        updated = await asyncio.wait_for(
+            pipeline.update_project(ready_project.id, {"title": "配音期间改标题"}),
+            timeout=3,
+        )
+        assert updated.title == "配音期间改标题"
+        assert time.monotonic() - began < 1.0
+    finally:
+        release.set()
+        await wait_for_job(pipeline, job.id)
+
+
+async def test_start_compose_is_rejected_while_video_running(
+    pipeline, store, ready_project, monkeypatch
+):
+    """锁放开之后，并发保护必须仍然有效：视频在跑时不能开始合成。"""
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def fake_generate(*args, **kwargs):
+        started.set()
+        await release.wait()
+        return VideoManifest(provider="mock")
+
+    monkeypatch.setattr(pipeline_module.video_service, "generate_clips", fake_generate)
+    job = await pipeline.start_video_generation(ready_project.id)
+    try:
+        await asyncio.wait_for(started.wait(), timeout=10)
+        with pytest.raises(PipelineError):
+            await pipeline.start_compose(ready_project.id)
+    finally:
+        release.set()
+        await wait_for_job(pipeline, job.id)
+
+
+async def test_llm_provider_is_closed_after_each_stage(pipeline, store, fake_llm):
+    """每个阶段结束都要把 LLM provider 关掉（review D 的第二半）。
+
+    provider 现在会持有复用的 httpx client；如果编排层不关，
+    「复用连接」就变成「泄漏连接」。这条用例盯的就是这个契约。
+    """
+    project = make_project(store, target_duration_sec=45)
+    await pipeline.generate_bible(project.id)
+    assert fake_llm.close_calls == 1, "生成圣经之后应该关一次"
+    await pipeline.generate_script(project.id)
+    assert fake_llm.close_calls == 2, "生成剧本之后应该关一次"
+    await pipeline.confirm_script(project.id)
+    await pipeline.generate_storyboard(project.id)
+    assert fake_llm.close_calls == 3, "生成分镜之后应该关一次"
+
+
 async def test_confirm_then_regenerate_script_is_blocked(pipeline, store):
     """P0-5 回归：确认剧本后不允许悄悄重新生成。"""
     project = make_project(store)

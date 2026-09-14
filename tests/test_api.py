@@ -247,8 +247,38 @@ def test_api_token_enforced_when_configured(tmp_path, monkeypatch):
         assert test_client.get("/api/health").status_code == 200  # health 免鉴权
         assert test_client.get("/api/projects").status_code == 401
         assert test_client.get("/api/projects", headers=good).status_code == 200
-        assert test_client.get("/api/projects?token=s3cret").status_code == 200
         assert test_client.get("/api/projects", headers={"X-API-Token": "wrong"}).status_code == 401
+
+        # query token 只对**只读产物**路径有效（<video>/<a download> 带不了请求头）；
+        # 接口一律只认请求头 —— query string 会进 access log / 浏览器历史 / Referer
+        pid = test_client.post("/api/projects", json={"input_text": "x"}, headers=good).json()["id"]
+        assert test_client.get(f"/api/projects/{pid}/final?token=s3cret").status_code == 404
+        assert test_client.get(f"/api/projects/{pid}/final", headers=good).status_code == 404
+        assert (
+            test_client.get(f"/api/projects/{pid}/compose/status?token=s3cret").status_code
+            == 401
+        )
+        assert test_client.post(
+            f"/api/projects/{pid}/compose?token=s3cret"
+        ).status_code == 401
+        assert test_client.get(f"/api/projects/{pid}/final?token=wrong").status_code == 401
+
+
+def test_url_token_allowlist():
+    """只读产物路径放行，写接口/JSON 接口不放行。"""
+    from videogen.main import url_token_allowed
+
+    assert url_token_allowed("/api/projects/abc/final")
+    assert url_token_allowed("/api/projects/abc/subtitles.vtt")
+    assert url_token_allowed("/api/projects/abc/music/audio")
+    assert url_token_allowed("/api/projects/abc/clips/scene_1_shot_1")
+    assert url_token_allowed("/api/projects/abc/characters/c1/reference")
+    # 写接口与 JSON 接口：只认请求头
+    assert not url_token_allowed("/api/projects")
+    assert not url_token_allowed("/api/projects/abc")
+    assert not url_token_allowed("/api/projects/abc/compose")
+    assert not url_token_allowed("/api/projects/abc/music")
+    assert not url_token_allowed("/static/index.html")
 
 
 # ── 视频阶段（后台任务）────────────────────────────────
@@ -884,10 +914,10 @@ def test_audio_generate_accepts_perform_mode(client):
     client.post(f"/api/projects/{pid}/storyboard/confirm")
     client.post(f"/api/projects/{pid}/video/generate")
 
-    from tests.conftest import wait_for_job
-
-    status = client.get(f"/api/projects/{pid}/video/status").json()
-    wait_for_job(client.videogen_pipeline, status["job"]["id"])
+    # 这里必须**同步**等视频任务结束：`tests.conftest.wait_for_job` 是 async 的，
+    # 早期写成不 await 的调用（coroutine never awaited）—— 靠 mock 跑得快才碰巧过，
+    # 真实 provider 下就是 flaky。
+    wait_video_job(client, pid)
 
     resp = client.post(
         f"/api/projects/{pid}/audio/generate",

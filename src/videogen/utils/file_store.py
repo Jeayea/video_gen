@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import re
 import shutil
@@ -26,6 +27,8 @@ from videogen.models.script import Script, ScriptOutline, StoryOutline
 from videogen.models.storyboard import Storyboard
 from videogen.models.video import VideoManifest
 from videogen.models.world_state import WorldState
+
+logger = logging.getLogger(__name__)
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -80,12 +83,39 @@ class FileStore:
             raise
 
     def _load(self, project_id: str, name: str, model_cls: type[T]) -> T | None:
+        """读一个产物 JSON；坏文件**不抛异常**，隔离成 `.bad` 后返回 None。
+
+        真实风险（review 复现过）：一个手改坏 / 版本不兼容的 `meta.json` 会让
+        `list_projects()` 直接抛 ValidationError —— 整个 `/api/projects` 变成 500，
+        一个坏项目把全部项目都带下水。这里改成「坏的那个当作不存在」，
+        并且**重命名而不是删除**（坏文件本身是排查线索，改好名字就能恢复）。
+        """
         if not self.is_valid_id(project_id):
             return None
         path = self._json_path(project_id, name)
         if not path.exists():
             return None
-        return model_cls.model_validate_json(path.read_text(encoding="utf-8"))
+        try:
+            return model_cls.model_validate_json(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            # pydantic 的 ValidationError 是 ValueError 的子类，一起兜住
+            self._quarantine(path, exc)
+            return None
+
+    def _quarantine(self, path: Path, exc: Exception) -> None:
+        """把损坏的产物改名成 `<名字>.bad`（不删除），并留下可操作的告警。"""
+        target = path.with_name(f"{path.name}.bad")
+        try:
+            path.replace(target)
+        except OSError:
+            logger.warning("产物损坏且无法隔离：%s（%s）", path, exc)
+            return
+        logger.warning(
+            "产物损坏，已隔离为 %s（原因：%s）——修好后改回 %s 即可恢复",
+            target.name,
+            exc,
+            path.name,
+        )
 
     # --- Project ---
     def save_project(self, project: Project) -> None:

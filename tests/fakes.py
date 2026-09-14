@@ -72,6 +72,8 @@ class FakeLLM(LLMProvider):
         self.calls: list[list[LLMMessage]] = []
         #: 成本记账用：假装这些调用花了 token
         self.token_estimate = 3
+        #: 编排层每个阶段结束后应该调用一次 aclose（防「复用连接」变成「泄漏连接」）
+        self.close_calls = 0
         self.model = "fake-model"
         self.models_used: list[str] = []
         #: 配音文案相关：返回的文案模板 / 故意留空的镜头 / 给的语速建议
@@ -99,6 +101,9 @@ class FakeLLM(LLMProvider):
         self.model = model or self.model
         self.models_used.append(model)
         return self
+
+    async def aclose(self) -> None:
+        self.close_calls += 1
 
     async def chat(self, messages: list[LLMMessage], **kwargs: Any) -> str:
         self.calls.append(messages)
