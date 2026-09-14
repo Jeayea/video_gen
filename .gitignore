@@ -19,3 +19,6 @@ assets/lipsync/
 
 # 第三方库（onnxruntime 等）偶尔在 cwd 落下的会话文件，别提交
 :memory:*
+
+# 端到端冒烟的工作目录（tools/e2e/mock_pipeline_e2e.py）
+.e2e/

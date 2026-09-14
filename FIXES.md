@@ -1348,4 +1348,29 @@ Job/Batch 状态仅在内存（多 worker 场景，README 已写明）、依赖�
 `tests/test_secrets.py`（2），`tests/test_state_machine.py` 加 3 个锁粒度/生命周期用例
 （含「短操作不能被长任务挡住」和「视频在跑时不能开始合成」的正反两面），
 `tests/test_api.py` 修掉未 await 的 flaky 调用并加 token 策略用例。
-合计 **661 个用例通过**，`pytest -W error::RuntimeWarning` 全绿（`ruff check src tests tools` 干净）。
+合计 **668 个用例通过**，`pytest -W error::RuntimeWarning` 全绿（`ruff check src tests tools` 干净）。
+
+### 端到端冒烟：这一轮改动**事后补跑**了一次（$0）
+
+用户问「这些改动有端到端生成果视频片段吗」—— 诚实回答：**当时没有**。
+最后一次真正生成片段是 09-11（真模型、真花钱，`clips/*.mp4` 时间戳都在那天），
+最后一次真实成片合成是 09-14 17:44（v0.20 的响度对比），而 v0.21 提交在 18:15：
+v0.21 这批改动（锁粒度、文件隔离、token 策略、LLM 生命周期）当时只有单测 +
+活服务只读冒烟，没有跑过「生成片段」。
+
+于是补了 `tools/e2e/mock_pipeline_e2e.py`：mock 视频/配音（$0）起独立服务，
+走真实 HTTP 接口从「分镜已确认」跑到成片。实测（`--force`，12 项检查全过）：
+
+| 环节 | 结果 |
+|------|------|
+| 视频片段 | 15/15 成功，落盘 15 个**真 H.264**（540x960，抽样 5.0s） |
+| 配音 | 15/15 成功，15 条可播放音频（44.0s 语音） |
+| 配乐 | `engine=generate`，intro/bed×2/outro 四段 + 和弦进行，本机作曲 $0 |
+| 成片 | `final.mp4` 67.0s、1080x1920 h264 + aac 96kHz、**-16.0 LUFS**（目标 -16）、TP -12.8 dBFS |
+| token 策略 | 不带 `X-API-Token` 的写请求 **401**；`?token=` 只读下载 **200** |
+| 坏 `meta.json` | `/api/projects` **200**、坏项目隔离成 `.json.bad`、其余项目照常列出 |
+
+**这次冒烟没覆盖的**：文本链路（圣经/剧本/分镜）与真实 provider —— 前者要花钱调 LLM
+（`--source` 项目的产物是复制过去的），后者按秒计费。所以 v0.21 的
+「LLM client 复用 + `aclose()`」目前仍只有 mock transport 的单测覆盖，
+**没有**在真实 OpenRouter 上跑过一次；闪避深度这次也没重量（那个数字来自 v0.19 的真实成片 -9.23 dB）。

@@ -73,8 +73,26 @@ python -c "import asyncio,videogen.utils.ffmpeg as f; \
 
 ```bash
 .venv/bin/python -m pytest -q
-.venv/bin/ruff check src tests
+.venv/bin/ruff check src tests tools
 ```
+
+### 端到端冒烟：不花一分钱跑完整条媒体链路
+
+```bash
+.venv/bin/python tools/e2e/mock_pipeline_e2e.py          # 跑完自动关服务
+.venv/bin/python tools/e2e/mock_pipeline_e2e.py --keep   # 保留服务，自己去 UI 点
+```
+
+它把一个真实项目的文本链路产物（圣经/剧本/分镜）复制成一个「分镜已确认」的新项目，
+用**独立 `PROJECTS_DIR`** + `VIDEO_PROVIDER=mock` + `TTS_PROVIDER=mock`（配音文案 LLM 全关）
+起一个 8099 的服务，然后**走真实 HTTP 接口**跑一遍：
+生成片段 → 生成配音 → 生成配乐 → 合成成片 → 下载成片。
+
+产出是**真能播的** mp4：mock provider 用 ffmpeg 画 540x960 的 H.264（纯色背景 + 横向扫过的
+白条，一眼能看出是视频而不是静帧），mock 配音是一段可播放的单音。所以它能证明
+「状态机 / 任务锁 / 滤镜链 / 响度归一 / 配乐与闪避接线」是通的，**不**证明画面与配音的质量
+（那要真模型，按秒计费）。顺带验两件容易悄悄回归的事：写接口不带 `X-API-Token` 必须被拒（401）、
+坏掉的 `meta.json` 会被隔离成 `.json.bad` 且不影响 `GET /api/projects`。结果落在 `.e2e/report.json`。
 
 ## 流水线与状态机
 
