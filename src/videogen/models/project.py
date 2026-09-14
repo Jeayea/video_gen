@@ -4,7 +4,9 @@ from datetime import UTC, datetime
 from enum import Enum
 from uuid import uuid4
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+from videogen.utils.region import normalize_region
 
 
 class AspectRatio(str, Enum):
@@ -71,6 +73,19 @@ class Project(BaseModel):
     input_text: str = ""
     #: 该项目的 LLM 模型（空 = 用 .env 里的默认）。多模型切换用。
     llm_model: str = ""
+    #: **整片的国家/地区限定**（cn/jp/kr/west/other；空 = 按角色名字自动推断）。
+    #: 生成圣经时会写进提示词（所有角色用该国名字 + 该国长相），并写进圣经的
+    #: `cast_region` 作为下游（定妆照/视频）的**权威依据** —— 比按名字猜可靠得多。
+    cast_region: str = ""
+    #: 生成圣经时的**额外要求**（人物设定 / 世界观 / 年代 / 语言 / 禁忌…），原文进提示词。
+    #: 例：「女主要 30 岁左右，全员日本人，不要玄幻，台词口语化」
+    bible_notes: str = ""
+
+    @field_validator("cast_region", mode="before")
+    @classmethod
+    def _coerce_cast_region(cls, value: object) -> str:
+        # "中国" / "Japanese" / "KR" 都归一成 cn/jp/kr；不认识就留空（= 自动）
+        return normalize_region(value)
 
     @property
     def output_resolution(self) -> tuple[int, int]:

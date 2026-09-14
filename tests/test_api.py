@@ -895,3 +895,57 @@ def test_audio_generate_accepts_perform_mode(client):
     )
     assert resp.status_code == 202, resp.text
     assert build_confirmed_project  # 保持导入（其它用例共用）
+
+
+def test_bible_generate_accepts_region_and_notes(client):
+    """在生成圣经时就能指定国家限定与额外要求（UI 一次请求搞定），并落进项目。"""
+    project = client.post(
+        "/api/projects", json={"input_text": "东京的复仇故事", "input_mode": "theme"}
+    ).json()
+    pid = project["id"]
+
+    res = client.post(
+        f"/api/projects/{pid}/bible/generate",
+        json={"cast_region": "日本", "notes": "女主要 30 岁左右；不要玄幻"},
+    )
+    assert res.status_code == 200
+    # 国家写进圣经 → 下游定妆照/视频以它为准
+    assert res.json()["cast_region"] == "jp"
+
+    saved = client.get(f"/api/projects/{pid}").json()
+    assert saved["cast_region"] == "jp"
+    assert saved["bible_notes"] == "女主要 30 岁左右；不要玄幻"
+
+
+def test_project_update_accepts_region_and_notes(client):
+    project = client.post("/api/projects", json={"input_text": "都市复仇"}).json()
+    res = client.put(
+        f"/api/projects/{project['id']}",
+        json={"cast_region": "kr", "bible_notes": "全员韩国人"},
+    )
+    assert res.status_code == 200
+    body = res.json()
+    assert body["cast_region"] == "kr"
+    assert body["bible_notes"] == "全员韩国人"
+    # 非法值不报错，归一成空（= 自动）
+    res = client.put(f"/api/projects/{project['id']}", json={"cast_region": "火星"})
+    assert res.json()["cast_region"] == ""
+
+
+def test_project_region_change_syncs_into_existing_bible(client):
+    """圣经已经存在时改国家限定，必须同步进圣经（下游读的是圣经里的 cast_region）。"""
+    project = client.post("/api/projects", json={"input_text": "都市复仇"}).json()
+    pid = project["id"]
+    assert client.post(f"/api/projects/{pid}/bible/generate").status_code == 200
+    assert client.get(f"/api/projects/{pid}/bible").json()["cast_region"] == ""
+
+    client.put(f"/api/projects/{pid}", json={"cast_region": "jp"})
+    assert client.get(f"/api/projects/{pid}/bible").json()["cast_region"] == "jp"
+
+
+def test_ui_exposes_bible_constraint_controls(client):
+    html = client.get("/static/index.html").text
+    assert 'id="cast-region"' in html
+    assert 'id="bible-notes"' in html
+    assert "renderBibleConstraint" in html
+    assert "cast_region: region" in html

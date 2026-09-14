@@ -13,7 +13,12 @@ from videogen.providers.image.base import ImageProviderError, ImageRequest
 from videogen.services import cost_service
 from videogen.utils.file_store import FileStore
 from videogen.utils.redact import scrub_secrets
-from videogen.utils.region import region_anchor, region_mentioned, resolve_region
+from videogen.utils.region import (
+    region_anchor,
+    region_conflict,
+    region_mentioned,
+    resolve_region,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -202,6 +207,8 @@ def reference_plan(
                 "region_label": guess.label,
                 "region_source": guess.source,
                 "region_confidence": round(guess.confidence, 2),
+                # 名字与「声明的国家」不一致时给出可执行提示（多半是圣经起名没对齐）
+                "region_note": region_conflict(character, bible.cast_region),
                 "prompt_preview": build_portrait_prompt(
                     character,
                     bible,

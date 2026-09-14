@@ -576,7 +576,7 @@ FFMPEG_AUTO_UPGRADE=true      # 主 ffmpeg 缺能力时自动换候选（如烧�
 
 ---
 
-## 10. 实现状态（v0.17，2026-09-13 更新）
+## 10. 实现状态（v0.18，2026-09-14 更新）
 
 ### 已落地
 
@@ -696,6 +696,9 @@ FFMPEG_AUTO_UPGRADE=true      # 主 ffmpeg 缺能力时自动换候选（如烧�
 - **名字 ↔ 国家 ↔ 脸对齐（v0.17）**：名字推国籍（假名/谚文/姓氏表/文本提示，带置信度）→
   该国的「平均脸/主角脸」英文锚点进定妆照与视频 prompt；一部片子一张脸谱（全剧组投票），
   `Character.region` 与 `IMAGE_REGION_OVERRIDE` 可人工压过。见 `utils/region.py` 与 README
+- **国家/人物设定可在生成圣经时声明（v0.18）**：`Project.cast_region` + `Project.bible_notes`
+  进提示词并写进 `StoryBible.cast_region`，下游以此为权威依据（名字启发式只做冲突提醒）。
+  见 README「名字 ↔ 国家 ↔ 脸」与 FIXES v0.18
 - **音画同步自检**：`utils/av_sync.py` 在成片阶段核对「音轨时长 ≈ 视频时长」，
   抓「`concat -c copy` 吃掉音频空洞」这类事故（真实事故：对比片漂移 7.154 秒）
 

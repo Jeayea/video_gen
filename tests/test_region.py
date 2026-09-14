@@ -10,6 +10,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from videogen.config import get_settings
 from videogen.models.bible import Character, StoryBible
 from videogen.models.storyboard import Shot
@@ -266,3 +268,107 @@ def test_bible_prompt_requires_alignment():
 
     assert '"region": "cn"' in BIBLE_GEN_SYSTEM
     assert "名字、地区、外貌三者必须对齐" in BIBLE_GEN_SYSTEM
+
+
+# ── 在生成 bible 时「声明」国家与人物设定 ────────────────
+
+
+def test_project_normalizes_cast_region():
+    from videogen.models.project import Project
+
+    assert Project(cast_region="日本").cast_region == "jp"
+    assert Project(cast_region="Chinese").cast_region == "cn"
+    assert Project(cast_region="火星").cast_region == ""
+    assert Project().cast_region == ""
+
+
+def test_bible_carries_declared_region():
+    bible = StoryBible(cast_region="jp")
+    assert bible.cast_region == "jp"
+    # 声明过就不再投票：即使全是中国名也按日本
+    bible.characters = [Character(id="c1", name="王小明", role="主角")]
+    guess = region.project_region(bible)
+    assert guess.region == "jp"
+    assert guess.source == "bible:cast_region"
+    assert guess.confidence == 1.0
+
+
+def test_declared_region_beats_name_but_reports_conflict():
+    bible = StoryBible(
+        cast_region="jp", characters=[Character(id="c1", name="王小明", role="主角")]
+    )
+    guess = region.resolve_region(bible.characters[0], bible)
+    assert guess.region == "jp"
+    assert "名字像" in guess.source
+    note = region.region_conflict(bible.characters[0], bible.cast_region)
+    assert "王小明" in note and "改名字" in note
+
+
+def test_character_region_still_wins_for_intentional_foreigners():
+    """剧情里的外国人：单独填 region，不算冲突。"""
+    character = Character(id="c1", name="Emily Carter", role="配角", region="west")
+    bible = StoryBible(cast_region="jp", characters=[character])
+    assert region.resolve_region(character, bible).region == "west"
+    assert region.region_conflict(character, bible.cast_region) == ""
+
+
+def test_config_override_still_beats_declared_region(monkeypatch):
+    bible = StoryBible(cast_region="jp", characters=[Character(id="c1", name="林悦")])
+    assert region.project_region(bible, override="cn").region == "cn"
+
+
+@pytest.mark.asyncio
+async def test_bible_prompt_carries_constraints():
+    """国家限定与额外要求要真的进提示词（否则等于没填）。"""
+    from videogen.models.project import Project
+    from videogen.providers.llm.base import LLMProvider
+    from videogen.services import bible_service
+
+    captured: dict[str, str] = {}
+
+    class SpyLLM(LLMProvider):
+        model = "spy"
+
+        async def chat_json(self, messages, schema=None, **kwargs):
+            captured["user"] = "\n".join(m.content for m in messages if m.role == "user")
+            return StoryBible(characters=[Character(id="char_1", name="田中由纪")])
+
+        async def chat(self, messages, **kwargs):  # pragma: no cover - 本用例用不到
+            raise NotImplementedError
+
+    project = Project(
+        input_text="东京的复仇故事",
+        cast_region="jp",
+        bible_notes="女主要 30 岁左右；不要玄幻",
+    )
+    bible = await bible_service.generate_bible(project, SpyLLM())
+    prompt = captured["user"]
+    assert "国家/地区限定" in prompt
+    assert "日文名" in prompt and "田中由纪" in prompt
+    assert "用户的额外要求" in prompt
+    assert "女主要 30 岁左右；不要玄幻" in prompt
+    # 声明写进圣经 → 下游不再靠名字猜
+    assert bible.cast_region == "jp"
+
+
+@pytest.mark.asyncio
+async def test_bible_prompt_without_constraints_has_no_blocks():
+    from videogen.models.project import Project
+    from videogen.providers.llm.base import LLMProvider
+    from videogen.services import bible_service
+
+    captured: dict[str, str] = {}
+
+    class SpyLLM(LLMProvider):
+        model = "spy"
+
+        async def chat_json(self, messages, schema=None, **kwargs):
+            captured["user"] = "\n".join(m.content for m in messages if m.role == "user")
+            return StoryBible(characters=[Character(id="char_1", name="林悦")])
+
+        async def chat(self, messages, **kwargs):  # pragma: no cover
+            raise NotImplementedError
+
+    await bible_service.generate_bible(Project(input_text="都市复仇"), SpyLLM())
+    assert "国家/地区限定" not in captured["user"]
+    assert "额外要求" not in captured["user"]

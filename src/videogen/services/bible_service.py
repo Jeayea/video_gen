@@ -5,6 +5,7 @@ import logging
 from videogen.models.bible import StoryBible
 from videogen.models.project import InputMode, Project
 from videogen.providers.llm.base import LLMMessage, LLMProvider
+from videogen.utils import region
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +61,51 @@ BIBLE_GEN_SYSTEM = """你是一位资深短剧策划。根据用户输入生成�
 - age 必须是数字（不要写 "25岁"）
 - 只输出 JSON"""
 
+#: 声明了国家/地区时给模型的「选角说明」：名字怎么起、长相按哪国、region 字段填什么
+_REGION_BRIEF = {
+    "cn": (
+        "中国大陆/华语。名字用中文名（姓+名，例：林悦、李薇儿、张建国、赵敏），"
+        "长相是中国人（East Asian features, an average everyday Chinese face）"
+    ),
+    "jp": (
+        "日本。名字用日文名（例：田中由纪、佐藤美咲、铃木健太、高桥凉子），"
+        "长相是日本人（East Asian features, an average everyday Japanese face）"
+    ),
+    "kr": (
+        "韩国。名字用韩文名（例：金敏俊、朴智恩、李承宇、崔秀珍），"
+        "长相是韩国人（East Asian features, an average everyday Korean face）"
+    ),
+    "west": (
+        "欧美。名字用英文名（例：Emily Carter、John Smith、Sarah Miller），"
+        "长相是欧美人（European or North American features）"
+    ),
+    "other": "不限定国家/地区，按剧情自洽即可",
+}
+
+
+def _constraint_block(project: Project) -> str:
+    """把「国家限定 + 额外要求」拼成提示词里的一段（都没填就返回空串）。"""
+    lines: list[str] = []
+    brief = _REGION_BRIEF.get(region.normalize_region(project.cast_region))
+    if brief:
+        lines += [
+            "## 国家/地区限定（硬要求，优先级高于你自己的偏好）",
+            f"- 整部戏：{brief}",
+            "- **每个角色都要填 `region` 字段**，值用 cn/jp/kr/west/other，默认全部填同一个值",
+            "- 名字必须和这个国家一致；不要出现混国籍的剧组",
+            "- 如果剧情确实需要一个外国人（留学生/外企高管等），在 description 里写明他的国籍，"
+            "并且只给这个角色填不同的 region",
+        ]
+    notes = " ".join(str(project.bible_notes or "").split())
+    if notes:
+        lines += [
+            "",
+            "## 用户的额外要求（人物设定 / 世界观 / 其它，必须遵守）",
+            notes,
+        ]
+    return "\n".join(lines)
+
+
 _MODE_DESC = {
     InputMode.THEME: "主题/关键词",
     InputMode.OUTLINE: "故事大纲",
@@ -76,9 +122,11 @@ async def generate_bible(project: Project, llm: LLMProvider) -> StoryBible:
 {project.input_text}
 
 目标时长: {project.target_duration_sec} 秒
-画面比例: {project.aspect_ratio.value}
-
-请生成故事圣经。"""
+画面比例: {project.aspect_ratio.value}"""
+    constraint = _constraint_block(project)
+    if constraint:
+        user_prompt += f"\n\n{constraint}"
+    user_prompt += "\n\n请生成故事圣经。"""
 
     messages = [
         LLMMessage(role="system", content=BIBLE_GEN_SYSTEM),
@@ -89,6 +137,11 @@ async def generate_bible(project: Project, llm: LLMProvider) -> StoryBible:
     bible = await llm.chat_json(messages, schema=StoryBible, temperature=0.7, max_tokens=4096)
     if not bible.characters:
         raise ValueError("故事圣经没有生成任何角色")
+
+    # 用户声明的国家写进圣经：下游（定妆照/视频）以它为准，不再靠名字猜
+    declared = region.normalize_region(project.cast_region)
+    if declared:
+        bible.cast_region = declared
 
     # 兜底：模型偶尔漏 id，补成稳定编号
     for i, character in enumerate(bible.characters, start=1):

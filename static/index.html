@@ -215,6 +215,25 @@ body {
 }
 
 /* JSON Editor */
+.bible-constraint {
+  margin: 10px 0 4px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg2, transparent);
+}
+.bible-constraint label {
+  display: block;
+  font-size: 12px;
+  color: var(--text2);
+  margin-bottom: 6px;
+}
+.bible-constraint select,
+.bible-constraint textarea {
+  width: 100%;
+  margin-top: 4px;
+  font-size: 12px;
+}
 .json-editor {
   display: none;
   margin-top: 10px;
@@ -615,6 +634,23 @@ async function renderProject(id) {
   html += `
     <div class="panel">
       <h3><span class="num">1</span> 故事圣经</h3>
+      <div class="bible-constraint">
+        <label>国家/地区限定（名字与长相都会按它来）
+          <select id="cast-region">
+            <option value="">自动（按角色名字判断）</option>
+            <option value="cn">中国大陆 / 华语</option>
+            <option value="jp">日本</option>
+            <option value="kr">韩国</option>
+            <option value="west">欧美</option>
+            <option value="other">不限定</option>
+          </select>
+        </label>
+        <label>额外要求（人物设定 / 世界观 / 年代 / 语言…）
+          <textarea id="bible-notes" rows="2"
+            placeholder="例：女主要 30 岁左右；全员日本人；不要玄幻；台词口语化"></textarea>
+        </label>
+        <span class="hint" id="cast-region-hint"></span>
+      </div>
       <div id="bible-view"><span style="color:var(--text2);font-size:12px">尚未生成</span></div>
       <div class="json-editor" id="bible-editor">
         <textarea id="bible-json"></textarea>
@@ -633,6 +669,8 @@ async function renderProject(id) {
       </div>
     </div>
   `;
+
+  renderBibleConstraint();
 
   // 2. 剧本
   html += `
@@ -2254,10 +2292,42 @@ function doCancelBatch() {
 // ── 生成 / 确认 / 退回 ──────────────────────────────────────────────
 
 function doGenerateBible() {
+  const region = valueOf('cast-region');
+  const notes = valueOf('bible-notes').trim();
   withBusy('生成故事圣经中（约 10 秒）...', () =>
     api(`/api/projects/${currentProjectId}/bible/generate`, {
-      method: 'POST', body: JSON.stringify({ model: currentModel() }),
+      method: 'POST',
+      body: JSON.stringify({ model: currentModel(), cast_region: region, notes }),
     }));
+}
+
+function valueOf(id) {
+  const el = document.getElementById(id);
+  return el ? el.value : '';
+}
+
+// 国家限定 + 额外要求跟着项目走（重新生成/刷新页面都还在）
+function renderBibleConstraint() {
+  const p = currentProject || {};
+  const region = document.getElementById('cast-region');
+  const notes = document.getElementById('bible-notes');
+  if (region && !region.dataset.touched) region.value = p.cast_region || '';
+  if (notes && !notes.dataset.touched) notes.value = p.bible_notes || '';
+  for (const [id, keep] of [['cast-region', 1], ['bible-notes', 1]]) {
+    const el = document.getElementById(id);
+    if (el && !el.dataset.bound) {
+      el.dataset.bound = '1';
+      el.addEventListener('input', () => { el.dataset.touched = '1'; });
+      el.addEventListener('change', () => { el.dataset.touched = '1'; });
+    }
+  }'';
+  const hint = document.getElementById('cast-region-hint');
+  if (hint) {
+    const declared = (currentBible && currentBible.cast_region) || p.cast_region;
+    hint.textContent = declared
+      ? '圣经已声明整片地区，定妆照与视频都按它来（不再靠名字猜）'
+      : '';
+  }
 }
 
 function doGenerateScript() {

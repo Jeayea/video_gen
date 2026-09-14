@@ -311,7 +311,7 @@ class Pipeline:
     # ── 项目元信息 ────────────────────────────────────────
 
     async def update_project(self, project_id: str, fields: dict) -> Project:
-        """更新标题 / 比例 / 目标时长（不影响已生成产物）。"""
+        """更新标题 / 比例 / 目标时长 / 国家限定（不影响已生成产物）。"""
         async with self._lock(project_id):
             project = self.get_project(project_id)
             data = project.model_dump()
@@ -323,7 +323,18 @@ class Pipeline:
             except Exception as exc:
                 raise PipelineError(f"项目更新失败：{exc}") from exc
             self.store.save_project(updated)
+            # 圣经已经存在时，把「国家限定」同步进去 —— 下游（定妆照/视频）读的是
+            # 圣经的 cast_region，只改项目字段的话不会生效（用户会以为改了没用）
+            if "cast_region" in fields:
+                await self._sync_bible_region(project_id, updated.cast_region)
             return updated
+
+    async def _sync_bible_region(self, project_id: str, cast_region: str) -> None:
+        bible = self.store.load_bible(project_id)
+        if bible is None or bible.cast_region == cast_region:
+            return
+        bible.cast_region = cast_region
+        self.store.save_bible(project_id, bible)
 
     # ── 故事圣经 ──────────────────────────────────────────
 

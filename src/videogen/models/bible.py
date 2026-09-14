@@ -64,10 +64,18 @@ class StyleGuide(BaseModel):
 
 
 class StoryBible(BaseModel):
+    #: 整片声明的国家/地区（生成时从 Project.cast_region 带过来；空 = 靠名字推断）。
+    #: 这是下游定妆照/视频的**权威依据**：声明过就不再靠启发式猜。
+    cast_region: str = ""
     characters: list[Character] = Field(default_factory=list)
     settings: list[Setting] = Field(default_factory=list)
     facts: list[Fact] = Field(default_factory=list)
     style: StyleGuide = Field(default_factory=StyleGuide)
+
+    @field_validator("cast_region", mode="before")
+    @classmethod
+    def _coerce_cast_region(cls, value: object) -> str:
+        return normalize_region(value)
 
     def get_character(self, char_id: str) -> Character | None:
         for c in self.characters:

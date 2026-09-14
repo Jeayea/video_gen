@@ -186,12 +186,24 @@ class UpdateProjectRequest(BaseModel):
     target_duration_sec: int | None = Field(default=None, ge=5, le=600)
     #: 为空表示不改；给空字符串表示恢复默认模型
     llm_model: str | None = None
+    #: 整片的国家/地区限定（cn/jp/kr/west/other；空 = 按名字自动判断）
+    cast_region: str | None = None
+    #: 生成圣经时的额外要求（人物设定 / 世界观 / 年代 / 语言…）
+    bible_notes: str | None = None
+
 
 
 class GenerateRequest(BaseModel):
     """生成类接口的通用参数：可临时指定 LLM 模型。"""
 
     model: str | None = None
+class BibleGenerateRequest(GenerateRequest):
+    """生成故事圣经：可以**顺手**带上国家限定与额外要求（UI 一次请求搞定）。"""
+
+    cast_region: str | None = None
+    #: 别名，和项目字段 `bible_notes` 对齐；两个都传时以 notes 为准
+    bible_notes: str | None = None
+    notes: str | None = None
 
 
 class ReferenceImageRequest(BaseModel):
@@ -456,7 +468,24 @@ async def delete_project(project_id: str):
 
 
 @app.post("/api/projects/{project_id}/bible/generate")
-async def generate_bible(project_id: str, req: GenerateRequest | None = None):
+async def generate_bible(project_id: str, req: BibleGenerateRequest | None = None):
+    """生成故事圣经。
+
+    可以带上「国家/地区限定」和「额外要求」：会先**落进项目**（重新生成时仍然生效），
+    再写进提示词，最后把国家写进圣经的 `cast_region` —— 下游定妆照/视频以它为准，
+    不再依赖按名字猜。
+    """
+    if req is not None:
+        patch = {
+            key: value
+            for key, value in (
+                ("cast_region", req.cast_region),
+                ("bible_notes", req.bible_notes if req.bible_notes is not None else req.notes),
+            )
+            if value is not None
+        }
+        if patch:
+            await pipeline.update_project(project_id, patch)
     bible = await pipeline.generate_bible(project_id, model=_model_of(project_id, req))
     return bible.model_dump()
 

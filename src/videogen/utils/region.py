@@ -39,6 +39,7 @@ __all__ = [
     "normalize_region",
     "project_region",
     "region_anchor",
+    "region_conflict",
     "region_mentioned",
     "resolve_region",
 ]
@@ -339,6 +340,11 @@ def project_region(
     if forced:
         return RegionGuess(forced, 1.0, "config:override")
 
+    # 圣经里声明过的国家（用户在生成 bible 时指定的）比投票硬得多
+    declared = normalize_region(getattr(bible, "cast_region", ""))
+    if declared:
+        return RegionGuess(declared, 1.0, "bible:cast_region")
+
     characters = list(getattr(bible, "characters", []) or [])
     if not characters:
         fallback = normalize_region(default) or "cn"
@@ -405,6 +411,14 @@ def resolve_region(
         getattr(character, "name", ""),
         text=f"{getattr(character, 'description', '')} {getattr(character, 'visual_prompt', '')}",
     )
+    declared = normalize_region(getattr(bible, "cast_region", ""))
+    if declared:
+        # 声明过就照声明来（用户比启发式可靠）；但名字明显指向别的国家时要**报出来** ——
+        # 这多半是圣经把名字起错了，让用户能看见并去改名/改 region
+        note = ""
+        if own.confident and own.region != declared:
+            note = f"(名字像{describe_region(own.region)}:{own.source})"
+        return RegionGuess(declared, 1.0, f"bible:cast_region{note}")
     if own.confident:
         return own
     project = project_region(bible, default=default)
@@ -412,6 +426,25 @@ def resolve_region(
         region=project.region,
         confidence=project.confidence,
         source=f"follow-cast:{own.source}->{project.region}",
+    )
+
+
+def region_conflict(character, declared: str) -> str:
+    """名字指向的国家和「声明的国家」不一致时返回一句可执行的提示，否则空串。"""
+    target = normalize_region(declared)
+    if not target:
+        return ""
+    if normalize_region(getattr(character, "region", "")):
+        return ""  # 已经单独指定过（例如剧情里的外国人），不算冲突
+    own = guess_region(
+        getattr(character, "name", ""),
+        text=f"{getattr(character, 'description', '')} {getattr(character, 'visual_prompt', '')}",
+    )
+    if not own.confident or own.region == target or own.region == "other":
+        return ""
+    return (
+        f"名字「{getattr(character, 'name', '')}」看起来是{describe_region(own.region)}名，"
+        f"但整片按{describe_region(target)}来 —— 建议改名字或单独给这个角色填 region"
     )
 
 
