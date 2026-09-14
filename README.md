@@ -23,7 +23,7 @@
 | BGM 曲库 | ✅ | 扫 `BGM_DIR` + `bgm.json` 元数据，按镜头情绪自动选曲 |
 | **按分镜现写配乐** | ✅ | `BGM_ENGINE=generate`：本机作曲（段落对齐镜头、动作爆发给重音、说话处让路）+ 卷积混响 + 响度归一，$0 不联网；也能接外部音乐模型（`BGM_ENGINE=cli`） |
 | 人声闪避 | ✅ | 说话时用 sidechain 自动压低音乐，说完抬回（`BGM_DUCK`，可逐次覆盖） |
-| **响度对齐** | ✅ | 逐条配音归一（实测极差 7.9dB → 0.0dB，有 ±6dB 上限保表演）+ 成片整体 `loudnorm` 到 `COMPOSE_TARGET_LUFS`（默认 -16 LUFS）|
+| **响度对齐** | ✅ | 逐条配音归一（实测极差 15.10dB → 2.50dB，有 ±10dB 上限保表演）+ 成片整体 `loudnorm` 到 `COMPOSE_TARGET_LUFS`（默认 -16 LUFS）|
 | FFmpeg 合成 + 字幕 | ✅ | 分段渲染 → concat → BGM 混音（含闪避）→ 响度归一 → 字幕（soft 内嵌 / burn 烧录 / none 只导 srt） |
 | 后台任务队列 | ✅ | 提交即返回 job id，进度查询 / 取消 / 单项目互斥 / 重启恢复 |
 | 手工编辑 / 分阶段确认门控 | ✅ | Web UI + REST |
@@ -93,6 +93,19 @@ python -c "import asyncio,videogen.utils.ffmpeg as f; \
 「状态机 / 任务锁 / 滤镜链 / 响度归一 / 配乐与闪避接线」是通的，**不**证明画面与配音的质量
 （那要真模型，按秒计费）。顺带验两件容易悄悄回归的事：写接口不带 `X-API-Token` 必须被拒（401）、
 坏掉的 `meta.json` 会被隔离成 `.json.bad` 且不影响 `GET /api/projects`。结果落在 `.e2e/report.json`。
+
+**要真画面/真配音**的话用同一个目录下的 `real_shot_e2e.py`：把源项目复制成新项目、
+只删掉指定的 N 个镜头，让流水线只补这几条 —— 花费只跟 N 有关（3 镜 ≈ $1.95），
+不带 `--yes` 就只播种 + 打印 preflight 实测报价，源项目一个字节都不动：
+
+```bash
+# 先看账（$0）
+.venv/bin/python tools/e2e/real_shot_e2e.py --shots scene_1_shot_1,scene_2_shot_2,scene_3_shot_2
+# 确认后真跑（真钱）
+.venv/bin/python tools/e2e/real_shot_e2e.py --shots <同上> --yes --force
+# 只重量一遍已有成片（$0）：响度极差 / 闪避深度
+.venv/bin/python tools/e2e/real_shot_e2e.py --verify-only
+```
 
 ## 流水线与状态机
 
@@ -332,6 +345,12 @@ ffmpeg 会报错的滤镜图。切换这个开关会让分段重新渲染。
 
 （剩下的 2.5dB 是那条 -32.1 LUFS 的张姐台词 —— 它需要 +12.1dB，被 ±10dB 的上限挡住了。
 想完全拉平就把 `AUDIO_NORMALIZE_MAX_DB` 调到 13。）
+
+**换一批新录的配音再量一次**（2026-09-14，`tools/e2e/real_shot_e2e.py` 真跑 3 个镜头：
+重生成片段 → 重新 TTS → 重新合成，详见 `FIXES.md`）：15 条分段里 **14 条落在 -19.7 ~ -20.1 LUFS**，
+唯一超出的仍是张姐的音色（`scene_2_shot_2` = **-23.0 LUFS**，增益已经被顶到 +10.0 上限）——
+也就是说**现在限制极差的不是算法，是那个上限**：其余 14 条的极差只有 **0.4dB**（-19.7 ~ -20.1）。
+这解释了为什么上面建议「想完全拉平就把上限调到 13」。
 
 成片整体：
 
