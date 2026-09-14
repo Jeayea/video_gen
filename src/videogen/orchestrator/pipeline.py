@@ -38,6 +38,7 @@ from videogen.services import (
     compose_service,
     consistency_service,
     cost_service,
+    music_service,
     preflight_service,
     script_service,
     storyboard_service,
@@ -1475,10 +1476,15 @@ class Pipeline:
                 )
                 for clip in unrecorded:
                     clip.cost_recorded = True
-            if manifest.ready_clips:
+            if manifest.ready_clips and settings.bgm_engine_mode == "library":
+                # 曲库选曲很便宜（只读元数据），配音阶段先选好，UI 能提前看到用哪首。
+                # 生成类引擎（generate / cli / auto）留到**合成**阶段：那时才有画面运动实测，
+                # 而且「重新合成」就能换配乐，不用重跑配音（配音要花钱，配乐不用）。
                 manifest.bgm = audio_service.pick_bgm(
                     storyboard, self._bgm(), preferred_id=settings.bgm_id
                 )
+            elif settings.bgm_engine_mode != "library":
+                manifest.bgm = None
             audio_service.align_storyboard(
                 storyboard,
                 manifest,
@@ -1675,11 +1681,22 @@ class Pipeline:
                     "bgm_id",
                     "bgm_gain_db",
                     "bgm_enabled",
+                    "bgm_engine",
+                    "bgm_mood",
+                    "bgm_duck",
+                    "bgm_force",
+                    "music_note",
                 }
                 clean = {k: v for k, v in overrides.items() if k in allowed and v is not None}
                 if clean:
                     settings = settings.model_copy(update=clean)
                     logger.info("合成参数覆盖：%s", ", ".join(sorted(clean)))
+
+            # 配乐在**合成阶段**定：重新合成就能换配乐（本地计算，不用重跑配音）
+            music_note = ""
+            audio, music_note = await self._attach_music(
+                project_id, project, storyboard, video, audio, settings, overrides or {}
+            )
 
             def on_progress(done: int, total: int, message: str) -> None:
                 ctx.set_progress(done=done, total=total, message=message)
@@ -1707,6 +1724,8 @@ class Pipeline:
                 self._settle_compose_status(project, audio, video)
                 raise
 
+            if music_note:
+                report.warnings.append(music_note)
             self.store.save_compose_report(project_id, report)
             cost_service.record(
                 self.store,
@@ -1722,6 +1741,62 @@ class Pipeline:
                 total=len(report.segments),
                 message=f"成片完成：{report.duration_sec:.1f}s",
             )
+
+    async def _attach_music(
+        self,
+        project_id: str,
+        project: Project,
+        storyboard: Storyboard,
+        video: VideoManifest | None,
+        audio: AudioManifest | None,
+        settings,
+        overrides: dict,
+    ) -> tuple[AudioManifest | None, str]:
+        """给这次合成定下配乐（曲库 / 本机现写 / 外部模型），返回（音频清单, 说明）。
+
+        配乐永远是**可选**的：失败只记一条 warning，绝不因为没音乐就不出片。
+        定下来的曲目会写回配音清单，UI 因此能看到/试听这次用的音乐。
+        """
+        request = music_service.MusicRequest(
+            engine=str(overrides.get("bgm_engine") or ""),
+            mood=str(overrides.get("bgm_mood") or ""),
+            note=str(overrides.get("music_note") or ""),
+            gain_db=overrides.get("bgm_gain_db"),
+            duck=overrides.get("bgm_duck"),
+            force=bool(overrides.get("bgm_force")),
+        )
+        outcome = await music_service.resolve_music(
+            project=project,
+            storyboard=storyboard,
+            video_manifest=video,
+            audio_manifest=audio,
+            output_dir=self.store.output_dir(project_id),
+            frames_dir=self.store.frames_dir(project_id),
+            settings=settings,
+            library=self._bgm(),
+            request=request,
+        )
+        if not outcome.ok:
+            note = outcome.note or "配乐不可用"
+            logger.warning("配乐跳过：%s", note)
+            return audio, f"配乐跳过：{note}"
+        if outcome.track is None:
+            # 结果里没有曲目（关掉配乐 / 曲库为空）→ **必须清掉**清单里上一次的曲目，
+            # 否则「这次不要 BGM」会偷偷继续用上一首（真实事故：A/B 的「无 BGM」版本里还有音乐）
+            manifest = (audio or AudioManifest()).model_copy(update={"bgm": None})
+            try:
+                self.store.save_audio_manifest(project_id, manifest)
+            except OSError:
+                logger.debug("清空配乐写入配音清单失败", exc_info=True)
+            # 「关掉配乐」不用在报告里记一条告警（那是配置，不是问题）
+            return manifest, "" if outcome.engine == "none" else outcome.note
+        manifest = audio or AudioManifest()
+        manifest = manifest.model_copy(update={"bgm": outcome.track})
+        try:
+            self.store.save_audio_manifest(project_id, manifest)
+        except OSError:
+            logger.debug("配乐写入配音清单失败", exc_info=True)
+        return manifest, outcome.note
 
     def _settle_compose_status(
         self, project: Project, audio: AudioManifest | None, video: VideoManifest | None

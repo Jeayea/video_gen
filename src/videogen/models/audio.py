@@ -17,7 +17,11 @@ class AudioKind(str, Enum):
 
 
 class BgmTrack(BaseModel):
-    """选中的背景音乐（来自本地曲库）。"""
+    """选中的背景音乐（本地曲库 / 本地作曲 / 外部模型）。
+
+    `engine` 要区分来源：合成本身不关心音乐怎么来的，但**报告和 UI 必须说清楚** ——
+    曲库是现成的曲子、`generate` 是本机按分镜现写的、`cli` 是外部音乐模型生成的。
+    """
 
     id: str
     title: str = ""
@@ -28,6 +32,16 @@ class BgmTrack(BaseModel):
     gain_db: float | None = None
     license: str = ""
     score: float = 0.0
+    #: library = 本地曲库 / generate = 本地作曲（跟着分镜走）/ cli = 外部音乐模型
+    engine: str = "library"
+    #: 生成曲的配乐谱（相对项目目录；曲库曲目为空）
+    plan_path: str = ""
+    #: 淡出时长（留空 = 用全局 BGM_FADE_SEC）
+    fade_sec: float | None = None
+    #: 人声闪避开关（留空 = 用全局 BGM_DUCK）
+    duck: bool | None = None
+    #: 是否需要循环铺满整片。生成的曲子本身就是整片长度，自然收尾更好听
+    loop: bool = True
 
 
 class AudioClip(BaseModel):

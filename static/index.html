@@ -131,6 +131,14 @@ body {
 .status-failed { background: #7f1d1d; color: #fca5a5; }
 .status-done { background: #14532d; color: #4ade80; }
 
+.music-block {
+  margin-top: 12px; padding-top: 12px; border-top: 1px dashed var(--border);
+}
+.music-sections { width: 100%; border-collapse: collapse; font-size: 12px; }
+.music-sections th { color: var(--text2); font-weight: 500; text-align: left; padding: 2px 6px; }
+.music-sections td { padding: 2px 6px; border-top: 1px solid var(--border); color: var(--text2); }
+.music-sections td.label { color: var(--text); }
+.music-sections .accents { font-size: 11px; color: var(--text2); line-height: 1.6; }
 .tag-mini {
   font-size: 11px; padding: 1px 6px; border-radius: 4px;
   background: var(--bg); border: 1px solid var(--border); color: var(--text2);
@@ -436,6 +444,7 @@ let currentProject = null;
 let currentVideo = null;
 let currentAudio = null;
 let currentCompose = null;
+let currentMusic = null;
 let currentCost = null;
 let currentBatch = null;
 let serverHealth = null;
@@ -594,6 +603,7 @@ async function renderProject(id) {
   currentVideo = await safeGet(`/api/projects/${id}/video/status`);
   currentAudio = await safeGet(`/api/projects/${id}/audio/status`);
   currentCompose = await safeGet(`/api/projects/${id}/compose/status`);
+  currentMusic = await safeGet(`/api/projects/${id}/music`);
   currentCost = await safeGet(`/api/projects/${id}/cost`);
   await loadPreflight('all');
   if (!modelInfo) {
@@ -780,6 +790,14 @@ async function renderProject(id) {
       <div id="compose-body">
         <span style="color:var(--text2);font-size:12px">尚未合成</span>
       </div>
+      <div class="music-block">
+        <div style="font-size:13px;margin-bottom:6px">🎵 背景音乐 <span id="music-tags"></span></div>
+        <div id="music-body">
+          <span style="color:var(--text2);font-size:12px">尚未配乐</span>
+        </div>
+        <div id="music-options" class="edit-form"></div>
+        <div class="panel-actions" id="music-actions"></div>
+      </div>
       <div class="progress-wrap" id="compose-progress" style="display:none">
         <div class="progress-bar"><div class="progress-fill" id="compose-progress-fill"></div></div>
         <div class="progress-text" id="compose-progress-text"></div>
@@ -855,6 +873,7 @@ async function renderProject(id) {
   renderVideo();
   renderAudio();
   renderCompose();
+  renderMusic();
   renderCost();
   renderModelSelect();
   renderBatch();
@@ -1915,11 +1934,8 @@ function renderCompose() {
       </select>
     </label>
     <div class="row">
-      <label>BGM 曲目 id（留空=按情绪自动选）
+      <label>曲库曲目 id（只对「曲库」引擎有意义，留空=按情绪自动选）
         <input id="compose-bgm-id" placeholder="tense_01" />
-      </label>
-      <label>BGM 音量 dB
-        <input id="compose-bgm-gain" type="number" min="-40" max="0" step="1" value="-20" />
       </label>
     </div>
     <div class="row">
@@ -1993,6 +2009,192 @@ async function refreshComposePanel() {
   if (!active && job && job.id === previousJobId) await refresh();
 }
 
+
+// ── 背景音乐 ────────────────────────────────────────────────────────
+
+const MUSIC_ENGINE_LABEL = {
+  library: '曲库', generate: '本机现写', cli: '外部模型', auto: '自动', none: '关闭',
+};
+const MUSIC_MOODS = [
+  ['', '自动（按分镜情绪）'],
+  ['tense', '紧张 / 悬疑'], ['sad', '悲伤 / 压抑'], ['warm', '温暖 / 日常'],
+  ['hopeful', '希望 / 坚定'], ['action', '激烈 / 动作'], ['mystery', '神秘 / 悬念'],
+  ['playful', '轻快 / 喜剧'], ['neutral', '中性 / 铺底'],
+];
+const SECTION_LABEL = {
+  intro: '开场', bed: '铺陈', build: '推进', climax: '高潮', resolve: '收束',
+};
+const LAYER_LABEL = {
+  pad: '铺底', piano: '钢琴', bass: '低音', lead: '旋律',
+  perc: '鼓组', strings: '弦乐', bells: '点音',
+};
+
+function mmss(sec) {
+  const total = Math.max(0, Math.round(Number(sec) || 0));
+  return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, '0')}`;
+}
+
+function renderMusic() {
+  const body = $('music-body'), options = $('music-options'), actions = $('music-actions');
+  const tags = $('music-tags');
+  if (!body || !options || !actions) return;
+
+  const m = currentMusic || {};
+  const track = m.track || null;
+  const plan = m.plan || null;
+  const sections = m.sections || [];
+  const notes = m.notes || [];
+  const accents = m.accents || [];
+  const engines = (modelInfo && modelInfo.music_engine_problems) || {};
+
+  tags.innerHTML =
+    `<span class="tag-mini ${track ? 'ok' : ''}">${
+      track ? esc(MUSIC_ENGINE_LABEL[track.engine] || track.engine) : '未配乐'}</span>` +
+    (plan ? `<span class="tag-mini">${esc(plan.color_label || plan.color || '')} · ${
+      esc(plan.key_name || '')} · ${plan.bpm}BPM</span>` : '') +
+    (sections.length ? `<span class="tag-mini">${sections.length} 段 / ${accents.length} 重音</span>` : '') +
+    (m.duck ? '<span class="tag-mini ok">人声闪避</span>' : '') +
+    (m.ready === false ? '<span class="tag-mini warn">引擎不可用</span>' : '');
+
+  const engine = track ? (track.engine || 'library') : (m.engine || 'library');
+  const gain = (m.gain_db === null || m.gain_db === undefined) ? -20 : m.gain_db;
+  const duck = m.duck !== false;
+  const mood = (currentProject && currentProject.music_mood) || '';
+  const note = (currentProject && currentProject.music_note) || m.note || '';
+
+  if (!track && !plan) {
+    body.innerHTML = `<div class="hint">还没有配乐。${
+      engine === 'library'
+        ? '曲库模式：把音乐放进 BGM_DIR，或把引擎切成「本机现写」。'
+        : '点「生成配乐」：本机按分镜现写，$0，不联网。'}</div>`;
+  } else {
+    const rows = sections.map(sec => `
+      <tr>
+        <td class="label">${esc(SECTION_LABEL[sec.label] || sec.label)}</td>
+        <td>${mmss(sec.start_sec)}–${mmss(sec.end_sec)}</td>
+        <td>能量 ${sec.energy}</td>
+        <td>${(sec.layers || []).map(x => esc(LAYER_LABEL[x] || x)).join('、') || '—'}</td>
+        <td>${(sec.chords || []).map(esc).join(' → ')}</td>
+        <td>${sec.dialogue ? '有台词（让路）' : ''}</td>
+      </tr>`).join('');
+    const accentText = accents.length
+      ? accents.slice(0, 6).map(a => `${mmss(a.at_sec)} ${esc(a.reason)}`).join('；') +
+        (accents.length > 6 ? `；…共 ${accents.length} 处` : '')
+      : '无';
+    body.innerHTML = `
+      ${m.audio_url ? `<audio controls preload="none" style="width:100%;max-width:420px;margin-bottom:6px"
+             src="${m.audio_url}"></audio>` : ''}
+      <div class="hint">
+        ${track ? `${esc(track.title || track.id)} · ${track.duration_sec || '?'}s · 音量 ${gain}dB ·
+          ${track.loop === false ? '整片长度不循环' : '循环铺满'} · ${esc(track.license || '')}` : ''}
+      </div>
+      <table class="music-sections">
+        <thead><tr><th>段落</th><th>时间</th><th>能量</th><th>配器</th><th>和弦</th><th></th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+      <div class="accents" style="margin-top:6px">重音（对齐镜头切换与画面动作）：${accentText}</div>
+      ${notes.length ? `<div class="hint" style="margin-top:6px">${notes.map(esc).join('<br>')}</div>` : ''}
+    `;
+  }
+
+  options.innerHTML = `
+    <div class="row">
+      <label>配乐引擎
+        <select id="music-engine">
+          ${['library', 'generate', 'cli', 'auto', 'none'].map(value => {
+            const problem = engines[value];
+            const suffix = problem ? `（不可用：${problem}）` : '';
+            return `<option value="${value}"${problem ? ' disabled' : ''}>${
+              MUSIC_ENGINE_LABEL[value] || value}${esc(suffix)}</option>`;
+          }).join('')}
+        </select>
+      </label>
+      <label>情绪色调
+        <select id="music-mood">
+          ${MUSIC_MOODS.map(([value, label]) =>
+            `<option value="${value}">${esc(label)}</option>`).join('')}
+        </select>
+      </label>
+    </div>
+    <label>配乐要求（自由文本，会参与情绪判断）
+      <input id="music-note" placeholder="压抑一点，结尾要有希望，别太吵" />
+    </label>
+    <div class="row">
+      <label>音乐音量 dB
+        <input id="music-gain" type="number" min="-40" max="0" step="1" value="${gain}" />
+      </label>
+      <label class="check" style="align-self:end">
+        <input type="checkbox" id="music-duck"${duck ? ' checked' : ''} /> 人声闪避（说话时压低音乐）
+      </label>
+    </div>
+    <div class="hint">
+      生成的是<b>干燥音轨 + 卷积混响 + 响度归一</b>：段落边界对齐镜头切换、
+      画面动作最猛处给重音、有人说话的段落去鼓并让旋律避开。
+      改完参数点「重新合成」即可听到，不用重跑配音（配乐不花钱）。
+    </div>
+  `;
+  const engineSel = $('music-engine');
+  if (engineSel) engineSel.value = engine;
+  const moodSel = $('music-mood');
+  if (moodSel) moodSel.value = mood;
+  const noteInput = $('music-note');
+  if (noteInput) noteInput.value = note;
+
+  const status = currentProject ? currentProject.status : '';
+  const canCompose = ['audio_ready', 'done'].includes(status);
+  const buttons = [];
+  buttons.push(`<button class="btn btn-sm" onclick="doGenerateMusic()"${
+    canCompose || (currentStoryboard && currentStoryboard.shots) ? '' : ' disabled'}>${
+    track || plan ? '重新生成配乐' : '生成配乐'}</button>`);
+  if (plan && m.audio_url) {
+    buttons.push(`<a class="btn btn-sm btn-outline" href="${m.audio_url}" download>下载音乐 WAV</a>`);
+  }
+  if (plan) {
+    buttons.push('<button class="btn btn-sm btn-outline" onclick="doShowMusicPrompt()">看外部模型提示词</button>');
+  }
+  actions.innerHTML = buttons.join('');
+}
+
+async function doGenerateMusic() {
+  const engine = $('music-engine') ? $('music-engine').value : 'generate';
+  const mood = $('music-mood') ? $('music-mood').value : '';
+  const note = $('music-note') ? $('music-note').value.trim() : '';
+  const gainRaw = $('music-gain') ? $('music-gain').value : '';
+  const duck = $('music-duck') ? $('music-duck').checked : true;
+  const body = { engine, mood, note, duck, force: true };
+  if (gainRaw !== '') body.gain_db = Number(gainRaw);
+  await withBusy('生成配乐（本机合成，$0）...', async () => {
+    const result = await api(`/api/projects/${currentProjectId}/music`, {
+      method: 'POST', body: JSON.stringify(body),
+    });
+    // 选择同时写进项目，重跑/重新合成时不会丢
+    await api(`/api/projects/${currentProjectId}`, {
+      method: 'PUT',
+      body: JSON.stringify({
+        music_engine: engine, music_mood: mood, music_note: note,
+        music_gain_db: gainRaw === '' ? null : Number(gainRaw), music_duck: duck,
+      }),
+    });
+    if (result && result.note) $('global-status').textContent = result.note;
+  });
+}
+
+async function doShowMusicPrompt() {
+  const data = await safeGet(`/api/projects/${currentProjectId}/music/prompt`);
+  if (!data || !data.prompt) { alert('还没有配乐谱'); return; }
+  const box = $('music-body');
+  const old = $('music-prompt');
+  if (old) { old.remove(); return; }
+  const node = document.createElement('textarea');
+  node.id = 'music-prompt';
+  node.rows = 4;
+  node.style.marginTop = '6px';
+  node.value = data.prompt;
+  box.appendChild(node);
+  node.select();
+  try { document.execCommand('copy'); } catch (e) { /* 复制失败就让用户自己选 */ }
+}
+
 function doCompose() {
   const mode = $('compose-subtitle-mode') ? $('compose-subtitle-mode').value : 'soft';
   const bgmId = $('compose-bgm-id') ? $('compose-bgm-id').value.trim() : '';
@@ -2003,6 +2205,12 @@ function doCompose() {
   if (bgmId) body.bgm_id = bgmId;
   if (gainRaw !== '') body.bgm_gain_db = Number(gainRaw);
   if (ambientGainRaw !== '') body.ambient_gain_db = Number(ambientGainRaw);
+  // 配乐参数一起提交：合成阶段会按引擎决定是用曲库、现写还是外部模型
+  if ($('music-engine')) body.bgm_engine = $('music-engine').value;
+  if ($('music-mood')) body.bgm_mood = $('music-mood').value;
+  if ($('music-note')) body.music_note = $('music-note').value.trim();
+  if ($('music-gain') && $('music-gain').value !== '') body.bgm_gain_db = Number($('music-gain').value);
+  if ($('music-duck')) body.bgm_duck = $('music-duck').checked;
   stopComposePolling();
   withBusy('提交合成任务...', () =>
     api(`/api/projects/${currentProjectId}/compose`, {

@@ -949,3 +949,207 @@ def test_ui_exposes_bible_constraint_controls(client):
     assert 'id="bible-notes"' in html
     assert "renderBibleConstraint" in html
     assert "cast_region: region" in html
+
+
+# ── 背景音乐（配乐引擎 / 配乐谱 / 试听）────────────────────────
+
+
+def shrink_storyboard(client: TestClient, project_id: str, shots: int = 2, duration: int = 2):
+    """把生成的 10 镜头分镜缩成两三个短镜头，让配乐生成用例跑得快。"""
+    store = client.videogen_store
+    storyboard = store.load_storyboard(project_id)
+    assert storyboard and storyboard.shots
+    for shot in storyboard.shots[:shots]:
+        shot.duration_sec = duration
+    storyboard.shots = storyboard.shots[:shots]
+    store.save_storyboard(project_id, storyboard)
+    return storyboard
+
+
+def test_models_reports_music_engines(client):
+    data = client.get("/api/models").json()
+    assert data["bgm_engine"] in {"library", "generate", "cli", "auto", "none"}
+    assert "generate" in data["music_moods"] or "tense" in data["music_moods"]
+    assert set(data["music_engine_problems"]) == {"library", "generate", "cli", "auto"}
+    # 曲库模式永远不会「不可用」（曲库为空只是没音乐，不是错误）
+    assert data["music_engine_problems"]["library"] == ""
+
+
+def test_music_empty_state(client):
+    pid = create_project(client)["id"]
+    data = client.get(f"/api/projects/{pid}/music").json()
+    assert data["track"] is None
+    assert data["plan"] is None
+    assert data["audio_available"] is False
+    assert data["engine"] in {"library", "generate", "cli", "auto", "none"}
+    assert client.get(f"/api/projects/{pid}/music/audio").status_code == 404
+    assert client.get(f"/api/projects/{pid}/music/prompt").status_code == 404
+
+
+def test_music_generate_writes_plan_and_is_audible(client):
+    pid = prepare_confirmed_storyboard(client)
+    shrink_storyboard(client, pid, shots=2, duration=2)
+
+    resp = client.post(
+        f"/api/projects/{pid}/music",
+        json={"engine": "generate", "mood": "sad", "note": "压抑一点"},
+    )
+    assert resp.status_code == 200, resp.text
+    payload = resp.json()
+    assert payload["ok"] is True
+    assert payload["engine"] == "generate"
+    assert payload["plan"]["color"] == "sad"
+    assert payload["sections"], "配乐谱必须有段落"
+    assert payload["notes"], "必须能说清为什么这样配"
+    assert payload["track"]["engine"] == "generate"
+    assert payload["track"]["loop"] is False
+    assert payload["audio_url"].endswith("/music/audio")
+
+    # 曲目写回了配音清单，合成时会用它
+    state = client.get(f"/api/projects/{pid}/music").json()
+    assert state["track"] is not None
+    assert state["audio_available"] is True
+    assert state["plan"]["duration_sec"] == pytest.approx(4.0)
+    assert state["sections"]
+    assert state["accents"] is not None
+
+    audio = client.get(f"/api/projects/{pid}/music/audio")
+    assert audio.status_code == 200
+    assert audio.content[:4] == b"RIFF"
+    assert len(audio.content) > 40_000
+
+    prompt = client.get(f"/api/projects/{pid}/music/prompt").json()["prompt"]
+    assert "no vocals" in prompt
+    assert "sad" in prompt or "悲伤" in prompt
+
+
+def test_music_generate_reuses_cache_until_forced(client):
+    pid = prepare_confirmed_storyboard(client)
+    shrink_storyboard(client, pid, shots=2, duration=2)
+    first = client.post(f"/api/projects/{pid}/music", json={"engine": "generate"}).json()
+    second = client.post(f"/api/projects/{pid}/music", json={"engine": "generate"}).json()
+    assert first["cached"] is False
+    assert second["cached"] is True
+    third = client.post(
+        f"/api/projects/{pid}/music", json={"engine": "generate", "force": True}
+    ).json()
+    assert third["cached"] is False
+
+
+def test_music_generate_requires_storyboard(client):
+    pid = create_project(client)["id"]
+    resp = client.post(f"/api/projects/{pid}/music", json={"engine": "generate"})
+    assert resp.status_code == 400
+    assert "分镜" in resp.json()["detail"]
+
+
+def test_music_generate_reports_unavailable_engine(client):
+    pid = prepare_confirmed_storyboard(client)
+    shrink_storyboard(client, pid, shots=2, duration=2)
+    # cli 引擎没配命令 → 明确报错，而不是静默出无声片
+    resp = client.post(f"/api/projects/{pid}/music", json={"engine": "cli"})
+    assert resp.status_code == 400
+    assert "BGM_CLI_CMD" in resp.json()["detail"]
+
+
+def test_music_engine_none_disables_music(client):
+    pid = prepare_confirmed_storyboard(client)
+    shrink_storyboard(client, pid, shots=2, duration=2)
+    resp = client.post(f"/api/projects/{pid}/music", json={"engine": "none"})
+    assert resp.status_code == 200
+    assert resp.json()["track"] is None
+    assert client.get(f"/api/projects/{pid}/music").json()["track"] is None
+
+
+def test_project_music_fields_round_trip(client):
+    pid = create_project(client)["id"]
+    resp = client.put(
+        f"/api/projects/{pid}",
+        json={
+            "music_engine": "generate",
+            "music_mood": "hopeful",
+            "music_note": "结尾要有希望",
+            "music_gain_db": -16,
+            "music_duck": False,
+        },
+    )
+    assert resp.status_code == 200
+    project = client.get(f"/api/projects/{pid}").json()
+    assert project["music_engine"] == "generate"
+    assert project["music_mood"] == "hopeful"
+    assert project["music_note"] == "结尾要有希望"
+    assert project["music_gain_db"] == -16
+    assert project["music_duck"] is False
+
+    state = client.get(f"/api/projects/{pid}/music").json()
+    assert state["engine"] == "generate"
+    assert state["note"] == "结尾要有希望"
+    assert state["gain_db"] == -16
+    assert state["duck"] is False
+
+
+def test_compose_endpoint_maps_music_overrides(media_client, monkeypatch):
+    """请求体的配乐字段必须真的落到 overrides 上（漏一个就会出现
+    「点了不要 BGM，却还是配了乐」这种静默错误）。"""
+    captured: dict = {}
+
+    async def fake_start(project_id, overrides=None):
+        captured["overrides"] = overrides or {}
+
+        class _Job:
+            def to_public(self):
+                return {"id": "fake", "status": "queued", "is_active": True}
+
+        return _Job()
+
+    monkeypatch.setattr(media_client.videogen_pipeline, "start_compose", fake_start)
+    resp = media_client.post(
+        "/api/projects/whatever/compose",
+        json={
+            "subtitle_mode": "soft",
+            "bgm_enabled": False,
+            "bgm_engine": "generate",
+            "bgm_mood": "sad",
+            "music_note": "安静一点",
+            "bgm_gain_db": -18,
+            "bgm_duck": False,
+            "bgm_force": True,
+        },
+    )
+    assert resp.status_code == 202, resp.text
+    overrides = captured["overrides"]
+    assert overrides["bgm_enabled"] is False
+    assert overrides["bgm_engine"] == "generate"
+    assert overrides["bgm_mood"] == "sad"
+    assert overrides["music_note"] == "安静一点"
+    assert overrides["bgm_gain_db"] == -18
+    assert overrides["bgm_duck"] is False
+    assert overrides["bgm_force"] is True
+
+
+def test_compose_request_accepts_music_overrides():
+    from pydantic import ValidationError
+
+    req = main.ComposeRequest(
+        bgm_engine="generate",
+        bgm_mood="sad",
+        music_note="安静",
+        bgm_duck=False,
+        bgm_force=True,
+    )
+    assert req.bgm_engine == "generate"
+    assert req.bgm_duck is False
+    with pytest.raises(ValidationError):
+        main.ComposeRequest(bgm_engine="乱写的引擎")
+
+
+def test_ui_exposes_music_controls(client):
+    html = client.get("/static/index.html").text
+    assert 'id="music-engine"' in html
+    assert 'id="music-mood"' in html
+    assert 'id="music-note"' in html
+    assert 'id="music-duck"' in html
+    assert "doGenerateMusic" in html
+    assert "renderMusic" in html
+    assert "music-sections" in html
+    assert "bgm_engine" in html

@@ -80,6 +80,16 @@ class Project(BaseModel):
     #: 生成圣经时的**额外要求**（人物设定 / 世界观 / 年代 / 语言 / 禁忌…），原文进提示词。
     #: 例：「女主要 30 岁左右，全员日本人，不要玄幻，台词口语化」
     bible_notes: str = ""
+    #: 配乐引擎（library/generate/cli/auto/none；空 = 用 .env 的 BGM_ENGINE）
+    music_engine: str = ""
+    #: 情绪色调覆盖（tense/sad/warm/hopeful/action/mystery/playful/neutral 或中文关键词）
+    music_mood: str = ""
+    #: 用户的配乐要求（自由文本）。例：「压抑一点，结尾要有希望，别太吵」
+    music_note: str = ""
+    #: 音乐音量（dB，留空 = 用全局 BGM_GAIN_DB）
+    music_gain_db: float | None = None
+    #: 人声闪避（说话时压低音乐；留空 = 用全局 BGM_DUCK）
+    music_duck: bool | None = None
 
     @field_validator("cast_region", mode="before")
     @classmethod

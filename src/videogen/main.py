@@ -12,10 +12,14 @@ from pydantic import BaseModel, Field
 
 from videogen import __version__
 from videogen.config import get_settings
+from videogen.models.audio import AudioManifest
 from videogen.models.bible import Character, StoryBible
+from videogen.models.music import MusicPlan
+from videogen.models.music import MusicRequest as MusicGenerateRequest
 from videogen.models.project import AspectRatio, InputMode, Project
 from videogen.orchestrator.batch import STOP_AFTER_STAGES, BatchManager
 from videogen.orchestrator.pipeline import Pipeline, PipelineError, PipelineNotFound
+from videogen.providers import bgm as bgm_providers
 from videogen.providers import video as video_providers
 from videogen.providers.image.base import ImageProviderError
 from videogen.providers.llm.base import LLMError
@@ -24,11 +28,13 @@ from videogen.providers.video.base import VideoProviderError
 from videogen.services import (
     character_image_service,
     lipsync_service,
+    music_service,
     subtitle_service,
     voice_catalog,
 )
 from videogen.services.character_image_service import CharacterImageError
 from videogen.services.cost_service import BudgetExceeded, PriceTable
+from videogen.utils import music as music_utils
 from videogen.utils.ffmpeg import (
     ffmpeg_available,
     ffmpeg_capabilities,
@@ -190,6 +196,15 @@ class UpdateProjectRequest(BaseModel):
     cast_region: str | None = None
     #: 生成圣经时的额外要求（人物设定 / 世界观 / 年代 / 语言…）
     bible_notes: str | None = None
+    #: 配乐引擎（library/generate/cli/auto/none；空字符串 = 恢复默认）
+    music_engine: str | None = None
+    #: 配乐情绪色调覆盖（tense/sad/… 或中文关键词）
+    music_mood: str | None = None
+    #: 用户的配乐要求（自由文本）
+    music_note: str | None = None
+    #: 音乐音量（dB）与人声闪避
+    music_gain_db: float | None = Field(default=None, ge=-60, le=0)
+    music_duck: bool | None = None
 
 
 
@@ -277,6 +292,17 @@ class ComposeRequest(BaseModel):
     subtitle_mode: str | None = Field(default=None, pattern="^(soft|burn|none)$")
     bgm_id: str | None = None
     bgm_gain_db: float | None = Field(default=None, ge=-60, le=0)
+    #: 本次用哪个配乐引擎（library/generate/cli/auto/none）；不改全局配置
+    bgm_engine: str | None = Field(default=None, pattern="^(library|generate|cli|auto|none)$")
+    #: false = 本次不配乐（连上一次生成的曲目也不混）
+    bgm_enabled: bool | None = None
+    #: 情绪色调覆盖（tense/sad/… 或中文关键词）
+    bgm_mood: str | None = None
+    #: 配乐要求（自由文本，参与情绪判断）
+    music_note: str | None = None
+    #: 人声闪避开关与「忽略缓存重新生成」
+    bgm_duck: bool | None = None
+    bgm_force: bool | None = None
     crf: int | None = Field(default=None, ge=0, le=51)
     subtitle_font_scale: float | None = Field(default=None, gt=0, le=0.2)
     #: 视频模型自带音轨：off = 丢弃；under = 压低垫在人声下面
@@ -327,6 +353,19 @@ async def list_models():
         "lipsync_ready": settings.lipsync_enabled
         and not lipsync_service.engine_problem(settings),
         "lipsync_problem": lipsync_service.engine_problem(settings),
+        # 配乐引擎：曲库 / 本机现写 / 外部模型；不可用时给出原因
+        "bgm_engine": settings.bgm_engine_mode,
+        "bgm_enabled": settings.bgm_enabled,
+        "bgm_ready": music_service.engine_problem(settings) == "",
+        "bgm_problem": music_service.engine_problem(settings),
+        "bgm_gain_db": settings.bgm_gain_db,
+        "bgm_duck": settings.bgm_duck,
+        "bgm_library_dir": str(settings.bgm_path),
+        "music_moods": sorted(music_utils.COLORS),
+        "music_engine_problems": {
+            mode: music_service.engine_problem(settings, mode)
+            for mode in ("library", "generate", "cli", "auto")
+        },
     }
 
 
@@ -828,6 +867,18 @@ async def compose_project(project_id: str, req: ComposeRequest | None = None):
             overrides["compose_ambient_mode"] = req.ambient_mode
         if req.ambient_gain_db is not None:
             overrides["compose_ambient_gain_db"] = req.ambient_gain_db
+        if req.bgm_enabled is not None:
+            overrides["bgm_enabled"] = req.bgm_enabled
+        if req.bgm_engine is not None:
+            overrides["bgm_engine"] = req.bgm_engine
+        if req.bgm_mood is not None:
+            overrides["bgm_mood"] = req.bgm_mood
+        if req.music_note is not None:
+            overrides["music_note"] = req.music_note
+        if req.bgm_duck is not None:
+            overrides["bgm_duck"] = req.bgm_duck
+        if req.bgm_force is not None:
+            overrides["bgm_force"] = req.bgm_force
     job = await pipeline.start_compose(project_id, overrides=overrides)
     return {"job": job.to_public()}
 
@@ -841,6 +892,149 @@ async def compose_status(project_id: str):
 async def cancel_compose(project_id: str):
     cancelled = await pipeline.cancel_compose(project_id)
     return {"cancelled": cancelled}
+
+
+# ── 背景音乐 ────────────────────────────────────────────────
+
+
+def _music_plan(project_id: str) -> MusicPlan | None:
+    """读回配乐谱（`output/music/music_plan.json`）。"""
+    path = store.output_dir(project_id) / "music" / "music_plan.json"
+    if not path.is_file():
+        return None
+    try:
+        return MusicPlan.model_validate_json(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def _music_gain(project: Project, track) -> float:
+    """音乐音量：曲目自带 > 项目设置 > 全局设置。"""
+    if track is not None and track.gain_db is not None:
+        return float(track.gain_db)
+    if project.music_gain_db is not None:
+        return float(project.music_gain_db)
+    return float(settings.bgm_gain_db)
+
+
+@app.get("/api/projects/{project_id}/music")
+async def get_music(project_id: str):
+    """当前配乐：用哪首、什么谱（段落/调式/重音）、能不能试听。
+
+    **不生成、不花钱**：只读现有产物。想生成走 `POST`（本机作曲，$0）。
+    """
+    project = pipeline.get_project(project_id)
+    manifest = store.load_audio_manifest(project_id)
+    track = manifest.bgm if manifest else None
+    plan = _music_plan(project_id)
+    audio_exists = bool(track and track.path and Path(track.path).is_file())
+    return {
+        "project_id": project_id,
+        "engine": (
+            (project.music_engine or settings.bgm_engine_mode).strip().lower() or "library"
+        ),
+        "settings_engine": settings.bgm_engine_mode,
+        "enabled": settings.bgm_enabled,
+        "ready": music_service.engine_problem(settings) == "",
+        "problem": music_service.engine_problem(settings),
+        "engine_problems": {
+            mode: music_service.engine_problem(settings, mode)
+            for mode in ("library", "generate", "cli", "auto")
+        },
+        "track": track.model_dump() if track else None,
+        "audio_available": audio_exists,
+        "audio_url": f"/api/projects/{project_id}/music/audio" if audio_exists else "",
+        "plan": plan.model_dump() if plan else None,
+        "plan_summary": plan.summary() if plan else None,
+        "notes": list(plan.notes) if plan else [],
+        "sections": [section.summary() for section in plan.sections] if plan else [],
+        "accents": (
+            [accent.model_dump() for accent in plan.accents[:40]] if plan else []
+        ),
+        "moods": sorted(music_utils.COLORS),
+        "gain_db": _music_gain(project, track),
+        "duck": (
+            track.duck
+            if track and track.duck is not None
+            else (project.music_duck if project.music_duck is not None else settings.bgm_duck)
+        ),
+        "note": project.music_note or settings.music_note,
+    }
+
+
+@app.post("/api/projects/{project_id}/music")
+async def generate_music(project_id: str, req: MusicGenerateRequest | None = None):
+    """生成/重生成配乐（同步返回：本机作曲通常几秒）。
+
+    - `engine=generate`（默认）：本机按分镜现写，$0，不联网
+    - `engine=library`：从 `BGM_DIR` 曲库按情绪挑一首
+    - `engine=cli`：外部音乐模型（可能很久，建议改用「合成」按钮走后台任务）
+
+    产出的曲目会写进配音清单，随后「重新合成」即可听到。
+    """
+    project = pipeline.get_project(project_id)
+    storyboard = store.load_storyboard(project_id)
+    if storyboard is None or not storyboard.shots:
+        raise HTTPException(400, "分镜不存在，先生成分镜")
+    request = req or MusicGenerateRequest(engine="generate")
+    if not request.engine:
+        request = request.model_copy(update={"engine": project.music_engine or "generate"})
+    if not request.note:
+        request = request.model_copy(update={"note": project.music_note})
+    if not request.mood:
+        request = request.model_copy(update={"mood": project.music_mood})
+    outcome = await music_service.resolve_music(
+        project=project,
+        storyboard=storyboard,
+        video_manifest=store.load_video_manifest(project_id),
+        audio_manifest=store.load_audio_manifest(project_id),
+        output_dir=store.output_dir(project_id),
+        frames_dir=store.frames_dir(project_id),
+        settings=settings,
+        library=bgm_providers.get_bgm_library(),
+        request=request,
+    )
+    if not outcome.ok:
+        raise HTTPException(400, outcome.note or "配乐生成失败")
+    if outcome.track is not None:
+        manifest = store.load_audio_manifest(project_id) or AudioManifest()
+        store.save_audio_manifest(
+            project_id, manifest.model_copy(update={"bgm": outcome.track})
+        )
+    payload = outcome.summary()
+    payload["plan"] = outcome.plan.model_dump() if outcome.plan else None
+    payload["sections"] = (
+        [section.summary() for section in outcome.plan.sections] if outcome.plan else []
+    )
+    payload["notes"] = list(outcome.plan.notes) if outcome.plan else []
+    payload["accents"] = (
+        [accent.model_dump() for accent in outcome.plan.accents] if outcome.plan else []
+    )
+    payload["audio_url"] = f"/api/projects/{project_id}/music/audio" if outcome.audio else ""
+    return payload
+
+
+@app.get("/api/projects/{project_id}/music/audio")
+async def get_music_audio(project_id: str):
+    """试听当前配乐（wav/mp3 都直接回文件）。"""
+    manifest = store.load_audio_manifest(project_id)
+    track = manifest.bgm if manifest else None
+    if track is None or not track.path:
+        raise HTTPException(404, "还没有配乐")
+    path = Path(track.path)
+    if not path.is_file():
+        raise HTTPException(404, "配乐文件不存在（可能已被清理）")
+    media = "audio/mpeg" if path.suffix.lower() in {".mp3", ".m4a", ".aac"} else "audio/wav"
+    return FileResponse(path, media_type=media, filename=path.name)
+
+
+@app.get("/api/projects/{project_id}/music/prompt")
+async def get_music_prompt(project_id: str):
+    """生成曲的英文提示词（想拿去 MusicGen / Stable Audio 自己生成时用）。"""
+    plan = _music_plan(project_id)
+    if plan is None:
+        raise HTTPException(404, "还没有配乐谱，先生成配乐")
+    return {"prompt": music_service.music_prompt(plan), "plan": plan.summary()}
 
 
 @app.get("/api/projects/{project_id}/final")

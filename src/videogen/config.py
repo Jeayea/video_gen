@@ -131,13 +131,46 @@ class Settings(BaseSettings):
     #: 运动实测的采样帧率
     audio_motion_fps: int = 6
 
-    # BGM
+    # BGM（背景音乐）
     bgm_enabled: bool = True
+    #: 配乐引擎：
+    #:   library  = 本地曲库按情绪挑一首（现成的曲子，人工准备）
+    #:   generate = **本机按分镜现写一首**（段落对齐镜头、动作爆发给重音、说话处让路，$0）
+    #:   cli      = 外部音乐模型（MusicGen / Stable Audio 等，走 bgm_cli_cmd 模板）
+    #:   auto     = 曲库有歌就用曲库，没有就现场写
+    #:   none     = 不配乐
+    bgm_engine: str = "library"
     bgm_dir: Path = Path("./assets/bgm")
     bgm_gain_db: float = -20.0
     bgm_fade_sec: float = 1.5
     #: 手动指定曲目 id（留空 = 按镜头情绪自动匹配）
     bgm_id: str = ""
+    #: 人声闪避：有人说话时自动把音乐压下去（sidechaincompress），说完再抬回来
+    bgm_duck: bool = True
+    #: 闪避强度（压缩比）、触发门限（dBFS）、起停时间（毫秒）
+    #: 门限别设太高：sidechaincompress 的压降 ≈ (人声高出多少 dB) × (1-1/ratio)，
+    #: 实测 -30dBFS 只能压 4dB（几乎听不出来），-40dBFS 约 9dB
+    bgm_duck_ratio: float = 6.0
+    bgm_duck_threshold_db: float = -40.0
+    bgm_duck_attack_ms: float = 25.0
+    bgm_duck_release_ms: float = 420.0
+
+    # 配乐生成（BGM_ENGINE=generate 时生效）
+    #: 强制情绪色调（tense/sad/warm/hopeful/action/mystery/playful/neutral；留空 = 按分镜情绪）
+    music_mood: str = ""
+    #: 强制速度（0 = 按色调）
+    music_bpm: int = 0
+    #: 用户的配乐要求（自由文本，会参与情绪判断），例：「压抑一点，结尾要有希望」
+    music_note: str = ""
+    #: 混响湿量 0..1（<0 = 按情绪自动：悲伤/神秘更大，动作片更干）
+    music_reverb: float = -1.0
+    #: 让 LLM 给一次配乐建议（段落/色调/能量）。**付费**（约 $0.001），默认关
+    music_llm_brief: bool = False
+    #: 外部音乐模型命令模板，必须含 {out} 与 {prompt}（{duration} 可选）
+    bgm_cli_cmd: str = ""
+    bgm_cli_timeout_sec: float = 1200.0
+    #: 追加给外部音乐模型命令的参数（空格分隔）
+    bgm_cli_args: str = ""
 
     # 合成
     #: soft=mp4 内嵌 mov_text 字幕轨（不需要 libass）| burn=烧进画面 | none=只导出 srt
@@ -263,6 +296,22 @@ class Settings(BaseSettings):
     @property
     def bgm_path(self) -> Path:
         return self.bgm_dir.expanduser().resolve()
+
+    @property
+    def bgm_engine_mode(self) -> str:
+        """配乐引擎，非法值一律当 library（绝不因为配置笔误把配乐静默关掉）。"""
+        engine = (self.bgm_engine or "library").strip().lower()
+        return engine if engine in {"library", "generate", "cli", "auto", "none"} else "library"
+
+    @property
+    def bgm_on(self) -> bool:
+        return self.bgm_enabled and self.bgm_engine_mode != "none"
+
+    @property
+    def music_reverb_ratio(self) -> float:
+        """混响湿量；<0 = 交给色调自己定。"""
+        value = float(self.music_reverb)
+        return -1.0 if value < 0 else min(1.0, max(0.0, value))
 
     @property
     def candidate_models(self) -> list[str]:

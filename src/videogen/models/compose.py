@@ -38,6 +38,12 @@ class ComposeReport(BaseModel):
     segments: list[ComposeSegment] = Field(default_factory=list)
     bgm_id: str = ""
     bgm_path: str = ""
+    #: 配乐来源：library（曲库）/ generate（本机现写）/ cli（外部模型）
+    bgm_engine: str = ""
+    #: 生成曲的配乐谱（相对项目目录）
+    bgm_plan_path: str = ""
+    #: 人声闪避是否真的生效（ffmpeg 缺 sidechaincompress 时会退回固定音量）
+    bgm_duck: bool = False
     #: 环境音（视频模型自带音轨）的处理方式与实际生效值
     ambient_mode: str = "off"
     ambient_mode_effective: str = "off"
@@ -59,6 +65,8 @@ class ComposeReport(BaseModel):
             "subtitles": bool(self.subtitles_path),
             "subtitles_vtt": bool(self.subtitles_vtt_path),
             "bgm": self.bgm_id,
+            "bgm_engine": self.bgm_engine,
+            "bgm_duck": self.bgm_duck,
             "ambient": self.ambient_mode_effective,
             "warnings": len(self.warnings),
         }

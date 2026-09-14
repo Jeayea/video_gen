@@ -536,6 +536,55 @@ async def test_compose_subtitle_modes(store):
     assert store.load_compose_report(project.id).subtitle_mode_effective == SubtitleMode.SOFT
 
 
+# ── 配乐混音滤镜（纯函数）──────────────────────────────
+
+
+def test_bgm_mix_filter_without_duck_uses_fixed_gain():
+    chain = compose_service.bgm_mix_filter(
+        gain_db=-20.0, fade_sec=1.5, duration=10.0, duck=False
+    )
+    assert "volume=-20.0dB" in chain
+    assert "afade=t=in:st=0:d=1.50" in chain
+    assert "afade=t=out:st=8.50:d=1.50" in chain
+    assert "atrim=duration=10.000" in chain
+    assert chain.endswith(
+        "[0:a][music]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[a]"
+    )
+    assert "sidechaincompress" not in chain
+
+
+def test_bgm_mix_filter_with_duck_wires_sidechain():
+    chain = compose_service.bgm_mix_filter(
+        gain_db=-18.0,
+        fade_sec=2.0,
+        duration=20.0,
+        duck=True,
+        duck_ratio=6.0,
+        duck_threshold_db=-30.0,
+        duck_attack_ms=25.0,
+        duck_release_ms=420.0,
+    )
+    # 人声要分成两路：一路进最终混音，一路当 sidechain
+    assert "[0:a]asplit=2[voice][side]" in chain
+    assert "[music][side]sidechaincompress=" in chain
+    assert "ratio=6" in chain
+    assert "attack=25" in chain
+    assert "release=420" in chain
+    assert "makeup=1[ducked]" in chain
+    # -30dBFS → 线性 0.0316
+    assert "threshold=0.03162" in chain
+    assert chain.endswith(
+        "[voice][ducked]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[a]"
+    )
+
+
+def test_bgm_mix_filter_fade_never_exceeds_a_third():
+    """很短的片子别把淡入淡出算成整段。"""
+    chain = compose_service.bgm_mix_filter(gain_db=-20.0, fade_sec=1.5, duration=1.2)
+    assert "afade=t=in:st=0:d=0.40" in chain
+    assert "afade=t=out:st=0.80:d=0.40" in chain
+
+
 @requires_ffmpeg
 @pytest.mark.asyncio
 async def test_compose_with_real_bgm(store, tmp_path):
@@ -556,7 +605,12 @@ async def test_compose_with_real_bgm(store, tmp_path):
     report = store.load_compose_report(project.id)
     assert report.bgm_id == "fake_bgm"
     assert report.bgm_gain_db == get_settings().bgm_gain_db
-    assert not any("BGM" in w for w in report.warnings)
+    assert report.bgm_engine == "library"
+    assert report.bgm_duck is True
+    assert report.warnings  # 至少有一条说明用了什么音乐
+    # 配乐成功时会记一条「用了什么音乐」的说明（不是问题），但绝不能有失败告警
+    assert any("配乐（本地曲库）" in w for w in report.warnings)
+    assert not any("配乐跳过" in w or "BGM 文件不存在" in w for w in report.warnings)
 
 
 @requires_ffmpeg

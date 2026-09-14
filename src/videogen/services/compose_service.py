@@ -228,8 +228,14 @@ async def _finish(
     margin_scale: float = 0.04,
     resolution: tuple[int, int] = (1080, 1920),
     exe: str | None = None,
+    bgm_loop: bool = True,
+    duck: bool = False,
+    duck_ratio: float = 6.0,
+    duck_threshold_db: float = -30.0,
+    duck_attack_ms: float = 25.0,
+    duck_release_ms: float = 420.0,
 ) -> SubtitleMode:
-    """最后一道工序：混 BGM + 挂字幕。返回真正生效的字幕模式。
+    """最后一道工序：混 BGM（可带人声闪避）+ 挂字幕。返回真正生效的字幕模式。
 
     `exe` 只用于**烧字幕**那一趟：主 ffmpeg 没有 libass 时，调用方会传一个
     带 libass 的候选（`resolve_ffmpeg_for({"subtitles"})`）；软字幕/无字幕
@@ -245,6 +251,22 @@ async def _finish(
 
     burn = effective == SubtitleMode.BURN and subtitle_file is not None
     soft = effective == SubtitleMode.SOFT and subtitle_file is not None
+    mix = (
+        bgm_mix_filter(
+            bgm_label="1:a",
+            voice_label="0:a",
+            gain_db=bgm_gain_db,
+            fade_sec=fade_sec,
+            duration=duration,
+            duck=duck,
+            duck_ratio=duck_ratio,
+            duck_threshold_db=duck_threshold_db,
+            duck_attack_ms=duck_attack_ms,
+            duck_release_ms=duck_release_ms,
+        )
+        if bgm_path
+        else ""
+    )
 
     if burn:
         # 烧字幕必须重编码视频；顺带把 BGM 混进去，少走一遍
@@ -257,14 +279,14 @@ async def _finish(
             margin_scale=margin_scale,
         )
         if bgm_path:
-            args += ["-stream_loop", "-1", "-i", str(bgm_path)]
+            args += _bgm_input(bgm_path, loop=bgm_loop)
             args += [
                 "-filter_complex",
-                f"[0:v]{burn_filter}[v];{_bgm_filter(1, bgm_gain_db, fade_sec, duration)}",
+                f"[0:v]{burn_filter}[v];{mix}",
                 "-map",
                 "[v]",
                 "-map",
-                "[bgm]",
+                "[a]",
             ]
         else:
             args += ["-vf", burn_filter, "-map", "0:v", "-map", "0:a?"]
@@ -296,15 +318,14 @@ async def _finish(
     # -map 当成下一个输入文件的输入选项。
     args = ["-y", "-hide_banner", "-loglevel", "error", "-i", source.name]
     if bgm_path:
-        args += ["-stream_loop", "-1", "-i", str(bgm_path)]
+        args += _bgm_input(bgm_path, loop=bgm_loop)
     if soft:
         args += ["-i", subtitle_file.name]
 
     if bgm_path:
         args += [
             "-filter_complex",
-            f"{_bgm_filter(1, bgm_gain_db, fade_sec, duration)};"
-            f"[0:a][bgm]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[a]",
+            mix,
             "-map",
             "0:v",
             "-map",
@@ -334,18 +355,58 @@ async def _finish(
     return effective
 
 
+def _bgm_input(bgm_path: Path, *, loop: bool) -> list[str]:
+    """BGM 的输入参数：曲库曲目循环铺满，生成的曲子本身就是整片长度（不循环）。"""
+    return (["-stream_loop", "-1"] if loop else []) + ["-i", str(bgm_path)]
+
+
 def _subtitle_input_index(bgm_path: Path | None) -> int:
     return 2 if bgm_path else 1
 
 
-def _bgm_filter(index: int, gain_db: float, fade_sec: float, duration: float) -> str:
+def bgm_mix_filter(
+    *,
+    bgm_label: str = "1:a",
+    voice_label: str = "0:a",
+    gain_db: float = -20.0,
+    fade_sec: float = 1.5,
+    duration: float = 0.0,
+    duck: bool = False,
+    duck_ratio: float = 6.0,
+    duck_threshold_db: float = -30.0,
+    duck_attack_ms: float = 25.0,
+    duck_release_ms: float = 420.0,
+) -> str:
+    """BGM 混音滤镜链（公开给测试与诊断用）。
+
+    两种形态：
+    - 不闪避：直接 `amix`（音乐固定音量压在人声下面）
+    - 闪避：`asplit` 出人声当 sidechain，说话时把音乐压下去（`sidechaincompress`），
+      说完 0.4 秒左右抬回来。比固定音量好得多 —— 固定音量要么平时太小、要么说话时糊。
+    """
     fade = max(0.0, min(fade_sec, duration / 3 if duration else fade_sec))
     fade_out_start = max(0.0, duration - fade)
-    return (
-        f"[{index}:a]volume={gain_db:.1f}dB,"
+    chain = (
+        f"[{bgm_label}]volume={gain_db:.1f}dB,"
         f"afade=t=in:st=0:d={fade:.2f},"
-        f"afade=t=out:st={fade_out_start:.2f}:d={fade:.2f}[bgm]"
+        f"afade=t=out:st={fade_out_start:.2f}:d={fade:.2f},"
+        f"atrim=duration={duration:.3f},asetpts=PTS-STARTPTS[music]"
     )
+    if not duck:
+        return (
+            f"{chain};[{voice_label}][music]amix=inputs=2:duration=first:"
+            "dropout_transition=0:normalize=0[a]"
+        )
+    # sidechaincompress 的 threshold 是线性幅度（0.00097563..1），这里从 dBFS 换算
+    threshold = min(1.0, max(0.001, 10 ** (duck_threshold_db / 20.0)))
+    return (
+        f"{chain};[{voice_label}]asplit=2[voice][side];"
+        f"[music][side]sidechaincompress=threshold={threshold:.5f}:"
+        f"ratio={duck_ratio:g}:attack={duck_attack_ms:g}:release={duck_release_ms:g}:"
+        "makeup=1[ducked];"
+        "[voice][ducked]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[a]"
+    )
+
 
 
 def subtitle_style(
@@ -565,6 +626,16 @@ async def compose(
         else:
             warnings.append(f"BGM 文件不存在，已跳过配乐：{bgm.id}")
 
+    # 人声闪避：说话时把音乐压下去。ffmpeg 没有 sidechaincompress 就退回固定音量
+    duck = settings.bgm_duck if (bgm is None or bgm.duck is None) else bool(bgm.duck)
+    if bgm_path and duck and "sidechaincompress" not in caps:
+        warnings.append("当前 ffmpeg 没有 sidechaincompress，本次配乐不做人声闪避（固定音量）")
+        duck = False
+    bgm_fade = settings.bgm_fade_sec
+    if bgm is not None and bgm.fade_sec is not None:
+        bgm_fade = float(bgm.fade_sec)
+    bgm_loop = True if bgm is None else bool(bgm.loop)
+
     final = output_dir / "final.mp4"
     _notify(on_progress, len(segments) + 1, len(segments) + 2, "混音 / 挂字幕")
     effective_mode = await _finish(
@@ -574,7 +645,7 @@ async def compose(
         duration=total_duration,
         bgm_path=bgm_path,
         bgm_gain_db=bgm.gain_db if bgm and bgm.gain_db is not None else settings.bgm_gain_db,
-        fade_sec=settings.bgm_fade_sec,
+        fade_sec=bgm_fade,
         subtitle_file=subtitles_path,
         mode=SubtitleMode(settings.subtitle_mode),
         caps=caps,
@@ -585,7 +656,25 @@ async def compose(
         font_scale=settings.compose_subtitle_font_scale,
         margin_scale=settings.compose_subtitle_margin_scale,
         resolution=(width, height),
+        bgm_loop=bgm_loop,
+        duck=duck,
+        duck_ratio=settings.bgm_duck_ratio,
+        duck_threshold_db=settings.bgm_duck_threshold_db,
+        duck_attack_ms=settings.bgm_duck_attack_ms,
+        duck_release_ms=settings.bgm_duck_release_ms,
     )
+    if bgm_path and bgm is not None:
+        engine_label = {
+            "generate": "本机现写",
+            "cli": "外部音乐模型",
+            "library": "本地曲库",
+        }.get(bgm.engine, bgm.engine or "曲库")
+        warnings.append(
+            f"配乐（{engine_label}）：{bgm.title or bgm.id}；音量 "
+            f"{bgm.gain_db if bgm.gain_db is not None else settings.bgm_gain_db:.1f}dB，"
+            f"{'人声闪避开' if duck else '固定音量'}"
+            f"{'，整片长度不循环' if not bgm_loop else ''}"
+        )
 
     if not final.exists() or final.stat().st_size == 0:
         raise ComposeError("ffmpeg 未产出有效成片文件")
@@ -613,6 +702,9 @@ async def compose(
         bgm_id=bgm.id if bgm else "",
         bgm_path=str(bgm.path) if bgm else "",
         bgm_gain_db=bgm.gain_db if bgm and bgm.gain_db is not None else settings.bgm_gain_db,
+        bgm_engine=bgm.engine if bgm else "",
+        bgm_plan_path=bgm.plan_path if bgm else "",
+        bgm_duck=duck if bgm_path else False,
         ambient_mode=ambient_mode,
         ambient_mode_effective=ambient_effective,
         ambient_gain_db=settings.compose_ambient_gain_db,

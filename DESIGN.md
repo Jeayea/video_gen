@@ -451,8 +451,13 @@ class VideoProvider(ABC):
   抽帧 → 多模态 `chat_json` → 写回 `shot.narration / dialogue_text` + 念法建议 → 再合成
 
 **BGM**
-- MVP：本地免版税曲库 + 按 `mood` 标签匹配
-- 后续：AI BGM 生成 API
+- 曲库（v0.4）：本地免版税曲库 + 按 `mood` 标签匹配
+- 本机现写（v0.19）：`BGM_ENGINE=generate` —— 由分镜情绪/时长/台词 + 画面运动实测
+  写出**配乐谱**（色调/调式/BPM/段落/和弦/配器/重音），再用纯标准库合成 WAV，
+  过 `afir` 卷积混响 + 压缩 + 响度归一；段落切点对齐镜头、运动爆发处给重音、
+  说话窗口让路。详见 README「配乐」
+- AI 音乐模型（v0.19）：`BGM_ENGINE=cli` + `BGM_CLI_CMD` 模板（`{out}`/`{prompt}`），
+  提示词由配乐谱生成（英文 + 段落时间轴）
 
 **音画对齐**
 - TTS 生成后测量时长，可微调 shot duration 以对齐
@@ -463,7 +468,10 @@ class VideoProvider(ABC):
 FFmpeg 流水线：
 1. 逐 shot：视频 + 对应 TTS 音轨 → 中间片段
 2. 拼接所有中间片段
-3. 混入 BGM（音量 ducking，旁白时降低）
+3. 混入 BGM：`volume` + 淡入淡出 + `atrim`，默认再叠一层**人声闪避**
+   （`[voice]asplit` → `sidechaincompress`，说话时压低音乐、说完 0.4s 抬回；
+   ffmpeg 没有这个滤镜就退回固定音量并告警）。生成的曲目不再 `-stream_loop`，
+   它是整片长度、自然收尾
 4. 可选：烧录字幕（srt）
 5. 输出 MP4，分辨率按项目 `aspect_ratio` 决定（9:16 → 1080×1920，16:9 → 1920×1080，1:1 → 1080×1080）
 
@@ -576,7 +584,7 @@ FFMPEG_AUTO_UPGRADE=true      # 主 ffmpeg 缺能力时自动换候选（如烧�
 
 ---
 
-## 10. 实现状态（v0.18，2026-09-14 更新）
+## 10. 实现状态（v0.19，2026-09-14 更新）
 
 ### 已落地
 
@@ -683,6 +691,8 @@ FFMPEG_AUTO_UPGRADE=true      # 主 ffmpeg 缺能力时自动换候选（如烧�
   详见 §4.2 与 README「分镜阶段就少而长」
 - 任务/批量状态仅在进程内存里（项目状态已落盘，重启会自动回收）
 - 一个镜头多音轨混音
+- 配乐只做「音乐床」：没有主题动机随剧情变形（leitmotif）、没有按角色区分的音色、
+  没有自动跟拍剪辑点做转场音效（当前重音只落在镜头切换与运动爆发上）
 - ~~视频**运动**信息进入文案生成~~ **已完成（v0.16）**：本地实测运动曲线（6fps/64×64 灰度、
   纯标准库）随抽帧一起发给配音导演，念法跟着画面节奏走。判读分「整段活跃度（按均值分档）」
   与「起伏窗口（按中位数 1.6×）」。详见 README「配音文案」与 `utils/motion.py`
@@ -698,6 +708,15 @@ FFMPEG_AUTO_UPGRADE=true      # 主 ffmpeg 缺能力时自动换候选（如烧�
   `Character.region` 与 `IMAGE_REGION_OVERRIDE` 可人工压过。见 `utils/region.py` 与 README
 - **国家/人物设定可在生成圣经时声明（v0.18）**：`Project.cast_region` + `Project.bible_notes`
   进提示词并写进 `StoryBible.cast_region`，下游以此为权威依据（名字启发式只做冲突提醒）。
+- **按分镜现写配乐（v0.19）**：`BGM_ENGINE=generate` —— `utils/music.py` 作曲 + 合成
+  （纯标准库，44.1kHz 立体声，波表/包络/噪声打击），`services/music_service.py` 负责
+  引擎解析、`afir` 卷积混响、响度归一、缓存指纹与**交付前自检**（后处理把音乐弄没就退回干燥音轨）。
+  配乐谱 `MusicPlan` 是结构化产物（段落/调式/BPM/配器/重音/说话窗口/人话说明），
+  `POST/GET /api/projects/{id}/music` 可生成、试听、导出外部模型提示词；UI 面板显示
+  段落表 + 音频播放器 + 引擎/情绪/音量/闪避开关
+- **人声闪避（v0.19）**：合成时 `sidechaincompress` 用人声当 side chain（`BGM_DUCK`，
+  可逐次覆盖）；`tools/music/measure_ducking.py` 逐窗口实测
+  （真实项目：说话段音乐 -9.2dB、静音段 +0.1dB、人声不变）
   见 README「名字 ↔ 国家 ↔ 脸」与 FIXES v0.18
 - **音画同步自检**：`utils/av_sync.py` 在成片阶段核对「音轨时长 ≈ 视频时长」，
   抓「`concat -c copy` 吃掉音频空洞」这类事故（真实事故：对比片漂移 7.154 秒）
