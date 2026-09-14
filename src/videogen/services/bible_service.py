@@ -19,6 +19,7 @@ BIBLE_GEN_SYSTEM = """你是一位资深短剧策划。根据用户输入生成�
       "aliases": ["别名1"],
       "age": 25,
       "role": "主角",
+      "region": "cn",
       "description": "中文描述",
       "visual_prompt": "English visual description for AI video generation",
       "voice_id": "",
@@ -47,7 +48,13 @@ BIBLE_GEN_SYSTEM = """你是一位资深短剧策划。根据用户输入生成�
 
 要求：
 - 角色 3-6 个，有明确冲突关系
-- visual_prompt 必须是英文，适合 AI 视频生成（只描述外貌/服装/气质，不要写角色 id）
+- **名字、地区、外貌三者必须对齐**：这是一部哪个国家的戏，全剧组就用那个国家的名字与长相
+  （`region` 填 cn/jp/kr/west/other）。中文名 → `region="cn"` 并给中国人长相；
+  日文名（含假名/日本姓氏）→ `region="jp"`；韩文名 → `region="kr"`；英文名 → `region="west"`。
+  用户输入里写明了国家/城市/语言时，以用户输入为准，**不要混国籍**
+- visual_prompt 必须是英文，适合 AI 视频生成（只描述外貌/服装/气质，不要写角色 id），
+  并且**外貌要和 region 一致**（例：region=cn 就写 Chinese woman, East Asian features…），
+  不要给中文名配一张欧美脸
 - id 只能是 char_1..char_6 / loc_1..loc_6 / fact_1..N 这类稳定编号
 - facts 收集关键数字/日期/关系，后续生成必须遵守
 - age 必须是数字（不要写 "25岁"）

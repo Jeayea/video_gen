@@ -5,6 +5,8 @@ from pathlib import Path
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from videogen.utils import region
+
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -232,6 +234,12 @@ class Settings(BaseSettings):
     #: 角色设定里没写人种时，用 'East Asian cast, Chinese television drama'
     #: 之类统一整组角色的面貌基调
     image_prompt_suffix: str = ""
+    #: 名字 → 国家 → 外貌锚点：中文名给中国脸、日文名给日本脸（详见 utils/region.py）
+    image_region_auto: bool = True
+    #: 名字看不出国籍时的兜底国家（cn/jp/kr/west/other）
+    image_region_default: str = "cn"
+    #: 强制整片按某个国家来（留空 = 自动；填 cn/jp/kr/west 可压过自动判断）
+    image_region_override: str = ""
 
     # 安全：留空表示不校验（仅建议在本机 127.0.0.1 上跑）；设置后所有 /api 请求需带
     # X-API-Token 头或 ?token= 查询参数
@@ -290,6 +298,15 @@ class Settings(BaseSettings):
     @property
     def audio_frame_width(self) -> int:
         return min(1600, max(160, int(self.audio_llm_frame_width or 640)))
+
+    @property
+    def image_region(self) -> str:
+        """归一后的兜底国家（非法值一律当 cn，绝不让笔误把脸谱带偏）。"""
+        return region.normalize_region(self.image_region_default) or "cn"
+
+    @property
+    def image_region_forced(self) -> str:
+        return region.normalize_region(self.image_region_override)
 
     @property
     def audio_motion_rate(self) -> float:

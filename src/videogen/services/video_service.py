@@ -13,6 +13,7 @@ from videogen.models.project import Project
 from videogen.models.storyboard import Shot, Storyboard
 from videogen.models.video import ClipStatus, MediaKind, VideoClip, VideoManifest
 from videogen.providers.video.base import VideoProvider, VideoRequest
+from videogen.utils import region
 from videogen.utils.redact import scrub_secrets
 
 logger = logging.getLogger(__name__)
@@ -418,7 +419,7 @@ def build_prompt(
     location = location_anchor(shot, bible, base)
     if location:
         parts.append(location)
-    anchor = appearance_anchor(shot, bible, base)
+    anchor = appearance_anchor(shot, bible, base, settings=settings)
     if anchor:
         parts.append(anchor)
     if settings.video_prompt_dialogue:
@@ -494,30 +495,33 @@ def dialogue_directive(shot: Shot, bible: StoryBible | None = None) -> str:
 
     不写台词时，模型会**自己编一段话**在说 —— 嘴按它编的话动，我们再叠 TTS，
     口型必然对不上。写上台词（并禁止字幕）后，原生表演与我们的配音才在同一句话上。
+
+    **故意不写说话人的名字**：中文名（「林悦」）出现在 prompt 里有被画成画面文字的风险
+    （图片 prompt 上真实发生过：中文名被当成海报标题）。对模型来说「画面里正在说话的那个人」
+    已经足够 —— 这一镜通常就一个说话人，两人同框时模型按台词本身也能对上。
     """
     text = " ".join(str(shot.dialogue_text or "").split())
     if not text:
         return ""
-    who = ""
-    if bible is not None and shot.dialogue_speaker:
-        character = bible.get_character(shot.dialogue_speaker)
-        if character is not None:
-            who = str(character.name or "")
-    lead = (
-        f"{who} speaks this exact Mandarin line"
-        if who
-        else "the character speaks this exact Mandarin line"
-    )
     return (
-        f'{lead}: "{text}" — natural lip-sync matched to the Mandarin speech, '
-        "mouth movement and breathing follow the line, no on-screen text or captions"
+        f'the on-screen speaker says this exact Mandarin line: "{text}" — natural lip-sync '
+        "matched to the Mandarin speech, mouth movement and breathing follow the line, "
+        "no on-screen text or captions"
     )
 
 
-def appearance_anchor(shot: Shot, bible: StoryBible | None, base: str = "") -> str:
+def appearance_anchor(
+    shot: Shot,
+    bible: StoryBible | None,
+    base: str = "",
+    *,
+    settings: Settings | None = None,
+) -> str:
     """在场角色的外貌锚点（跨镜头一致性用的文字版）。
 
     `base` 里已经出现过的描述会跳过（分镜 LLM 抄过就不重复）。
+    另外会补一句「整个剧组按哪国人来」的人种锚点：没有参考图时，这是唯一能拦住
+    「中文名角色长出欧美脸」的东西（有参考图时它也只是锦上添花）。
     """
     if not bible:
         return ""
@@ -533,11 +537,25 @@ def appearance_anchor(shot: Shot, bible: StoryBible | None, base: str = "") -> s
         head = look.split(",")[0].strip().lower()
         if head and head in haystack:
             continue
-        chunks.append(f"{character.name or char_id}: {look[:_APPEARANCE_MAX_CHARS]}")
+        # 这里**不写角色名**：中文名进 prompt 会被模型画成画面上的文字
+        # （真实事故：中文名 + 风格变成海报标题，见 character_image_service 的说明）。
+        # 名字对人类读者有用，对模型没用 —— 模型只需要「画面里这个人的长相」。
+        chunks.append(look[:_APPEARANCE_MAX_CHARS])
         haystack += " " + head
     if not chunks:
         return ""
-    return "same characters as before, consistent face and hairstyle — " + "; ".join(chunks)
+    clause = "same characters as before, consistent face and hairstyle — " + "; ".join(chunks)
+    settings = settings or get_settings()
+    if settings.image_region_auto:
+        guess = region.project_region(
+            bible,
+            override=settings.image_region_override,
+            default=settings.image_region_default,
+        )
+        anchor = region.region_anchor(guess.region)
+        if anchor and not region.region_mentioned(base):
+            clause += f". cast look: {anchor}"
+    return clause
 
 
 def _mentions(text: str, aspect_ratio: str) -> bool:

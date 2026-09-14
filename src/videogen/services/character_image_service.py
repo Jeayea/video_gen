@@ -13,6 +13,7 @@ from videogen.providers.image.base import ImageProviderError, ImageRequest
 from videogen.services import cost_service
 from videogen.utils.file_store import FileStore
 from videogen.utils.redact import scrub_secrets
+from videogen.utils.region import region_anchor, region_mentioned, resolve_region
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +41,7 @@ def build_portrait_prompt(
     *,
     aspect_ratio: str = "1:1",
     extra: str = "",
+    settings: Settings | None = None,
 ) -> str:
     """把圣经里的角色设定拼成「角色参考图」prompt。
 
@@ -55,8 +57,16 @@ def build_portrait_prompt(
     2. **不要说 "sheet" / "poster" / "design"**。这会把画面带成「角色设定海报」
        （带排版和标注）而不是一张干净的证件照。
 
-    `bible` 只留作签名兼容（风格/定位刻意不注入，理由见上）。
+    第三条规则（v0.17 起）：**外貌要和名字对得上国家的「平均脸」**。名字本身绝不能进
+    prompt（会被画成文字），所以这里把名字翻成英文的外貌锚点（`utils/region.py`）：
+    中文名 → `Chinese cast … average everyday Chinese face, not mixed-race and not
+    Westernised`。不加这句时，模型会按自己的先验往欧美化的五官上靠 ——
+    一个中文名角色长一张欧美脸，正是用户报的问题。角色自己的 `visual_prompt`
+    或 `IMAGE_PROMPT_SUFFIX` 里已经写明了人种时**不叠加**（避免自相矛盾）。
+
+    `bible` 用来算「整个剧组按哪国来」（一部片子一张脸谱）。
     """
+    settings = settings or get_settings()
     lines: list[str] = []
     tail: list[str] = []
     if character.age:
@@ -70,6 +80,19 @@ def build_portrait_prompt(
     lines.append(subject)
 
     look = _one_line(character.visual_prompt) or _one_line(character.description)
+    suffix = _one_line(extra)
+    # 名字 → 国家 → 该国的「平均脸/主角脸」锚点（已写明人种时不叠加）
+    region = resolve_region(
+        character,
+        bible,
+        override=settings.image_region_override,
+        default=settings.image_region_default,
+        auto=settings.image_region_auto,
+    )
+    anchor = region_anchor(region.region)
+    if anchor and not region_mentioned(look) and not region_mentioned(suffix):
+        lines.append(anchor)
+
     if look:
         lines.append(_base_look(look))
     else:
@@ -88,7 +111,6 @@ def build_portrait_prompt(
         "no border, no poster layout, no collage, single subject only"
     )
     lines.append(f"{aspect_ratio} composition")
-    suffix = _one_line(extra)
     if suffix:
         lines.append(suffix)
     return "\n".join(lines)
@@ -161,6 +183,13 @@ def reference_plan(
             orphans.append(character.id)
         if not has and orphan is None:
             missing += 1
+        guess = resolve_region(
+            character,
+            bible,
+            override=settings.image_region_override,
+            default=settings.image_region_default,
+            auto=settings.image_region_auto,
+        )
         rows.append(
             {
                 "id": character.id,
@@ -168,11 +197,17 @@ def reference_plan(
                 "has_reference": has,
                 "orphan_file": orphan.name if orphan else "",
                 "reference_image": character.reference_image,
+                # 这个角色的脸按哪国人来画（名字推断 / 跟剧组 / 人工指定）
+                "region": guess.region,
+                "region_label": guess.label,
+                "region_source": guess.source,
+                "region_confidence": round(guess.confidence, 2),
                 "prompt_preview": build_portrait_prompt(
                     character,
                     bible,
                     aspect_ratio=settings.image_aspect_ratio,
                     extra=settings.image_prompt_suffix,
+                    settings=settings,
                 )[:400],
             }
         )
@@ -319,6 +354,7 @@ async def generate_character_image(
         bible,
         aspect_ratio=settings.image_aspect_ratio,
         extra=settings.image_prompt_suffix,
+        settings=settings,
     )
 
     # 花钱前先看预算（角色图很便宜，但超支一样是超支）

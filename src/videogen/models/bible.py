@@ -3,6 +3,7 @@ from __future__ import annotations
 from pydantic import BaseModel, Field, field_validator
 
 from videogen.utils.coerce import StrList, coerce_optional_int
+from videogen.utils.region import normalize_region
 
 
 class Relationship(BaseModel):
@@ -17,6 +18,9 @@ class Character(BaseModel):
     aliases: StrList = Field(default_factory=list)
     age: int | None = None
     role: str = ""  # 主角/反派/配角
+    #: 角色所属国家/地区（cn/jp/kr/west/other）：决定参考图往哪国人脸上靠。
+    #: 留空就按**名字**推断（详见 utils/region.py），推不出来就跟整个剧组一致
+    region: str = ""
     description: str = ""
     visual_prompt: str = ""
     voice_id: str = ""
@@ -31,6 +35,12 @@ class Character(BaseModel):
     def _coerce_age(cls, value: object) -> int | None:
         # LLM 常写 "25岁" / "约30" / ""，不能让它崩掉整个圣经
         return coerce_optional_int(value)
+
+    @field_validator("region", mode="before")
+    @classmethod
+    def _coerce_region(cls, value: object) -> str:
+        # 模型可能写 "中国" / "Chinese" / "CN"，统一归一到内部键；不认识就留空
+        return normalize_region(value)
 
 
 class Setting(BaseModel):

@@ -1121,3 +1121,48 @@ ffmpeg -y -ss 3.0 -i projects/<id>/clips/scene_1_shot_4.mp4 \
 暗部占比 0.08、垂直边缘 0.15）。连基准都测不准，说明这些量根本反映不了嘴的开合
 （特写里摇头/机位微移都会盖过嘴）。所以**没有**把它做成通过/不通过，
 只保留引擎自检 + 改写时段 + 人工看帧。要做成自动判据得另上 SyncNet 或人脸关键点。
+
+## v0.17 · 名字 ↔ 国家 ↔ 脸对齐（哪国人就长哪国脸）
+
+用户报的：**角色设定和名字尽量对齐** —— 角色叫中文名/日文名，就该捏对应国家的
+「平均脸 / 主角脸」，而不是中文名配一张欧美脸。
+
+### 问题是什么
+
+图片/视频模型接到 `A 28-year-old woman` 时按自己的先验画，而那个先验**偏欧美化**。
+名字是唯一「总是存在」的国籍线索，但它**绝不能进 prompt**（会被画成画面上的文字，
+v0.10 的真实事故），所以必须先在本地把名字翻成英文的外貌锚点。
+
+### 做了什么
+
+| 能力 | 实现 | 位置 |
+|------|------|------|
+| 名字 → 国家（带置信度） | 假名 0.95 / 谚文 0.95 / 文本提示 0.9 / 日本姓氏 0.8 / 罗马字姓氏 0.75·0.7 / 中文姓氏 0.6 / 拉丁兜底 0.6 / **共用汉字姓 0.4** | `utils/region.py` |
+| 一部片子一张脸谱 | 全剧组按「置信度 × 角色重要性」投票，分不出国籍的角色跟随多数派 | `region.project_region` |
+| 外貌锚点 | `Chinese cast — East Asian features of a typical Chinese television drama lead, an average everyday Chinese face …, not mixed-race and not Westernised` | `region.REGION_ANCHORS` |
+| 圣经生成 | 提示词要求「名字、地区、外貌三者必须对齐」，并新增 `Character.region` 字段（人工可改） | `services/bible_service.py` + `models/bible.py` |
+| 定妆照 | 注入该角色的国家锚点；已写明人种 / `IMAGE_PROMPT_SUFFIX` 写了人种时**不叠加** | `character_image_service.build_portrait_prompt` |
+| 视频 prompt | `appearance_anchor` 补整个剧组的人种锚点（没有参考图时唯一能拦住欧美脸的东西） | `services/video_service.py` |
+| 配置 | `IMAGE_REGION_AUTO` / `IMAGE_REGION_DEFAULT` / `IMAGE_REGION_OVERRIDE` | `config.py` + `.env.example` |
+
+### 途中处理的两个真问题
+
+1. **中日韩共用汉字姓判不出来**：金=Kim/Jin、李=Lee/Li、林=Lim/Hayashi…
+   这些姓氏单独看**永远分不出国籍**。做法是给 0.4 的**低置信度**，让它跟随整个剧组 ——
+   「金敏俊」在国剧里就是中国人、在韩剧里就是韩国人。韩国特有汉字姓（朴/禹/鞠…）
+   和片假名韩姓（キム・ジウン）另有高置信度通道。
+2. **中文名漏进了视频 prompt**（两处）：
+   - `appearance_anchor` 写的是 `林悦: A young woman…`
+   - `dialogue_directive` 写的是 `林悦 speaks this exact Mandarin line: "…"`
+
+   和图片 prompt 是同一类风险（中文被画成画面上的文字，v0.10 真实事故）。
+   现在两处都不带名字：前者只给外貌，后者改成 `the on-screen speaker says this exact
+   Mandarin line`。对模型来说「画面里正在说话的那个人」已经够用。
+   验证：真实项目里 build_prompt 的输出已不含任何角色名。
+
+### 测试
+
+新增 `tests/test_region.py`（24 个）：假名/谚文/日文姓氏/韩国特有姓/共用姓/拉丁四种、
+文本提示压过名字、剧组投票（含主角加权与 override）、单角色优先级、锚点注入与
+「已写明人种不叠加」、prompt 里绝不出现中文、`region` 字段归一化。
+

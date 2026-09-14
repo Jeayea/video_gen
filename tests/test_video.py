@@ -208,9 +208,10 @@ def test_build_prompt_injects_bible_appearance_for_consistency(store, ready_proj
 
     prompt = video_service.build_prompt(shot, ready_project, bible)
 
-    assert character.name in prompt
     assert character.visual_prompt.split(",")[0][:30] in prompt
     assert "consistent face" in prompt
+    # 但**名字不能进 prompt**：中文名会被模型画成画面上的文字（v0.17 修）
+    assert character.name not in prompt
 
 
 def test_appearance_anchor_skips_descriptions_already_in_the_prompt(store, ready_project, bible):
