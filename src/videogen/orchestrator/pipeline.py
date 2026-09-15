@@ -1155,6 +1155,20 @@ class Pipeline:
             # 取消：保留已生成片段，状态退回可重试的位置
             async with self._lock(project_id):
                 self.store.purge_media(project_id, compose=True)
+                # **取消也要记账**：已经落盘的片段 provider 已经按秒计过费了，
+                # 不记的话账本就少一笔（真实事故：取消时 3 个片段共 $1.95 没进账本，
+                # 而片段随后被删掉，连「补记账」的机会都没有了）。
+                # 仍按片段上的 `cost_recorded` 标记记，所以续跑不会重复计费。
+                cancelled = self.store.load_video_manifest(project_id)
+                recorded = self._record_video_cost(
+                    project_id,
+                    cancelled,
+                    price_per_second=price_per_second,
+                    settings=settings,
+                )
+                if recorded:
+                    self.store.save_video_manifest(project_id, cancelled)
+                    logger.info("视频任务被取消，已为已生成片段补记账 $%.4f", recorded)
                 self._settle_video_status(
                     self.get_project(project_id),
                     self.store.load_video_manifest(project_id),
@@ -1382,6 +1396,31 @@ class Pipeline:
         groups, _ = audio_script_service.script_targets(storyboard, mode, force=resolved_force)
         return sum(len(shots) for _, shots in groups)
 
+    def _record_audio_cost(self, project_id: str, manifest: AudioManifest) -> float:
+        """把「还没记过账」的配音花费写进账本，返回这次记了多少 USD。
+
+        与 `_record_video_cost` 同一套规则：按条目上的 `cost_recorded` 标记记，
+        所以「取消 / 崩溃后续跑」既不会漏记也不会重复计费。
+        """
+        unrecorded = [c for c in manifest.ready_clips if not c.cost_recorded]
+        if not unrecorded:
+            return 0.0
+        reported = sum(max(0.0, c.provider_usd) for c in unrecorded)
+        cost_service.record(
+            self.store,
+            project_id,
+            cost_service.audio_entry(
+                manifest.provider,
+                sum(count_speech_chars(c.text) for c in unrecorded),
+                len(unrecorded),
+                # 云端 TTS 会报实际花费；全为 0（Edge 免费）时按字符单价估算
+                actual_usd=reported if reported > 0 else None,
+            ),
+        )
+        for clip in unrecorded:
+            clip.cost_recorded = True
+        return round(reported, 6)
+
     async def _run_audio_job(
         self,
         ctx: JobContext,
@@ -1465,6 +1504,13 @@ class Pipeline:
             )
         except asyncio.CancelledError:
             async with self._lock(project_id):
+                # 取消也要记账（理由同 `_run_video_job`）：已经合成的配音 TTS 已经计过费
+                cancelled = self.store.load_audio_manifest(project_id)
+                if cancelled is not None:
+                    recorded = self._record_audio_cost(project_id, cancelled)
+                    if recorded:
+                        self.store.save_audio_manifest(project_id, cancelled)
+                        logger.info("配音任务被取消，已为已生成条目补记账 $%.4f", recorded)
                 self._settle_audio_status(
                     self.get_project(project_id),
                     self.store.load_audio_manifest(project_id),
@@ -1492,22 +1538,7 @@ class Pipeline:
 
             # 与视频同一套规则：按条目上的「已记账」标记记，而不是和上次清单做集合差
             # （否则「文案被 LLM 改写后重新合成」这种同 id 重跑会漏记）
-            unrecorded = [c for c in manifest.ready_clips if not c.cost_recorded]
-            if unrecorded:
-                reported = sum(max(0.0, c.provider_usd) for c in unrecorded)
-                cost_service.record(
-                    self.store,
-                    project_id,
-                    cost_service.audio_entry(
-                        manifest.provider,
-                        sum(count_speech_chars(c.text) for c in unrecorded),
-                        len(unrecorded),
-                        # 云端 TTS 会报实际花费；全为 0（Edge 免费）时按字符单价估算
-                        actual_usd=reported if reported > 0 else None,
-                    ),
-                )
-                for clip in unrecorded:
-                    clip.cost_recorded = True
+            self._record_audio_cost(project_id, manifest)
             if manifest.ready_clips and settings.bgm_engine_mode == "library":
                 # 曲库选曲很便宜（只读元数据），配音阶段先选好，UI 能提前看到用哪首。
                 # 生成类引擎（generate / cli / auto）留到**合成**阶段：那时才有画面运动实测，

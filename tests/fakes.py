@@ -400,6 +400,7 @@ class FakeVideoProvider(VideoProvider):
         supports_reference_image: bool = False,
         price_usd_per_sec: float | None = None,
         duration_options: list[float] | None = None,
+        actual_cost_usd: float | None = None,
     ):
         self.supports_reference_image = supports_reference_image
         self.requests: list[VideoRequest] = []
@@ -414,6 +415,8 @@ class FakeVideoProvider(VideoProvider):
         #: 成本前置用例用：模拟真实模型的「最短档位 + 按秒单价」
         self.price_usd_per_sec = price_usd_per_sec
         self.duration_options_sec = sorted(float(x) for x in (duration_options or []))
+        #: 每个片段「实际扣费」，用来测记账（真实 provider 会回传这个值）
+        self.actual_cost_usd = actual_cost_usd
 
     async def planned_seconds(self, requested_sec: float) -> float:
         """有档位就抬到最近的一档（与 OpenRouter 的 `_clamp_duration` 同语义）。"""
@@ -457,6 +460,7 @@ class FakeVideoProvider(VideoProvider):
                 media_kind=self.media_kind,
                 duration_sec=request.duration_sec,
                 task_id=f"fake-{request.shot_id}",
+                actual_cost_usd=self.actual_cost_usd,
             )
         finally:
             self.active -= 1

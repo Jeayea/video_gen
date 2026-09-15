@@ -471,6 +471,57 @@ async def test_cancel_video_job(store, ready_project, fake_llm):
     assert list(store.clips_dir(ready_project.id).glob("*.mp4")) == []  # 不留半截文件
 
 
+async def wait_until(predicate, timeout: float = 10.0) -> bool:
+    """等某个条件成立（比固定 sleep 稳：并发度、调度顺序都不影响结论）。"""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        if predicate():
+            return True
+        await asyncio.sleep(0.02)
+    return False
+
+
+@pytest.mark.asyncio
+async def test_cancelled_video_job_still_records_cost(store, ready_project, fake_llm):
+    """取消也要记账：已经落盘的片段 provider 已经按秒计过费了。
+
+    真实事故：9 镜里跑完 3 镜时用户取消，片段随后被删掉，$1.95 一条都没进账本
+    —— 账本少一笔比多一笔危险得多（预算是按账本放行的）。
+    """
+    provider = FakeVideoProvider(delay=0.3, actual_cost_usd=0.65)
+    pipeline = build_pipeline(store, fake_llm, provider)
+
+    def ready_count() -> int:
+        manifest = store.load_video_manifest(ready_project.id)
+        return len(manifest.ready_clips) if manifest else 0
+
+    def video_usd() -> float:
+        entries = pipeline.cost_report(ready_project.id).entries
+        return sum(e.usd for e in entries if e.stage == "video")
+
+    job = await pipeline.start_video_generation(ready_project.id)
+    assert await wait_until(lambda: ready_count() >= 1), "一个片段都没跑完，无法验证记账"
+    assert await pipeline.cancel_video_generation(ready_project.id) == 1
+    finished = await wait_job(pipeline, job.id)
+    assert finished.status.value == "cancelled"
+
+    # 取消是「先落状态、后收尾」的（jobs.cancel 立刻置 cancelled 再 cancel 任务），
+    # 记账在协程收尾时补上 —— 所以这里等它落地，而不是假设已经落地
+    assert await wait_until(lambda: video_usd() > 0), "取消后视频花费没进账本"
+
+    manifest = store.load_video_manifest(ready_project.id)
+    ready = manifest.ready_clips
+    assert video_usd() == pytest.approx(len(ready) * 0.65)
+    assert all(c.cost_recorded for c in ready)  # 已打标记，续跑不会重复计
+
+    # 续跑跑完剩下的镜头：账本只应该多出「新生成的」那部分，不能重复计
+    provider.delay = 0.0
+    job2 = await pipeline.start_video_generation(ready_project.id)
+    await wait_job(pipeline, job2.id)
+    assert video_usd() == pytest.approx(len(manifest.clips) * 0.65)
+
+
 @pytest.mark.asyncio
 async def test_video_status_shape(video_pipeline, store, ready_project):
     status = video_pipeline.video_status(ready_project.id)

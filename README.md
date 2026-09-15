@@ -427,6 +427,11 @@ UI 也会显示（`每镜都不短于 5 秒` + `本片 N 镜 · 计费 M 秒 ≈
 重新生成/重新合成时会清掉标记（重跑就是重新计费），记账后打标记并落盘，
 所以「产物已落盘、账本还没写」时进程挂掉也不会重复计费。
 
+**取消任务也会记账**（v0.21 修的真实事故）：取消前已经落盘的片段 provider 已经按秒
+计过费了，早期版本只在任务正常结束时记账，于是「跑 3 镜后取消」的 $1.95 一条都没进账本；
+更糟的是这些片段随后可能被删掉，连「补记账」的机会都没有。现在取消路径同样按
+`cost_recorded` 标记补记一次，续跑也不会重复计。
+
 ```bash
 # 给老版本漏记的项目补齐（幂等：不调 API、不动媒体、不动状态）
 curl -X POST localhost:8000/api/projects/<id>/cost/reconcile
@@ -626,9 +631,6 @@ curl -s -X POST localhost:8001/api/projects/$PID/characters/references/generate 
 `scene_4_shot_4`）重置为待生成后重跑 —— 这是**唯一**变量（prompt / 模型 / 秒数都没变）：
 
 
-同一个项目跑了一次对照实验：把 3 个含林悦正脸的镜头（`scene_1_shot_3` / `scene_2_shot_3` /
-`scene_4_shot_4`）重置为待生成后重跑 —— 这是**唯一**变量（prompt / 模型 / 秒数都没变）：
-
 | | 修复前 | 带参考图重跑后 |
 |---|---|---|
 | `scene_1_shot_3` | 棕色齐肩发、圆脸 | 黑短发，与定妆照同一张脸 |
@@ -653,6 +655,22 @@ curl -s -X POST localhost:8001/api/projects/$PID/characters/references/generate 
 
 角色设定里没写人种时，整组角色容易「各长各的」——用 `IMAGE_PROMPT_SUFFIX` 统一基调
 （英文，例如 `East Asian cast, Chinese television drama`）；它是追加到 prompt 末尾的额外约束。
+
+**想让角色照着一张具体的脸画**（「就照这张图」）：用 `tools/image/restyle.py` ——
+图片 provider 支持参考图输入（`input_references`），所以「照片 → 漫画风」就是一次图生图，
+风格词与「必须保留的五官特征」都写在预设里：
+
+```bash
+# 转风格：输入一张照片，输出同一个人、同一张脸的漫画风图（$0.04/张）
+.venv/bin/python tools/image/restyle.py --input 素材/某人.jpg --out refs/char_1.jpg --preset anime
+# 转完直接装成项目里的角色定妆照（会覆盖 refs/char_1.*）
+.venv/bin/python tools/image/restyle.py --input 素材/某人.jpg --preset anime \
+    --project <project_id> --character char_1
+```
+
+预设：`anime`（日式赛璐璐）/ `comic`（国漫厚涂）/ `ink`（水墨），都强制「保留五官特征」。
+**只对你有权使用的图这么做**：把别人的剧照转成二次元再公开传播，同时涉及摄影作品版权与
+演员肖像权（音轨同理，所以「扒原音轨」这件事本项目不做）。
 
 另外 `refs/<cid>.*` 里有文件但圣经没登记（并发写坏 / 手工拷贝）时，
 `references/plan` 会把它列进 `orphans`，生成入口会**免费补登记**，不会重复扣钱。
