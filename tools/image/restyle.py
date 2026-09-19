@@ -33,6 +33,8 @@ sys.path.insert(0, str(ROOT / "src"))
 from videogen.config import get_settings  # noqa: E402
 from videogen.providers.image import get_image_provider  # noqa: E402
 from videogen.providers.image.base import ImageRequest  # noqa: E402
+from videogen.services import cost_service  # noqa: E402
+from videogen.utils.file_store import FileStore  # noqa: E402
 
 #: 统一写死「必须保留的特征」，否则模型会顺手换脸
 KEEP = (
@@ -58,6 +60,25 @@ PRESETS = {
         "Black inkwork, rice-paper texture, restrained muted colours. " + KEEP
     ),
 }
+
+
+def record_cost(project_id: str, provider: str, model: str, usd: float) -> None:
+    """把这张图记进项目账本。
+
+    图片是**真花钱**的，而这个工具跑在流水线外 —— 不记的话「用工具转几版定妆照」
+    这些钱就永远不在账本里（和「取消任务不记账」是同一类问题）。
+    """
+    settings = get_settings()
+    store = FileStore(settings.projects_path)
+    if not store.project_dir(project_id).is_dir():
+        print(f"  （账本跳过：项目 {project_id} 不存在）")
+        return
+    cost_service.record(
+        store,
+        project_id,
+        cost_service.image_entry(provider, model, 1, actual_usd=usd if usd > 0 else None),
+    )
+    print(f"  记账：${usd:.4f} → 项目 {project_id}")
 
 
 def upload(base_url: str, project_id: str, character_id: str, path: Path) -> dict:
@@ -122,6 +143,15 @@ def main() -> int:
         restyle(source, out, prompt=prompt, resolution=args.resolution, aspect=args.aspect)
     )
     print(f"  产物：{result}（{result.stat().st_size / 1e6:.2f} MB）")
+
+    if args.project:
+        # 图生图也是真花钱：记进账本（单价用配置值，$0.04/张）
+        record_cost(
+            args.project,
+            "openrouter",
+            get_settings().openrouter_image_model,
+            float(get_settings().image_price_usd),
+        )
 
     if args.project and args.character:
         reply = upload(args.base_url, args.project, args.character, result)
