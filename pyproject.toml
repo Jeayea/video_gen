@@ -37,6 +37,10 @@ select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF", "BLE"]
 # 代码库是中文注释/文案，全角标点是有意为之
 ignore = ["RUF001", "RUF002", "RUF003", "UP042"]
 
+[tool.ruff.lint.per-file-ignores]
+# 案例内容文件：整段中文文案 + 带长 URL 的来源表，硬折到 100 列反而不可读
+"tools/case_diving/content.py" = ["E501"]
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]

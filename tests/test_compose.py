@@ -20,9 +20,12 @@ from videogen.orchestrator.pipeline import Pipeline, PipelineError
 from videogen.providers.tts.mock import MockTTSProvider
 from videogen.providers.video.mock import MockVideoProvider
 from videogen.services import compose_service, subtitle_service
+from videogen.utils.av_sync import check_av_sync
 from videogen.utils.ffmpeg import (
     ffmpeg_available,
     ffmpeg_capabilities_for,
+    ffprobe_available,
+    probe_duration,
     probe_streams,
     resolve_ffmpeg,
     run_ffmpeg,
@@ -1227,3 +1230,155 @@ async def test_compose_skips_lipsync_for_narration_only_shots(store, monkeypatch
     assert finished.status.value == "succeeded", finished.error
     report = store.load_compose_report(project.id)
     assert not any("逐帧口型" in item for item in report.warnings), report.warnings
+
+
+# ── 成片变速（COMPOSE_SPEED）────────────────────────────
+# 动机：视频模型按**最短档位**计费（H3 = 5 秒），所以 5 秒镜头最划算 ——
+# 排 5 秒镜头再整体 2 倍速，每镜观感 2.5 秒，档位一分不浪费。
+
+
+def test_atempo_chain_keeps_every_step_legal():
+    """任意倍率都拆成 0.5~2.0 的合法级联：老版 ffmpeg 不认 atempo=4。"""
+    assert compose_service.atempo_chain(1.0) == "atempo=1"
+    assert compose_service.atempo_chain(2.0) == "atempo=2"
+    assert compose_service.atempo_chain(1.5) == "atempo=1.5"
+    assert compose_service.atempo_chain(4.0) == "atempo=2,atempo=2"
+    assert compose_service.atempo_chain(3.0) == "atempo=2,atempo=1.5"
+    for speed in (0.5, 0.8, 1.0, 1.7, 2.0, 3.3, 4.0):
+        product = 1.0
+        for step in compose_service.atempo_chain(speed).split(","):
+            factor = float(step.split("=")[1])
+            assert 0.5 <= factor <= 2.0, step
+            product *= factor
+        assert product == pytest.approx(speed, rel=1e-9)
+
+
+def test_atempo_chain_rejects_non_positive_speed():
+    with pytest.raises(compose_service.ComposeError):
+        compose_service.atempo_chain(0)
+
+
+def test_speed_filter_scales_pts_and_keeps_pitch():
+    """视频缩放 PTS，音频走 atempo —— 故意不用 asetrate（那会把配音变花栗鼠）。"""
+    chain = compose_service.speed_filter(2.0)
+    assert chain == "[0:v]setpts=PTS/2[v];[0:a]atempo=2[a]"
+    assert "asetrate" not in chain
+
+
+def test_srt_timeline_scales_with_speed():
+    """变速后侧挂字幕必须跟着缩短，否则会比画面晚一倍。"""
+    segments = fake_segments([2.0, 2.0], ["第一句", "第二句"])
+
+    normal = subtitle_service.build_srt(segments)
+    assert "00:00:00,000 --> 00:00:02,000" in normal
+    assert "00:00:02,000 --> 00:00:04,000" in normal
+
+    fast = subtitle_service.build_srt(segments, speed=2.0)
+    assert "00:00:00,000 --> 00:00:01,000" in fast
+    assert "00:00:01,000 --> 00:00:02,000" in fast
+
+    vtt = subtitle_service.build_vtt(segments, speed=2.0)
+    assert "00:00:00.000 --> 00:00:01.000" in vtt
+
+
+@requires_ffmpeg
+@pytest.mark.asyncio
+async def test_compose_speed_halves_the_delivered_film(store):
+    """2 倍速：交付时长减半，且音画仍同步（配音/口型/字幕一起被缩放）。"""
+    pipeline = real_pipeline(store)
+    project = await prepare_media(store, pipeline, small_project(store, shots=2, shot_duration=2))
+
+    job = await pipeline.start_compose(project.id, overrides={"compose_speed": 2.0})
+    finished = await wait_for_job(pipeline, job.id, timeout=180)
+    assert finished.status.value == "succeeded", finished.error
+
+    report = store.load_compose_report(project.id)
+    project_dir = store.ensure_project_dir(project.id)
+    final = project_dir / report.output_path
+
+    assert report.speed == 2.0
+    assert report.source_duration_sec == store.load_storyboard(project.id).total_duration_sec
+    assert report.duration_sec == pytest.approx(report.source_duration_sec / 2, abs=0.01)
+    assert any("2 倍速" in item for item in report.warnings), report.warnings
+
+    if ffprobe_available():
+        measured = await probe_duration(final)
+        assert measured is not None
+        assert measured == pytest.approx(report.duration_sec, abs=0.35)
+        # 音画同步自检在变速**之后**跑，必须仍然是通的
+        sync = await check_av_sync(final)
+        assert sync.ok, sync
+
+    # 侧挂字幕的时间轴必须一起缩短
+    srt = (project_dir / report.subtitles_path).read_text(encoding="utf-8")
+    ends = [
+        line.partition("-->")[2].strip()
+        for line in srt.splitlines()
+        if "-->" in line
+    ]
+    assert ends
+    last_end = _stamp_to_seconds(ends[-1])
+    assert last_end <= report.duration_sec + 0.05, (last_end, report.duration_sec)
+
+
+def _stamp_to_seconds(stamp: str) -> float:
+    hours, minutes, rest = stamp.split(":")
+    seconds, _, millis = rest.partition(",")
+    return int(hours) * 3600 + int(minutes) * 60 + int(seconds) + int(millis) / 1000
+
+
+@requires_ffmpeg
+@pytest.mark.asyncio
+async def test_compose_speed_one_is_a_no_op(store):
+    """默认 1.0 倍速不能多跑一趟 ffmpeg、也不能改时长口径。"""
+    pipeline = real_pipeline(store)
+    project = await prepare_media(store, pipeline, small_project(store, shots=2, shot_duration=2))
+
+    job = await pipeline.start_compose(project.id)
+    finished = await wait_for_job(pipeline, job.id, timeout=180)
+    assert finished.status.value == "succeeded", finished.error
+
+    report = store.load_compose_report(project.id)
+    assert report.speed == 1.0
+    assert report.duration_sec == report.source_duration_sec
+    assert not any("倍速" in item for item in report.warnings), report.warnings
+
+
+def test_apply_speed_pins_exact_duration():
+    """回归：变速必须带 `-t` 掐到精确时长。
+
+    真实事故：`atempo` 输出不精确等于「源时长 / speed」，AAC 还会再补 padding，
+    67s 成片 2 倍速实测视频 33.583s / 音频 33.753s（差 0.17s），
+    刚好越过 0.20s 的音画同步阈值被报成「成片音画不同步」。
+    """
+    seen: dict = {}
+
+    async def fake_run(args, *, timeout_sec=0.0, cwd=None, exe=None):
+        seen["args"] = list(args)
+
+    import videogen.services.compose_service as module
+
+    original = module.run_ffmpeg
+    module.run_ffmpeg = fake_run
+    try:
+        asyncio.run(
+            compose_service.apply_speed(
+                Path("final.mp4"),
+                Path("final_speed.mp4"),
+                speed=2.0,
+                duration=33.5,
+                fps=24,
+                crf=23,
+                preset="veryfast",
+                cwd=Path("."),
+            )
+        )
+    finally:
+        module.run_ffmpeg = original
+
+    args = seen["args"]
+    assert "-t" in args
+    assert args[args.index("-t") + 1] == "33.500"
+    # 帧率必须显式给：否则 setpts 改完时间戳会被 CFR 转换吃掉
+    assert args[args.index("-r") + 1] == "24"
+    assert "setpts=PTS/2" in " ".join(args)

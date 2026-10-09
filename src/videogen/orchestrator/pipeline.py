@@ -1740,6 +1740,7 @@ class Pipeline:
                     "compose_subtitle_mode",
                     "compose_crf",
                     "compose_preset",
+                    "compose_speed",
                     "compose_subtitle_font",
                     "compose_subtitle_font_scale",
                     "compose_ambient_mode",

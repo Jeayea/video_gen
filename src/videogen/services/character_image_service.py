@@ -115,6 +115,14 @@ def build_portrait_prompt(
         "no words, no name, no labels, no captions, no title, no logo, no watermark, "
         "no border, no poster layout, no collage, single subject only"
     )
+    # 「队服」这类词会让模型自己补上国旗/队徽/品牌标（真实事故：中文教练的
+    # "navy team polo" 被画成 TEAM USA 队服 + 美国国旗 + Nike 标；运动队服被
+    # 画上五星红旗）。这些徽标既涉及旗帜/商标，又会在每个镜头里长得不一样，
+    # 所以在这里统一禁掉，而不是逐个角色去改描述。
+    lines.append(
+        "Plain unbranded clothing with no national flag, no flag patch, no insignia, "
+        "no emblem, no team crest, no brand mark, no sponsor patch"
+    )
     lines.append(f"{aspect_ratio} composition")
     if suffix:
         lines.append(suffix)

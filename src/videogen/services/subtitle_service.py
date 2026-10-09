@@ -61,15 +61,24 @@ def speaker_name_map(bible: StoryBible | None) -> dict[str, str]:
 def build_srt(
     segments: list[ComposeSegment],
     audio: AudioManifest | None = None,
+    *,
+    speed: float = 1.0,
 ) -> str:
-    """生成 SRT。时间轴按段落时长累加，和成片完全一致。"""
-    cues = _cues(segments, audio)
+    """生成 SRT。时间轴按段落时长累加，和成片完全一致。
+
+    `speed` 是成片的变速倍率：成片被整体加速后，字幕时间轴也必须一起缩短，
+    否则侧挂字幕会比画面晚（`speed > 1` 时）。烧进画面的字幕**不能**传它 ——
+    那趟烧字发生在变速之前，用的是原始时间轴。
+    """
+    cues = _cues(segments, audio, speed=speed)
     return "\n".join(f"{index}\n{start} --> {end}\n{text}\n" for index, start, end, text in cues)
 
 
 def build_vtt(
     segments: list[ComposeSegment],
     audio: AudioManifest | None = None,
+    *,
+    speed: float = 1.0,
 ) -> str:
     """生成 WebVTT。
 
@@ -77,7 +86,7 @@ def build_vtt(
     浏览器的 `<track>` **只认 VTT**，认不出 SRT（也不认 mp4 里的 mov_text 软轨），
     所以 Web 预览必须有一份 VTT。
     """
-    cues = _cues(segments, audio)
+    cues = _cues(segments, audio, speed=speed)
     body = "\n".join(
         f"{index}\n{start.replace(',', '.')} --> {end.replace(',', '.')}\n{text}\n"
         for index, start, end, text in cues
@@ -103,14 +112,18 @@ def srt_to_vtt(srt: str) -> str:
 
 
 def _cues(
-    segments: list[ComposeSegment], audio: AudioManifest | None
+    segments: list[ComposeSegment], audio: AudioManifest | None, *, speed: float = 1.0
 ) -> list[tuple[int, str, str, str]]:
-    """算出每条字幕的 (序号, 起, 止, 文本)，SRT / VTT 共用。"""
+    """算出每条字幕的 (序号, 起, 止, 文本)，SRT / VTT 共用。
+
+    `speed > 1`（成片加速）时所有时间戳按 `1/speed` 缩放，跟着画面一起变短。
+    """
+    scale = 1.0 / max(0.01, float(speed))
     cues: list[tuple[int, str, str, str]] = []
     cursor = 0.0
     for segment in segments:
         start = cursor
-        end = cursor + segment.duration_sec
+        end = cursor + segment.duration_sec * scale
         cursor = end
 
         text = segment.text.strip()
@@ -124,7 +137,7 @@ def _cues(
             if clip is not None:
                 speech = clip.duration_sec
         if speech > 0:
-            end = min(end, start + max(_MIN_CUE_SEC, speech + _TAIL_HOLD_SEC))
+            end = min(end, start + max(_MIN_CUE_SEC, (speech + _TAIL_HOLD_SEC) * scale))
 
         cues.append((len(cues) + 1, _stamp(start), _stamp(end), text))
     return cues

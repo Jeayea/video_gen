@@ -384,6 +384,101 @@ async def _finish(
     return effective
 
 
+#: atempo 每一级的合法区间。老版 ffmpeg 只认 0.5~2.0，所以任意倍率都拆成多级串联
+_ATEMPO_MIN = 0.5
+_ATEMPO_MAX = 2.0
+
+
+def atempo_chain(speed: float) -> str:
+    """把任意倍速拆成若干级合法 `atempo`（每级都落在 0.5~2.0）。
+
+    直接写 `atempo=4` 在老版 ffmpeg 上会报错，而 `atempo=2,atempo=2` 到处都能跑。
+    """
+    value = float(speed)
+    if value <= 0:
+        raise ComposeError(f"变速倍率必须大于 0（收到 {speed!r}）")
+    factors: list[float] = []
+    remaining = value
+    while remaining > _ATEMPO_MAX:
+        factors.append(_ATEMPO_MAX)
+        remaining /= _ATEMPO_MAX
+    while remaining < _ATEMPO_MIN:
+        factors.append(_ATEMPO_MIN)
+        remaining /= _ATEMPO_MIN
+    factors.append(remaining)
+    return ",".join(f"atempo={factor:g}" for factor in factors)
+
+
+def speed_filter(speed: float) -> str:
+    """整片变速的滤镜图。
+
+    - 视频：`setpts=PTS/speed` —— 只改时间戳，不动帧内容
+    - 音频：`atempo` —— **变速不变调**，用改采样率那套会把配音变成花栗鼠
+    """
+    return f"[0:v]setpts=PTS/{float(speed):g}[v];[0:a]{atempo_chain(speed)}[a]"
+
+
+async def apply_speed(
+    source: Path,
+    output: Path,
+    *,
+    speed: float,
+    duration: float,
+    fps: int,
+    crf: int,
+    preset: str,
+    cwd: Path,
+    exe: str | None = None,
+) -> None:
+    """把成片整体变速（`speed == 1` 时调用方不该调它）。
+
+    配音、口型、BGM、**烧进画面的字幕**都已经在 `source` 里了，一起被缩放，
+    所以变速之后它们之间仍然同步 —— 这也是为什么变速要放在最后一道工序。
+
+    **必须显式给 `-r`**：`setpts` 只改时间戳、不改帧数，不指定输出帧率时 ffmpeg
+    会按目标帧率复制/丢帧回到 CFR，把加速效果吃掉或产生重影。
+
+    **必须给 `-t duration`**：`atempo` 的输出并不精确等于 `源时长 / speed`，
+    AAC 编码还会再补一段 padding（67s 成片 2 倍速实测：视频 33.583s / 音频 33.753s，
+    差 0.17s —— 刚好越过 0.20s 的音画同步阈值被报出来）。掐到精确时长后两边都是
+    33.500s，漂移归零。
+    """
+    args = [
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        source.name,
+        "-filter_complex",
+        speed_filter(speed),
+        "-map",
+        "[v]",
+        "-map",
+        "[a]",
+        "-r",
+        str(max(1, int(fps))),
+        "-c:v",
+        "libx264",
+        "-preset",
+        preset,
+        "-crf",
+        str(crf),
+        "-pix_fmt",
+        "yuv420p",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "160k",
+        "-t",
+        f"{max(0.01, float(duration)):.3f}",
+        "-movflags",
+        "+faststart",
+        output.name,
+    ]
+    await run_ffmpeg(args, timeout_sec=BURN_TIMEOUT_SEC, cwd=cwd, exe=exe)
+
+
 def _final_loudness_filter(target_lufs: float, true_peak_db: float) -> str:
     """成片整体响度归一：loudnorm 到目标 LUFS + 真峰值限幅。
 
@@ -557,6 +652,15 @@ async def compose(
     fps = max(1, settings.video_fps)
     caps = await ffmpeg_capabilities()
     desired_mode = settings.subtitle_mode
+    speed = float(settings.compose_speed or 1.0)
+    speed_changing = abs(speed - 1.0) > 1e-9
+    if speed_changing and desired_mode == SubtitleMode.SOFT:
+        # 内嵌软字幕（mov_text）只有一条整体时间戳，**不参与变速缩放** ——
+        # 与其交一条字幕整体错位的片子，不如改烧进画面（帧被缩放，字自然跟着走）
+        warnings.append(
+            f"成片 {speed:g} 倍速：内嵌软字幕无法随变速缩放，已自动改为烧字幕"
+        )
+        desired_mode = SubtitleMode.BURN
     burn_exe: str | None = None
     if desired_mode == SubtitleMode.BURN:
         # 主 ffmpeg 常常没有 libass（brew 的 9.x 就没有），别急着降级：
@@ -735,6 +839,48 @@ async def compose(
     if not final.exists() or final.stat().st_size == 0:
         raise ComposeError("ffmpeg 未产出有效成片文件")
 
+    # ── 整片变速（最后一道工序）─────────────────────────────
+    # 放在响度归一与烧字幕**之后**：配音、逐帧口型、BGM、烧进画面的字幕都已在文件里，
+    # 一起被缩放 → 它们之间的同步关系不变。换到前面任何一步都要各自补偿，必错。
+    delivered_duration = total_duration
+    if speed_changing:
+        delivered_duration = round(total_duration / speed, 3)
+        sped = output_dir / "final_speed.mp4"
+        sped.unlink(missing_ok=True)
+        await apply_speed(
+            final,
+            sped,
+            speed=speed,
+            duration=delivered_duration,
+            fps=fps,
+            crf=settings.compose_crf,
+            preset=settings.compose_preset,
+            cwd=output_dir,
+            exe=burn_exe,
+        )
+        if not sped.exists() or sped.stat().st_size == 0:
+            raise ComposeError(f"变速输出失败（{speed:g} 倍速）")
+        sped.replace(final)  # 同一目录内替换，成片路径不变
+        warnings.append(
+            f"成片 {speed:g} 倍速：{total_duration:g}s → {delivered_duration:g}s"
+            f"（每镜观感 {1 / speed:.2f} 倍时长；音频用 atempo，变速不变调）"
+        )
+        if effective_mode == SubtitleMode.SOFT:
+            # 走到这里说明连烧字幕的 ffmpeg 都没找到：软轨已随变速被丢弃
+            warnings.append("变速后内嵌软字幕轨已丢弃，请用侧挂 .srt/.vtt（时间轴已按倍速重算）")
+            effective_mode = SubtitleMode.NONE
+        # 侧挂字幕必须跟着变速重算：用户拿它上传平台或用 <track> 预览
+        if subtitles_path is not None:
+            subtitles_path.write_text(
+                subtitle_service.build_srt(segments, audio_manifest, speed=speed),
+                encoding="utf-8",
+            )
+            if subtitles_vtt_path is not None:
+                subtitles_vtt_path.write_text(
+                    subtitle_service.build_vtt(segments, audio_manifest, speed=speed),
+                    encoding="utf-8",
+                )
+
     # 成片自检：音轨时长必须和视频基本相等。拼接丢掉音频空洞时（mp4 音轨表达不了
     # 空洞 → 后面所有声音整体提前）这个差值会等于空洞之和，一眼可见。
     sync = await check_av_sync(final)
@@ -763,7 +909,9 @@ async def compose(
         subtitles_vtt_path=(
             _relative(subtitles_vtt_path, project_dir) if subtitles_vtt_path else None
         ),
-        duration_sec=total_duration,
+        duration_sec=delivered_duration,
+        source_duration_sec=total_duration,
+        speed=speed,
         subtitle_mode=SubtitleMode(settings.subtitle_mode),
         subtitle_mode_effective=effective_mode,
         segments=segments,

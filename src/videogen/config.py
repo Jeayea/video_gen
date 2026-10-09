@@ -192,6 +192,13 @@ class Settings(BaseSettings):
     compose_true_peak_db: float = -1.5
     compose_crf: int = 23
     compose_preset: str = "veryfast"
+    #: 成片变速（1.0 = 原速，2.0 = 2 倍速快放，0.5 = 慢放）。范围 0.5~4。
+    #: 用途：视频模型按**最短档位**计费（H3 = 5 秒），所以 5 秒镜头最划算 ——
+    #: 排 25 个 5 秒镜头再整体 2 倍速，成片 62.5 秒、每镜观感 2.5 秒，档位一分不浪费。
+    #: 变速放在**最后一道 pass**（混音 + 响度归一 + 烧字幕之后），配音/口型/BGM/
+    #: 烧进画面的字幕一起被缩放，因此仍然同步；音频用 `atempo`（变速不变调）。
+    #: **内嵌软字幕（soft）的时间戳不参与变速**，所以变速时会自动改烧字幕。
+    compose_speed: float = Field(default=1.0, ge=0.5, le=4.0)
     compose_concurrency: int = 2
     compose_subtitle_font: str = ""
     #: 字幕字号 = min(宽, 高) * 该比例（0.05 ≈ 1080 宽的竖屏 54px）

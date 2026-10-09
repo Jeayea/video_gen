@@ -18,6 +18,7 @@ class ComposeSegment(BaseModel):
     shot_id: str
     scene_id: str = ""
     index: int = 0
+    #: 该镜在成片里的时长（**变速前**口径 = 分镜时长；成片实际观感要除以 `speed`）
     duration_sec: float = 0.0
     video_path: str = ""
     audio_path: str | None = None
@@ -37,6 +38,11 @@ class ComposeReport(BaseModel):
     #: 浏览器可直接播放的 WebVTT 侧挂字幕（UI 预览用；soft/burn 都导出）
     subtitles_vtt_path: str | None = None
     duration_sec: float = 0.0
+    #: 变速前的原始时长（= 分镜总时长；`speed == 1` 时与 `duration_sec` 相同）。
+    #: 交付的是 `duration_sec`（变速后），分镜/配音的时长口径仍是这一个
+    source_duration_sec: float = 0.0
+    #: 成片变速倍率（1.0 = 原速）。2.0 = 2 倍速快放，成片时长是原始时长的一半
+    speed: float = 1.0
     subtitle_mode: SubtitleMode = SubtitleMode.SOFT
     #: 实际生效的字幕模式（请求 burn 但 ffmpeg 没有 libass 时会降级）
     subtitle_mode_effective: SubtitleMode | None = None
@@ -75,6 +81,8 @@ class ComposeReport(BaseModel):
         return {
             "segments": len(self.segments),
             "duration_sec": self.duration_sec,
+            "source_duration_sec": self.source_duration_sec,
+            "speed": self.speed,
             "subtitle_mode": self.subtitle_mode_effective or self.subtitle_mode,
             "subtitles": bool(self.subtitles_path),
             "subtitles_vtt": bool(self.subtitles_vtt_path),

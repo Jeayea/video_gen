@@ -4,7 +4,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 HOST="${HOST:-127.0.0.1}"
-PORT="${PORT:-8000}"
+PORT="${PORT:-8001}"
 RELOAD="${RELOAD:-1}"
 
 args=(--host "$HOST" --port "$PORT")

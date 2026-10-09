@@ -345,6 +345,9 @@ class ComposeRequest(BaseModel):
     compose_loudness_normalize: bool | None = None
     #: 保留中间分段（排查用，默认关）
     compose_keep_segments: bool | None = None
+    #: 本次成片变速倍率（1.0 = 原速，2.0 = 2 倍速快放）；不写回配置。
+    #: 变速时内嵌软字幕会自动改烧字幕（软轨时间戳不参与变速）
+    speed: float | None = Field(default=None, ge=0.5, le=4.0)
     crf: int | None = Field(default=None, ge=0, le=51)
     subtitle_font_scale: float | None = Field(default=None, gt=0, le=0.2)
     #: 视频模型自带音轨：off = 丢弃；under = 压低垫在人声下面
@@ -927,6 +930,8 @@ async def compose_project(project_id: str, req: ComposeRequest | None = None):
             overrides["compose_loudness_normalize"] = req.compose_loudness_normalize
         if req.compose_keep_segments is not None:
             overrides["compose_keep_segments"] = req.compose_keep_segments
+        if req.speed is not None:
+            overrides["compose_speed"] = req.speed
     job = await pipeline.start_compose(project_id, overrides=overrides)
     return {"job": job.to_public()}
 
