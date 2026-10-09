@@ -85,6 +85,9 @@ async def test_bible_extracts_only_initial_chapters(store, pipeline, fake_llm):
     assert [p.name for p in bible.props] == ["U盘"]
     assert bible.style.genre == "都市"
     assert "晚晚" in bible.get_character("char_1").aliases
+    # LLM 合并没给性别时，用逐章抽取到的性别兜底（配音选角靠它挑男女声）；抽取也没写就留空
+    assert bible.get_character("char_1").gender == "female"
+    assert bible.get_character("char_2").gender == ""
 
     novel = store.load_novel(project.id)
     assert [c.extracted for c in novel.chapters] == [True, False, False, False]

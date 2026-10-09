@@ -34,7 +34,13 @@ from videogen.models.script import (
 from videogen.models.world_state import WorldState
 from videogen.providers.llm.base import LLMMessage, LLMProvider
 from videogen.utils.coerce import coerce_int, ensure_str_list
-from videogen.utils.duration import apply_duration_budget, deviation_ratio, scale_durations
+from videogen.utils.duration import (
+    SPEECH_CHARS_PER_SEC,
+    apply_duration_budget,
+    deviation_ratio,
+    dialogue_char_budget,
+    scale_durations,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -668,6 +674,7 @@ _PARTIAL_NOTE = """## 重要：这一段不是全篇
 #: 原著改编时追加给剧本医生的说明：情节走向是原著定的，不该被「医」掉
 _ADAPTATION_NOTE = """## 重要：这是原著改编
 情节、结局与人物选择以原著为准。**不要**要求改动原著情节、加入新冲突或改结局；
+原著自带的设定（超自然/荒诞前提、没有解释原因的事件、开放式结局）**不是问题，不要报**。
 只报**改编造成**的问题：压缩后因果断裂、关键信息没交代、人物动机在剧本里看不出来。"""
 
 
@@ -721,9 +728,11 @@ async def review_structure(
         message = " ".join(str(item.message or "").split())
         if not message:
             continue
+        # 改编时评审看不到原著，分不清「改编弄断的」和「原著本来就这样」（实测把原著的
+        # 荒诞前提报成 ERROR 拦住确认），所以只提示、不拦
         severity = (
             IssueSeverity.ERROR
-            if str(item.severity).strip().lower() == "error"
+            if str(item.severity).strip().lower() == "error" and not adaptation
             else IssueSeverity.WARNING
         )
         issues.append(
@@ -763,6 +772,9 @@ async def generate_scene(
 标题: {outline_scene.title}
 概述: {outline_scene.brief}
 本场时长: 必须为 {budget} 秒（允许 ±2 秒）
+台词总量: 本场全部台词合计不超过 {dialogue_char_budget(budget)} 字
+（按每秒约 {SPEECH_CHARS_PER_SEC} 字念，还要给动作和停顿留时间）；
+超了就删句、并句，只留推动剧情的那几句
 全剧预算: 共 {total_scenes} 场，合计 {project.target_duration_sec} 秒
 （这是第 {len(prev_scenes) + 1} 场）
 比例: {project.aspect_ratio.value}（影响构图描述）
@@ -801,7 +813,8 @@ def _source_block(outline_scene: OutlineScene) -> str:
 ## 原著片段（本场改编依据）
 {excerpt[:SOURCE_EXCERPT_MAX_CHARS]}
 
-改编要求：台词优先采用原著对白（可删减、口语化，不得改变意思）；叙述与心理描写改写成
+改编要求：台词从原著对白里**挑**最关键的几句（可删减、口语化，不得改变意思），
+总量服从上面的「台词总量」，不要把原文对白整段搬进来；叙述与心理描写改写成
 动作或少量对白；不要加入原著没有的情节；说话人必须映射到故事圣经里的角色 id。
 """
 

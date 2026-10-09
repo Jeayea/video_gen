@@ -3,12 +3,36 @@ from __future__ import annotations
 import math
 
 __all__ = [
+    "SPEECH_CHARS_PER_SEC",
     "apply_duration_budget",
     "deviation_ratio",
+    "dialogue_char_budget",
     "fit_durations",
     "plan_shot_count",
     "scale_durations",
+    "speech_chars",
+    "speech_seconds",
 ]
+
+#: 中文台词的念白语速（字/秒），与分镜提示词里的「台词字数 ÷ 4.5」同一个口径
+SPEECH_CHARS_PER_SEC = 4.5
+#: 一场戏里台词最多占多少时长（其余留给动作、反应与停顿）
+DIALOGUE_SHARE = 0.8
+
+
+def speech_chars(text: str) -> int:
+    """要念出来的字数：只数文字与数字，标点和空白不算。"""
+    return sum(1 for ch in text or "" if ch.isalnum())
+
+
+def speech_seconds(text: str) -> float:
+    """按 `SPEECH_CHARS_PER_SEC` 估算念完这段台词要多少秒。"""
+    return speech_chars(text) / SPEECH_CHARS_PER_SEC
+
+
+def dialogue_char_budget(duration_sec: int) -> int:
+    """一场 `duration_sec` 秒的戏最多能放多少字台词。"""
+    return max(0, int(duration_sec * SPEECH_CHARS_PER_SEC * DIALOGUE_SHARE))
 
 
 def scale_durations(values: list[int], target: int, minimum: int = 1) -> list[int]:

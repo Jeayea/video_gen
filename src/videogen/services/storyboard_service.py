@@ -210,6 +210,9 @@ async def generate_shots_for_scene(
 - video_prompt 必须是英文，且不得包含 char_N / loc_N 这类 id
 - 每个镜头都要填 location（场景 id），video_prompt 的背景要和该场景一致
 - 台词对应的镜头要标记 dialogue_text 和 dialogue_speaker（speaker 用角色 id）
+- **一个镜头只有一个说话人**：dialogue_text 只放 dialogue_speaker 这一个人的话
+  （整条会用他的声音念），两个人一来一回就拆成两个镜头（正反打）；
+  台词念不完（字数 ÷ 4.5 秒）也拆到下一个镜头
 - 无对白的空镜/过渡镜 narration 可为 null
 
 输出 JSON: {{"shots": [...]}}"""

@@ -17,6 +17,8 @@ class Character(BaseModel):
     name: str
     aliases: StrList = Field(default_factory=list)
     age: int | None = None
+    #: male / female / 空（未知）：配音选角优先认它，空时才从描述里的性别词推断
+    gender: str = ""
     role: str = ""  # 主角/反派/配角
     #: 角色所属国家/地区（cn/jp/kr/west/other）：决定参考图往哪国人脸上靠。
     #: 留空就按**名字**推断（详见 utils/region.py），推不出来就跟整个剧组一致
@@ -36,11 +38,27 @@ class Character(BaseModel):
         # LLM 常写 "25岁" / "约30" / ""，不能让它崩掉整个圣经
         return coerce_optional_int(value)
 
+    @field_validator("gender", mode="before")
+    @classmethod
+    def _coerce_gender(cls, value: object) -> str:
+        return normalize_gender(value)
+
     @field_validator("region", mode="before")
     @classmethod
     def _coerce_region(cls, value: object) -> str:
         # 模型可能写 "中国" / "Chinese" / "CN"，统一归一到内部键；不认识就留空
         return normalize_region(value)
+
+
+_GENDER_WORDS = {
+    "male": "male", "m": "male", "man": "male", "男": "male", "男性": "male",
+    "female": "female", "f": "female", "woman": "female", "女": "female", "女性": "female",
+}
+
+
+def normalize_gender(value: object) -> str:
+    """把 "男" / "Male" / "女性" 这类写法归一到 male / female，认不出来就留空。"""
+    return _GENDER_WORDS.get(str(value or "").strip().lower(), "")
 
 
 class Setting(BaseModel):

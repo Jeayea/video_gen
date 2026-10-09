@@ -20,7 +20,15 @@ from dataclasses import dataclass, field
 
 from pydantic import BaseModel, Field, field_validator
 
-from videogen.models.bible import Character, Fact, Prop, Setting, StoryBible, StyleGuide
+from videogen.models.bible import (
+    Character,
+    Fact,
+    Prop,
+    Setting,
+    StoryBible,
+    StyleGuide,
+    normalize_gender,
+)
 from videogen.models.novel import (
     NovelChapter,
     NovelCharacterNote,
@@ -67,7 +75,8 @@ NOVEL_EXTRACT_SYSTEM = """你是小说改编的资料员。阅读给定的一章
 4. summary 150-300 字，按发生顺序写清这一章的事件；beats 3-8 条按顺序的具体情节点（动作+对象）
 5. hook 写本章结尾留下的悬念（没有就留空）
 6. suggested_scenes：这一章拍成短剧需要几场（1-4），按关键事件数估
-7. locations 只收真实发生戏份的地点，description 摘录原文对环境的描写
+7. locations 只收真实发生戏份的地点（房间/街道/建筑这一级），床、沙发、镜子这类家具陈设不算地点；
+   description 摘录原文对环境的描写
 8. props 只收**推动剧情**的关键道具（信物/凶器/证据/关键文件…），最多 {max_props} 个；
    手机、水杯这类随手物品和桌椅陈设都不算，没有就给空数组。description 只写物品外观
 9. facts 只收对后续剧情有约束力的数字/时间/关系事实
@@ -94,13 +103,17 @@ NOVEL_MERGE_SYSTEM = """你是小说影视化改编的资产统筹。
 3. visual_prompt 必须是英文，只描述外貌/服装/气质（场景写环境、道具写物品本身），
    依据候选资料里的原文描写；原文没写的部分按身份/年龄/年代补一个合理、普通的外观
 4. 角色的 region 填 cn/jp/kr/west/other，与名字和原著背景一致，visual_prompt 的长相与 region 一致
-5. age 必须是数字或 null
-6. style 只在「已有圣经」没有类型/基调时填写（genre/tone/pacing），否则给空对象
+5. age 必须是整数：原文写了就用原文；没写就按身份、人物关系与年代**推断**一个合理的整数
+   （父母 ≈ 子女年龄 + 25~30；在职的成年人至少 20 多岁；学生按学段），
+   并与 visual_prompt 里的年龄段一致；只有毫无线索时才给 null
+6. gender 填 male / female（候选资料里的性别、「父亲/母亲/哥哥/妹妹」这类称谓都是依据），
+   实在判断不了留空
+7. style 只在「已有圣经」没有类型/基调时填写（genre/tone/pacing），否则给空对象
 
 只输出 JSON：
 {{"characters": [{{"from": ["C1"], "same_as": "", "name": "...", "aliases": [], "age": 25,
-   "role": "主角/配角/反派", "region": "cn", "description": "中文", "visual_prompt": "English",
-   "personality": ["..."]}}],
+   "gender": "male", "role": "主角/配角/反派", "region": "cn", "description": "中文",
+   "visual_prompt": "English", "personality": ["..."]}}],
  "settings": [{{"from": ["L1"], "same_as": "", "name": "...", "description": "中文",
    "visual_prompt": "English"}}],
  "props": [{{"from": ["P1"], "same_as": "", "name": "...", "description": "中文外观",
@@ -434,6 +447,8 @@ async def merge_into_bible(
             if hit:
                 item = next(i for i in items if i.id == hit)
                 _add_aliases(item, candidate.names())
+                if isinstance(item, Character) and not item.gender:
+                    item.gender = _extracted_gender([candidate])
             else:
                 pending[kind].append(candidate)
 
@@ -506,6 +521,11 @@ def _apply_characters(
         existing = bible.get_character(same_as) if same_as else None
         if existing is not None:
             _add_aliases(existing, names)
+            # 只补空着的性别（不改已有条目的其它字段：定妆照/音色都挂在它上面）
+            if not existing.gender:
+                existing.gender = normalize_gender(entry.get("gender")) or _extracted_gender(
+                    sources
+                )
             continue
         if added >= room:
             logger.info("角色已满（上限），跳过：%s", entry.get("name"))
@@ -524,11 +544,23 @@ def _apply_characters(
                 "id": _next_id("char", bible.characters),
                 "name": name,
                 "age": coerce_optional_int(entry.get("age")),
+                "gender": normalize_gender(entry.get("gender")) or _extracted_gender(sources),
             }
         )
         _add_aliases(character, [*ensure_str_list(entry.get("aliases")), *names])
         bible.characters.append(character)
         added += 1
+
+
+def _extracted_gender(sources: list[_Candidate]) -> str:
+    """LLM 没给性别时，用逐章抽取到的性别（候选资料的第一项）兜底；各章说法不一就留空。"""
+    found = {
+        gender
+        for c in sources
+        for note in c.notes
+        if (gender := normalize_gender(note.split("；", 1)[0]))
+    }
+    return found.pop() if len(found) == 1 else ""
 
 
 def _apply_simple(

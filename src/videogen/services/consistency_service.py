@@ -6,9 +6,9 @@ import re
 from videogen.models.bible import StoryBible
 from videogen.models.consistency import ConsistencyIssue, ConsistencyReport, IssueSeverity
 from videogen.models.script import Scene, Script
-from videogen.models.storyboard import Storyboard
+from videogen.models.storyboard import Shot, Storyboard
 from videogen.models.world_state import WorldState
-from videogen.utils.duration import deviation_ratio
+from videogen.utils.duration import deviation_ratio, speech_chars, speech_seconds
 
 #: 时长偏离目标超过这个比例算问题
 DURATION_TOLERANCE = 0.2
@@ -30,6 +30,12 @@ _FALSE_POSITIVE_NAMES = {
     "想说",
     "要说",
 }
+
+#: 以代词/指示词开头的匹配不是人名（第一人称小说里「她大笑」「我也不知道」「谁知道」）
+_NON_NAME_PREFIXES = tuple("我你他她它您咱谁这那")
+
+#: 台词念完需要的时长超过场次时长的倍数：超过 1 倍提示，超过 2 倍（严格模式）拦确认
+DIALOGUE_OVERLOAD_ERROR_RATIO = 2.0
 
 
 def validate_script(
@@ -57,6 +63,7 @@ def validate_script(
         issues.extend(_check_names_in_text(scene, known_names))
         issues.extend(_check_numbers(scene, bible))
         issues.extend(_check_scene_content(scene, strict=strict))
+        issues.extend(_check_dialogue_load(scene, strict=strict))
 
     issues.extend(_check_timeline(script))
     issues.extend(_check_structure(script, strict=strict, partial=partial))
@@ -288,6 +295,8 @@ def validate_storyboard(
                     )
                 )
 
+        issues.extend(_check_shot_voice(shot, script))
+
         if not shot.video_prompt.strip():
             issues.append(
                 ConsistencyIssue(
@@ -324,6 +333,64 @@ def validate_storyboard(
             )
 
     return issues
+
+
+#: 判断「混进了别人的台词」时，台词至少要有这么多字（太短的「好」「嗯」谁都可能说）
+_MIXED_LINE_MIN_CHARS = 4
+
+
+def _check_shot_voice(shot: Shot, script: Script) -> list[ConsistencyIssue]:
+    """一条配音只有一个声音：别人的台词混进这个镜头会被同一个音色念出来；台词太长会拉长镜头。"""
+    text = shot.dialogue_text or ""
+    if not text.strip():
+        return []
+    issues: list[ConsistencyIssue] = []
+    scene = next((s for s in script.scenes if s.id == shot.scene_id), None)
+    if scene and shot.dialogue_speaker:
+        own = {_compact(d.line) for d in scene.dialogue if d.speaker == shot.dialogue_speaker}
+        compact_text = _compact(text)
+        others = sorted({
+            d.speaker
+            for d in scene.dialogue
+            if d.speaker != shot.dialogue_speaker
+            and len(line := _compact(d.line)) >= _MIXED_LINE_MIN_CHARS
+            and line not in own
+            and line in compact_text
+        })
+        if others:
+            issues.append(
+                ConsistencyIssue(
+                    severity=IssueSeverity.ERROR,
+                    scene_id=shot.scene_id,
+                    shot_id=shot.id,
+                    category="presence",
+                    message=(
+                        f"镜头 {shot.id} 的台词里混进了 {'、'.join(others)} 的台词，"
+                        f"但整条会用 {shot.dialogue_speaker} 的声音念"
+                    ),
+                    suggestion="把不同人的台词拆到各自的镜头里（一个镜头只有一个说话人）",
+                )
+            )
+    needed = speech_seconds(text)
+    if shot.duration_sec > 0 and needed > shot.duration_sec * 2:
+        issues.append(
+            ConsistencyIssue(
+                severity=IssueSeverity.WARNING,
+                scene_id=shot.scene_id,
+                shot_id=shot.id,
+                category="duration",
+                message=(
+                    f"镜头 {shot.id} 的台词 {speech_chars(text)} 字，念完约 {needed:.0f} 秒，"
+                    f"镜头只有 {shot.duration_sec} 秒"
+                ),
+                suggestion="拆成多个镜头或删减台词（否则配音会把镜头拉长）",
+            )
+        )
+    return issues
+
+
+def _compact(text: str) -> str:
+    return "".join(ch for ch in text or "" if ch.isalnum())
 
 
 def merge_storyboard_issues(
@@ -375,6 +442,8 @@ def _check_names_in_text(scene: Scene, known_names: set[str]) -> list[Consistenc
     for match in name_pattern.findall(full_text):
         if match in seen or match in known_names or match in _FALSE_POSITIVE_NAMES:
             continue
+        if match.startswith(_NON_NAME_PREFIXES):
+            continue
         seen.add(match)
         issues.append(
             ConsistencyIssue(
@@ -386,6 +455,29 @@ def _check_names_in_text(scene: Scene, known_names: set[str]) -> list[Consistenc
             )
         )
     return issues
+
+
+def _check_dialogue_load(scene: Scene, *, strict: bool = False) -> list[ConsistencyIssue]:
+    """台词总量 vs 场次时长：念不完的台词会在配音阶段把镜头拉长，成片远超目标时长。"""
+    if scene.duration_sec <= 0 or not scene.dialogue:
+        return []
+    needed = sum(speech_seconds(d.line) for d in scene.dialogue)
+    if needed <= scene.duration_sec:
+        return []
+    ratio = needed / scene.duration_sec
+    blocking = strict and ratio > DIALOGUE_OVERLOAD_ERROR_RATIO
+    return [
+        ConsistencyIssue(
+            severity=IssueSeverity.ERROR if blocking else IssueSeverity.WARNING,
+            scene_id=scene.id,
+            category="duration",
+            message=(
+                f"{scene.id} 有 {len(scene.dialogue)} 句台词，念完约 {needed:.0f} 秒，"
+                f"但这场只有 {scene.duration_sec} 秒"
+            ),
+            suggestion="删掉不推动剧情的台词，或加长这场的时长（否则配音会把镜头拉长）",
+        )
+    ]
 
 
 def _check_scene_content(scene: Scene, *, strict: bool = False) -> list[ConsistencyIssue]:

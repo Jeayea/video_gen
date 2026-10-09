@@ -326,6 +326,9 @@ def infer_gender(character: Character | None) -> tuple[str | None, str]:
     """
     if character is None:
         return None, ""
+    declared = str(getattr(character, "gender", "") or "")
+    if declared in ("male", "female"):
+        return declared, "圣经 gender 字段"
     text = " ".join(
         str(part).lower()
         for part in (
@@ -459,6 +462,9 @@ def _score(voice: VoiceProfile, character: Character | None, settings: Settings)
     age = getattr(character, "age", None)
     if isinstance(age, int) and age > 0:
         score -= abs(voice.age_mid - age) / 10.0
+    elif voice.age[1] <= _CHILD_VOICE_MAX_AGE and not _looks_young(character):
+        # 年龄未知时不让童声兜底（实测：没填年龄的「父亲」被配成了 8-16 岁的云夏）
+        score -= 5.0
     if voice.locale != "zh-CN":
         score -= 6.0  # 同一部戏里混口音很出戏
     if voice.dialect:
@@ -468,6 +474,25 @@ def _score(voice: VoiceProfile, character: Character | None, settings: Settings)
     if voice.id == settings.tts_voice_male and voice.gender == "male":
         score += 0.5
     return score
+
+
+#: 音色年龄上限不超过这个岁数的算「童声/少年音」
+_CHILD_VOICE_MAX_AGE = 16
+#: 描述里出现这些词，年龄未知时也允许用童声
+_YOUNG_HINTS = (
+    "孩子", "小孩", "儿童", "少年", "少女", "男孩", "女孩", "小学", "初中", "幼",
+    "child", "kid", "boy", "girl", "teen",
+)
+
+
+def _looks_young(character: Character | None) -> bool:
+    if character is None:
+        return False
+    text = " ".join(
+        str(getattr(character, field, "") or "").lower()
+        for field in ("name", "role", "description", "visual_prompt")
+    )
+    return _hits(text, _YOUNG_HINTS) > 0
 
 
 def _reuse_delivery(voice: VoiceProfile, index: int, *, cloud: bool = False) -> VoiceDirection:

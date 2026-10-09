@@ -236,3 +236,35 @@ def test_catalog_rows_expose_metadata_for_ui():
     assert row["gender"] == "female"
     assert row["age"] and row["timbre"] and row["label"]
     assert all(r["locale"].startswith("zh") for r in rows)
+
+
+# ── 年龄未知 / 圣经里声明的性别（NOVEL 实测：父亲被配成少年音）──────────────
+
+
+def test_declared_gender_wins_over_text_guess():
+    character = Character(id="char_1", name="小林", gender="女", description="公司代表")
+    assert character.gender == "female"
+    assert infer_gender(character) == ("female", "圣经 gender 字段")
+    assert Character(id="char_2", name="某人", gender="unknown").gender == ""
+
+
+def test_unknown_age_adult_never_falls_back_to_child_voice():
+    """《变形记》实测：父亲没填年龄，男声里格里高占了云希，父亲被分到 8-16 岁的云夏。"""
+    bible = make_bible(
+        Character(id="char_1", name="格里高", role="主角", gender="male", description="推销员"),
+        Character(id="char_3", name="父亲", role="配角", gender="male",
+                  description="格里高的父亲"),
+    )
+    casting = cast_voice_map(make_storyboard(["char_1", "char_3"]), bible)
+    assert not casting.voice_map["char_3"].endswith("YunxiaNeural")
+    assert voice_gender(casting.voice_map["char_3"]) == "male"
+
+
+def test_young_character_without_age_can_still_get_child_voice():
+    bible = make_bible(
+        Character(id="char_1", name="男主", role="主角", gender="male", age=25),
+        Character(id="char_2", name="小宝", role="配角", gender="male",
+                  description="邻居家的小男孩"),
+    )
+    casting = cast_voice_map(make_storyboard(["char_1", "char_2"]), bible)
+    assert casting.voice_map["char_2"].endswith("YunxiaNeural")

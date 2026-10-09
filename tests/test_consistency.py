@@ -12,10 +12,10 @@ from tests.fakes import FakeLLM, FakeVideoProvider
 from videogen.config import get_settings
 from videogen.models.bible import Character, StoryBible
 from videogen.models.project import Project, ProjectStatus
-from videogen.models.script import Scene, Script
+from videogen.models.script import DialogueLine, Scene, Script
 from videogen.models.storyboard import Shot, Storyboard
 from videogen.orchestrator.pipeline import Pipeline, PipelineError
-from videogen.services import consistency_service, video_service
+from videogen.services import consistency_service, script_service, video_service
 from videogen.utils.ffmpeg import ffmpeg_available
 from videogen.utils.file_store import FileStore
 
@@ -423,3 +423,90 @@ def test_reference_request_model_validation():
     with pytest.raises(ValidationError):
         ReferenceImageRequest(content_base64="")
     assert ReferenceImageRequest(filename="a.png", content_base64=PNG).filename == "a.png"
+
+
+# ── 台词量 / 一镜一个说话人 / 改编评审（NOVEL 实测暴露的问题）─────────────────
+
+
+def _two_people() -> StoryBible:
+    return StoryBible(characters=[
+        Character(id="char_1", name="我", role="主角"),
+        Character(id="char_2", name="女朋友", role="主角"),
+    ])
+
+
+def test_dialogue_overload_warns_then_blocks_in_strict_mode():
+    """12 秒的场塞 120 字台词（≈27 秒）：配音会把镜头拉长，成片远超目标时长。"""
+    line = "你什么都知道，像上帝一样，真讨厌！" * 2  # 30 字
+    lines = [DialogueLine(speaker="char_2", line=line) for _ in range(4)]
+    script = _script(Scene(id="scene_1", summary="吵架", dialogue=lines, duration_sec=12))
+
+    lenient = consistency_service.validate_script(script, _two_people())
+    strict = consistency_service.validate_script(script, _two_people(), strict=True)
+
+    hits = [i for i in lenient.issues if i.category == "duration" and "念完约" in i.message]
+    assert hits and hits[0].severity.value == "warning"
+    assert any("念完约" in i.message for i in consistency_service.has_errors(strict))
+
+
+def test_dialogue_that_fits_is_not_flagged():
+    script = _script(Scene(
+        id="scene_1", summary="会合", duration_sec=12,
+        dialogue=[DialogueLine(speaker="char_1", line="你有点着急了吧。")],
+    ))
+    report = consistency_service.validate_script(script, _two_people(), strict=True)
+    assert not [i for i in report.issues if "念完约" in i.message]
+
+
+def test_pronoun_led_phrases_are_not_names():
+    """第一人称小说：「她大笑」「我也不知道」「谁知道」不是人名。"""
+    summary = "她大笑说好。我也不知说什么。谁知说完就变了。"
+    scene = Scene(id="scene_1", summary=summary, duration_sec=12)
+    report = consistency_service.validate_script(_script(scene), _two_people())
+    assert not [i for i in report.issues if "未定义的人名" in i.message]
+
+
+def test_storyboard_flags_other_speakers_line_in_shot():
+    """一条配音只有一个声音：别人的台词混进来会被同一个音色念掉。"""
+    script = _script(Scene(id="scene_2", duration_sec=12, dialogue=[
+        DialogueLine(speaker="char_2", line="你就这么往地下坐呀！"),
+        DialogueLine(speaker="char_1", line="我累了！我走不动了。"),
+    ]))
+    storyboard = Storyboard(shots=[Shot(
+        id="scene_2_shot_2", scene_id="scene_2", shot_no=1, duration_sec=6,
+        character_in_frame=["char_1", "char_2"], video_prompt="two people on a street",
+        dialogue_text="你就这么往地下坐呀！我累了！我走不动了。", dialogue_speaker="char_2",
+    )])
+    issues = consistency_service.validate_storyboard(storyboard, script, _two_people())
+    mixed = [i for i in issues if "混进了" in i.message]
+    assert mixed and mixed[0].severity.value == "error" and "char_1" in mixed[0].message
+
+
+def test_storyboard_warns_when_shot_line_is_far_too_long():
+    script = _script(Scene(id="scene_1", duration_sec=12))
+    storyboard = Storyboard(shots=[Shot(
+        id="scene_1_shot_1", scene_id="scene_1", shot_no=1, duration_sec=3,
+        character_in_frame=["char_2"], video_prompt="a woman talking",
+        dialogue_text="我昨天好像是个男人。我现在真不知该站在男人的立场上，还是该站在女人的立场上了。",
+        dialogue_speaker="char_2",
+    )])
+    issues = consistency_service.validate_storyboard(storyboard, script, _two_people())
+    assert any(i.category == "duration" and "念完约" in i.message for i in issues)
+
+
+class _ReviewLLM:
+    async def chat_json(self, messages, schema, **kwargs):
+        return schema.model_validate({"issues": [
+            {"severity": "error", "message": "身体互换的触发机制不明"},
+        ]})
+
+
+async def test_adaptation_review_never_blocks():
+    """改编时评审看不到原著，原著自带的荒诞前提不能被报成 ERROR 拦住确认。"""
+    script = _script(Scene(id="scene_1", summary="两人身体互换", duration_sec=12))
+    original = await script_service.review_structure(_ReviewLLM(), script, _two_people())
+    adapted = await script_service.review_structure(
+        _ReviewLLM(), script, _two_people(), adaptation=True
+    )
+    assert original[0].severity.value == "error"
+    assert adapted[0].severity.value == "warning"
