@@ -455,7 +455,7 @@ class VideoProvider(ABC):
 - 本机现写（v0.19）：`BGM_ENGINE=generate` —— 由分镜情绪/时长/台词 + 画面运动实测
   写出**配乐谱**（色调/调式/BPM/段落/和弦/配器/重音），再用纯标准库合成 WAV，
   过 `afir` 卷积混响 + 压缩 + 响度归一；段落切点对齐镜头、运动爆发处给重音、
-  说话窗口让路。详见 README「配乐」
+  说话窗口让路。详见 AGENTS.md「配乐」
 - AI 音乐模型（v0.19）：`BGM_ENGINE=cli` + `BGM_CLI_CMD` 模板（`{out}`/`{prompt}`），
   提示词由配乐谱生成（英文 + 段落时间轴）
 
@@ -688,14 +688,14 @@ FFMPEG_AUTO_UPGRADE=true      # 主 ffmpeg 缺能力时自动换候选（如烧�
 - ~~分镜阶段的「模型时长档位感知」~~ **已完成（v0.11）**：生成分镜前先读 provider 的时长档位，
   按「每镜 ≥ 最短、≤ 最长、贴近目标时长」算出每场镜头数并写进提示词；生成后再用
   `apply_duration_tier` 做确定性兜底（合并超出计划的镜头 + 重分配时长，合不动就告警）。
-  详见 §4.2 与 README「分镜阶段就少而长」
+  详见 §4.2 与 AGENTS.md「分镜阶段就少而长」
 - 任务/批量状态仅在进程内存里（项目状态已落盘，重启会自动回收）
 - 一个镜头多音轨混音
 - 配乐只做「音乐床」：没有主题动机随剧情变形（leitmotif）、没有按角色区分的音色、
   没有自动跟拍剪辑点做转场音效（当前重音只落在镜头切换与运动爆发上）
 - ~~视频**运动**信息进入文案生成~~ **已完成（v0.16）**：本地实测运动曲线（6fps/64×64 灰度、
   纯标准库）随抽帧一起发给配音导演，念法跟着画面节奏走。判读分「整段活跃度（按均值分档）」
-  与「起伏窗口（按中位数 1.6×）」。详见 README「配音文案」与 `utils/motion.py`
+  与「起伏窗口（按中位数 1.6×）」。详见 AGENTS.md「配音文案」与 `utils/motion.py`
 - ~~**逐帧口型对齐**~~ **已完成（v0.16）**：`LIPSYNC_ENGINE=wav2lip-onnx` 走可插拔引擎
   （内置 Wav2Lip ONNX，独立环境 `.venv-lipsync`、不需要 torch、本地 CPU、$0；
   LatentSync/MuseTalk 这类 CUDA 引擎走 `cli` + `LIPSYNC_CMD` 模板），
@@ -705,7 +705,7 @@ FFMPEG_AUTO_UPGRADE=true      # 主 ffmpeg 缺能力时自动换候选（如烧�
   脸部修复（GFPGAN/CodeFormer）
 - **名字 ↔ 国家 ↔ 脸对齐（v0.17）**：名字推国籍（假名/谚文/姓氏表/文本提示，带置信度）→
   该国的「平均脸/主角脸」英文锚点进定妆照与视频 prompt；一部片子一张脸谱（全剧组投票），
-  `Character.region` 与 `IMAGE_REGION_OVERRIDE` 可人工压过。见 `utils/region.py` 与 README
+  `Character.region` 与 `IMAGE_REGION_OVERRIDE` 可人工压过。见 `utils/region.py` 与 AGENTS.md「名字 ↔ 国家 ↔ 脸」
 - **国家/人物设定可在生成圣经时声明（v0.18）**：`Project.cast_region` + `Project.bible_notes`
   进提示词并写进 `StoryBible.cast_region`，下游以此为权威依据（名字启发式只做冲突提醒）。
 - **按分镜现写配乐（v0.19）**：`BGM_ENGINE=generate` —— `utils/music.py` 作曲 + 合成
@@ -730,7 +730,7 @@ FFMPEG_AUTO_UPGRADE=true      # 主 ffmpeg 缺能力时自动换候选（如烧�
 - **人声闪避（v0.19）**：合成时 `sidechaincompress` 用人声当 side chain（`BGM_DUCK`，
   可逐次覆盖）；`tools/music/measure_ducking.py` 逐窗口实测
   （真实项目：说话段音乐 -9.2dB、静音段 +0.1dB、人声不变）
-  见 README「名字 ↔ 国家 ↔ 脸」与 FIXES v0.18
+  见 AGENTS.md「名字 ↔ 国家 ↔ 脸」与 FIXES v0.18
 - **音画同步自检**：`utils/av_sync.py` 在成片阶段核对「音轨时长 ≈ 视频时长」，
   抓「`concat -c copy` 吃掉音频空洞」这类事故（真实事故：对比片漂移 7.154 秒）
 
