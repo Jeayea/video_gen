@@ -204,6 +204,8 @@ def repair_storyboard(
         speaker = (shot.dialogue_speaker or "").strip()
         if not speaker or speaker in shot.character_in_frame or speaker not in known:
             continue  # 说话人不存在时交给校验报 ERROR，不能猜
+        if shot.voice_offscreen:
+            continue  # 画外音：人本来就不在画面里（门外喊话），补进去反而穿帮
         before = list(shot.character_in_frame)
         shot.character_in_frame = [*before, speaker]
         fixed.append(f"镜头 {shot.id}：把说话人 {speaker} 补进画面角色（原为 {before}）")
@@ -280,7 +282,10 @@ def validate_storyboard(
                         suggestion="改为故事圣经里的角色 id",
                     )
                 )
-            elif shot.dialogue_speaker not in shot.character_in_frame:
+            elif (
+                shot.dialogue_speaker not in shot.character_in_frame
+                and not shot.voice_offscreen
+            ):
                 issues.append(
                     ConsistencyIssue(
                         severity=IssueSeverity.WARNING,

@@ -506,13 +506,23 @@ def build_segment_prompt(
             lines.append(anchor)
     for directive in (
         settings.video_background_directive,
-        settings.video_performance_directive,
+        _without_no_cut(settings.video_performance_directive),
         settings.video_style_prompt,
     ):
         text = " ".join(str(directive or "").split())
         if text:
             lines.append(text)
     return ". ".join(lines)
+
+
+#: 单镜表演要求里「不许切」的说法：段落 prompt 要求按时间戳硬切，两者自相矛盾
+_NO_CUT = re.compile(r"\b(no cuts?|without cuts?|continuous take|single take|one take)\b", re.I)
+
+
+def _without_no_cut(directive: str) -> str:
+    """去掉表演要求里禁止剪切的条目（逗号分隔），其余原样保留。"""
+    items = [item for item in str(directive or "").split(",") if not _NO_CUT.search(item)]
+    return ",".join(items)
 
 
 def provider_switched(manifest: VideoManifest, provider: VideoProvider) -> bool:
@@ -846,6 +856,12 @@ def dialogue_directive(shot: Shot, bible: StoryBible | None = None) -> str:
     text = " ".join(str(shot.dialogue_text or "").split())
     if not text:
         return ""
+    if shot.voice_offscreen:
+        # 说话人在门外/电话里：让模型画「听见声音」，别把说话人硬塞进画面对口型
+        return (
+            f'an off-screen voice is heard saying: "{text}" — the speaker is not visible, '
+            "nobody on screen lip-syncs this line, no on-screen text or captions"
+        )
     return (
         f'the on-screen speaker says this exact Mandarin line: "{text}" — natural lip-sync '
         "matched to the Mandarin speech, mouth movement and breathing follow the line, "

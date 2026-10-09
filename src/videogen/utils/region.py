@@ -353,6 +353,7 @@ def project_region(
     weights = {"主角": 2.0, "反派": 2.0, "次要反派": 1.5, "配角": 1.0, "龙套": 0.5}
     scores: dict[str, float] = {}
     reasons: dict[str, str] = {}
+    declared_other = False
     for character in characters:
         guess = guess_region(
             getattr(character, "name", ""),
@@ -364,6 +365,7 @@ def project_region(
         if explicit:
             guess = RegionGuess(explicit, 1.0, "character:region")
         if guess.region == "other":
+            declared_other = declared_other or explicit == "other"
             continue
         role = str(getattr(character, "role", "") or "").strip()
         weight = guess.confidence * weights.get(role, 1.0)
@@ -371,6 +373,10 @@ def project_region(
         reasons.setdefault(guess.region, guess.source)
 
     if not scores:
+        if declared_other:
+            # 圣经明确写了「不限定」（例如翻译小说没判出国籍）：不加人种锚点，
+            # 不能退回默认国家（真实事故：卡夫卡的布拉格一家被画成了中国脸）
+            return RegionGuess("other", 1.0, "character:region")
         fallback = normalize_region(default) or "cn"
         return RegionGuess(fallback, 0.2, "default")
     best = max(scores, key=lambda key: scores[key])

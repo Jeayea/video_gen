@@ -36,6 +36,7 @@ def build_segments(
                 audio_path=audio_clip.path if audio_clip else None,
                 text=text,
                 volume=(audio_clip.volume if audio_clip else "") or "",
+                voice_offscreen=shot.voice_offscreen,
             )
         )
     return segments

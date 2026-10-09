@@ -57,6 +57,9 @@ class ShotDraft(BaseModel):
     narration: str | None = None
     dialogue_text: str | None = None
     dialogue_speaker: str | None = None
+    #: 画外音：说话人不在画面里（门外 / 电话里 / 隔墙喊话）。这时不把他补进画面、
+    #: 视频 prompt 不要求画面里有人对口型、合成时也不做口型
+    voice_offscreen: bool = False
 
     @field_validator("duration_sec", mode="before")
     @classmethod
@@ -67,6 +70,14 @@ class ShotDraft(BaseModel):
     @classmethod
     def _empty_to_none(cls, value: object) -> str | None:
         return ensure_optional_str(value)
+
+    @field_validator("voice_offscreen", mode="before")
+    @classmethod
+    def _coerce_offscreen(cls, value: object) -> bool:
+        # 模型会写 null / "true" / "是"
+        if isinstance(value, str):
+            return value.strip().lower() in {"true", "yes", "1", "是"}
+        return bool(value)
 
 
 class Shot(BaseModel):
@@ -88,6 +99,9 @@ class Shot(BaseModel):
     narration: str | None = None
     dialogue_text: str | None = None
     dialogue_speaker: str | None = None
+    #: 画外音：说话人不在画面里（门外 / 电话里 / 隔墙喊话）。这时不把他补进画面、
+    #: 视频 prompt 不要求画面里有人对口型、合成时也不做口型
+    voice_offscreen: bool = False
     #: 配音文案来源标记："llm:narration" / "llm:polish" / "llm:full" = 这条是
     #: LLM 看着画面写的；空 = 剧本/人工原文。同一模式重跑会跳过，不重复花额度。
     voice_script_source: str = ""

@@ -28,6 +28,8 @@ class ComposeSegment(BaseModel):
     volume: str = ""
     #: 这条配音在合成时实际补了多少 dB（响度归一的结果，写进报告）
     gain_db: float = 0.0
+    #: 画外音：画面里没人开口，不做「配音对齐到开口」
+    voice_offscreen: bool = False
 
 
 class ComposeReport(BaseModel):

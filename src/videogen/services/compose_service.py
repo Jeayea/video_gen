@@ -1064,6 +1064,7 @@ async def _render_all(
             if (
                 lipsynced is None
                 and align_mouth
+                and not segment.voice_offscreen
                 and audio_path is not None
                 and await has_ambient(video_path)
             ):

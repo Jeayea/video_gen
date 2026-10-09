@@ -372,3 +372,17 @@ async def test_bible_prompt_without_constraints_has_no_blocks():
     await bible_service.generate_bible(Project(input_text="都市复仇"), SpyLLM())
     assert "国家/地区限定" not in captured["user"]
     assert "额外要求" not in captured["user"]
+
+
+def test_cast_declared_other_gets_no_default_face(settings):
+    """卡夫卡实测：全员 region=other，却退回默认 cn，布拉格一家被画成中国脸。"""
+    bible = StoryBible(characters=[
+        Character(id="char_1", name="格里高·萨姆莎", role="主角", region="other",
+                  visual_prompt="a young man in a salesman's suit"),
+        Character(id="char_2", name="母亲", role="配角", region="other",
+                  visual_prompt="a middle-aged woman in an early 20th century dress"),
+    ])
+    assert region.project_region(bible, default="cn").region == "other"
+    shot = Shot(id="s1", scene_id="scene_1", shot_no=1, character_in_frame=["char_2"])
+    assert "cast look" not in video_service.appearance_anchor(shot, bible, settings=settings)
+

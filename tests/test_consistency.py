@@ -510,3 +510,27 @@ async def test_adaptation_review_never_blocks():
     )
     assert original[0].severity.value == "error"
     assert adapted[0].severity.value == "warning"
+
+
+def test_offscreen_speaker_is_not_forced_into_frame():
+    """门外喊话（画外音）：不把说话人补进画面、不报「说话人不在画面」、不做逐帧口型。"""
+    from videogen.models.storyboard import ShotDraft
+    from videogen.services import lipsync_service
+
+    script = _script(Scene(id="scene_1", duration_sec=12, dialogue=[
+        DialogueLine(speaker="char_2", line="格里高，你还好吗？"),
+    ]))
+    shot = Shot(
+        id="scene_1_shot_1", scene_id="scene_1", shot_no=1, duration_sec=3,
+        character_in_frame=[], video_prompt="a closed bedroom door",
+        dialogue_text="格里高，你还好吗？", dialogue_speaker="char_2", voice_offscreen=True,
+    )
+    storyboard, fixed = consistency_service.repair_storyboard(
+        Storyboard(shots=[shot]), script, _two_people()
+    )
+    assert not fixed and storyboard.shots[0].character_in_frame == []
+    issues = consistency_service.validate_storyboard(storyboard, script, _two_people())
+    assert not [i for i in issues if i.category == "presence"]
+    assert not lipsync_service.shot_eligible(storyboard.shots[0])
+    assert ShotDraft(voice_offscreen=None).voice_offscreen is False
+    assert ShotDraft(voice_offscreen="true").voice_offscreen is True

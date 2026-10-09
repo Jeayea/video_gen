@@ -120,6 +120,8 @@ def shot_eligible(shot, *, scope: str = "dialogue") -> bool:
         return True
     if not clean_spoken_text(getattr(shot, "dialogue_text", "")):
         return False
+    if getattr(shot, "voice_offscreen", False):
+        return False  # 画外音：画面里没人在说这句
     speaker = (getattr(shot, "dialogue_speaker", "") or "").strip()
     in_frame = [str(item) for item in (getattr(shot, "character_in_frame", None) or [])]
     return not (speaker and in_frame and speaker not in in_frame)

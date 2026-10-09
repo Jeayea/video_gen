@@ -324,3 +324,24 @@ async def test_segment_mode_full_media_chain_composes(store):
     report = store.load_compose_report(project.id)
     assert len(report.segments) == 3
     assert store.load_project(project.id).status == ProjectStatus.DONE
+
+
+def test_segment_prompt_drops_no_cut_directive_but_keeps_the_rest(settings):
+    """单镜表演要求里的「single continuous take with no cuts」和段内硬切自相矛盾。"""
+    shots = [_shot("s1", "scene_1", 3, video_prompt="a door"),
+             _shot("s2", "scene_1", 3, video_prompt="a bed")]
+    prompt = video_service.build_segment_prompt(shots, Project(title="t"), StoryBible())
+    assert "no cuts" not in prompt and "continuous take" not in prompt
+    assert "natural blinking and breathing" in prompt and "no morphing" in prompt
+    single = video_service.build_prompt(shots[0], Project(title="t"), StoryBible())
+    assert "single continuous take with no cuts" in single  # 单镜生成照旧
+
+
+def test_offscreen_voice_is_not_lip_synced_on_screen(settings):
+    """门外喊话：prompt 写「画外音」，不再要求画面里的人对口型。"""
+    shot = _shot("s1", "scene_1", 3, video_prompt="a closed door", dialogue_text="格里高！快开门！")
+    shot.dialogue_speaker = "char_3"
+    shot.voice_offscreen = True
+    prompt = video_service.build_segment_prompt([shot], Project(title="t"), StoryBible())
+    assert "off-screen voice" in prompt and "on-screen speaker" not in prompt
+    assert "格里高！快开门！" in prompt

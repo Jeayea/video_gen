@@ -47,7 +47,8 @@ STORYBOARD_SYSTEM = """你是一位专业分镜师。根据剧本场景生成分
   "props_in_frame": ["prop_1"],
   "narration": null 或 "旁白文字",
   "dialogue_text": null 或 "台词文字",
-  "dialogue_speaker": null 或 "char_id"
+  "dialogue_speaker": null 或 "char_id",
+  "voice_offscreen": false
 }
 
 要求：
@@ -213,6 +214,8 @@ async def generate_shots_for_scene(
 - **一个镜头只有一个说话人**：dialogue_text 只放 dialogue_speaker 这一个人的话
   （整条会用他的声音念），两个人一来一回就拆成两个镜头（正反打）；
   台词念不完（字数 ÷ 4.5 秒）也拆到下一个镜头
+- 说话人**不在画面里**（门外、电话里、隔墙喊话、画外音）时 voice_offscreen=true，
+  且 character_in_frame 不要放他；画面拍听见声音的人或那扇门
 - 无对白的空镜/过渡镜 narration 可为 null
 
 输出 JSON: {{"shots": [...]}}"""
@@ -246,6 +249,7 @@ async def generate_shots_for_scene(
                 narration=draft.narration,
                 dialogue_text=draft.dialogue_text,
                 dialogue_speaker=draft.dialogue_speaker,
+                voice_offscreen=bool(draft.voice_offscreen and draft.dialogue_text),
             )
         )
     return shots

@@ -1861,7 +1861,7 @@ function shotBlockHtml(s, si) {
           ${(s.character_in_frame || []).length ? `<span class="tag-mini" title="出镜角色">👤 ${esc(namesOf('characters', s.character_in_frame))}</span>` : ''}
           ${s.location ? `<span class="tag-mini" title="场景">📍 ${esc(assetName('settings', s.location))}</span>` : ''}
           ${(s.props_in_frame || []).length ? `<span class="tag-mini" title="关键道具">🔑 ${esc(namesOf('props', s.props_in_frame))}</span>` : ''}
-          ${s.dialogue_text ? `<span style="color:var(--accent2)" title="${esc(s.dialogue_speaker)}">💬 ${esc(speakerName(s.dialogue_speaker))}</span>` : ''}
+          ${s.dialogue_text ? `<span style="color:var(--accent2)" title="${esc(s.dialogue_speaker)}">💬 ${esc(speakerName(s.dialogue_speaker))}${s.voice_offscreen ? '（画外音）' : ''}</span>` : ''}
         </div>
         <div>${esc(s.visual_description)}</div>
         ${s.video_prompt ? `<div class="prompt">${esc(s.video_prompt)}</div>` : ''}
