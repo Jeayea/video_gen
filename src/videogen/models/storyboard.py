@@ -52,6 +52,8 @@ class ShotDraft(BaseModel):
     video_prompt: str = ""
     #: 这一镜发生在哪个场景（故事圣经 settings 的 id）——背景一致性与丰富度的锚点
     location: str = ""
+    #: 画面里出现的关键道具（故事圣经 props 的 id）
+    props_in_frame: StrList = Field(default_factory=list)
     narration: str | None = None
     dialogue_text: str | None = None
     dialogue_speaker: str | None = None
@@ -79,6 +81,10 @@ class Shot(BaseModel):
     video_prompt: str = ""
     #: 这一镜发生在哪个场景（故事圣经 settings 的 id），用于注入背景锚点
     location: str = ""
+    #: 画面里出现的关键道具（故事圣经 props 的 id）：有参考图时一起送进视频模型
+    props_in_frame: StrList = Field(default_factory=list)
+    #: 段落分镜：所属段落 id（同一段的镜头一次生成、段内硬切）。空 = 单镜生成
+    segment_id: str = ""
     narration: str | None = None
     dialogue_text: str | None = None
     dialogue_speaker: str | None = None
@@ -120,6 +126,14 @@ class Storyboard(BaseModel):
 
     def scene_ids(self) -> set[str]:
         return {s.scene_id for s in self.shots}
+
+    def segment_ids(self) -> list[str]:
+        """按出现顺序去重的段落 id（没编段的镜头不算）。"""
+        seen: list[str] = []
+        for shot in self.shots:
+            if shot.segment_id and shot.segment_id not in seen:
+                seen.append(shot.segment_id)
+        return seen
 
 
 __all__ = [

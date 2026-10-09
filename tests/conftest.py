@@ -48,6 +48,9 @@ def fast_video_settings(monkeypatch):
     # 配音文案：默认关掉，防止本地 .env 打开后让无关用例多调 LLM / 抽帧
     monkeypatch.setattr(settings, "audio_llm_script", "off")
     monkeypatch.setattr(settings, "audio_llm_vision", False)
+    # 段落分镜：老用例按「一镜一次生成」写断言（假 provider 也只写小文件、切不了），
+    # 默认关掉；段落相关用例（test_segments.py）自己打开
+    monkeypatch.setattr(settings, "video_segment_mode", False)
     return settings
 
 

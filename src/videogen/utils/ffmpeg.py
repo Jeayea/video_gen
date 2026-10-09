@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import shutil
 from collections.abc import Iterable
 from pathlib import Path
@@ -12,7 +13,9 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "FFmpegError",
+    "cut_clip",
     "describe_media",
+    "detect_cuts",
     "ffmpeg_available",
     "ffmpeg_candidates",
     "ffmpeg_capabilities",
@@ -509,6 +512,85 @@ async def run_ffmpeg(
     if process.returncode != 0:
         tail = (stderr or b"").decode("utf-8", "replace").strip().splitlines()[-3:]
         raise FFmpegError(f"ffmpeg 退出码 {process.returncode}：{' | '.join(tail)[:300]}")
+
+
+_PTS_RE = re.compile(r"pts_time:([0-9.]+)")
+
+
+async def detect_cuts(
+    path: Path, *, threshold: float = 0.3, timeout_sec: float = 120.0
+) -> list[float] | None:
+    """找出视频里的硬切时间点（秒，升序）。没有 ffmpeg / 探测失败返回 None。
+
+    用 `select=gt(scene,阈值)` + `showinfo`：画面整体突变的帧就是切点。段落分镜用它
+    把「计划切点」吸附到模型真正切镜的位置（模型很少严格按时间戳切）。
+    """
+    exe = resolve_ffmpeg()
+    if not exe or not Path(path).is_file():
+        return None
+    try:
+        code, out = await _capture(
+            exe,
+            [
+                "-hide_banner",
+                "-i",
+                str(path),
+                "-an",
+                "-filter:v",
+                f"select='gt(scene,{threshold})',showinfo",
+                "-f",
+                "null",
+                "-",
+            ],
+            timeout_sec=timeout_sec,
+        )
+    except Exception:  # 探测不到切点就按计划时间切
+        logger.debug("切点探测失败: %s", path, exc_info=True)
+        return None
+    if code != 0:
+        return None
+    return sorted({round(float(m), 3) for m in _PTS_RE.findall(out)})
+
+
+async def cut_clip(
+    source: Path, target: Path, *, start: float, duration: float, timeout_sec: float = 300.0
+) -> None:
+    """从 `source` 里精确切出 [start, start+duration) 写到 `target`（重编码，切点精确到帧）。
+
+    `-c copy` 只能在关键帧上切，段内切点几乎都不在关键帧上，会多出或少掉零点几秒画面，
+    所以这里重编码；音轨（模型原生环境音）一起切，保证和画面等长。
+    """
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_name(f".{target.stem}.cut{target.suffix}")
+    await run_ffmpeg(
+        [
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-ss",
+            f"{max(0.0, start):.3f}",
+            "-i",
+            str(source),
+            "-t",
+            f"{max(0.04, duration):.3f}",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "18",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-movflags",
+            "+faststart",
+            str(tmp),
+        ],
+        timeout_sec=timeout_sec,
+    )
+    tmp.replace(target)
 
 
 def _tail(text: str, lines: int = 3) -> str:

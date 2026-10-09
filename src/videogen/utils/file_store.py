@@ -16,6 +16,7 @@ from videogen.models.bible import StoryBible
 from videogen.models.compose import ComposeReport
 from videogen.models.consistency import ConsistencyReport
 from videogen.models.cost import CostReport
+from videogen.models.novel import NovelSource
 from videogen.models.project import (
     LEGACY_STATUS_MAP,
     LEGACY_VIDEO_READY,
@@ -188,6 +189,13 @@ class FileStore:
 
     def load_story_outline(self, project_id: str) -> StoryOutline | None:
         return self._load(project_id, "story_outline", StoryOutline)
+
+    # --- Novel（小说原文切章 + 逐章抽取）---
+    def save_novel(self, project_id: str, novel: NovelSource) -> None:
+        self._save(project_id, "novel", novel)
+
+    def load_novel(self, project_id: str) -> NovelSource | None:
+        return self._load(project_id, "novel", NovelSource)
 
     # --- Script ---
     def save_script(self, project_id: str, script: Script) -> None:

@@ -266,6 +266,28 @@ CHAPTER_SCENE_SYSTEM = """你是分场编剧。把指定的**章**展开成可�
   "duration_sec": 12}]}"""
 
 
+NOVEL_CHAPTER_SCENE_SYSTEM = """你是原著改编的分场编剧。
+把指定的**章**按原著改编成可直接拍摄的分场大纲（不写台词）。
+
+硬要求：
+1. 忠于原著：事件顺序、因果、人物动机都以原文为准；不新增原著没有的情节与人物
+2. 篇幅有限时做「取舍与压缩」：保留推动剧情的关键事件与冲突，删掉旁支、重复与大段心理描写；
+   相邻的小事件可以合并成一场
+3. 心理活动/叙述性信息改写成可拍的动作、表情或少量对白，不要写「她心想……」
+4. 每场写清：地点（用故事圣经里的 loc id 对应的场景）+ 可见环境细节、谁要什么、
+   这场结束时局势怎么变了
+5. source_excerpt：从原文里**原样摘录**这一场依据的段落（200-600 字，尽量包含这场的原文对白）
+
+只输出 JSON：
+{"scenes": [{"chapter_id": "ch_1", "title": "场标题",
+  "brief": "3-5句：地点+环境细节 / 谁要什么 / 阻力是什么 / 这场结束时局势怎么变了",
+  "environment": "这场环境的关键视觉元素（名词短语）",
+  "source_excerpt": "原文摘录", "duration_sec": 12}]}"""
+
+#: 单场带进剧本提示词的原著片段上限（摘录是改编依据，不是全文）
+SOURCE_EXCERPT_MAX_CHARS = 1500
+
+
 def _format_chapter_index(outline: StoryOutline) -> str:
     lines = []
     for chapter in outline.chapters:
@@ -467,8 +489,13 @@ async def expand_chapters(
     chapter_ids: list[str],
     *,
     start_index: int = 0,
+    sources: dict[str, str] | None = None,
 ) -> ScriptOutline:
-    """把选中的章展开成「分场大纲」（id 由系统分配，续接已有场次编号）。"""
+    """把选中的章展开成「分场大纲」（id 由系统分配，续接已有场次编号）。
+
+    `sources`（章 id → 原文）给了就是**原著改编**：原文进提示词，换用改编口径的
+    system prompt，并让模型为每场摘出依据的原文片段（逐场写剧本时据此保留原著对白）。
+    """
     wanted = [story_outline.get_chapter(cid) for cid in chapter_ids]
     chapters = [c for c in wanted if c is not None]
     if not chapters:
@@ -488,6 +515,11 @@ async def expand_chapters(
             detail.append(f"可用场景: {', '.join(chapter.locations)}")
         if chapter.characters:
             detail.append(f"在场角色: {', '.join(chapter.characters)}")
+        if chapter.props:
+            detail.append(f"关键道具: {', '.join(chapter.props)}")
+        source = (sources or {}).get(chapter.id, "")
+        if source:
+            detail.append(f"原著原文:\n{source}")
         detail.append(
             f"请展开成 {chapter.scene_budget} 场，合计约 {chapter.duration_budget_sec} 秒"
         )
@@ -511,12 +543,20 @@ async def expand_chapters(
 请逐章展开成分场大纲。场次数量与每场时长按上面给出的预算；
 environment 必须具体到可见细节（不要写「办公室」这种泛称）。只输出 JSON。"""
 
+    adapting = any((sources or {}).get(c.id) for c in chapters)
+    if adapting:
+        user_prompt += "\n\n这是原著改编：按原文取舍压缩，不要新增情节；每场附上 source_excerpt。"
     messages = [
-        LLMMessage(role="system", content=CHAPTER_SCENE_SYSTEM),
+        LLMMessage(
+            role="system", content=NOVEL_CHAPTER_SCENE_SYSTEM if adapting else CHAPTER_SCENE_SYSTEM
+        ),
         LLMMessage(role="user", content=user_prompt),
     ]
     response = await llm.chat_json(
-        messages, schema=ChapterOutlineResponse, temperature=0.7, max_tokens=8192
+        messages,
+        schema=ChapterOutlineResponse,
+        temperature=0.4 if adapting else 0.7,
+        max_tokens=8192,
     )
     raw = [s for s in response.scenes if isinstance(s, dict)]
     if not raw:
@@ -555,6 +595,7 @@ environment 必须具体到可见细节（不要写「办公室」这种泛称�
                 ),
                 chapter_id=cid,
                 environment=str(item.get("environment") or ""),
+                source_excerpt=str(item.get("source_excerpt") or "")[:SOURCE_EXCERPT_MAX_CHARS],
             )
         )
     outline.target_duration_sec = sum(s.duration_budget_sec for s in outline.scenes)
@@ -624,8 +665,19 @@ _PARTIAL_NOTE = """## 重要：这一段不是全篇
 - 与「全篇尚未展开」有关的问题一律不要报；只报这一段自己站不住的地方"""
 
 
+#: 原著改编时追加给剧本医生的说明：情节走向是原著定的，不该被「医」掉
+_ADAPTATION_NOTE = """## 重要：这是原著改编
+情节、结局与人物选择以原著为准。**不要**要求改动原著情节、加入新冲突或改结局；
+只报**改编造成**的问题：压缩后因果断裂、关键信息没交代、人物动机在剧本里看不出来。"""
+
+
 async def review_structure(
-    llm: LLMProvider, script: Script, bible: StoryBible, *, partial: bool = False
+    llm: LLMProvider,
+    script: Script,
+    bible: StoryBible,
+    *,
+    partial: bool = False,
+    adaptation: bool = False,
 ) -> list[ConsistencyIssue]:
     """让 LLM 当剧本医生做一遍结构评审，返回 ERROR/WARNING 级的结构问题。
 
@@ -640,6 +692,8 @@ async def review_structure(
     lines = [f"## 目标时长\n{total} 秒 / {len(script.scenes)} 场"]
     if partial:
         lines.append(_PARTIAL_NOTE)
+    if adaptation:
+        lines.append(_ADAPTATION_NOTE)
     lines.append("## 角色\n" + "；".join(
         f"{c.id}={c.name}（{c.role}，{c.description[:40]}）" for c in bible.characters
     ))
@@ -712,7 +766,7 @@ async def generate_scene(
 全剧预算: 共 {total_scenes} 场，合计 {project.target_duration_sec} 秒
 （这是第 {len(prev_scenes) + 1} 场）
 比例: {project.aspect_ratio.value}（影响构图描述）
-
+{_source_block(outline_scene)}
 请生成本场完整内容（JSON）。"""
 
     messages = [
@@ -736,6 +790,20 @@ async def generate_scene(
         emotion=response.emotion,
     )
     return scene, response
+
+
+def _source_block(outline_scene: OutlineScene) -> str:
+    """原著改编：本场依据的原文片段 + 改编要求（非改编场次返回空串）。"""
+    excerpt = (outline_scene.source_excerpt or "").strip()
+    if not excerpt:
+        return ""
+    return f"""
+## 原著片段（本场改编依据）
+{excerpt[:SOURCE_EXCERPT_MAX_CHARS]}
+
+改编要求：台词优先采用原著对白（可删减、口语化，不得改变意思）；叙述与心理描写改写成
+动作或少量对白；不要加入原著没有的情节；说话人必须映射到故事圣经里的角色 id。
+"""
 
 
 def normalize_script_durations(script: Script, target_duration_sec: int) -> bool:

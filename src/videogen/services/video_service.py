@@ -13,7 +13,9 @@ from videogen.models.project import Project
 from videogen.models.storyboard import Shot, Storyboard
 from videogen.models.video import ClipStatus, MediaKind, VideoClip, VideoManifest
 from videogen.providers.video.base import VideoProvider, VideoRequest
+from videogen.services.storyboard_service import Segment, segments_of
 from videogen.utils import region
+from videogen.utils.ffmpeg import cut_clip, detect_cuts, ffmpeg_available, probe_duration
 from videogen.utils.redact import scrub_secrets
 
 logger = logging.getLogger(__name__)
@@ -63,6 +65,7 @@ async def generate_clips(
             stale.status = ClipStatus.PENDING
             stale.error = ""
             stale.task_id = None
+            stale.segment_path = ""
             # 旧花费已经记过账了，重跑要当成一笔新账（否则新花费永远进不了账本）
             stale.cost_usd = 0.0
             stale.cost_recorded = False
@@ -75,19 +78,31 @@ async def generate_clips(
     if not shots:
         raise ValueError("分镜为空，没有可生成的镜头")
 
-    todo: list[Shot] = []
-    for shot in shots:
-        clip = manifest.get(shot.id) or VideoClip(shot_id=shot.id, scene_id=shot.scene_id)
-        if clip.status == ClipStatus.READY and _clip_file_exists(project_dir, clip):
+    # 段落分镜：同一段的镜头一次生成；没编段的镜头各自成段（= 原来的单镜生成）
+    todo: list[Segment] = []
+    for segment in segments_of(storyboard):
+        stale = False
+        for shot in segment.shots:
+            clip = manifest.get(shot.id)
+            if not (
+                clip is not None
+                and clip.status == ClipStatus.READY
+                and _clip_file_exists(project_dir, clip)
+            ):
+                stale = True
+        if not stale:
             continue  # 续跑：已经生成好的不重复烧额度
-        clip.status = ClipStatus.PENDING
-        clip.error = ""
-        clip.media_kind = MediaKind.VIDEO
-        clip.duration_sec = shot.duration_sec
-        clip.aspect_ratio = project.aspect_ratio.value
-        clip.provider = provider.name
-        manifest.upsert(clip)
-        todo.append(shot)
+        for shot in segment.shots:
+            clip = manifest.get(shot.id) or VideoClip(shot_id=shot.id, scene_id=shot.scene_id)
+            clip.status = ClipStatus.PENDING
+            clip.error = ""
+            clip.media_kind = MediaKind.VIDEO
+            clip.duration_sec = shot.duration_sec
+            clip.aspect_ratio = project.aspect_ratio.value
+            clip.provider = provider.name
+            clip.segment_id = shot.segment_id
+            manifest.upsert(clip)
+        todo.append(segment)
 
     _emit(on_progress, manifest)
     if not todo:
@@ -95,9 +110,10 @@ async def generate_clips(
         return manifest
 
     logger.info(
-        "开始生成视频片段 project=%s 待生成 %d/%d 并发=%d 重试=%d",
+        "开始生成视频片段 project=%s 待生成 %d 段（%d 镜）/%d 镜 并发=%d 重试=%d",
         project.id,
         len(todo),
+        sum(len(seg.shots) for seg in todo),
         len(shots),
         manifest.concurrency,
         max_retries,
@@ -105,10 +121,26 @@ async def generate_clips(
 
     semaphore = asyncio.Semaphore(manifest.concurrency)
 
-    async def run_one(shot: Shot) -> None:
+    async def run_one(segment: Segment) -> None:
         async with semaphore:
+            if len(segment.shots) > 1:
+                await _generate_segment(
+                    segment,
+                    project,
+                    provider,
+                    clips_dir,
+                    project_dir,
+                    manifest,
+                    bible=bible,
+                    seed=seed,
+                    max_retries=max_retries,
+                    retry_backoff_sec=retry_backoff_sec,
+                    on_progress=on_progress,
+                )
+                _emit(on_progress, manifest)
+                return
             await _generate_one(
-                shot,
+                segment.shots[0],
                 project,
                 provider,
                 clips_dir,
@@ -122,7 +154,7 @@ async def generate_clips(
             )
             _emit(on_progress, manifest)
 
-    await asyncio.gather(*(run_one(shot) for shot in todo))
+    await asyncio.gather(*(run_one(segment) for segment in todo))
 
     ready, failed = len(manifest.ready_clips), len(manifest.failed_clips)
     logger.info("视频片段生成结束 project=%s 成功=%d 失败=%d", project.id, ready, failed)
@@ -220,6 +252,269 @@ async def _generate_one(
         return
 
 
+#: 计划切点附近多远内的真实硬切会被采用（秒）
+_SNAP_WINDOW_SEC = 1.0
+
+
+async def _generate_segment(
+    segment: Segment,
+    project: Project,
+    provider: VideoProvider,
+    clips_dir: Path,
+    project_dir: Path,
+    manifest: VideoManifest,
+    *,
+    bible: StoryBible | None = None,
+    seed: int = 0,
+    max_retries: int,
+    retry_backoff_sec: float,
+    on_progress: ProgressCallback,
+    settings: Settings | None = None,
+) -> None:
+    """一段（多个镜头）一次生成，再按镜头切回单镜片段。
+
+    计费口径：整段只买一次（扣费记在段内第一个镜头的片段上，其余为 0，账本不重复）。
+    **整段已经生成成功、只是切分失败时绝不重买**：整段文件留在 `clips/segments/`，
+    下次续跑直接重切。
+    """
+    settings = settings or get_settings()
+    clips = [manifest.get(shot.id) for shot in segment.shots]
+    if any(clip is None for clip in clips):  # pragma: no cover - 调用方保证已 upsert
+        return
+    output = clips_dir / "segments" / f"{segment.id}.mp4"
+    output.parent.mkdir(parents=True, exist_ok=True)
+    references, segment_seed = resolve_segment_references(
+        segment.shots, bible, project_dir, provider, seed, settings=settings
+    )
+    request = VideoRequest(
+        shot_id=segment.id,
+        scene_id=segment.scene_id,
+        prompt=build_segment_prompt(segment.shots, project, bible, settings=settings),
+        duration_sec=max(1, segment.duration_sec),
+        aspect_ratio=project.aspect_ratio.value,
+        output_path=output,
+        reference_images=references,
+        seed=segment_seed,
+    )
+
+    def update(**fields: object) -> None:
+        for clip in clips:
+            for key, value in fields.items():
+                setattr(clip, key, value)
+            manifest.upsert(clip)
+
+    # 上一轮整段已经买到、只是没切成功：直接重切，不重新提交
+    reuse = clips[0].segment_path and (Path(project_dir) / clips[0].segment_path).is_file()
+    generated = None
+    if not reuse:
+        update(
+            status=ClipStatus.GENERATING,
+            cost_usd=0.0,
+            cost_recorded=False,
+            prompt=request.prompt,
+            segment_id=segment.id,
+            segment_path="",
+        )
+        _emit(on_progress, manifest)
+        attempts = max_retries + 1
+        for attempt in range(1, attempts + 1):
+            update(attempts=attempt)
+            try:
+                generated = await provider.generate(request)
+                break
+            except asyncio.CancelledError:
+                _cleanup_partial(output)
+                update(status=ClipStatus.PENDING, error="任务被取消")
+                raise
+            except Exception as exc:  # noqa: BLE001 - 单段失败必须被隔离
+                message = scrub_secrets(f"{type(exc).__name__}: {exc}")[:400]
+                retryable = bool(getattr(exc, "retryable", True))
+                job_id = str(getattr(exc, "job_id", "") or "")
+                update(error=message, **({"task_id": job_id} if job_id else {}))
+                _cleanup_partial(output)
+                if attempt < attempts and retryable:
+                    logger.warning(
+                        "段落 %s 第 %d/%d 次生成失败，准备重试：%s",
+                        segment.id,
+                        attempt,
+                        attempts,
+                        message,
+                    )
+                    if retry_backoff_sec:
+                        await asyncio.sleep(retry_backoff_sec * attempt)
+                    continue
+                update(status=ClipStatus.FAILED)
+                logger.error("段落 %s 生成失败：%s", segment.id, message)
+                return
+        assert generated is not None
+        # 先把「已经买到」记下来：后面切分失败也不会丢掉这笔账和这段视频
+        clips[0].cost_usd = round(generated.actual_cost_usd or 0.0, 6)
+        update(
+            task_id=generated.task_id,
+            segment_path=_relative(generated.path, project_dir),
+            media_kind=generated.media_kind,
+            generated_at=datetime.now(UTC).isoformat(),
+        )
+
+    source = Path(project_dir) / clips[0].segment_path
+    if clips[0].media_kind == MediaKind.PLACEHOLDER or not ffmpeg_available():
+        # 占位文件切不了（mock 缺 ffmpeg）：每个镜头都指向整段占位文件，合成会照常拒绝
+        update(
+            status=ClipStatus.READY,
+            path=clips[0].segment_path,
+            media_kind=MediaKind.PLACEHOLDER,
+            error="" if clips[0].media_kind == MediaKind.PLACEHOLDER else "没有 ffmpeg，无法切分",
+        )
+        return
+    try:
+        pieces = await split_segment(
+            source,
+            [max(1, int(shot.duration_sec)) for shot in segment.shots],
+            snap=settings.video_segment_snap_cuts,
+        )
+        for shot, clip, (offset, length) in zip(segment.shots, clips, pieces, strict=True):
+            target = clips_dir / f"{shot.id}.mp4"
+            await cut_clip(source, target, start=offset, duration=length)
+            clip.path = _relative(target, project_dir)
+            clip.segment_offset_sec = round(offset, 3)
+            clip.duration_sec = max(1, round(length))
+    except Exception as exc:  # noqa: BLE001 - 切分失败只影响这一段，且不重买
+        message = scrub_secrets(f"{type(exc).__name__}: {exc}")[:300]
+        update(
+            status=ClipStatus.FAILED,
+            error=f"整段已生成（{clips[0].segment_path}），切分失败：{message}；重试会直接重切，不重新计费",
+        )
+        logger.error("段落 %s 切分失败（整段已保留）：%s", segment.id, message)
+        return
+    update(status=ClipStatus.READY, error="")
+    logger.info("段落 %s 生成并切分为 %d 个镜头", segment.id, len(segment.shots))
+
+
+async def split_segment(
+    source: Path, durations: list[int], *, snap: bool = True
+) -> list[tuple[float, float]]:
+    """算出每个镜头在整段里的 (起点, 时长)。
+
+    计划切点 = 镜头时长累加；模型实际出片比计划短时按比例缩（比计划长的尾巴是档位多买的，
+    直接丢掉）。`snap=True` 时把每个计划切点吸附到 ±1 秒内最近的真实硬切 —— 模型很少严格按
+    时间戳切镜，按计划时间硬切会把上一镜的半秒画面带进下一镜。
+    """
+    planned_total = float(sum(durations))
+    actual = await probe_duration(source)
+    total = min(planned_total, actual) if actual else planned_total
+    scale = total / planned_total if planned_total else 1.0
+    bounds: list[float] = []
+    acc = 0.0
+    for value in durations[:-1]:
+        acc += value * scale
+        bounds.append(acc)
+    if snap and bounds:
+        cuts = await detect_cuts(source) or []
+        snapped: list[float] = []
+        floor = 0.0
+        for planned in bounds:
+            near = [c for c in cuts if abs(c - planned) <= _SNAP_WINDOW_SEC and c > floor + 0.3]
+            choice = min(near, key=lambda c: abs(c - planned)) if near else planned
+            choice = max(choice, floor + 0.3)
+            snapped.append(choice)
+            floor = choice
+        bounds = snapped
+    edges = [0.0, *bounds, total]
+    return [
+        (round(edges[i], 3), round(max(0.04, edges[i + 1] - edges[i]), 3))
+        for i in range(len(durations))
+    ]
+
+
+def resolve_segment_references(
+    shots: list[Shot],
+    bible: StoryBible | None,
+    project_dir: Path,
+    provider: VideoProvider,
+    default_seed: int = 0,
+    *,
+    settings: Settings | None = None,
+) -> tuple[list[Path], int | None]:
+    """整段的参考图：段内所有角色在前（按出场顺序），再是场景、道具，合计不超上限。"""
+    if not shots:
+        return [], (default_seed or None)
+    merged = shots[0].model_copy(
+        update={
+            "character_in_frame": _unique(c for s in shots for c in s.character_in_frame),
+            "props_in_frame": _unique(p for s in shots for p in s.props_in_frame),
+            "location": next((s.location for s in shots if s.location), ""),
+        }
+    )
+    return resolve_references(
+        merged, bible, project_dir, provider, default_seed, settings=settings
+    )
+
+
+def _unique(items) -> list[str]:
+    out: list[str] = []
+    for item in items:
+        if item and item not in out:
+            out.append(item)
+    return out
+
+
+def build_segment_prompt(
+    shots: list[Shot],
+    project: Project,
+    bible: StoryBible | None = None,
+    *,
+    settings: Settings | None = None,
+) -> str:
+    """一段多镜头的 prompt：逐镜头写清时间戳、景别运镜、画面与台词，公共锚点只写一次。"""
+    settings = settings or get_settings()
+    total = sum(max(1, int(s.duration_sec)) for s in shots)
+    lines = [
+        f"A multi-shot sequence in one continuous video: {len(shots)} shots joined by hard cuts, "
+        f"{total} seconds in total, aspect ratio {project.aspect_ratio.value}. "
+        "Cut exactly at the listed timestamps; keep the same characters, wardrobe, setting and "
+        "lighting across every shot"
+    ]
+    start = 0
+    for index, shot in enumerate(shots, start=1):
+        end = start + max(1, int(shot.duration_sec))
+        base = _strip_prompt_label(shot.video_prompt or shot.visual_description or "")
+        parts = [camera_directive(shot.camera), base or "cinematic shot"]
+        mood = mood_directive(shot.mood)
+        if mood:
+            parts.append(f"emotion: {mood}")
+        if settings.video_prompt_dialogue:
+            spoken = dialogue_directive(shot, bible)
+            if spoken:
+                parts.append(spoken)
+        body = ", ".join(p for p in parts if p)
+        lines.append(f"Shot {index} ({start}-{end}s): {body}")
+        start = end
+    merged = shots[0].model_copy(
+        update={
+            "character_in_frame": _unique(c for s in shots for c in s.character_in_frame),
+            "props_in_frame": _unique(p for s in shots for p in s.props_in_frame),
+            "location": next((s.location for s in shots if s.location), ""),
+        }
+    )
+    joined = " ".join(lines)
+    for anchor in (
+        location_anchor(merged, bible, joined),
+        prop_anchor(merged, bible, joined),
+        appearance_anchor(merged, bible, joined, settings=settings),
+    ):
+        if anchor:
+            lines.append(anchor)
+    for directive in (
+        settings.video_background_directive,
+        settings.video_performance_directive,
+        settings.video_style_prompt,
+    ):
+        text = " ".join(str(directive or "").split())
+        if text:
+            lines.append(text)
+    return ". ".join(lines)
+
+
 def provider_switched(manifest: VideoManifest, provider: VideoProvider) -> bool:
     """旧清单是不是另一个 provider / 模型的产物（是就要全部重跑、也就全部重新计费）。
 
@@ -235,23 +530,42 @@ def provider_switched(manifest: VideoManifest, provider: VideoProvider) -> bool:
     )
 
 
+def _ref_path(root: Path, project_dir: Path, relative: str, label: str) -> Path | None:
+    """参考图的绝对路径；越出项目目录或文件不存在就返回 None（并告警）。"""
+    candidate = (Path(project_dir) / relative).resolve()
+    try:  # 参考图必须留在项目目录内
+        candidate.relative_to(root)
+    except ValueError:
+        logger.warning("%s 的参考图越出项目目录，已忽略：%s", label, relative)
+        return None
+    if not candidate.is_file():
+        logger.warning("%s 的参考图不存在，已忽略：%s", label, candidate)
+        return None
+    return candidate
+
+
 def resolve_references(
     shot: Shot,
     bible: StoryBible | None,
     project_dir: Path,
     provider: VideoProvider,
     default_seed: int = 0,
+    *,
+    settings: Settings | None = None,
 ) -> tuple[list[Path], int | None]:
     """挑出这个镜头要用的参考图（可多张）与 seed（角色一致性）。
 
     规则：provider 支持参考图时，**画面里每个配了参考图且文件还在的角色各带一张** ——
-    双人镜头必须同时锁住两个人；去重后按 `character_in_frame` 顺序返回。
+    双人镜头必须同时锁住两个人；角色图永远排在最前（provider 只收一张时退回第一张）。
+    剧集资产（`VIDEO_ASSET_REFERENCES`）：再按「场景 → 画面里的关键道具」补上配了图的资产，
+    合计不超过 `VIDEO_MAX_REFERENCE_IMAGES` 张。
     seed 优先用第一个角色的，其次用全局 `VIDEO_SEED`。
     一张都没有就返回 `([], None)`，绝不因为缺参考图就跳过生成。
     """
     if not provider.supports_reference_image or not bible:
         return [], (default_seed or None)
 
+    settings = settings or get_settings()
     root = Path(project_dir).resolve()
     paths: list[Path] = []
     # 角色自己的 seed 优先于全局 VIDEO_SEED（只在第一次遇到时取）
@@ -260,24 +574,31 @@ def resolve_references(
         character = bible.get_character(char_id)
         if character is None or not character.reference_image:
             continue
-        candidate = (Path(project_dir) / character.reference_image).resolve()
-        try:  # 参考图必须留在项目目录内
-            candidate.relative_to(root)
-        except ValueError:
-            logger.warning(
-                "角色 %s 的参考图越出项目目录，已忽略：%s", char_id, character.reference_image
-            )
-            continue
-        if not candidate.is_file():
-            logger.warning("角色 %s 的参考图不存在，已忽略：%s", char_id, candidate)
+        candidate = _ref_path(root, project_dir, character.reference_image, f"角色 {char_id}")
+        if candidate is None:
             continue
         if candidate not in paths:
             paths.append(candidate)
         if char_seed is None and character.seed is not None:
             char_seed = character.seed
 
+    if settings.video_asset_references:
+        assets: list[tuple[str, str]] = []
+        setting = bible.get_setting(shot.location) if shot.location else None
+        if setting is not None and setting.reference_image:
+            assets.append((setting.reference_image, f"场景 {setting.id}"))
+        for prop_id in shot.props_in_frame or []:
+            prop = bible.get_prop(prop_id)
+            if prop is not None and prop.reference_image:
+                assets.append((prop.reference_image, f"道具 {prop.id}"))
+        for relative, label in assets:
+            candidate = _ref_path(root, project_dir, relative, label)
+            if candidate is not None and candidate not in paths:
+                paths.append(candidate)
+
+    limit = max(1, settings.video_max_reference_images)
     seed = char_seed if char_seed is not None else (default_seed or None)
-    return paths, seed
+    return paths[:limit], seed
 
 
 def resolve_reference(
@@ -419,6 +740,9 @@ def build_prompt(
     location = location_anchor(shot, bible, base)
     if location:
         parts.append(location)
+    props = prop_anchor(shot, bible, base)
+    if props:
+        parts.append(props)
     anchor = appearance_anchor(shot, bible, base, settings=settings)
     if anchor:
         parts.append(anchor)
@@ -488,6 +812,25 @@ def location_anchor(shot: Shot, bible: StoryBible | None, base: str = "") -> str
     if head and head in base.lower():
         return ""
     return f"setting: {look[:_APPEARANCE_MAX_CHARS]}"
+
+
+def prop_anchor(shot: Shot, bible: StoryBible | None, base: str = "") -> str:
+    """画面里关键道具的外观锚点（同一件道具跨镜头长一个样）。prompt 里已经写了就跳过。"""
+    if not bible or not shot.props_in_frame:
+        return ""
+    looks: list[str] = []
+    for prop_id in shot.props_in_frame:
+        prop = bible.get_prop(prop_id)
+        if prop is None:
+            continue
+        look = " ".join(str(prop.visual_prompt or "").split())
+        if not look:
+            continue
+        head = look.split(",")[0].strip().lower()
+        if head and head in base.lower():
+            continue
+        looks.append(look[:_APPEARANCE_MAX_CHARS])
+    return f"key props: {'; '.join(looks)}" if looks else ""
 
 
 def dialogue_directive(shot: Shot, bible: StoryBible | None = None) -> str:

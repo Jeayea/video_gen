@@ -18,14 +18,17 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "STORYBOARD_SYSTEM",
     "MergeReport",
+    "Segment",
     "absorb_bucket",
     "apply_duration_tier",
+    "assign_segments",
     "generate_shots_for_scene",
     "merge_shots",
     "merge_to_count",
     "normalize_storyboard_durations",
     "plan_merge_buckets",
     "sanitize_video_prompt",
+    "segments_of",
 ]
 
 STORYBOARD_SYSTEM = """你是一位专业分镜师。根据剧本场景生成分镜脚本。
@@ -41,6 +44,7 @@ STORYBOARD_SYSTEM = """你是一位专业分镜师。根据剧本场景生成分
   "mood": "画面情绪（建议用英文情绪词：shocked / wronged / determined …）",
   "video_prompt": "subject + action + environment + lighting（全英文，不要写标签）",
   "location": "loc_id（这一镜发生在哪个场景，必须是故事圣经里的场景 id）",
+  "props_in_frame": ["prop_1"],
   "narration": null 或 "旁白文字",
   "dialogue_text": null 或 "台词文字",
   "dialogue_speaker": null 或 "char_id"
@@ -56,6 +60,7 @@ STORYBOARD_SYSTEM = """你是一位专业分镜师。根据剧本场景生成分
 - location 必须填故事圣经场景列表里真实存在的 id：视频生成时会用它的环境描述做**背景锚点**，
   跨镜头背景才不漂
 - character_in_frame 必须是故事圣经里已有的角色 id
+- props_in_frame 只填画面里**看得见**、且在故事圣经道具列表里的关键道具 id；没有就给空数组
 - 构图提示随 aspect_ratio 变化
 - 台词尽量对准角色镜头，**且说话人必须出现在 character_in_frame 里**（说话却不在画面里是穿帮）
 - camera 必须同时写清景别与运镜（如「近景 · 缓推」）；一个镜头里只写**一个连续动作**，
@@ -82,6 +87,10 @@ def _format_brief_bible(bible: StoryBible) -> str:
     lines.append("场景（id 用于 location 字段；video_prompt 里要写成具体环境描述）:")
     for s in bible.settings:
         lines.append(f"  - id={s.id} 名称={s.name} 环境={s.visual_prompt or s.description}")
+    if bible.props:
+        lines.append("关键道具（id 用于 props_in_frame；video_prompt 里写成物品外观）:")
+        for p in bible.props:
+            lines.append(f"  - id={p.id} 名称={p.name} 外观={p.visual_prompt or p.description}")
     return "\n".join(lines)
 
 
@@ -116,6 +125,13 @@ def sanitize_video_prompt(prompt: str, bible: StoryBible) -> str:
     return text.strip()
 
 
+#: 段落分镜下给分镜 LLM 的节奏要求（镜头可以短，计费按「段」算）
+SEGMENT_SHOT_RULES = """- 同一场相邻的镜头会被编成一段（8-15 秒）**一次生成、段内硬切**，
+  计费按段算：所以镜头可以短（2-6 秒），每个镜头只聚焦一个画面单元（一个动作 / 一个反应 / 一个特写）
+- 段内靠换景别、换角度、换拍摄对象形成剪辑节奏；同一场里不要换地点
+- 有台词的镜头时长 ≥ 台词字数 ÷ 4.5 + 1 秒，演不完的台词拆到下一个镜头"""
+
+
 def duration_constraints(scene_sec: int, tier: DurationTier | None) -> str:
     """把视频模型的计费档位翻译成给 LLM 的硬约束（没档位就返回空串）。"""
     if tier is None or not tier.active:
@@ -148,6 +164,7 @@ async def generate_shots_for_scene(
     tier: DurationTier | None = None,
     environment: str = "",
     story_context: str = "",
+    segment_mode: bool = False,
 ) -> list[Shot]:
     """为一个场景生成镜头列表（id / shot_no / scene_id 由系统分配）。
 
@@ -173,6 +190,8 @@ async def generate_shots_for_scene(
         else ""
     )
     tier_block = f"\n## 时长硬约束（视频模型计费档位）\n{constraints}\n" if constraints else ""
+    if segment_mode and not constraints:
+        tier_block = f"\n## 段落节奏（视频按段生成）\n{SEGMENT_SHOT_RULES}\n"
     user_prompt = f"""## 角色与场景参考
 {_format_brief_bible(bible)}
 
@@ -202,6 +221,7 @@ async def generate_shots_for_scene(
     response = await llm.chat_json(messages, schema=ShotsResponse, temperature=0.5, max_tokens=4096)
 
     known_locs = {s.id for s in bible.settings}
+    known_props = {p.id for p in bible.props}
     shots: list[Shot] = []
     for index, draft in enumerate(response.shots, start=1):
         location = str(draft.location or "").strip()
@@ -219,6 +239,7 @@ async def generate_shots_for_scene(
                 mood=draft.mood,
                 video_prompt=sanitize_video_prompt(draft.video_prompt, bible),
                 location=location,
+                props_in_frame=[p for p in draft.props_in_frame if p in known_props],
                 narration=draft.narration,
                 dialogue_text=draft.dialogue_text,
                 dialogue_speaker=draft.dialogue_speaker,
@@ -564,3 +585,113 @@ def apply_duration_tier(
     storyboard.audio_aligned = False
     storyboard.duration_normalized = True
     return warnings
+
+
+# ── 段落分镜 ──────────────────────────────────────────
+
+
+@dataclass
+class Segment:
+    """一个视频生成任务：同一场里相邻的 1-N 个镜头，段内硬切。"""
+
+    id: str
+    scene_id: str
+    shots: list[Shot] = field(default_factory=list)
+
+    @property
+    def duration_sec(self) -> int:
+        return sum(max(1, int(s.duration_sec)) for s in self.shots)
+
+    @property
+    def shot_ids(self) -> list[str]:
+        return [s.id for s in self.shots]
+
+
+def assign_segments(
+    storyboard: Storyboard,
+    *,
+    target_sec: float = 12.0,
+    max_sec: float = 15.0,
+    min_sec: float = 0.0,
+    max_shots: int = 4,
+) -> list[Segment]:
+    """把镜头编成段落（写回每个镜头的 `segment_id`），返回段落列表。
+
+    规则（确定性，同样的分镜永远编出同样的段）：
+    - 只在同一场内编段；地点（`location`）变了就断开
+    - 装到 `target_sec` 就收段；再装会超过 `max_sec` 或超过 `max_shots` 个镜头也收段
+    - 场末尾的段短于模型最短档位 `min_sec` 时，能并进前一段（不超上限）就并进去，省一次最短计费
+    - 单个镜头本身超过上限也自成一段（不拆镜头，交给模型档位去裁）
+    """
+    max_sec = max(1.0, float(max_sec))
+    target_sec = min(max(1.0, float(target_sec)), max_sec)
+    max_shots = max(1, int(max_shots))
+    segments: list[Segment] = []
+    scene_order: list[str] = []
+    by_scene: dict[str, list[Shot]] = {}
+    for shot in storyboard.shots:
+        if shot.scene_id not in by_scene:
+            scene_order.append(shot.scene_id)
+            by_scene[shot.scene_id] = []
+        by_scene[shot.scene_id].append(shot)
+
+    for scene_id in scene_order:
+        groups: list[list[Shot]] = []
+        current: list[Shot] = []
+        for shot in by_scene[scene_id]:
+            if current:
+                total = sum(max(1, int(s.duration_sec)) for s in current)
+                loc_changed = bool(
+                    shot.location and current[-1].location and shot.location != current[-1].location
+                )
+                full = (
+                    total >= target_sec
+                    or total + max(1, int(shot.duration_sec)) > max_sec
+                    or len(current) >= max_shots
+                )
+                if loc_changed or full:
+                    groups.append(current)
+                    current = []
+            current.append(shot)
+        if current:
+            groups.append(current)
+        # 场末尾太短的一段：并进前一段（同地点、不超上限、不超镜头数）
+        if len(groups) >= 2 and min_sec > 0:
+            last, prev = groups[-1], groups[-2]
+            last_sec = sum(max(1, int(s.duration_sec)) for s in last)
+            prev_sec = sum(max(1, int(s.duration_sec)) for s in prev)
+            same_place = not (
+                last[0].location and prev[-1].location and last[0].location != prev[-1].location
+            )
+            if (
+                last_sec < min_sec
+                and same_place
+                and prev_sec + last_sec <= max_sec
+                and len(prev) + len(last) <= max_shots
+            ):
+                groups[-2] = prev + last
+                groups.pop()
+        for index, group in enumerate(groups, start=1):
+            segment = Segment(id=f"{scene_id}_seg_{index}", scene_id=scene_id, shots=group)
+            for shot in group:
+                shot.segment_id = segment.id
+            segments.append(segment)
+    return segments
+
+
+def segments_of(storyboard: Storyboard) -> list[Segment]:
+    """按镜头上已有的 `segment_id` 还原段落（没编段的镜头各自成段 = 单镜生成）。"""
+    segments: list[Segment] = []
+    index: dict[str, Segment] = {}
+    for shot in storyboard.shots:
+        key = shot.segment_id
+        if not key:
+            segments.append(Segment(id=shot.id, scene_id=shot.scene_id, shots=[shot]))
+            continue
+        segment = index.get(key)
+        if segment is None:
+            segment = Segment(id=key, scene_id=shot.scene_id)
+            index[key] = segment
+            segments.append(segment)
+        segment.shots.append(shot)
+    return segments

@@ -11,7 +11,8 @@ from videogen.models.bible import StoryBible
 from videogen.models.compose import ComposeReport
 from videogen.models.consistency import ConsistencyReport
 from videogen.models.cost import CostReport, CostStage
-from videogen.models.project import Project, ProjectStatus
+from videogen.models.novel import NovelSource
+from videogen.models.project import InputMode, Project, ProjectStatus
 from videogen.models.script import (
     DEFAULT_CHAPTER_DURATION_SEC,
     OutlineScene,
@@ -20,7 +21,7 @@ from videogen.models.script import (
     StoryOutline,
 )
 from videogen.models.storyboard import DurationTier, Shot, Storyboard
-from videogen.models.video import VideoManifest
+from videogen.models.video import ClipStatus, VideoManifest
 from videogen.models.world_state import WorldState
 from videogen.orchestrator.jobs import Job, JobContext, JobManager
 from videogen.providers import bgm as bgm_providers
@@ -39,6 +40,7 @@ from videogen.services import (
     consistency_service,
     cost_service,
     music_service,
+    novel_service,
     preflight_service,
     script_service,
     storyboard_service,
@@ -237,17 +239,30 @@ class Pipeline:
             await provider.aclose()
         return list(storyboard.shots) if switched else _pending_shots(storyboard, video)
 
-    async def _estimate_video_usd(self, shots: list[Shot]) -> float:
-        """按 provider 的计费档位与单价估算花费（问不到就退回配置单价）。"""
+    async def _estimate_video_usd(
+        self, shots: list[Shot], storyboard: Storyboard | None = None
+    ) -> float:
+        """按 provider 的计费档位与单价估算花费（问不到就退回配置单价）。
+
+        给了 `storyboard` 就按**段落**算：一段只买一次档位（与真正生成同一口径）。
+        """
         if not shots:
             return 0.0
+        wanted = {shot.id for shot in shots}
+        units = [float(shot.duration_sec) for shot in shots]
+        if storyboard is not None:
+            units = [
+                float(segment.duration_sec)
+                for segment in storyboard_service.segments_of(storyboard)
+                if any(sid in wanted for sid in segment.shot_ids)
+            ]
         prices = cost_service.PriceTable.from_settings()
         provider = self._video()
         try:
             price = await provider.price_per_second()
             seconds = 0.0
-            for shot in shots:
-                seconds += await provider.planned_seconds(float(shot.duration_sec))
+            for unit in units:
+                seconds += await provider.planned_seconds(unit)
         except Exception:
             logger.warning("视频成本预估失败，按配置单价估算", exc_info=True)
             return cost_service.estimate_video_usd(
@@ -257,6 +272,53 @@ class Pipeline:
             await provider.aclose()
         unit = prices.video_per_second if price is None else max(0.0, price)
         return round(seconds * unit, 6)
+
+    async def _apply_segment_mode(
+        self,
+        storyboard: Storyboard,
+        *,
+        tier: DurationTier | None = None,
+        query_tier: bool = True,
+        video: VideoManifest | None = None,
+        only_if_missing: bool = False,
+    ) -> Storyboard:
+        """按配置给分镜编段（段落分镜）；关掉段落模式时返回一份去掉段落标记的副本。
+
+        `only_if_missing=True`（视频阶段/preflight 用）：已经编过段就不动；老项目已经有
+        单镜生成好的片段时也不编段 —— 否则已就绪的镜头会被卷进新段落、整段重买。
+        """
+        settings = get_settings()
+        if not settings.video_segment_mode:
+            if any(shot.segment_id for shot in storyboard.shots):
+                storyboard = storyboard.model_copy(deep=True)
+                for shot in storyboard.shots:
+                    shot.segment_id = ""
+            return storyboard
+        if only_if_missing and (
+            all(shot.segment_id for shot in storyboard.shots)
+            or (video is not None and video.ready_clips)
+        ):
+            return storyboard
+        if query_tier and tier is None:
+            tier = await self._duration_tier()
+        max_sec = float(settings.video_segment_max_sec)
+        if tier is not None and tier.max_sec:
+            max_sec = min(max_sec, float(tier.max_sec))
+        segments = storyboard_service.assign_segments(
+            storyboard,
+            target_sec=settings.video_segment_target_sec,
+            max_sec=max_sec,
+            min_sec=tier.min_sec if tier is not None else 0.0,
+            max_shots=settings.video_segment_max_shots,
+        )
+        logger.info(
+            "段落分镜：%d 个镜头 -> %d 段（目标 %gs / 上限 %gs）",
+            len(storyboard.shots),
+            len(segments),
+            settings.video_segment_target_sec,
+            max_sec,
+        )
+        return storyboard
 
     def _record_llm_cost(self, project_id: str, stage: CostStage, llm: LLMProvider) -> None:
         """把这次阶段调用消耗的 token 记进账本（provider 不支持记账时跳过）。"""
@@ -339,7 +401,14 @@ class Pipeline:
 
     # ── 故事圣经 ──────────────────────────────────────────
 
-    async def generate_bible(self, project_id: str, model: str = "") -> StoryBible:
+    async def generate_bible(
+        self, project_id: str, model: str = "", *, novel_chapters: int | None = None
+    ) -> StoryBible:
+        """生成故事圣经。
+
+        小说模式：切章 → 抽取前 `novel_chapters` 章（默认 `NOVEL_INITIAL_CHAPTERS`）→
+        合并成圣经，并顺手把章节拼成长篇大纲（章节即大纲，不调 LLM）。
+        """
         async with self._lock(project_id):
             project = self.get_project(project_id)
             self._require(project, GENERATE_BIBLE_STATUSES, "生成故事圣经")
@@ -347,7 +416,10 @@ class Pipeline:
             llm = self._llm(model)
 
             try:
-                bible = await bible_service.generate_bible(project, llm)
+                if project.input_mode == InputMode.NOVEL:
+                    bible = await self._novel_bible(project, llm, novel_chapters)
+                else:
+                    bible = await bible_service.generate_bible(project, llm)
             except Exception as exc:
                 self._fail(project, "故事圣经生成")
                 raise PipelineError(f"故事圣经生成失败：{exc}") from exc
@@ -362,6 +434,105 @@ class Pipeline:
             self.store.remove_artifact(project_id, "consistency_report")
             self._invalidate_media(project_id)
             return bible
+
+    # ── 小说改编（切章 / 增量抽取 / 合并）────────────────────
+
+    def _load_novel(self, project_id: str) -> NovelSource:
+        novel = self.store.load_novel(project_id)
+        if novel is None or not novel.chapters:
+            raise PipelineError("小说还没有切章：请先生成故事圣经（小说模式会先切章并抽取前几章）")
+        return novel
+
+    async def _novel_bible(
+        self, project: Project, llm: LLMProvider, chapters: int | None
+    ) -> StoryBible:
+        """切章 + 抽取前 N 章 + 合并成圣经 + 章节大纲。原文没变时沿用已抽取的章与已有圣经。"""
+        settings = get_settings()
+        novel, resplit = novel_service.prepare_novel(
+            project,
+            self.store.load_novel(project.id),
+            chunk_chars=settings.novel_chunk_chars,
+            max_chars=settings.novel_chapter_max_chars,
+        )
+        if resplit:
+            # 原文变了：旧圣经/旧大纲对应的是另一份文本，整份重来
+            self.store.remove_artifact(project.id, "story_bible")
+            self.store.remove_artifact(project.id, "story_outline")
+        self.store.save_novel(project.id, novel)
+        count = max(1, chapters or settings.novel_initial_chapters)
+        ids = [c.id for c in novel.chapters[:count]]
+        bible, _ = await self._extract_and_merge(project, llm, novel, ids)
+        return bible
+
+    async def _extract_and_merge(
+        self, project: Project, llm: LLMProvider, novel: NovelSource, chapter_ids: list[str]
+    ) -> tuple[StoryBible, StoryOutline]:
+        """抽取指定章（已抽过的跳过）→ 把没合并过的章并进圣经 → 重建章节大纲。
+
+        合并是增量的：已有角色/场景/道具的 id、参考图、音色都不动，只补别名和新条目。
+        """
+        settings = get_settings()
+        unknown = [cid for cid in chapter_ids if novel.get_chapter(cid) is None]
+        if unknown:
+            raise PipelineError(f"未知的章: {', '.join(unknown)}")
+        bible = self.store.load_bible(project.id)
+        await novel_service.extract_chapters(
+            llm,
+            novel,
+            chapter_ids,
+            bible=bible,
+            concurrency=settings.novel_extract_concurrency,
+            max_props=settings.novel_max_props_per_chapter,
+            # 每抽完一章就落盘：中途失败也不会丢掉已经花钱抽好的章
+            on_progress=lambda partial: self.store.save_novel(project.id, partial),
+        )
+        # 圣经不在了（原文改过 / 被删）就把所有抽过的章重新并一遍
+        to_merge = [
+            c.id for c in novel.chapters if c.extracted and (bible is None or not c.merged)
+        ]
+        if to_merge or bible is None:
+            bible = await novel_service.merge_into_bible(
+                llm,
+                project,
+                bible,
+                novel,
+                to_merge,
+                max_characters=settings.novel_max_characters,
+            )
+            for chapter in novel.chapters:
+                if chapter.id in to_merge:
+                    chapter.merged = True
+            self.store.save_bible(project.id, bible)
+            self.store.save_novel(project.id, novel)
+        assert bible is not None
+        story = novel_service.build_story_outline(
+            project, novel, bible, self.store.load_story_outline(project.id)
+        )
+        self.store.save_story_outline(project.id, story)
+        return bible, story
+
+    async def extract_novel_chapters(
+        self, project_id: str, chapter_ids: list[str], *, model: str = ""
+    ) -> StoryOutline:
+        """只抽取并合并资产（不写剧本）：选章前先看看这几章会带进来哪些角色/场景/道具。"""
+        async with self._lock(project_id):
+            project = self.get_project(project_id)
+            if project.input_mode != InputMode.NOVEL:
+                raise PipelineError("只有小说模式的项目才能按章抽取")
+            self._require(project, EDIT_BIBLE_STATUSES, "抽取章节资产（需先退回剧本阶段）")
+            novel = self._load_novel(project_id)
+            self._guard_budget(project_id, action="抽取章节资产")
+            llm = self._llm(model)
+            try:
+                _, story = await self._extract_and_merge(project, llm, novel, chapter_ids)
+            except PipelineError:
+                raise
+            except Exception as exc:
+                raise PipelineError(f"章节抽取失败：{exc}") from exc
+            finally:
+                self._record_llm_cost(project_id, CostStage.BIBLE, llm)
+                await llm.aclose()
+            return story
 
     async def update_bible(self, project_id: str, data: dict) -> StoryBible:
         async with self._lock(project_id):
@@ -396,6 +567,16 @@ class Pipeline:
             bible = self.store.load_bible(project_id)
             if not bible:
                 raise PipelineError("故事圣经不存在，请先生成圣经")
+            if project.input_mode == InputMode.NOVEL:
+                # 小说的章就是大纲：按切章 + 已抽取结果重建，不调 LLM、不原创
+                outline = novel_service.build_story_outline(
+                    project,
+                    self._load_novel(project_id),
+                    bible,
+                    None if force else self.store.load_story_outline(project_id),
+                )
+                self.store.save_story_outline(project_id, outline)
+                return outline
 
             settings = get_settings()
             self._guard_budget(project_id, action="生成长篇大纲")
@@ -460,6 +641,9 @@ class Pipeline:
                 raise PipelineError("故事圣经不存在，请先生成圣经")
 
             self._guard_budget(project_id, action="生成剧本")
+            novel_mode = project.input_mode == InputMode.NOVEL
+            if novel_mode:
+                bible = await self._prepare_novel_chapters(project, chapters, model)
             llm = self._llm(model)
             review_issues: list = []
             try:
@@ -471,7 +655,11 @@ class Pipeline:
                 # review_structure 自己吞异常，评审失败不会连累剧本生成
                 if get_settings().script_llm_review:
                     review_issues = await script_service.review_structure(
-                        llm, script, bible, partial=self._is_partial_arc(project_id)
+                        llm,
+                        script,
+                        bible,
+                        partial=self._is_partial_arc(project_id),
+                        adaptation=novel_mode,
                     )
             except Exception as exc:
                 self._fail(project, "剧本生成")
@@ -511,6 +699,29 @@ class Pipeline:
             )
             return script
 
+    async def _prepare_novel_chapters(
+        self, project: Project, chapters: list[str] | None, model: str
+    ) -> StoryBible:
+        """小说模式写剧本前：选中的章没抽取过就先抽取并合并进圣经（增量，id 不变）。
+
+        小说动辄几十章，「不选 = 全部章」会一口气烧掉整本书的视频额度，所以必须显式选章。
+        """
+        if not chapters:
+            raise PipelineError("小说模式必须指定要拍的章（chapters），不会默认展开整本书")
+        novel = self._load_novel(project.id)
+        llm = self._llm(model)
+        try:
+            bible, _ = await self._extract_and_merge(project, llm, novel, chapters)
+        except PipelineError:
+            raise
+        except Exception as exc:
+            self._fail(project, "章节抽取")
+            raise PipelineError(f"章节抽取失败：{exc}") from exc
+        finally:
+            self._record_llm_cost(project.id, CostStage.BIBLE, llm)
+            await llm.aclose()
+        return bible
+
     async def _run_script_generation(
         self,
         project: Project,
@@ -531,6 +742,8 @@ class Pipeline:
         story = self.store.load_story_outline(project_id)
 
         outline: ScriptOutline | None = None
+        if project.input_mode == InputMode.NOVEL and not (story and story.chapters):
+            raise PipelineError("小说模式缺少章节大纲：请先生成故事圣经（会切章并抽取）")
         if story and story.chapters:
             outline, script, world_state = await self._expand_selected_chapters(
                 project, bible, llm, story, chapters=chapters, force=force
@@ -616,7 +829,11 @@ class Pipeline:
 
         existing = outline.chapter_ids()
         todo = [cid for cid in selected if cid not in existing]
+        novel = (
+            self.store.load_novel(project_id) if project.input_mode == InputMode.NOVEL else None
+        )
         for cid in todo:
+            source = novel.get_chapter(cid) if novel else None
             # 一次展开一章：多章挤在一个 prompt 里时模型会漏写后面的章
             extra = await script_service.expand_chapters(
                 llm,
@@ -625,6 +842,7 @@ class Pipeline:
                 story,
                 [cid],
                 start_index=len(outline.scenes),
+                sources={cid: source.text} if source else None,
             )
             outline.scenes.extend(extra.scenes)
             if extra.scenes:
@@ -813,7 +1031,9 @@ class Pipeline:
         # 视频模型的最短计费档位（H3 = 5 秒）：分镜阶段就按它拆镜头，
         # 否则 3 秒的镜头也要买 5 秒（事后合并只能补救，不如一开始就不浪费）
         tier = await self._duration_tier()
-        if tier is not None:
+        # 段落分镜：计费按段算，镜头本身不必被抬到最短档位（短镜头才有剪辑节奏）
+        segment_mode = get_settings().video_segment_mode
+        if tier is not None and not segment_mode:
             logger.info(
                 "分镜按视频档位生成：最短 %gs / 目标 %ss（来源 %s）",
                 tier.min_sec,
@@ -834,19 +1054,23 @@ class Pipeline:
                 project,
                 bible,
                 scene,
-                tier=tier,
+                tier=None if segment_mode else tier,
                 environment=entry.environment if entry else "",
                 story_context=_chapter_context(story, entry),
+                segment_mode=segment_mode,
             )
             storyboard.shots.extend(shots)
             self.store.save_storyboard(project_id, storyboard)
 
-        if tier is not None:
+        if tier is not None and not segment_mode:
             warnings = storyboard_service.apply_duration_tier(storyboard, script, tier)
             for warning in warnings:
                 logger.warning("分镜档位对齐：%s", warning)
         else:
             storyboard_service.normalize_storyboard_durations(storyboard, script)
+            storyboard.duration_tier = tier
+        if segment_mode:
+            await self._apply_segment_mode(storyboard, tier=tier, query_tier=False)
         self.store.save_storyboard(project_id, storyboard)
         return storyboard
 
@@ -889,6 +1113,8 @@ class Pipeline:
                 storyboard = Storyboard.model_validate(data)
             except Exception as exc:
                 raise PipelineError(f"分镜更新失败：{exc}") from exc
+            # 镜头改了时长/顺序，段落要按新分镜重编（编段是确定性的）
+            storyboard = await self._apply_segment_mode(storyboard)
             self.store.save_storyboard(project_id, storyboard)
             self._invalidate_media(project_id)
             self._revalidate(
@@ -914,10 +1140,17 @@ class Pipeline:
         except Exception as exc:  # noqa: BLE001 - 估不出价不该让接口 500
             logger.warning("视频 provider 初始化失败，按配置单价估算：%s", exc)
         try:
+            storyboard = self.store.load_storyboard(project_id)
+            video = self.store.load_video_manifest(project_id)
+            if storyboard is not None and storyboard.shots:
+                # 只算不写：没编过段的老分镜按「会怎么编」来估价（与真正生成同一口径）
+                storyboard = await self._apply_segment_mode(
+                    storyboard.model_copy(deep=True), video=video, only_if_missing=True
+                )
             return await preflight_service.preflight(
                 project=project,
-                storyboard=self.store.load_storyboard(project_id),
-                video=self.store.load_video_manifest(project_id),
+                storyboard=storyboard,
+                video=video,
                 audio=self.store.load_audio_manifest(project_id),
                 provider=provider or preflight_service.UnavailableVideoProvider(),
                 report=self.cost_report(project_id),
@@ -1072,8 +1305,12 @@ class Pipeline:
             # 注意：换 provider/模型时旧片段会**全部重跑**，预算必须按全部算 ——
             # 否则「生成缺失片段」会把预算门控绕过去（真实场景：mock → H3 一次 $9.75）。
             video = self.store.load_video_manifest(project_id)
+            storyboard = await self._apply_segment_mode(
+                storyboard, video=video, only_if_missing=True
+            )
+            self.store.save_storyboard(project_id, storyboard)
             targets = await self._budget_shots(storyboard, video)
-            upcoming = await self._estimate_video_usd(targets)
+            upcoming = await self._estimate_video_usd(targets, storyboard)
             self._guard_budget(
                 project_id, upcoming_usd=upcoming, action="生成视频片段"
             )
@@ -1113,6 +1350,12 @@ class Pipeline:
             bible = self.store.load_bible(project_id)
             settings = get_settings()
             existing = self.store.load_video_manifest(project_id)
+            # 批量链路不经过 start_video_generation，这里再兜一次编段（已编过就不动）
+            storyboard = await self._apply_segment_mode(
+                storyboard, video=existing, only_if_missing=True
+            )
+            if storyboard.shots:
+                self.store.save_storyboard(project_id, storyboard)
             # 用「上一次的生成时间」判断这一轮是否真的重跑过片段（换 provider 也算重跑）
             before_generated = {
                 c.shot_id: c.generated_at for c in (existing.clips if existing else [])
@@ -1228,7 +1471,13 @@ class Pipeline:
         2. 进程在「片段已落盘、账本还没写」时挂掉，下次续跑只补记账，不会重复计费
         3. 失败重试成功只记一次
         """
-        unrecorded = [c for c in manifest.ready_clips if not c.cost_recorded]
+        # 段落整段已买到但切分失败的片段是 FAILED 却带着扣费：也必须记账
+        unrecorded = [
+            c
+            for c in manifest.clips
+            if not c.cost_recorded
+            and (c.status == ClipStatus.READY or (c.status == ClipStatus.FAILED and c.cost_usd > 0))
+        ]
         if not unrecorded:
             return 0.0
         actual = round(sum(c.cost_usd for c in unrecorded), 6)
@@ -1991,7 +2240,12 @@ class Pipeline:
         stage("bible")
         await self.generate_bible(project_id, model=model)
         stage("script")
-        await self.generate_script(project_id, model=model)
+        chapters: list[str] | None = None
+        if self.get_project(project_id).input_mode == InputMode.NOVEL:
+            # 批量链路不选章：小说只拍第一章（整本书一口气出片的花费不可控）
+            story = self.store.load_story_outline(project_id)
+            chapters = [story.chapters[0].id] if story and story.chapters else None
+        await self.generate_script(project_id, model=model, chapters=chapters)
         await self.confirm_script(project_id)
         stage("storyboard")
         await self.generate_storyboard(project_id, model=model)

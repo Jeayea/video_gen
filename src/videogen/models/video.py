@@ -47,6 +47,11 @@ class VideoClip(BaseModel):
     attempts: int = 0
     error: str = ""
     prompt: str = ""
+    #: 段落分镜：这个片段是从哪一段整段视频里切出来的（空 = 单镜生成）
+    segment_id: str = ""
+    #: 在整段视频里的起点（秒）与整段文件路径（相对项目目录），便于复查切点
+    segment_offset_sec: float = 0.0
+    segment_path: str = ""
     updated_at: str = Field(default_factory=lambda: datetime.now(UTC).isoformat())
 
 

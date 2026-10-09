@@ -10,6 +10,10 @@
 |------|------|------|
 | 项目 / 文件存储 | ✅ | `projects/{id}/*.json`，原子写 |
 | 故事圣经 Story Bible | ✅ | 角色 / 设定 / 关键事实 / 风格，LLM 生成 |
+| **段落分镜（默认开）** | ✅ | 同一场相邻镜头编成 8-15 秒的一段，**一次生成、段内硬切**，再按镜头切回单镜片段（切点吸附到真实硬切）；短镜头不再各自被抬到最短档位计费，配音/口型/合成不变 |
+| **Web 工作台** | ✅ | 项目卡片首页（搜索 / 状态筛选）+ 新建弹窗；项目内左侧**阶段导航**（完成度 / 每阶段摘要）；剧集资产卡片；分镜按段落分组；明暗主题 |
+| **小说改编（`input_mode=novel`）** | ✅ | 自动切章（$0）→ **只抽要拍的章** → 增量合并进圣经（已有角色 id / 定妆照 / 音色不变）→ 章节即大纲 → 按原著改编成场次（原文进提示词，台词优先用原著对白） |
+| **剧集资产（角色 / 场景 / 关键道具）** | ✅ | 资产就是圣经条目；出场章节 / 镜头用量自动统计；场景图（无人背景板）与道具图（白底单品）可 AI 生成或上传，**和角色图一起送进视频模型** |
 | **长篇剧集大纲（20+ 章）** | ✅ | 先出全篇骨架（因果链 / 章末钩子 / 预算），再分批扩写正文；**按章选做**：只把勾选的章展开成剧本 |
 | 逐场剧本 + World State | ✅ | 逐场注入 bible + 前场摘要 + 世界状态，逐场落盘 |
 | 一致性校验 | ✅ | 人名/数字/时间线/时长 + 分镜层校验 |
@@ -376,7 +380,31 @@ ffmpeg 会报错的滤镜图。切换这个开关会让分段重新渲染。
 就是这次对比跑第一轮复用到了归一后的分段才暴露出来的。现在参数写进固定名字的
 `{shot}.params` 再比对**内容**。
 
-## 分镜阶段就「少而长」（视频档位感知）
+## 段落分镜：短镜头的剪辑节奏，按段计费
+
+「少而长」能省钱，但镜头一长，剪辑节奏就没了。段落分镜（`VIDEO_SEGMENT_MODE=true`，默认开）
+换一种思路：**镜头照样可以短，计费单位换成「段」**。
+
+```
+分镜：  [3s 中景][2s 特写][4s 近景] | [5s 全景]      ← 镜头可以 2-6 秒
+编段：  └──── 段 1：9 秒，一次生成 ────┘ | 段 2：5 秒
+视频：  一次请求，prompt 里逐镜头写时间戳（Shot 1 (0-3s) … Shot 2 (3-5s) …）+ 段内硬切
+切回：  按镜头切成 3 个单镜片段（切点吸附到画面里 ±1 秒内的真实硬切）→ 配音 / 口型 / 合成照旧
+```
+
+- **编段规则**（确定性）：只在同一场内编、地点变了就断开；装到 `VIDEO_SEGMENT_TARGET_SEC`（12）
+  就收段，超过 `VIDEO_SEGMENT_MAX_SEC`（15，还会被模型最长档位压住）或 `VIDEO_SEGMENT_MAX_SHOTS`（4）
+  也收段；场尾短于最短档位的一段并进前一段
+- **省多少**：H3 下 3 个 3 秒镜头，逐镜要买 3×5=15 秒，编成一段只买 9 秒。preflight 与预算门控
+  都按段算（`segments_total` / `segments_to_generate`），「合并短镜头」建议在段落模式下不再出现
+- **账只记一次**：整段的扣费记在段内第一个镜头的片段上，其余为 0
+- **切分失败不重买**：整段文件留在 `clips/segments/<段 id>.mp4`，片段标 FAILED 并带上原因；
+  再点一次「生成」会直接重切，不重新提交（账照样记）
+- **老项目不受影响**：已经有单镜生成好的片段时不会自动编段（否则已就绪的镜头会被卷进新段落、整段重买）
+- 分镜 LLM 会收到段落节奏要求（每镜聚焦一个动作、台词时长 ≥ 字数÷4.5+1 秒）；段落模式下
+  不再按最短档位强行拉长单个镜头。想回到「一镜一次生成」就设 `VIDEO_SEGMENT_MODE=false`
+
+## 分镜阶段就「少而长」（视频档位感知，`VIDEO_SEGMENT_MODE=false` 时生效）
 
 视频模型按**最短档位**计费（H3 最短 5 秒），所以「3 秒的镜头」其实也要付 5 秒的钱。
 与其事后合并，不如**生成分镜时就把档位写成硬约束**：
@@ -1043,6 +1071,60 @@ curl -s -X POST localhost:8001/api/projects/$PID/script/generate \
 
 没有长篇大纲的项目**保持老行为**（一次性分场大纲），所以老项目不受影响。
 
+## 小说改编：章节即大纲，只抽要拍的章
+
+建项目时 `input_mode` 选 `novel`（UI：「小说原文（按章改编）」），把原文整段贴进 `input_text`。
+和主题/大纲模式的区别是**不原创**：章就是大纲，圣经是从原文**抽**出来的。
+
+```
+① 切章（纯规则，$0）  第X章/回/节/卷、序章/楔子/尾声/番外、Chapter N；没有章标题就按字数切段；
+                        超长章再拆（NOVEL_CHUNK_CHARS / NOVEL_CHAPTER_MAX_CHARS）
+② 生成圣经            只抽前 N 章（NOVEL_INITIAL_CHAPTERS，默认 3）的人物/场景/关键道具 → 合并成圣经
+                        → 用切章结果拼出长篇大纲（不调 LLM）
+③ 选章生成剧本         没抽过的章先抽取、增量并进圣经 → 按原著改编成场次（原文进提示词）
+                        → 每场带原著片段逐场写剧本（台词优先原著对白）
+④ 分镜 → 视频 → …      完全复用原流程
+```
+
+- **增量合并、id 不变**：名字/别名对得上的直接合并（只补别名，不花钱）；对不上的候选交给 LLM 判断
+  「是已有角色的另一个称呼（外号/职务称呼）/ 值得进圣经的新角色 / 路人不收」。已有条目的 id、
+  参考图、音色一律不动，所以先给前几章配好的定妆照，后面加章不会作废
+- **必须显式选章**：小说模式下 `script/generate` 不带 `chapters` 直接 400 —— 「不选 = 全部章」
+  会一口气展开整本书，视频费不可控。批量链路（`/api/batches`）对小说只拍第一章
+- **剧本医生改口径**：只报改编造成的问题（压缩后因果断裂、关键信息没交代），不要求改原著情节
+- 原文改了（`input_text` 变了）：下次生成圣经会重新切章、整份重来
+
+```bash
+# 1) 建项目（原文整段贴进 input_text）
+curl -s -X POST localhost:8000/api/projects -H 'Content-Type: application/json' \
+  -d '{"title":"某小说","input_mode":"novel","input_text":"第一章 …"}'
+# 2) 切章 + 抽前 2 章 + 合并成圣经（只花 LLM）
+curl -s -X POST localhost:8000/api/projects/$PID/bible/generate -d '{"novel_chapters":2}' -H 'Content-Type: application/json'
+# 3) 看切章结果（不含原文）/ 只抽取某几章的资产（不写剧本）
+curl -s localhost:8000/api/projects/$PID/novel
+curl -s -X POST localhost:8000/api/projects/$PID/novel/extract -d '{"chapters":["ch_3"]}' -H 'Content-Type: application/json'
+# 4) 选章写剧本（没抽过的章会先抽取）
+curl -s -X POST localhost:8000/api/projects/$PID/script/generate -d '{"chapters":["ch_1","ch_3"]}' -H 'Content-Type: application/json'
+```
+
+## 剧集资产：角色 / 场景 / 关键道具
+
+资产的**唯一来源是故事圣经**（`characters` / `settings` / `props`），不另存一份；
+`GET /api/projects/{id}/assets` 给出每个资产的出场章节（来自长篇大纲）与镜头用量（来自分镜）。
+
+| 资产 | 参考图 | 进视频模型的方式 |
+|------|--------|------------------|
+| 角色 | 定妆照（正面、中性表情、干净背景） | `input_references`，**永远排最前** |
+| 场景 | 无人背景板（按项目画幅） | 镜头 `location` 对应的场景图，排在角色之后 |
+| 关键道具 | 白底单品图（1:1） | 镜头 `props_in_frame` 里的道具图，排在场景之后 |
+
+- 关键道具只收**推动剧情**、会被特写或反复出现的物品（信物/证据/关键文件…），每章最多
+  `NOVEL_MAX_PROPS_PER_CHAPTER` 个；手机、水杯、桌椅陈设都不算。分镜会填 `props_in_frame`，
+  道具的英文外观也会作为 `key props:` 锚点进视频 prompt
+- `VIDEO_ASSET_REFERENCES=true`（默认）时场景/道具图才会送进视频模型；单镜头合计不超过
+  `VIDEO_MAX_REFERENCE_IMAGES`（默认 4）张。**没配图的资产没有任何影响**，老项目行为不变
+- 资产图的 prompt 会剔除中日韩字符（图片模型会把 prompt 里的中文画进画面），按张计入成本账本
+
 ## 剧本严谨：两层检查 + 拦确认
 
 **第一层：确定性修复**（不花 LLM、不改创作）
@@ -1082,6 +1164,11 @@ LLM 评审失败一律降级（只记 warning），绝不会因为它把生成�
 | GET/PUT/DELETE | `/api/projects/{id}` | 详情 / 改标题比例时长 / 删除 |
 | POST | `/api/projects/{id}/bible/generate` | 生成故事圣经 |
 | GET/PUT | `/api/projects/{id}/bible` | 读取 / 全量覆盖（仅剧本确认前） |
+| GET | `/api/projects/{id}/novel` | 小说切章结果（章标题 / 字数 / 是否抽取，不含原文） |
+| POST | `/api/projects/{id}/novel/extract` | 只抽取选中章并合并进圣经（`chapters:[...]`，不写剧本，只花 LLM） |
+| GET | `/api/projects/{id}/assets` | **剧集资产总览**：角色 / 场景 / 道具的出场章节、镜头用量、参考图（$0） |
+| POST/GET/DELETE | `/api/projects/{id}/assets/{kind}/{aid}/reference` | 资产参考图上传 / 下载 / 删除（`kind` = characters / settings / props） |
+| POST | `/api/projects/{id}/assets/{kind}/{aid}/reference/generate` | **AI 生成资产图**：场景 = 无人背景板，道具 = 白底单品，角色 = 定妆照（按张计费） |
 | POST/GET | `/api/projects/{id}/story-outline/generate` · `/story-outline` | **长篇剧集大纲**（20+ 章骨架 + 逐章正文；只花 LLM） |
 | POST | `/api/projects/{id}/script/generate` | 生成剧本（body 可带 `chapters:["ch_1","ch_2"]` 只展开选中章；`force` 清空重来。失败后重试即续跑） |
 | GET/PUT | `/api/projects/{id}/script` | 读取 / 全量覆盖（仅确认前） |
@@ -1134,7 +1221,8 @@ src/videogen/
 ├── services/                 # bible / script / storyboard / consistency / video / audio
 │                             #   / audio_script（LLM 看画面写配音文案）/ subtitle（SRT 时间轴）
 │                             #   / lipsync（逐帧口型，可插拔引擎）/ compose（FFmpeg 合成）
-│                             #   / cost（记账）
+│                             #   / cost（记账）/ novel（小说切章·抽取·增量合并）
+│                             #   / asset（剧集资产总览 + 场景/道具参考图）
 ├── providers/llm/            # LLMProvider 抽象 + OpenRouter 实现（JSON 修复 + schema 重试）
 ├── providers/video/          # VideoProvider 抽象 + MockVideoProvider（ffmpeg 占位视频）
 ├── providers/tts/            # TTSProvider 抽象 + EdgeTTSProvider + MockTTSProvider
@@ -1146,6 +1234,7 @@ src/videogen/
 ├── tools/demo_bgm.py         # 生成演示用免版权 BGM（ffmpeg 合成）
 └── utils/                    # file_store / coerce / duration / ffmpeg / text / redact
                               #   / motion（画面运动实测）/ audio_align（口型起点对齐）
+                              #   / novel（按章切分，纯规则）
                               #   / lip_sync（口型诊断测量）/ av_sync（音画时长自检）
 
 tools/lipsync/                # 逐帧口型的独立环境与脚本（不进主环境依赖）
@@ -1295,6 +1384,25 @@ tools/lipsync/                # 逐帧口型的独立环境与脚本（不进主
 36. **角色长相在镜头之间只是「近似一致」**：参考图能锁住大致脸型/发型/服装，但每个镜头
     独立生成，仍会出现「同一角色不同镜头像两个人」的情况（可用的缓解：参考图 + 圣经里的
     `visual_prompt` 文字锚点 + 同一场景锚点，三者一起上；想更稳只能换更贵的多镜头一致性方案）
+
+37. **小说抽取是同步请求**：生成圣经 / 选章写剧本时，没抽过的章会在同一个 HTTP 请求里逐章抽取
+    （并发 `NOVEL_EXTRACT_CONCURRENCY`）。一次选几十章会让请求跑好几分钟；每抽完一章就落盘，
+    中途失败重试会跳过已抽好的章，不会重复花钱
+38. **增量合并只补别名，不改已有条目**：后面章节里对角色外貌的新描写不会回写到已有角色上
+    （避免定妆照与描述对不上）；需要的话直接编辑圣经。合并的「同一个人」判断由 LLM 做，
+    外号与正名差得太远时可能被当成新角色 —— 在圣经里把它并进 aliases 即可
+39. **章节切分是规则式的**：不规范的章标题（如「一、」「（一）」）认不出来时会按字数切段；
+    正文里以「第X章/节」开头且不带句末标点的短句可能被误认成标题
+40. **场景/道具参考图对视频模型的影响因模型而异**：多张参考图里排在后面的权重通常更弱
+    （见第 18 条），provider 不接受多图时只保留第一张（角色图）
+
+41. **段落分镜依赖模型「按时间戳切镜」的能力**：prompt 里写了逐镜头时间戳和硬切，但模型可能不切、
+    少切或切在别处。切点吸附只在计划切点 ±1 秒内找真实硬切，找不到就按计划时间切 ——
+    这时一个单镜片段里可能带着上一镜的尾巴。质量没有用真实模型验证过，换模型前建议用
+    `tools/e2e/real_shot_e2e.py` 先小样本试
+42. **段落里任何一个镜头要重做，整段都要重买**：段是一次生成的，没法只重生成其中一个镜头
+43. **切回单镜要重编码**：为了切点精确到帧，每个片段会用 libx264 重编码一次（多花一点 CPU，
+    画质损失很小）
 
 ## 安全
 

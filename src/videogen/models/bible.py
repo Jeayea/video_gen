@@ -46,8 +46,25 @@ class Character(BaseModel):
 class Setting(BaseModel):
     id: str
     name: str
+    aliases: StrList = Field(default_factory=list)
     description: str = ""
     visual_prompt: str = ""
+    #: 场景参考图（相对项目目录，如 "refs/loc_1.png"）：视频生成时作为背景参考
+    reference_image: str = ""
+
+
+class Prop(BaseModel):
+    """关键道具：推动剧情、会被特写或反复出现的物品（不是场景陈设）。
+
+    有参考图时随镜头一起送进视频模型，保证道具外观跨镜头一致。
+    """
+
+    id: str
+    name: str
+    aliases: StrList = Field(default_factory=list)
+    description: str = ""
+    visual_prompt: str = ""
+    reference_image: str = ""
 
 
 class Fact(BaseModel):
@@ -69,6 +86,7 @@ class StoryBible(BaseModel):
     cast_region: str = ""
     characters: list[Character] = Field(default_factory=list)
     settings: list[Setting] = Field(default_factory=list)
+    props: list[Prop] = Field(default_factory=list)
     facts: list[Fact] = Field(default_factory=list)
     style: StyleGuide = Field(default_factory=StyleGuide)
 
@@ -82,6 +100,12 @@ class StoryBible(BaseModel):
             if c.id == char_id:
                 return c
         return None
+
+    def get_setting(self, setting_id: str) -> Setting | None:
+        return next((s for s in self.settings if s.id == setting_id), None)
+
+    def get_prop(self, prop_id: str) -> Prop | None:
+        return next((p for p in self.props if p.id == prop_id), None)
 
     def get_character_by_name(self, name: str) -> Character | None:
         for c in self.characters:

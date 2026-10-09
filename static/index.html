@@ -6,17 +6,48 @@
 <title>videogen — AI 短剧流水线</title>
 <style>
 :root {
-  --bg: #0f1117;
-  --surface: #1a1d27;
-  --border: #2a2d3a;
-  --text: #e4e4e7;
-  --text2: #9ca3af;
-  --accent: #6366f1;
-  --accent2: #818cf8;
+  --bg: #0b0e14;
+  --bg2: #0f131b;
+  --surface: #151a24;
+  --surface2: #1b2130;
+  --border: #252d3d;
+  --text: #e6e9ef;
+  --text2: #94a0b4;
+  --accent: #14b8a6;
+  --accent2: #2dd4bf;
+  --accent-soft: rgba(20, 184, 166, 0.14);
+  --violet: #a78bfa;
   --green: #22c55e;
   --yellow: #eab308;
   --red: #ef4444;
-  --radius: 10px;
+  --radius: 12px;
+  --shadow: 0 1px 2px rgba(0,0,0,.3), 0 8px 24px rgba(0,0,0,.18);
+  color-scheme: dark;
+}
+:root[data-theme="light"] {
+  --bg: #f5f7fa;
+  --bg2: #eef1f5;
+  --surface: #ffffff;
+  --surface2: #f3f5f8;
+  --border: #dde3eb;
+  --text: #18202e;
+  --text2: #5b6779;
+  --accent: #0d9488;
+  --accent2: #0f766e;
+  --accent-soft: rgba(13, 148, 136, 0.10);
+  --violet: #7c3aed;
+  --shadow: 0 1px 2px rgba(16,24,40,.06), 0 6px 18px rgba(16,24,40,.06);
+  color-scheme: light;
+}
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+    --bg: #f5f7fa; --bg2: #eef1f5; --surface: #ffffff; --surface2: #f3f5f8;
+    --border: #dde3eb; --text: #18202e; --text2: #5b6779;
+    --accent: #0d9488; --accent2: #0f766e; --accent-soft: rgba(13, 148, 136, 0.10);
+    --violet: #7c3aed;
+    --shadow: 0 1px 2px rgba(16,24,40,.06), 0 6px 18px rgba(16,24,40,.06);
+    color-scheme: light;
+  }
 }
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body {
@@ -24,27 +55,6 @@ body {
   background: var(--bg); color: var(--text);
   min-height: 100vh;
 }
-.header {
-  padding: 16px 24px;
-  border-bottom: 1px solid var(--border);
-  display: flex; align-items: center; gap: 12px;
-}
-.header h1 { font-size: 18px; font-weight: 600; }
-.header .badge {
-  background: var(--accent); color: #fff;
-  font-size: 11px; padding: 2px 8px; border-radius: 99px;
-}
-.layout {
-  display: grid;
-  grid-template-columns: 320px 1fr;
-  height: calc(100vh - 57px);
-}
-.sidebar {
-  border-right: 1px solid var(--border);
-  overflow-y: auto;
-  padding: 16px;
-}
-.sidebar h2 { font-size: 13px; color: var(--text2); margin-bottom: 12px; text-transform: uppercase; letter-spacing: 0.05em; }
 .create-form { display: flex; flex-direction: column; gap: 10px; margin-bottom: 20px; }
 .create-form label { font-size: 12px; color: var(--text2); }
 .create-form input, .create-form select, .create-form textarea {
@@ -77,29 +87,8 @@ body {
 .btn-danger { background: transparent; border: 1px solid var(--red); color: var(--red); }
 .btn-danger:hover { background: var(--red); color: #fff; }
 
-.project-list { display: flex; flex-direction: column; gap: 6px; }
-.project-item {
-  padding: 10px 12px; border-radius: 8px; cursor: pointer;
-  border: 1px solid transparent;
-  transition: all 0.15s;
-  position: relative;
-}
-.project-item:hover { background: var(--surface); }
-.project-item.active { border-color: var(--accent); background: var(--surface); }
-.project-item .title { font-size: 13px; font-weight: 500; padding-right: 20px; }
-.project-item .meta { font-size: 11px; color: var(--text2); margin-top: 2px; }
-.project-item .del {
-  position: absolute; top: 8px; right: 8px;
-  background: transparent; border: none; color: var(--text2);
-  cursor: pointer; font-size: 13px; line-height: 1; padding: 2px 4px;
-  border-radius: 4px; display: none;
-}
-.project-item:hover .del { display: block; }
-.project-item .del:hover { color: var(--red); background: #7f1d1d33; }
 
 .main { overflow-y: auto; padding: 24px; }
-.empty { text-align: center; padding: 80px 20px; color: var(--text2); }
-.empty h3 { font-size: 16px; margin-bottom: 8px; }
 
 .panel {
   background: var(--surface); border: 1px solid var(--border);
@@ -353,51 +342,306 @@ body {
   transition: width 0.3s ease;
 }
 .progress-text { font-size: 12px; color: var(--text2); margin-top: 6px; }
+
+/* ── 外壳：顶栏 / 视图 ─────────────────────────────────────────── */
+.topbar {
+  position: sticky; top: 0; z-index: 20;
+  display: flex; align-items: center; gap: 16px;
+  padding: 10px 24px; background: color-mix(in srgb, var(--bg) 88%, transparent);
+  backdrop-filter: blur(10px); border-bottom: 1px solid var(--border);
+}
+.brand { display: flex; align-items: center; gap: 10px; }
+.brand-mark {
+  width: 32px; height: 32px; border-radius: 9px; display: grid; place-items: center;
+  background: linear-gradient(135deg, var(--accent), var(--violet)); color: #fff; font-size: 14px;
+}
+.brand-name { font-weight: 700; font-size: 15px; letter-spacing: .02em; }
+.brand-sub { font-size: 11px; color: var(--text2); }
+.nav-tabs { display: flex; gap: 4px; background: var(--surface); padding: 3px; border-radius: 10px; border: 1px solid var(--border); }
+.nav-tabs button {
+  border: 0; background: transparent; color: var(--text2); padding: 6px 14px; border-radius: 8px;
+  font-size: 13px; cursor: pointer;
+}
+.nav-tabs button.active { background: var(--accent-soft); color: var(--accent2); font-weight: 600; }
+.spacer { flex: 1; }
+.icon-btn {
+  border: 1px solid var(--border); background: var(--surface); color: var(--text2);
+  width: 32px; height: 32px; border-radius: 8px; cursor: pointer; font-size: 14px;
+}
+.icon-btn:hover { color: var(--text); border-color: var(--accent); }
+#global-status { font-size: 12px; color: var(--accent2); }
+.view { padding: 24px; max-width: 1480px; margin: 0 auto; }
+.view[hidden] { display: none; }
+
+/* ── 项目首页 ─────────────────────────────────────────────────── */
+.home-head { display: flex; align-items: flex-end; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; }
+.home-head h1 { font-size: 22px; font-weight: 700; }
+.home-head .sub { color: var(--text2); font-size: 13px; }
+.home-tools { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 18px; }
+.search {
+  background: var(--surface); border: 1px solid var(--border); color: var(--text);
+  border-radius: 10px; padding: 8px 12px; font-size: 13px; min-width: 220px; outline: none;
+}
+.search:focus { border-color: var(--accent); }
+.chip {
+  border: 1px solid var(--border); background: var(--surface); color: var(--text2);
+  padding: 5px 12px; border-radius: 99px; font-size: 12px; cursor: pointer;
+}
+.chip.active { background: var(--text); color: var(--bg); border-color: var(--text); }
+.stat-chip { font-size: 12px; padding: 4px 10px; border-radius: 99px; background: var(--surface2); color: var(--text2); }
+.stat-chip.accent { background: var(--accent-soft); color: var(--accent2); }
+.project-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 16px; }
+.project-card {
+  background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+  overflow: hidden; cursor: pointer; box-shadow: var(--shadow); transition: transform .12s, border-color .12s;
+  position: relative;
+}
+.project-card:hover { transform: translateY(-2px); border-color: var(--accent); }
+.project-cover {
+  height: 120px; position: relative; display: grid; place-items: center;
+  background:
+    radial-gradient(120% 90% at 0% 0%, color-mix(in srgb, var(--accent) 30%, transparent), transparent 60%),
+    radial-gradient(120% 90% at 100% 100%, color-mix(in srgb, var(--violet) 26%, transparent), transparent 60%),
+    var(--surface2);
+}
+.project-cover img { width: 100%; height: 100%; object-fit: cover; }
+.project-cover .cover-icon { font-size: 26px; opacity: .55; }
+.project-cover .corner { position: absolute; top: 8px; left: 8px; }
+.project-cover .ratio {
+  position: absolute; right: 8px; bottom: 8px; font-size: 11px; padding: 1px 6px; border-radius: 6px;
+  background: rgba(0,0,0,.45); color: #fff;
+}
+.project-card .body { padding: 12px 14px 14px; }
+.project-card .title { font-size: 14px; font-weight: 600; margin-bottom: 6px; }
+.project-card .meta { font-size: 12px; color: var(--text2); display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+.mode-badge { font-size: 11px; padding: 1px 7px; border-radius: 6px; background: var(--accent-soft); color: var(--accent2); }
+.project-card .del {
+  position: absolute; top: 8px; right: 8px; display: none; border: 0; border-radius: 7px;
+  background: rgba(0,0,0,.5); color: #fff; width: 26px; height: 26px; cursor: pointer;
+}
+.project-card:hover .del { display: block; }
+.project-card .del:hover { background: var(--red); }
+.empty-card {
+  border: 1px dashed var(--border); border-radius: var(--radius); padding: 48px 16px; text-align: center;
+  color: var(--text2); grid-column: 1 / -1;
+}
+
+/* ── 新建项目弹窗 ─────────────────────────────────────────────── */
+.modal-backdrop {
+  position: fixed; inset: 0; z-index: 50; background: rgba(5, 8, 14, .6);
+  display: grid; place-items: center; padding: 16px;
+}
+.modal-backdrop[hidden] { display: none; }
+.modal {
+  width: min(560px, 100%); max-height: 90vh; overflow: auto; background: var(--surface);
+  border: 1px solid var(--border); border-radius: 16px; padding: 20px 22px; box-shadow: var(--shadow);
+}
+.modal h2 { font-size: 17px; margin-bottom: 4px; }
+.modal .sub { font-size: 12px; color: var(--text2); margin-bottom: 14px; }
+.mode-pick { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; }
+.mode-pick label {
+  border: 1px solid var(--border); border-radius: 10px; padding: 9px 10px; cursor: pointer;
+  font-size: 13px; color: var(--text); display: flex; flex-direction: column; gap: 2px;
+}
+.mode-pick label small { color: var(--text2); font-size: 11px; }
+.mode-pick input { display: none; }
+.mode-pick label:has(input:checked) { border-color: var(--accent); background: var(--accent-soft); }
+.create-form .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.create-form .row2 > div { display: flex; flex-direction: column; gap: 6px; }
+.modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 6px; }
+
+/* ── 项目工作区：头部 + 左侧阶段导航 ──────────────────────────── */
+.proj-header {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 12px 16px; margin-bottom: 16px; box-shadow: var(--shadow);
+}
+.proj-header .back { border: 1px solid var(--border); background: var(--surface2); color: var(--text); border-radius: 8px; padding: 5px 10px; cursor: pointer; font-size: 12px; }
+.proj-header .ptitle { font-size: 16px; font-weight: 700; }
+.proj-header .pmeta { font-size: 12px; color: var(--text2); }
+.proj-header .next { font-size: 12px; color: var(--accent2); }
+.proj-header select { background: var(--surface2); border: 1px solid var(--border); color: var(--text); border-radius: 8px; padding: 5px 8px; font-size: 12px; }
+.workspace { display: grid; grid-template-columns: 220px minmax(0, 1fr); gap: 16px; align-items: start; }
+.stage-nav {
+  position: sticky; top: 72px; background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 10px; box-shadow: var(--shadow);
+}
+.stage-item {
+  display: flex; align-items: center; gap: 10px; width: 100%; text-align: left;
+  border: 0; background: transparent; color: var(--text); padding: 8px 10px; border-radius: 9px;
+  cursor: pointer; font-size: 13px;
+}
+.stage-item:hover { background: var(--surface2); }
+.stage-item.active { background: var(--accent-soft); }
+.stage-item.active .stage-label { color: var(--accent2); font-weight: 600; }
+.stage-dot {
+  width: 22px; height: 22px; border-radius: 50%; display: grid; place-items: center; flex: none;
+  font-size: 11px; border: 1.5px solid var(--border); color: var(--text2);
+}
+.stage-item.done .stage-dot { background: var(--accent); border-color: var(--accent); color: #fff; }
+.stage-item.current .stage-dot { border-color: var(--accent2); color: var(--accent2); box-shadow: 0 0 0 3px var(--accent-soft); }
+.stage-text { display: flex; flex-direction: column; min-width: 0; }
+.stage-sub { font-size: 11px; color: var(--text2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.stage-progress { margin: 10px 6px 4px; font-size: 11px; color: var(--text2); }
+.stage-progress .bar { height: 5px; border-radius: 99px; background: var(--surface2); margin-top: 6px; overflow: hidden; }
+.stage-progress .bar span { display: block; height: 100%; background: linear-gradient(90deg, var(--accent), var(--violet)); }
+.stage-body > .panel[data-stage] { display: none; }
+.stage-body > .panel[data-stage].shown { display: block; }
+
+/* ── 剧集资产卡片 ─────────────────────────────────────────────── */
+.asset-section-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 8px; margin: 16px 0 8px; font-size: 13px; font-weight: 600; white-space: nowrap; }
+.asset-section-head .count { white-space: normal; }
+.asset-section-head .count { font-weight: 400; color: var(--text2); font-size: 12px; }
+.asset-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 12px; }
+.asset-card {
+  background: var(--surface2); border: 1px solid var(--border); border-radius: 12px; overflow: hidden;
+  display: flex; flex-direction: column;
+}
+.asset-img { aspect-ratio: 4 / 3; background: var(--bg2); display: grid; place-items: center; position: relative; }
+.asset-card.kind-characters .asset-img { aspect-ratio: 3 / 4; }
+.asset-img img { width: 100%; height: 100%; object-fit: cover; }
+.asset-img .ph { font-size: 28px; opacity: .35; }
+.asset-img .state {
+  position: absolute; top: 6px; left: 6px; font-size: 10px; padding: 1px 7px; border-radius: 99px;
+  background: rgba(0,0,0,.55); color: #fff;
+}
+.asset-img .state.ok { background: color-mix(in srgb, var(--green) 85%, black); }
+.asset-info { padding: 8px 10px 10px; display: flex; flex-direction: column; gap: 4px; flex: 1; }
+.asset-name { font-size: 13px; font-weight: 600; display: flex; gap: 6px; align-items: center; }
+.asset-role { font-size: 10px; padding: 0 6px; border-radius: 5px; background: var(--accent-soft); color: var(--accent2); font-weight: 500; }
+.asset-desc { font-size: 11px; color: var(--text2); line-height: 1.5; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.asset-usage { font-size: 11px; color: var(--text2); }
+.asset-actions { display: flex; gap: 6px; margin-top: 6px; flex-wrap: wrap; align-items: center; }
+.btn-xs { padding: 3px 9px; font-size: 11px; border-radius: 6px; }
+.asset-actions .ref-upload {
+  font-size: 11px; padding: 3px 9px; border: 1px solid var(--border); border-radius: 6px; cursor: pointer; color: var(--text2);
+}
+.asset-actions .ref-upload input { display: none; }
+
+/* ── 分镜：按段落分组 ─────────────────────────────────────────── */
+.segment-block {
+  border: 1px solid var(--border); border-radius: 12px; margin-bottom: 12px; overflow: hidden;
+  background: var(--bg2);
+}
+.segment-head {
+  display: flex; align-items: center; gap: 8px; padding: 8px 12px; font-size: 12px;
+  background: var(--surface2); border-bottom: 1px solid var(--border);
+}
+.segment-head .seg-name { font-weight: 600; color: var(--violet); }
+.segment-timeline { display: flex; height: 6px; border-radius: 99px; overflow: hidden; flex: 1; max-width: 260px; gap: 2px; }
+.segment-timeline span { background: var(--accent); opacity: .75; }
+.segment-timeline span:nth-child(2n) { background: var(--violet); }
+.segment-block .shot-block { margin: 8px; }
+.seg-chip { font-size: 10px; padding: 0 6px; border-radius: 5px; background: color-mix(in srgb, var(--violet) 18%, transparent); color: var(--violet); }
+
+@media (max-width: 900px) {
+  .workspace { grid-template-columns: 1fr; }
+  .stage-nav { position: static; display: flex; overflow-x: auto; gap: 4px; }
+  .stage-item { width: auto; flex: none; }
+  .stage-sub, .stage-progress { display: none; }
+  .view { padding: 16px; }
+  .topbar { padding: 10px 16px; gap: 10px; }
+  .brand-sub, #health { display: none; }
+}
+.view .main { padding: 0; overflow: visible; }
+
+.status-tag { display: inline-block; }
+.status-video_generating, .status-audio_generating, .status-composing { background: #1e3a8a; color: #bfdbfe; }
+.status-video_ready, .status-audio_ready { background: #134e4a; color: #99f6e4; }
+:root[data-theme="light"] .status-video_generating, :root[data-theme="light"] .status-audio_generating,
+:root[data-theme="light"] .status-composing { background: #dbeafe; color: #1e40af; }
+:root[data-theme="light"] .status-video_ready, :root[data-theme="light"] .status-audio_ready { background: #ccfbf1; color: #115e59; }
+.proj-header #model-hint { font-size: 11px; }
 </style>
 </head>
 <body>
 
-<div class="header">
-  <h1>videogen</h1>
-  <span class="badge">v0.12</span>
-  <span style="flex:1"></span>
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-mark">▶</span>
+    <div><div class="brand-name">videogen</div><div class="brand-sub">AI 短剧工坊</div></div>
+  </div>
+  <nav class="nav-tabs">
+    <button id="tab-projects" class="active" onclick="showHome()">项目</button>
+    <button id="tab-batch" onclick="showBatch()">批量生产</button>
+  </nav>
+  <span class="spacer"></span>
+  <span id="global-status"></span>
   <span id="health" style="font-size:12px;color:var(--text2)"></span>
-  <span id="global-status" style="font-size:12px;color:var(--text2)"></span>
-</div>
+  <button class="icon-btn" onclick="toggleTheme()" title="切换明暗主题">◐</button>
+</header>
 
-<div class="layout">
-  <div class="sidebar">
+<section class="view" id="home-view">
+  <div class="home-head">
+    <div>
+      <h1>项目</h1>
+      <div class="sub">从一句创意或一部小说，到一条带配音和配乐的短剧</div>
+    </div>
+    <span class="spacer"></span>
+    <span id="home-stats" style="display:flex;gap:6px;flex-wrap:wrap"></span>
+    <button class="btn" onclick="openCreate()">＋ 新建项目</button>
+  </div>
+  <div class="home-tools">
+    <input class="search" id="project-search" placeholder="搜索项目" oninput="renderProjectGrid()">
+    <span id="status-filters" style="display:flex;gap:6px;flex-wrap:wrap"></span>
+  </div>
+  <div class="project-grid" id="project-list"></div>
+</section>
+
+<section class="view" id="batch-view" hidden>
+  <div class="home-head">
+    <div>
+      <h1>批量生产</h1>
+      <div class="sub">一次提交多个主题，自动跑完整条链路（跳过人工确认门控）</div>
+    </div>
+  </div>
+  <div id="batch-root"></div>
+</section>
+
+<section class="view" id="project-view" hidden>
+  <div class="main" id="main"></div>
+</section>
+
+<div class="modal-backdrop" id="create-modal" hidden onclick="if (event.target === this) closeCreate()">
+  <div class="modal">
     <h2>新建项目</h2>
+    <div class="sub">选一种输入方式。小说会自动切章，之后按章挑着拍。</div>
     <div class="create-form">
       <label>标题</label>
       <input id="inp-title" placeholder="都市逆袭短剧" value="">
-      <label>输入模式</label>
-      <select id="inp-mode">
+      <label>输入方式</label>
+      <div class="mode-pick" id="mode-pick">
+        <label><input type="radio" name="inp-mode-radio" value="theme" checked onchange="setInputMode(this.value)">主题 / 关键词<small>一句话创意，AI 写故事</small></label>
+        <label><input type="radio" name="inp-mode-radio" value="outline" onchange="setInputMode(this.value)">故事大纲<small>已有梗概，AI 扩写</small></label>
+        <label><input type="radio" name="inp-mode-radio" value="full_script" onchange="setInputMode(this.value)">完整剧本<small>按现成剧本拆分</small></label>
+        <label><input type="radio" name="inp-mode-radio" value="novel" onchange="setInputMode(this.value)">小说原文<small>自动切章，按章改编</small></label>
+      </div>
+      <select id="inp-mode" hidden>
         <option value="theme">主题/关键词</option>
         <option value="outline">故事大纲</option>
         <option value="full_script">完整剧本</option>
+        <option value="novel">小说原文（按章改编）</option>
       </select>
       <label>输入内容</label>
-      <textarea id="inp-text" placeholder="例如：一个被裁员的程序员靠 AI 逆袭创业"></textarea>
-      <label>画面比例</label>
-      <select id="inp-aspect">
-        <option value="9:16">竖屏 9:16（抖音）</option>
-        <option value="16:9">横屏 16:9（B站）</option>
-        <option value="1:1">方形 1:1</option>
-      </select>
-      <label>目标时长（秒）</label>
-      <input id="inp-duration" type="number" value="45" min="5" max="600">
-      <button class="btn" onclick="createProject()">创建项目</button>
-    </div>
-
-    <h2>项目列表</h2>
-    <div class="project-list" id="project-list"></div>
-  </div>
-
-  <div class="main" id="main">
-    <div class="empty">
-      <h3>选择或创建一个项目</h3>
-      <p>输入创意 → 生成圣经 → 生成剧本 → 确认 → 生成分镜 → 确认</p>
+      <textarea id="inp-text" rows="6" placeholder="例如：一个被裁员的程序员靠 AI 逆袭创业"></textarea>
+      <div class="row2">
+        <div>
+          <label>画面比例</label>
+          <select id="inp-aspect">
+            <option value="9:16">竖屏 9:16（抖音）</option>
+            <option value="16:9">横屏 16:9（B站）</option>
+            <option value="1:1">方形 1:1</option>
+          </select>
+        </div>
+        <div>
+          <label>目标时长（秒）</label>
+          <input id="inp-duration" type="number" value="45" min="5" max="600">
+        </div>
+      </div>
+      <div class="modal-actions">
+        <button class="btn btn-outline" onclick="closeCreate()">取消</button>
+        <button class="btn" onclick="createProject()">创建项目</button>
+      </div>
     </div>
   </div>
 </div>
@@ -533,22 +777,136 @@ async function loadHealth() {
 
 // ── 项目列表 ────────────────────────────────────────────────────────
 
+let allProjects = [];
+let projectFilter = 'all';
+
+const PROJECT_FILTERS = [
+  ['all', '全部'],
+  ['draft', '待开始'],
+  ['working', '进行中'],
+  ['done', '已出片'],
+  ['failed', '失败'],
+];
+const MODE_LABEL = { theme: '主题', outline: '大纲', full_script: '剧本', novel: '小说' };
+
+function projectBucket(p) {
+  if (p.status === 'draft') return 'draft';
+  if (p.status === 'done') return 'done';
+  if (p.status === 'failed') return 'failed';
+  return 'working';
+}
+
 async function loadProjects() {
-  const projects = await api('/api/projects');
+  allProjects = await api('/api/projects');
+  renderProjectGrid();
+}
+
+function renderProjectGrid() {
   const list = $('project-list');
-  if (projects.length === 0) {
-    list.innerHTML = '<p style="font-size:12px;color:var(--text2)">暂无项目</p>';
+  if (!list) return;
+  const counts = { all: allProjects.length, draft: 0, working: 0, done: 0, failed: 0 };
+  allProjects.forEach(p => { counts[projectBucket(p)] += 1; });
+  $('home-stats').innerHTML =
+    `<span class="stat-chip">${counts.all} 个项目</span>` +
+    `<span class="stat-chip accent">${counts.working} 进行中</span>` +
+    `<span class="stat-chip">${counts.done} 已出片</span>`;
+  $('status-filters').innerHTML = PROJECT_FILTERS.map(([key, label]) =>
+    `<button class="chip ${projectFilter === key ? 'active' : ''}" onclick="setProjectFilter('${key}')">${label}${key !== 'all' && counts[key] ? ` ${counts[key]}` : ''}</button>`
+  ).join('');
+  const q = ($('project-search').value || '').trim().toLowerCase();
+  const shown = allProjects
+    .filter(p => projectFilter === 'all' || projectBucket(p) === projectFilter)
+    .filter(p => !q || (p.title || '').toLowerCase().includes(q))
+    .sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)));
+  if (!shown.length) {
+    list.innerHTML = allProjects.length
+      ? '<div class="empty-card">没有符合条件的项目</div>'
+      : '<div class="empty-card">还没有项目。点右上角「新建项目」，从一句创意或一部小说开始。</div>';
     return;
   }
-  list.innerHTML = projects.map(p => `
-    <div class="project-item ${p.id === currentProjectId ? 'active' : ''}"
-         onclick="selectProject('${p.id}')">
+  list.innerHTML = shown.map(p => `
+    <div class="project-card" onclick="selectProject('${p.id}')">
+      <div class="project-cover">
+        <span class="cover-icon">${p.input_mode === 'novel' ? '📖' : '🎬'}</span>
+        <span class="corner">${statusTag(p.status)}</span>
+        <span class="ratio">${esc(p.aspect_ratio)}</span>
+      </div>
       <button class="del" title="删除项目"
               onclick="event.stopPropagation(); deleteProject('${p.id}', '${esc(p.title)}')">✕</button>
-      <div class="title">${esc(p.title) || '未命名'}</div>
-      <div class="meta">${statusTag(p.status)} · ${p.aspect_ratio} · ${p.target_duration_sec}s</div>
+      <div class="body">
+        <div class="title">${esc(p.title) || '未命名'}</div>
+        <div class="meta">
+          <span class="mode-badge">${esc(MODE_LABEL[p.input_mode] || p.input_mode)}</span>
+          <span>目标 ${p.target_duration_sec}s</span>
+          <span>· ${esc(String(p.created_at || '').slice(0, 10))}</span>
+        </div>
+      </div>
     </div>
   `).join('');
+}
+
+function setProjectFilter(key) {
+  projectFilter = key;
+  renderProjectGrid();
+}
+
+// ── 视图切换 / 主题 ─────────────────────────────────────────────────
+
+function showView(name) {
+  ['home', 'batch', 'project'].forEach(v => { $(`${v}-view`).hidden = v !== name; });
+  $('tab-projects').classList.toggle('active', name !== 'batch');
+  $('tab-batch').classList.toggle('active', name === 'batch');
+  window.scrollTo(0, 0);
+}
+
+function showHome() {
+  currentProjectId = null;
+  stopProjectPolling();
+  showView('home');
+  loadProjects().catch(() => {});
+}
+
+async function showBatch() {
+  showView('batch');
+  $('batch-root').innerHTML = batchPanelHtml();
+  if (!currentBatch || !currentBatch.is_active) {
+    const batchList = await safeGet('/api/batches?limit=1');
+    if (Array.isArray(batchList) && batchList.length) currentBatch = batchList[0];
+  }
+  renderBatch();
+}
+
+function stopProjectPolling() {
+  [videoPollTimer, audioPollTimer, composePollTimer, costPollTimer].forEach(t => t && clearTimeout(t));
+  videoPollTimer = audioPollTimer = composePollTimer = costPollTimer = null;
+}
+
+function toggleTheme() {
+  const root = document.documentElement;
+  const dark = root.dataset.theme
+    ? root.dataset.theme === 'dark'
+    : !window.matchMedia('(prefers-color-scheme: light)').matches;
+  root.dataset.theme = dark ? 'light' : 'dark';
+  try { localStorage.setItem('videogen_theme', root.dataset.theme); } catch (e) { /* 存不了就算了 */ }
+}
+
+(function initTheme() {
+  try {
+    const saved = localStorage.getItem('videogen_theme');
+    if (saved) document.documentElement.dataset.theme = saved;
+  } catch (e) { /* 隐私模式下读不到 */ }
+})();
+
+function openCreate() {
+  $('create-modal').hidden = false;
+  setTimeout(() => $('inp-title').focus(), 0);
+}
+
+function closeCreate() { $('create-modal').hidden = true; }
+
+function setInputMode(value) {
+  $('inp-mode').value = value;
+  onInputModeChange();
 }
 
 async function createProject() {
@@ -563,8 +921,10 @@ async function createProject() {
   try {
     $('global-status').textContent = '创建中...';
     const p = await api('/api/projects', { method: 'POST', body: JSON.stringify(body) });
-    currentProjectId = p.id;
-    await refresh();
+    closeCreate();
+    $('inp-text').value = '';
+    $('inp-title').value = '';
+    await selectProject(p.id);
   } catch (e) {
     alert('创建失败: ' + e.message);
   } finally {
@@ -573,7 +933,9 @@ async function createProject() {
 }
 
 async function selectProject(id) {
+  if (currentProjectId !== id) { activeStage = null; lastStageStatus = null; }
   currentProjectId = id;
+  showView('project');
   await refresh();
 }
 
@@ -581,10 +943,7 @@ async function deleteProject(id, title) {
   if (!confirm(`确定删除项目「${title}」？该操作会删除磁盘上的全部产物。`)) return;
   try {
     await api(`/api/projects/${id}`, { method: 'DELETE' });
-    if (currentProjectId === id) {
-      currentProjectId = null;
-      $('main').innerHTML = '<div class="empty"><h3>项目已删除</h3><p>在左侧选择或创建项目</p></div>';
-    }
+    if (currentProjectId === id) showHome();
     await loadProjects();
   } catch (e) {
     alert('删除失败: ' + e.message);
@@ -626,31 +985,30 @@ async function renderProject(id) {
 
   const scriptTotal = currentScript ? currentScript.scenes.reduce((a, s) => a + s.duration_sec, 0) : null;
 
-  let html = `
-    <div class="panel">
-      <h3>项目信息 ${statusTag(p.status)}</h3>
-      <div style="font-size:13px;color:var(--text2)">
-        <strong style="color:var(--text)">${esc(p.title)}</strong> ·
-        ${p.aspect_ratio} · 目标 ${p.target_duration_sec}s ·
-        输入模式: ${esc(p.input_mode)}
+  let html = '';
+  const header = `
+    <div class="proj-header">
+      <button class="back" onclick="showHome()">← 项目</button>
+      <div style="min-width:0">
+        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+          <span class="ptitle">${esc(p.title)}</span> ${statusTag(p.status)}
+          <span class="mode-badge">${esc(MODE_LABEL[p.input_mode] || p.input_mode)}</span>
+        </div>
+        <div class="pmeta">${p.aspect_ratio} · 目标 ${p.target_duration_sec}s ·
+          ${esc((p.input_text || '').replace(/\s+/g, ' ').substring(0, 60))}${(p.input_text || '').length > 60 ? '…' : ''}</div>
       </div>
-      <div style="font-size:12px;color:var(--text2);margin-top:6px">
-        输入: ${esc((p.input_text || '').substring(0, 100))}${(p.input_text || '').length > 100 ? '...' : ''}
-      </div>
-      <div style="font-size:12px;color:var(--text2);margin-top:6px">
-        下一步：${esc(nextStep(p.status))}
-      </div>
-      <div class="voice-row" style="margin-top:8px">
-        <span class="voice-name">LLM 模型</span>
+      <span class="spacer"></span>
+      <span class="next">下一步：${esc(nextStep(p.status))}</span>
+      <label class="pmeta" style="display:flex;align-items:center;gap:6px">LLM
         <select id="project-model"></select>
-        <span class="hint" id="model-hint"></span>
-      </div>
+      </label>
+      <span class="hint" id="model-hint"></span>
     </div>
   `;
 
   // 1. 故事圣经
   html += `
-    <div class="panel">
+    <div class="panel" data-stage="bible">
       <h3><span class="num">1</span> 故事圣经</h3>
       <div class="bible-constraint">
         <label>国家/地区限定（名字与长相都会按它来）
@@ -668,6 +1026,11 @@ async function renderProject(id) {
             placeholder="例：女主要 30 岁左右；全员日本人；不要玄幻；台词口语化"></textarea>
         </label>
         <span class="hint" id="cast-region-hint"></span>
+        ${p.input_mode === 'novel' ? `
+        <label>小说模式：先抽取前几章（其余章在选中展开时再增量抽取，已有角色 id 不变）
+          <input id="novel-chapters" type="number" min="1" max="500"
+                 value="${(modelInfo && modelInfo.novel_initial_chapters) || 3}">
+        </label>` : ''}
       </div>
       <div id="bible-view"><span style="color:var(--text2);font-size:12px">尚未生成</span></div>
       <div class="json-editor" id="bible-editor">
@@ -692,7 +1055,7 @@ async function renderProject(id) {
 
   // 2. 剧本
   html += `
-    <div class="panel">
+    <div class="panel" data-stage="script">
       <h3><span class="num">2</span> 剧本
         ${p.status === 'script_review' ? '<span style="font-size:11px;color:var(--yellow)">待确认</span>' : ''}
         ${scriptTotal !== null ? `<span class="tag-mini ${scriptTotal > p.target_duration_sec * 1.2 ? 'warn' : ''}">${scriptTotal}s / 目标 ${p.target_duration_sec}s</span>` : ''}
@@ -710,8 +1073,10 @@ async function renderProject(id) {
         </div>
       </div>
       <div class="panel-actions">
-        ${inStatus(p, ['draft','failed','script_review'])
+        ${inStatus(p, ['draft','failed','script_review']) && p.input_mode !== 'novel'
           ? '<button class="btn btn-sm" onclick="doGenerateScript()" id="btn-script">生成剧本</button>' : ''}
+        ${p.input_mode === 'novel' && !currentStoryOutline
+          ? '<span class="hint">小说模式：先生成故事圣经（会切章并抽取前几章），再在章节列表里勾选要拍的章</span>' : ''}
         ${inStatus(p, ['draft','failed','script_review']) && !currentStoryOutline
           ? `<button class="btn btn-sm btn-outline" onclick="doGenerateStoryOutline()" id="btn-story">生成长篇大纲（${modelInfo && modelInfo.story_chapters ? modelInfo.story_chapters : 20} 章）</button>` : ''}
         <button class="btn btn-sm btn-outline" onclick="startEdit('script')" id="btn-script-edit" style="display:none">编辑 JSON</button>
@@ -725,7 +1090,7 @@ async function renderProject(id) {
 
   // 3. 分镜
   html += `
-    <div class="panel">
+    <div class="panel" data-stage="storyboard">
       <h3><span class="num">3</span> 分镜
         ${p.status === 'storyboard_review' ? '<span style="font-size:11px;color:var(--yellow)">待确认</span>' : ''}
         ${currentStoryboard && currentStoryboard.shots.length
@@ -756,7 +1121,7 @@ async function renderProject(id) {
 
   // 4. 视频片段
   html += `
-    <div class="panel">
+    <div class="panel" data-stage="video">
       <h3><span class="num">4</span> 视频片段
         <span id="video-tags"></span>
       </h3>
@@ -773,7 +1138,7 @@ async function renderProject(id) {
 
   // 5. 配音
   html += `
-    <div class="panel">
+    <div class="panel" data-stage="audio">
       <h3><span class="num">5</span> 配音
         <span id="audio-tags"></span>
       </h3>
@@ -791,7 +1156,7 @@ async function renderProject(id) {
 
   // 6. 成片
   html += `
-    <div class="panel">
+    <div class="panel" data-stage="compose">
       <h3><span class="num">6</span> 成片合成
         <span id="compose-tags"></span>
       </h3>
@@ -817,7 +1182,7 @@ async function renderProject(id) {
 
   // 7. 成本
   html += `
-    <div class="panel">
+    <div class="panel" data-stage="cost">
       <h3><span class="num">7</span> 成本
         <span id="cost-tags"></span>
       </h3>
@@ -825,10 +1190,145 @@ async function renderProject(id) {
     </div>
   `;
 
-  // 8. 批量生产
-  html += `
+  main.innerHTML = `${header}
+    <div class="workspace">
+      <aside class="stage-nav" id="stage-nav"></aside>
+      <div class="stage-body" id="stage-body">${html}</div>
+    </div>`;
+  renderStageNav();
+  renderBible();
+  renderStoryOutline();
+  renderScript();
+  renderStoryboard();
+  renderVideo();
+  renderAudio();
+  renderCompose();
+  renderMusic();
+  renderCost();
+  renderModelSelect();
+  await loadConsistency(id);
+}
+
+// ── 项目工作区：左侧阶段导航 ────────────────────────────────────────
+// 所有阶段面板都照常渲染（各自的 render 函数按 id 找元素），导航只决定显示哪一个。
+
+let activeStage = null;
+let lastStageStatus = null;
+
+const STAGES = [
+  ['bible', '圣经与资产'],
+  ['script', '剧本'],
+  ['storyboard', '分镜'],
+  ['video', '视频'],
+  ['audio', '配音'],
+  ['compose', '成片与配乐'],
+  ['cost', '成本'],
+];
+const FLOW = ['bible', 'script', 'storyboard', 'video', 'audio', 'compose'];
+
+function stageForStatus(p) {
+  switch (p.status) {
+    case 'draft': return currentBible ? 'script' : 'bible';
+    case 'script_review': return 'script';
+    case 'script_confirmed':
+    case 'storyboard_review': return 'storyboard';
+    case 'storyboard_confirmed':
+    case 'video_generating': return 'video';
+    case 'video_ready':
+    case 'audio_generating': return 'audio';
+    case 'audio_ready':
+    case 'composing':
+    case 'done': return 'compose';
+    default: {
+      const clips = currentVideo && currentVideo.manifest && currentVideo.manifest.clips;
+      if (clips && clips.length) return 'video';
+      if (currentStoryboard) return 'storyboard';
+      if (currentScript || currentStoryOutline) return 'script';
+      return 'bible';
+    }
+  }
+}
+
+function stageSub(key) {
+  const sb = currentStoryboard;
+  switch (key) {
+    case 'bible': {
+      const b = currentBible;
+      if (!b) return '未生成';
+      return `${b.characters.length} 角色 · ${b.settings.length} 场景 · ${(b.props || []).length} 道具`;
+    }
+    case 'script': {
+      if (currentScript) {
+        const sec = currentScript.scenes.reduce((a, x) => a + x.duration_sec, 0);
+        return `${currentScript.scenes.length} 场 · ${sec}s`;
+      }
+      return currentStoryOutline ? `${currentStoryOutline.chapters.length} 章待选` : '未生成';
+    }
+    case 'storyboard': {
+      if (!sb) return '未生成';
+      const segs = new Set(sb.shots.map(x => x.segment_id).filter(Boolean)).size;
+      return `${sb.shots.length} 镜${segs ? ` · ${segs} 段` : ''}`;
+    }
+    case 'video': {
+      const sm = currentVideo && currentVideo.summary;
+      return sm ? `${sm.ready}/${sm.total} 片段` : '未生成';
+    }
+    case 'audio': {
+      const sm = currentAudio && currentAudio.summary;
+      return sm ? `${sm.ready}/${sm.total} 条` : '未生成';
+    }
+    case 'compose': return currentProject && currentProject.status === 'done' ? '已出片' : '未合成';
+    case 'cost': {
+      const sm = currentCost && currentCost.summary;
+      return sm && sm.entries ? usd(sm.total_usd) : '$0';
+    }
+    default: return '';
+  }
+}
+
+function renderStageNav() {
+  const nav = $('stage-nav');
+  const p = currentProject;
+  if (!nav || !p) return;
+  const auto = stageForStatus(p);
+  // 状态变了（例如刚确认剧本 / 视频跑完）就跟着流程走到下一步；同一状态下尊重手动选择
+  if (!activeStage || lastStageStatus !== p.status) activeStage = auto;
+  lastStageStatus = p.status;
+  const doneAll = p.status === 'done';
+  const currentIndex = FLOW.indexOf(auto);
+  nav.innerHTML = STAGES.map(([key, label], i) => {
+    const flowIndex = FLOW.indexOf(key);
+    const done = flowIndex >= 0 && (doneAll || flowIndex < currentIndex);
+    const current = !doneAll && key === auto;
+    const mark = done ? '✓' : flowIndex >= 0 ? String(flowIndex + 1) : '$';
+    return `<button class="stage-item ${done ? 'done' : ''} ${current ? 'current' : ''} ${key === activeStage ? 'active' : ''}"
+                    onclick="selectStage('${key}')">
+      <span class="stage-dot">${mark}</span>
+      <span class="stage-text"><span class="stage-label">${label}</span><span class="stage-sub">${esc(stageSub(key))}</span></span>
+    </button>`;
+  }).join('') + `
+    <div class="stage-progress">流程进度 ${doneAll ? FLOW.length : Math.max(0, currentIndex)}/${FLOW.length}
+      <div class="bar"><span style="width:${Math.round(100 * (doneAll ? FLOW.length : Math.max(0, currentIndex)) / FLOW.length)}%"></span></div>
+    </div>`;
+  applyStage();
+}
+
+function applyStage() {
+  document.querySelectorAll('#stage-body > .panel[data-stage]').forEach(panel => {
+    panel.classList.toggle('shown', panel.dataset.stage === activeStage);
+  });
+}
+
+function selectStage(key) {
+  activeStage = key;
+  renderStageNav();
+  window.scrollTo({ top: 0 });
+}
+
+function batchPanelHtml() {
+  return `
     <div class="panel">
-      <h3><span class="num">8</span> 批量生产
+      <h3>批量任务
         <span id="batch-tags"></span>
       </h3>
       <div class="hint" style="margin-bottom:8px">
@@ -872,20 +1372,6 @@ async function renderProject(id) {
       <div id="batch-body"></div>
     </div>
   `;
-
-  main.innerHTML = html;
-  renderBible();
-  renderStoryOutline();
-  renderScript();
-  renderStoryboard();
-  renderVideo();
-  renderAudio();
-  renderCompose();
-  renderMusic();
-  renderCost();
-  renderModelSelect();
-  renderBatch();
-  await loadConsistency(id);
 }
 
 function inStatus(p, statuses) { return statuses.includes(p.status); }
@@ -914,45 +1400,109 @@ function renderBible() {
     const bible = currentBible;
     if (!bible || !$('bible-view')) return;
     $('btn-bible-edit').style.display = '';
-    const chars = bible.characters.map(c => {
-      const hasRef = !!(c.reference_image);
-      const thumb = hasRef
-        ? `<img class="ref-thumb" alt="${esc(c.name)} 参考图"
-                src="${withToken(`/api/projects/${currentProjectId}/characters/${encodeURIComponent(c.id)}/reference?t=${Date.now()}`)}" />`
-        : '<span class="ref-thumb empty">无图</span>';
-      return `<div class="char-tag" title="${esc(c.reference_image || '未设置参考图')}">
-        ${thumb}
-        <span class="name">${esc(c.name)}</span>
-        <span class="role">${esc(c.role)}</span>
-        <button class="btn btn-xs btn-green" title="用图片模型生成定妆照（按张计费）"
-                onclick="generateReference('${esc(c.id)}', ${hasRef ? 'true' : 'false'})">
-          ${hasRef ? 'AI 重画' : 'AI 生成'}
-        </button>
-        <label class="ref-upload">
-          ${hasRef ? '换图' : '上传'}
-          <input type="file" accept="image/png,image/jpeg,image/webp"
-                 onchange="uploadReference('${esc(c.id)}', this)" />
-        </label>
-        ${hasRef ? `<button class="btn btn-xs" onclick="clearReference('${esc(c.id)}')">清除</button>` : ''}
-      </div>`;
-    }).join('');
+    const style = [bible.style.genre, bible.style.tone, bible.style.pacing].filter(Boolean).map(esc).join(' · ');
     $('bible-view').innerHTML = `
-      <div class="bible-chars">${chars}</div>
-      <div class="panel-actions" style="margin-top:8px">
+      <div class="hint">${style || '未设定风格'} · ${bible.facts.length} 条关键事实</div>
+      <div id="asset-view"><span class="hint">加载剧集资产…</span></div>
+      <div class="panel-actions" style="margin-top:12px">
         <button class="btn btn-sm" onclick="generateAllReferences()">AI 补齐缺失的角色图</button>
         <span class="hint" id="ref-plan-hint"></span>
       </div>
-      <div style="font-size:12px;color:var(--text2);margin-top:8px">
-        ${esc(bible.style.genre)} · ${esc(bible.style.tone)} · ${esc(bible.style.pacing)} ·
-        ${bible.facts.length} 条关键事实 · ${bible.settings.length} 个场景
-      </div>
       <details style="margin-top:8px">
         <summary style="font-size:11px;color:var(--text2);cursor:pointer">查看完整 JSON</summary>
-        <pre style="background:var(--bg);border-radius:6px;padding:10px;font-size:11px;overflow-x:auto;max-height:250px;overflow-y:auto;margin-top:6px;color:#93c5fd">${esc(JSON.stringify(bible, null, 2))}</pre>
+        <pre style="background:var(--bg2);border-radius:8px;padding:10px;font-size:11px;overflow-x:auto;max-height:250px;overflow-y:auto;margin-top:6px;color:var(--text2)">${esc(JSON.stringify(bible, null, 2))}</pre>
       </details>
     `;
     refreshReferencePlan();
+    renderAssets();
   } catch (e) { /* 面板渲染失败不应影响其它面板 */ }
+}
+
+// ── 剧集资产（角色 / 场景 / 关键道具）──────────────────────────────────────
+// 资产就是圣经里的条目；配了参考图的场景/道具会和角色图一起送进视频模型（角色图排最前）。
+
+const ASSET_LABEL = { characters: '角色', settings: '场景', props: '道具' };
+const ASSET_ICON = { characters: '👤', settings: '🏙', props: '🔑' };
+const ASSET_HINT = {
+  characters: '定妆照：正面、中性表情、干净背景',
+  settings: '无人背景板，按项目画幅',
+  props: '白底单品图，只收推动剧情的关键道具',
+};
+
+async function renderAssets() {
+  const el = $('asset-view');
+  if (!el || !currentProjectId) return;
+  let assets;
+  try {
+    assets = await api(`/api/projects/${currentProjectId}/assets`);
+  } catch (e) { el.innerHTML = ''; return; }
+  const roles = {};
+  ((currentBible && currentBible.characters) || []).forEach(c => { roles[c.id] = c.role; });
+  const card = (kind, a) => {
+    const base = `/api/projects/${currentProjectId}/assets/${kind}/${encodeURIComponent(a.id)}/reference`;
+    const usage = [
+      a.chapters.length ? `${a.chapters.length} 章` : '',
+      a.shots ? `${a.shots} 个镜头` : '',
+    ].filter(Boolean).join(' · ') || '尚未出场';
+    const role = kind === 'characters' && roles[a.id] ? `<span class="asset-role">${esc(roles[a.id])}</span>` : '';
+    const desc = a.description || a.visual_prompt || (a.aliases || []).join(' / ') || '—';
+    return `<div class="asset-card kind-${kind}">
+      <div class="asset-img">
+        ${a.has_reference
+          ? `<img alt="${esc(a.name)}" loading="lazy" src="${withToken(`${base}?t=${Date.now()}`)}" />`
+          : `<span class="ph">${ASSET_ICON[kind]}</span>`}
+        <span class="state ${a.has_reference ? 'ok' : ''}">${a.has_reference ? '已有参考图' : '无参考图'}</span>
+      </div>
+      <div class="asset-info">
+        <div class="asset-name">${esc(a.name)} ${role}</div>
+        <div class="asset-desc" title="${esc(desc)}">${esc(desc)}</div>
+        <div class="asset-usage">${esc(usage)}</div>
+        <div class="asset-actions">
+          <button class="btn btn-xs btn-green" title="${ASSET_HINT[kind]}（按张计费）"
+                  onclick="generateAssetReference('${kind}', '${esc(a.id)}', ${a.has_reference})">
+            ${a.has_reference ? 'AI 重画' : 'AI 生成'}
+          </button>
+          <label class="ref-upload">${a.has_reference ? '换图' : '上传'}
+            <input type="file" accept="image/png,image/jpeg,image/webp"
+                   onchange="uploadAssetReference('${kind}', '${esc(a.id)}', this)" />
+          </label>
+          ${a.has_reference ? `<button class="btn btn-xs btn-outline" onclick="clearAssetReference('${kind}', '${esc(a.id)}')">清除</button>` : ''}
+        </div>
+      </div>
+    </div>`;
+  };
+  const section = kind => `
+    <div class="asset-section-head">${ASSET_LABEL[kind]}
+      <span class="count">${assets.summary[kind].with_reference}/${assets.summary[kind].total} 有参考图 · ${ASSET_HINT[kind]}</span>
+    </div>
+    ${(assets[kind] || []).length
+      ? `<div class="asset-grid">${assets[kind].map(a => card(kind, a)).join('')}</div>`
+      : `<div class="hint">暂无${ASSET_LABEL[kind]}</div>`}`;
+  el.innerHTML = ['characters', 'settings', 'props'].map(section).join('');
+}
+
+async function generateAssetReference(kind, id, hasRef) {
+  if (hasRef && !confirm('已有参考图，重画会再花一次图片模型的钱，继续？')) return;
+  await withBusy(`AI 生成${ASSET_LABEL[kind]}图 ${id}...`, () =>
+    api(`/api/projects/${currentProjectId}/assets/${kind}/${encodeURIComponent(id)}/reference/generate`,
+      { method: 'POST', body: JSON.stringify({ force: !!hasRef }) }));
+}
+
+async function uploadAssetReference(kind, id, input) {
+  const file = input.files && input.files[0];
+  if (!file) return;
+  await withBusy(`上传 ${id} 的参考图...`, async () => {
+    const content_base64 = await readFileBase64(file);
+    await api(`/api/projects/${currentProjectId}/assets/${kind}/${encodeURIComponent(id)}/reference`, {
+      method: 'POST', body: JSON.stringify({ filename: file.name, content_base64 }),
+    });
+  });
+}
+
+async function clearAssetReference(kind, id) {
+  await withBusy('清除参考图...', () =>
+    api(`/api/projects/${currentProjectId}/assets/${kind}/${encodeURIComponent(id)}/reference`,
+      { method: 'DELETE' }));
 }
 
 async function saveBible() {
@@ -1000,6 +1550,7 @@ function renderStoryOutline() {
     ? `≈$${(pickedSec * secPerDollar).toFixed(2)} 视频费`
     : '视频费以「成本预估」为准';
   const canEdit = ['draft', 'failed', 'script_review'].includes(p.status);
+  const novelMode = p.input_mode === 'novel';
 
   el.innerHTML = `
     <div class="story-outline">
@@ -1019,6 +1570,7 @@ function renderStoryOutline() {
                      onchange="toggleChapter('${c.id}', this.checked)">
               <span class="chapter-title">${esc(c.id)} · ${esc(c.title)}</span>
               ${expanded.has(c.id) ? '<span class="tag-mini ok">已展开</span>' : ''}
+              ${novelMode && !c.source_extracted ? '<span class="tag-mini warn">未抽取</span>' : ''}
               <span class="tag-mini">${c.scene_budget || 3} 场 / 约 ${chapterExpectedSec(c)}s</span>
             </label>
             <div class="chapter-body">
@@ -1039,7 +1591,15 @@ function renderStoryOutline() {
           <button class="btn btn-sm btn-outline" onclick="selectUnexpandedChapters()">选中未展开的章</button>
         ` : '<span class="hint">剧本已确认：如需继续加章，先退回剧本阶段</span>'}
       </div>
-      ${(outline.chapters.some(c => !c.summary && !(c.beats || []).length))
+      ${novelMode && canEdit ? `
+        <div class="panel-actions">
+          <button class="btn btn-sm btn-outline" onclick="doExtractChapters()" ${picked.length ? '' : 'disabled'}>
+            只抽取选中章的资产（不写剧本，只花 LLM 的钱）
+          </button>
+        </div>` : ''}
+      ${novelMode && outline.chapters.some(c => !c.source_extracted)
+        ? `<div class="hint">有 ${outline.chapters.filter(c => !c.source_extracted).length} 章尚未抽取：勾选后生成剧本时会先抽取并合并进圣经（已有角色 id 不变）</div>`
+        : (!novelMode && outline.chapters.some(c => !c.summary && !(c.beats || []).length))
         ? `<div class="hint" style="color:var(--yellow)">有 ${outline.chapters.filter(c => !c.summary && !(c.beats || []).length).length} 章只有骨架（正文没写完，可重新生成大纲续写）</div>` : ''}
     </div>
   `;
@@ -1074,6 +1634,15 @@ function doGenerateStoryOutline() {
   withBusy(`生成长篇大纲中（${n} 章，约 1-3 分钟）...`, () =>
     api(`/api/projects/${currentProjectId}/story-outline/generate`, {
       method: 'POST', body: JSON.stringify({ chapters: n, model: currentModel() }),
+    }));
+}
+
+function doExtractChapters() {
+  const ids = [...selectedChapters];
+  if (!ids.length) return alert('先勾选章节');
+  withBusy(`抽取 ${ids.length} 章的人物/场景/道具...`, () =>
+    api(`/api/projects/${currentProjectId}/novel/extract`, {
+      method: 'POST', body: JSON.stringify({ chapters: ids, model: currentModel() }),
     }));
 }
 
@@ -1215,13 +1784,57 @@ function renderStoryboard() {
     const sb = currentStoryboard;
     if (!sb || !$('storyboard-view')) return;
     $('btn-storyboard-edit').style.display = '';
-    $('storyboard-view').innerHTML = storyboardTierHint(sb) + sb.shots.map((s, si) => `
+    $('storyboard-view').innerHTML = storyboardTierHint(sb) + segmentSummary(sb) + groupBySegment(sb.shots).map(group => {
+      const blocks = group.items.map(({ shot, index }) => shotBlockHtml(shot, index)).join('');
+      if (!group.id || group.items.length < 2) return blocks;
+      const total = group.items.reduce((a, x) => a + x.shot.duration_sec, 0);
+      const bars = group.items.map(x => `<span style="flex:${x.shot.duration_sec}" title="${esc(x.shot.id)} · ${x.shot.duration_sec}s"></span>`).join('');
+      return `<div class="segment-block">
+        <div class="segment-head">
+          <span class="seg-name">段落 ${esc(group.label)}</span>
+          <span>${total}s · ${group.items.length} 镜 · 一次生成、段内硬切</span>
+          <span class="segment-timeline">${bars}</span>
+          <span class="tag-mini">${esc(group.items[0].shot.scene_id)}</span>
+        </div>
+        ${blocks}
+      </div>`;
+    }).join('');
+  } catch (e) { /* 面板渲染失败不应影响其它面板 */ }
+}
+
+// 段落分镜：相邻、同 segment_id 的镜头归成一组（没编段的镜头各自一组）
+function groupBySegment(shots) {
+  const groups = [];
+  shots.forEach((shot, index) => {
+    const last = groups[groups.length - 1];
+    if (shot.segment_id && last && last.id === shot.segment_id) {
+      last.items.push({ shot, index });
+    } else {
+      groups.push({ id: shot.segment_id || '', items: [{ shot, index }] });
+    }
+  });
+  let n = 0;
+  groups.forEach(g => { if (g.id && g.items.length > 1) g.label = String(++n); });
+  return groups;
+}
+
+function segmentSummary(sb) {
+  const groups = groupBySegment(sb.shots).filter(g => g.id && g.items.length > 1);
+  if (!groups.length) return '';
+  const merged = groups.reduce((a, g) => a + g.items.length, 0);
+  return `<div class="hint" style="margin-bottom:10px">段落分镜：${sb.shots.length} 个镜头编成
+    ${groupBySegment(sb.shots).length} 次视频生成（${merged} 个镜头合进 ${groups.length} 段，段内硬切、生成后自动切回单镜）</div>`;
+}
+
+function shotBlockHtml(s, si) {
+  return `
       <div class="shot-block" id="shot-${si}">
         <div class="shot-header">
           <span class="shot-no">${s.shot_no}</span>
           <span class="camera">${esc(s.camera)}</span>
           <span style="color:var(--text2)">${s.duration_sec}s</span>
           <span class="tag-mini">${esc(s.scene_id)}</span>
+          ${(s.props_in_frame || []).length ? `<span class="tag-mini">🔑 ${s.props_in_frame.map(esc).join(' ')}</span>` : ''}
           ${s.dialogue_text ? `<span style="color:var(--accent2)">💬 ${esc(s.dialogue_speaker)}</span>` : ''}
         </div>
         <div>${esc(s.visual_description)}</div>
@@ -1266,8 +1879,7 @@ function renderStoryboard() {
           </div>
         </div>
       </div>
-    `).join('');
-  } catch (e) { /* 面板渲染失败不应影响其它面板 */ }
+  `;
 }
 
 function storyboardTierHint(sb) {
@@ -1369,7 +1981,7 @@ function videoHint(status) {
   if (status === 'storyboard_review') return '请先确认分镜，再生成视频片段';
   if (status === 'video_generating') return '正在生成…';
   if (status === 'video_ready') return '片段已就绪，可以生成配音';
-  if (v && v.manifest && v.manifest.provider === 'openrouter') {
+  if (currentVideo && currentVideo.manifest && currentVideo.manifest.provider === 'openrouter') {
     return '真实模型按秒计费（最短 5 秒/镜头），预算不足会在提交前被拒绝';
   }
   if (status === 'audio_ready') return '片段已就绪，可以补跑失败镜头或直接合成';
@@ -1413,6 +2025,7 @@ function renderVideo() {
           <div class="clip-head">
             <span class="clip-no">#${shot.shot_no != null ? shot.shot_no : '?'}</span>
             <span class="tag-mini">${esc(c.scene_id || '')}</span>
+            ${c.segment_id ? `<span class="seg-chip" title="与同段镜头一次生成后切出">${esc(c.segment_id.replace(/^.*_seg_/, '段 '))}</span>` : ''}
             <span style="color:var(--text2)">${c.duration_sec}s</span>
             <span class="tag-mini ${statusClass}">${esc(clipStatusLabel(c.status))}</span>
             ${c.media_kind === 'placeholder' ? '<span class="tag-mini warn">占位文件</span>' : ''}
@@ -2358,25 +2971,6 @@ function readFileBase64(file) {
   });
 }
 
-async function uploadReference(charId, input) {
-  const file = input.files && input.files[0];
-  if (!file) return;
-  await withBusy(`上传 ${charId} 的参考图...`, async () => {
-    const content_base64 = await readFileBase64(file);
-    await api(`/api/projects/${currentProjectId}/characters/${encodeURIComponent(charId)}/reference`, {
-      method: 'POST',
-      body: JSON.stringify({ filename: file.name, content_base64 }),
-    });
-  });
-}
-
-async function clearReference(charId) {
-  await withBusy('清除参考图...', () =>
-    api(`/api/projects/${currentProjectId}/characters/${encodeURIComponent(charId)}/reference`, {
-      method: 'DELETE',
-    }));
-}
-
 async function refreshReferencePlan() {
   const hint = $('ref-plan-hint');
   if (!hint || !currentProjectId) return;
@@ -2388,16 +2982,6 @@ async function refreshReferencePlan() {
   } catch (e) {
     hint.textContent = '';
   }
-}
-
-async function generateReference(charId, hasRef) {
-  if (hasRef && !confirm('该角色已有参考图，重画会再花一次图片模型的钱，继续？')) return;
-  await withBusy(`AI 生成 ${charId} 的角色图...`, async () => {
-    const res = await api(
-      `/api/projects/${currentProjectId}/characters/${encodeURIComponent(charId)}/reference/generate`,
-      { method: 'POST', body: JSON.stringify({ force: !!hasRef }) });
-    if (res && res.cost_usd) console.info(`角色图花费 $${res.cost_usd}`);
-  });
 }
 
 async function generateAllReferences() {
@@ -2510,11 +3094,25 @@ function doCancelBatch() {
 function doGenerateBible() {
   const region = valueOf('cast-region');
   const notes = valueOf('bible-notes').trim();
-  withBusy('生成故事圣经中（约 10 秒）...', () =>
+  const body = { model: currentModel(), cast_region: region, notes };
+  let label = '生成故事圣经中（约 10 秒）...';
+  if (currentProject && currentProject.input_mode === 'novel') {
+    const n = parseInt(valueOf('novel-chapters'), 10) || 3;
+    body.novel_chapters = n;
+    if (!confirm(`小说模式：切章（$0）→ 逐章抽取前 ${n} 章的人物/场景/道具 → 合并成圣经。\n只花 LLM 的钱，不花视频费。继续？`)) return;
+    label = `切章并抽取前 ${n} 章（约 ${n * 10} 秒）...`;
+  }
+  withBusy(label, () =>
     api(`/api/projects/${currentProjectId}/bible/generate`, {
-      method: 'POST',
-      body: JSON.stringify({ model: currentModel(), cast_region: region, notes }),
+      method: 'POST', body: JSON.stringify(body),
     }));
+}
+
+function onInputModeChange() {
+  const novel = $('inp-mode').value === 'novel';
+  $('inp-text').placeholder = novel
+    ? '粘贴小说原文（自动按「第X章 / Chapter N」切章；没有章标题就按字数切段）'
+    : '例如：一个被裁员的程序员靠 AI 逆袭创业';
 }
 
 function valueOf(id) {

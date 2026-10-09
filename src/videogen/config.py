@@ -42,6 +42,15 @@ class Settings(BaseSettings):
     video_shot_target_sec: float = 0.0
     #: 单个镜头的时长上限（秒）。0 = 用模型最长档位（H3 = 15 秒）
     video_max_shot_sec: float = 0.0
+    #: 段落分镜：同一场相邻镜头编成一段（段内硬切）一次生成，生成后按镜头切回单镜片段。
+    #: 一段只买一次最短档位，2-4 秒的短镜头不再各自被抬到 5 秒计费
+    video_segment_mode: bool = True
+    #: 每段目标 / 上限秒数（上限还会被模型最长档位压住）/ 每段最多几个镜头
+    video_segment_target_sec: float = 12.0
+    video_segment_max_sec: float = 15.0
+    video_segment_max_shots: int = 4
+    #: 切回单镜时，把切点吸附到画面里真实的硬切（±1 秒内）；关掉就严格按计划时间切
+    video_segment_snap_cuts: bool = True
     video_concurrency: int = 3
     #: 追加到每个视频 prompt 的「表演与连贯性」规范。真实样本里模型会把哭戏演成舞台剧
     #: （眉毛挤成一团、身体僵硬），也会在长 prompt 下变形；这段是统一的最低要求
@@ -104,6 +113,15 @@ class Settings(BaseSettings):
     #: 长篇剧集大纲：默认章数 / 单批扩写章数（一次写 20 章正文必被截断，所以要分批）
     story_chapters: int = 20
     story_chapter_chunk: int = 4
+    #: 小说模式：没有章标题时按多少字切一段 / 单章超过多少字再拆成几部分
+    novel_chunk_chars: int = 5000
+    novel_chapter_max_chars: int = 12000
+    #: 小说模式：逐章抽取的并发数 / 生成圣经时先抽前几章（其余章选中展开时再增量抽取）
+    novel_extract_concurrency: int = 4
+    novel_initial_chapters: int = 3
+    #: 小说模式：圣经最多收几个角色 / 每章最多抽几个关键道具
+    novel_max_characters: int = 12
+    novel_max_props_per_chapter: int = 3
     tts_timeout_sec: float = 60.0
     #: 每句对白后面留的呼吸时间（秒），用于音画对齐
     audio_gap_sec: float = 0.25
@@ -260,6 +278,10 @@ class Settings(BaseSettings):
     #: 固定 seed（0 = 不指定），真实 provider 用来稳定人物外观
     video_seed: int = 0
     reference_image_max_mb: float = 8.0
+    #: 剧集资产：场景/道具有参考图时也一起送进视频模型（角色图永远排在最前）
+    video_asset_references: bool = True
+    #: 单个镜头最多带几张参考图（角色 + 场景 + 道具合计）
+    video_max_reference_images: int = 4
 
     # 批量生产
     batch_max_items: int = 20

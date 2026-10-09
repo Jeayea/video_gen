@@ -19,6 +19,8 @@ class InputMode(str, Enum):
     THEME = "theme"
     OUTLINE = "outline"
     FULL_SCRIPT = "full_script"
+    #: 小说原文：按章切分 → 逐章抽取 → 合并成圣经；章节即大纲，选章改编成场次
+    NOVEL = "novel"
 
 
 class ProjectStatus(str, Enum):

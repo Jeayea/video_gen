@@ -123,15 +123,30 @@ async def video_plan(
     ]
 
     storyboard_seconds = sum(int(s.duration_sec) for s in shots)
+    # 计费单位是「段」：段落分镜下一段只买一次档位；没编段的镜头各自成段（= 单镜计费）
+    segments = storyboard_service.segments_of(storyboard) if storyboard else []
+    pending_ids = {shot.id for shot in pending}
     billed_all = 0.0
     billed_pending = 0.0
-    for shot in shots:
-        seconds = await _planned(provider, shot.duration_sec)
+    segments_pending = 0
+    for segment in segments:
+        seconds = await _planned(provider, segment.duration_sec)
         billed_all += seconds
-        if shot in pending:
+        if any(sid in pending_ids for sid in segment.shot_ids):
             billed_pending += seconds
+            segments_pending += 1
     if switched:
         billed_pending = billed_all
+        segments_pending = len(segments)
+    segment_mode = any(len(seg.shots) > 1 for seg in segments)
+    if not switched:
+        # 段里缺一个镜头，整段都要重生成：待生成镜头按「整段」展开
+        pending = [
+            shot
+            for seg in segments
+            if any(sid in pending_ids for sid in seg.shot_ids)
+            for shot in seg.shots
+        ]
 
     to_generate = len(shots) if switched else len(pending)
 
@@ -147,6 +162,9 @@ async def video_plan(
         "duration_options": [round(value, 3) for value in options],
         "shots_total": len(shots),
         "to_generate": to_generate,
+        "segment_mode": segment_mode,
+        "segments_total": len(segments),
+        "segments_to_generate": segments_pending,
         "existing_ready": len(ready),
         "existing_failed": len(failed),
         "existing_placeholder": len(placeholders),
@@ -178,7 +196,8 @@ async def video_plan(
             f"已就绪的 {len(ready)} 个片段会全部重新生成"
         )
 
-    plan["merge_plan"] = _merge_plan(
+    # 段落分镜已经把短镜头按段计费了，「合并短镜头」不再省钱，也不该再劝人合并
+    plan["merge_plan"] = {} if segment_mode else _merge_plan(
         storyboard,
         provider,
         price_per_second=price,

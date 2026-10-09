@@ -54,6 +54,8 @@ class OutlineScene(BaseModel):
     chapter_id: str = ""
     #: 展开时保留的章级背景/环境线索，供分镜与视频 prompt 使用
     environment: str = ""
+    #: 小说改编：这一场依据的原著片段（逐场写剧本时据此保留原著对白与事件）
+    source_excerpt: str = ""
 
 
 class ScriptOutline(BaseModel):
@@ -90,11 +92,15 @@ class StoryChapter(BaseModel):
     hook: str = ""
     characters: StrList = Field(default_factory=list)
     locations: StrList = Field(default_factory=list)
+    #: 本章出现的关键道具（圣经 props 的 id）
+    props: StrList = Field(default_factory=list)
+    #: 小说模式：这一章有没有从原文抽取过（没抽取的章展开前会先抽取）
+    source_extracted: bool = False
     #: 建议展开成几场 / 大约多少秒成片（成本可见）
     scene_budget: int = DEFAULT_CHAPTER_SCENES
     duration_budget_sec: int = DEFAULT_CHAPTER_DURATION_SEC
 
-    @field_validator("beats", "characters", "locations", mode="before")
+    @field_validator("beats", "characters", "locations", "props", mode="before")
     @classmethod
     def _coerce_list(cls, value: object) -> object:
         try:

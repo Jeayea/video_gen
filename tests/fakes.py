@@ -41,6 +41,20 @@ from videogen.utils.text import clean_spoken_text
 
 SCENE_ID_RE = re.compile(r"场次(?:\s*ID)?[:：]\s*(\S+)")
 
+#: 小说各章「原文里出现」的人物：ch_2 用外号「赵总」称呼 char_2，并引入新角色苏青
+_NOVEL_CAST: dict[str, list[dict]] = {
+    "ch_1": [
+        {"name": "林晚", "aliases": ["晚晚"], "gender": "女", "appearance": "黑色长发，白衬衫"},
+        {"name": "赵明远", "identity": "总监", "appearance": "西装，鬓角花白"},
+        {"name": "路人甲", "identity": "保安"},
+    ],
+    "ch_2": [
+        {"name": "林晚", "appearance": "黑色长发"},
+        {"name": "赵总", "identity": "总监"},
+        {"name": "苏青", "gender": "女", "identity": "林晚的大学室友", "appearance": "短发"},
+    ],
+}
+
 
 class FakeLLM(LLMProvider):
     """离线假 LLM：按 system prompt 判断当前阶段，返回结构化的假数据。
@@ -90,6 +104,9 @@ class FakeLLM(LLMProvider):
         self.vision_calls = 0
         #: 配音文案各模式的调用次数
         self.voice_modes: list[str] = []
+        #: 小说模式：抽取过哪些章 / 合并调用了几次
+        self.novel_extracted: list[str] = []
+        self.novel_merges = 0
 
     # ── LLMProvider 接口 ──────────────────────────────
 
@@ -157,6 +174,12 @@ class FakeLLM(LLMProvider):
                     for i in range(1, self.scenes + 1)
                 ]
             }
+        if "小说改编的资料员" in system:
+            self._maybe_fail("novel_extract")
+            return self._novel_extract(user)
+        if "影视化改编的资产统筹" in system:
+            self._maybe_fail("novel_merge")
+            return self._novel_merge(user)
         if "长篇剧集的总编剧" in system:
             return self._story_outline(system, user)
         if "分场编剧" in system:
@@ -218,9 +241,63 @@ class FakeLLM(LLMProvider):
             ]
         }
 
+    def _novel_extract(self, user: str) -> dict:
+        match = re.search(r"章节 ID: (ch_\d+)", user)
+        chapter_id = match.group(1) if match else "ch_1"
+        self.novel_extracted.append(chapter_id)
+        cast = _NOVEL_CAST.get(chapter_id, [{"name": "林晚"}])
+        return {
+            "summary": f"{chapter_id} 原文概要：林晚发现方案被抢，决定当面对质。",
+            "beats": [f"{chapter_id} 林晚翻出U盘", f"{chapter_id} 赵明远否认"],
+            "hook": f"{chapter_id} U盘里还有另一份文件",
+            "suggested_scenes": 2,
+            "characters": cast,
+            "locations": [{"name": "星辰科技办公室", "description": "落地窗，工位一排排"}],
+            "props": [{"name": "U盘", "description": "银色金属外壳，有划痕"}],
+            "facts": ["方案截止日期是周五"],
+        }
+
+    def _novel_merge(self, user: str) -> dict:
+        """按候选编号给条目；「赵总」认成已有的赵明远，「路人甲」不收。"""
+        self.novel_merges += 1
+        existing = dict(
+            (name, cid) for cid, name in re.findall(r"^\s+- (char_\d+) (\S+?)（", user, re.M)
+        )
+        candidates = re.findall(r"^\s+- \[([CLP]\d+)\] (\S+?)(?:；|$)", user, re.M)
+        looks = {"林晚": "a young Chinese woman", "苏青": "a Chinese woman with short hair"}
+        out: dict = {"characters": [], "settings": [], "props": [], "style": {}}
+        for tag, name in candidates:
+            if tag.startswith("C"):
+                if name == "路人甲":
+                    continue
+                same_as = existing.get("赵明远", "") if name == "赵总" else ""
+                out["characters"].append(
+                    {
+                        "from": [tag],
+                        "same_as": same_as,
+                        "name": name,
+                        "age": "28岁",
+                        "role": "主角" if name == "林晚" else "配角",
+                        "region": "cn",
+                        "visual_prompt": looks.get(name, "a middle-aged Chinese man in a suit"),
+                    }
+                )
+            elif tag.startswith("L"):
+                out["settings"].append(
+                    {"from": [tag], "name": name, "visual_prompt": "modern open-plan office"}
+                )
+            else:
+                out["props"].append(
+                    {"from": [tag], "name": name, "visual_prompt": "a scratched silver USB drive"}
+                )
+        if "没有类型/基调" in user:
+            out["style"] = {"genre": "都市", "tone": "压抑", "pacing": "快"}
+        return out
+
     def _chapter_scenes(self, user: str) -> dict:
         """把选中的章展开成场次（每章按配置给若干场）。"""
         ids = re.findall(r"^## (ch_\d+)｜", user, flags=re.MULTILINE)
+        adapting = "原著原文" in user
         scenes = []
         for chapter_id in ids:
             for index in range(1, self.chapter_scenes + 1):
@@ -231,6 +308,11 @@ class FakeLLM(LLMProvider):
                         "brief": f"{chapter_id} 第 {index} 场：地点+环境细节，人物目标与阻力",
                         "environment": "冷白顶灯 / 玻璃隔断 / 桌上摊开的杂志",
                         "duration_sec": 12,
+                        **(
+                            {"source_excerpt": f"{chapter_id} 原文：“这是我的方案。”林晚说。"}
+                            if adapting
+                            else {}
+                        ),
                     }
                 )
         return {"scenes": scenes}

@@ -27,6 +27,7 @@ from videogen.providers.llm.base import LLMError
 from videogen.providers.tts.base import TTSProviderError
 from videogen.providers.video.base import VideoProviderError
 from videogen.services import (
+    asset_service,
     character_image_service,
     lipsync_service,
     music_service,
@@ -256,6 +257,8 @@ class BibleGenerateRequest(GenerateRequest):
     #: 别名，和项目字段 `bible_notes` 对齐；两个都传时以 notes 为准
     bible_notes: str | None = None
     notes: str | None = None
+    #: 小说模式：先抽取前几章（留空 = NOVEL_INITIAL_CHAPTERS；其余章选中展开时再抽）
+    novel_chapters: int | None = Field(default=None, gt=0, le=500)
 
 
 class ReferenceImageRequest(BaseModel):
@@ -392,6 +395,7 @@ async def list_models():
         },
         "voice_allow_accent": settings.tts_allow_accent_voices,
         "story_chapters": settings.story_chapters,
+        "novel_initial_chapters": settings.novel_initial_chapters,
         # 逐帧口型（可选后处理）：引擎不可用时给出原因，UI 要能提前告诉用户
         "lipsync_engine": settings.lipsync,
         "lipsync_scope": settings.lipsync_scope_mode,
@@ -570,7 +574,11 @@ async def generate_bible(project_id: str, req: BibleGenerateRequest | None = Non
         }
         if patch:
             await pipeline.update_project(project_id, patch)
-    bible = await pipeline.generate_bible(project_id, model=_model_of(project_id, req))
+    bible = await pipeline.generate_bible(
+        project_id,
+        model=_model_of(project_id, req),
+        novel_chapters=req.novel_chapters if req is not None else None,
+    )
     return bible.model_dump()
 
 
@@ -587,6 +595,47 @@ async def update_bible(project_id: str, data: dict):
     """全量更新故事圣经（仅允许在剧本确认前）。"""
     bible = await pipeline.update_bible(project_id, data)
     return bible.model_dump()
+
+
+# ── 小说改编 Routes ─────────────────────────────────────────
+
+
+class NovelExtractRequest(GenerateRequest):
+    """按章抽取并合并资产（不写剧本）。"""
+
+    chapters: list[str] = Field(min_length=1, max_length=200)
+
+
+@app.get("/api/projects/{project_id}/novel")
+async def get_novel(project_id: str):
+    """切章结果（不含原文，避免把整本书塞进响应）。"""
+    pipeline.get_project(project_id)
+    novel = store.load_novel(project_id)
+    if novel is None:
+        raise HTTPException(404, "还没有切章：小说模式请先生成故事圣经")
+    return {
+        "source_chars": novel.source_chars,
+        "chapters": [
+            {
+                "id": c.id,
+                "title": c.title,
+                "chars": len(c.text),
+                "extracted": c.extracted,
+                "merged": c.merged,
+                "summary": c.summary,
+            }
+            for c in novel.chapters
+        ],
+    }
+
+
+@app.post("/api/projects/{project_id}/novel/extract")
+async def extract_novel(project_id: str, req: NovelExtractRequest):
+    """抽取选中的章并增量合并进圣经（只花 LLM 的钱）；已抽过的章跳过。"""
+    outline = await pipeline.extract_novel_chapters(
+        project_id, req.chapters, model=_model_of(project_id, req)
+    )
+    return outline.model_dump()
 
 
 # ── 长篇剧集大纲 Routes ─────────────────────────────────────
@@ -1257,6 +1306,91 @@ async def generate_reference(project_id: str, char_id: str, req: GenerateReferen
             force=req.force,
             use_reference=req.use_reference,
             prompt_override=req.prompt,
+        )
+    except BudgetExceeded as exc:
+        raise HTTPException(402, str(exc)) from exc
+    except (CharacterImageError, ImageProviderError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {"status": "ok", **result}
+
+
+# ── 剧集资产（角色 / 场景 / 关键道具）──────────────────────
+
+
+def _load_asset(project_id: str, kind: str, asset_id: str):
+    bible = pipeline.get_bible(project_id)
+    if not bible:
+        raise HTTPException(404, "故事圣经不存在")
+    if kind not in asset_service.ASSET_KINDS:
+        raise HTTPException(400, f"未知的资产类别: {kind}")
+    item = next((i for i in getattr(bible, kind) if i.id == asset_id), None)
+    if item is None:
+        raise HTTPException(404, f"资产不存在: {kind}/{asset_id}")
+    return item
+
+
+@app.get("/api/projects/{project_id}/assets")
+async def list_assets(project_id: str):
+    """剧集资产总览：出场章节 / 镜头用量 / 参考图（只读，$0）。"""
+    pipeline.get_project(project_id)
+    return asset_service.list_assets(store, project_id)
+
+
+@app.post("/api/projects/{project_id}/assets/{kind}/{asset_id}/reference")
+async def upload_asset_reference(
+    project_id: str, kind: str, asset_id: str, req: ReferenceImageRequest
+):
+    """上传资产参考图（base64）：场景图 / 道具图 / 角色图。"""
+    import base64
+    import binascii
+
+    _load_asset(project_id, kind, asset_id)
+    suffix = Path(req.filename).suffix.lower()
+    if suffix not in {".png", ".jpg", ".jpeg", ".webp"}:
+        raise HTTPException(400, "只支持 png / jpg / jpeg / webp")
+    try:
+        raw = base64.b64decode(req.content_base64, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise HTTPException(400, f"base64 解码失败：{exc}") from exc
+    limit = int(settings.reference_image_max_mb * 1024 * 1024)
+    if len(raw) > limit:
+        raise HTTPException(400, f"参考图太大（{len(raw)} 字节 > {limit} 字节）")
+    if not raw:
+        raise HTTPException(400, "参考图内容为空")
+
+    target = store.refs_dir(project_id) / f"{asset_id}{suffix}"
+    asset_service.clear_reference_files(store, project_id, asset_id, keep=target)
+    target.write_bytes(raw)
+    await asset_service.set_reference(store, project_id, kind, asset_id, f"refs/{target.name}")
+    return {"status": "ok", "kind": kind, "asset_id": asset_id, "path": f"refs/{target.name}"}
+
+
+@app.get("/api/projects/{project_id}/assets/{kind}/{asset_id}/reference")
+async def get_asset_reference(project_id: str, kind: str, asset_id: str):
+    item = _load_asset(project_id, kind, asset_id)
+    path = store.resolve_artifact(project_id, item.reference_image)
+    if not item.reference_image or not path:
+        raise HTTPException(404, "该资产还没有参考图")
+    return FileResponse(path)
+
+
+@app.delete("/api/projects/{project_id}/assets/{kind}/{asset_id}/reference")
+async def delete_asset_reference(project_id: str, kind: str, asset_id: str):
+    item = _load_asset(project_id, kind, asset_id)
+    await asset_service.set_reference(store, project_id, kind, asset_id, "")
+    asset_service.clear_reference_files(store, project_id, asset_id)
+    return {"status": "ok", "removed": bool(item.reference_image)}
+
+
+@app.post("/api/projects/{project_id}/assets/{kind}/{asset_id}/reference/generate")
+async def generate_asset_reference(
+    project_id: str, kind: str, asset_id: str, req: GenerateReferenceRequest
+):
+    """AI 生成资产参考图（按张计费）：场景 = 无人背景板，道具 = 白底单品，角色 = 定妆照。"""
+    _load_asset(project_id, kind, asset_id)
+    try:
+        result = await asset_service.generate_asset_image(
+            store, project_id, kind, asset_id, force=req.force, prompt_override=req.prompt
         )
     except BudgetExceeded as exc:
         raise HTTPException(402, str(exc)) from exc
