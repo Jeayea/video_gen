@@ -1374,6 +1374,22 @@ function batchPanelHtml() {
   `;
 }
 
+// 展示用：圣经 id → 名字（角色 / 场景 / 道具）。编辑框里仍然用 id，保证能原样存回
+function assetName(kind, id) {
+  const items = (currentBible && currentBible[kind]) || [];
+  const hit = items.find(x => x.id === id);
+  return hit ? hit.name : (id || '');
+}
+
+function speakerName(id) {
+  if (id === 'narrator') return '旁白';
+  return assetName('characters', id);
+}
+
+function namesOf(kind, ids) {
+  return (ids || []).map(id => assetName(kind, id)).filter(Boolean).join('、');
+}
+
 function inStatus(p, statuses) { return statuses.includes(p.status); }
 
 function nextStep(status) {
@@ -1577,6 +1593,11 @@ function renderStoryOutline() {
               ${c.summary ? `<div>${esc(c.summary)}</div>` : `<div style="color:var(--text2)">${esc(c.brief)}</div>`}
               ${(c.beats && c.beats.length) ? `<ul>${c.beats.map(b => `<li>${esc(b)}</li>`).join('')}</ul>` : ''}
               ${c.hook ? `<div class="chapter-hook">章末钩子：${esc(c.hook)}</div>` : ''}
+              ${(c.characters || []).length || (c.locations || []).length || (c.props || []).length ? `<div style="margin-top:4px">${[
+                (c.characters || []).length ? `👤 ${esc(namesOf('characters', c.characters))}` : '',
+                (c.locations || []).length ? `📍 ${esc(namesOf('settings', c.locations))}` : '',
+                (c.props || []).length ? `🔑 ${esc(namesOf('props', c.props))}` : '',
+              ].filter(Boolean).join(' · ')}</div>` : ''}
             </div>
           </div>
         `).join('')}
@@ -1674,7 +1695,7 @@ function renderScript() {
             <div class="heading">${esc(s.heading || s.id)} <span class="tag-mini">${esc(s.id)}</span></div>
             <div class="summary">${esc(s.summary)}</div>
             <div class="dialogue">
-              ${s.dialogue.map(d => `<div><span class="speaker">${esc(d.speaker)}:</span> ${esc(d.line)}</div>`).join('')}
+              ${s.dialogue.map(d => `<div><span class="speaker" title="${esc(d.speaker)}">${esc(speakerName(d.speaker))}：</span>${esc(d.line)}</div>`).join('')}
             </div>
             <div class="duration">${s.duration_sec}s · ${esc(s.emotion)}</div>
             <div class="scene-actions">
@@ -1834,8 +1855,10 @@ function shotBlockHtml(s, si) {
           <span class="camera">${esc(s.camera)}</span>
           <span style="color:var(--text2)">${s.duration_sec}s</span>
           <span class="tag-mini">${esc(s.scene_id)}</span>
-          ${(s.props_in_frame || []).length ? `<span class="tag-mini">🔑 ${s.props_in_frame.map(esc).join(' ')}</span>` : ''}
-          ${s.dialogue_text ? `<span style="color:var(--accent2)">💬 ${esc(s.dialogue_speaker)}</span>` : ''}
+          ${(s.character_in_frame || []).length ? `<span class="tag-mini" title="出镜角色">👤 ${esc(namesOf('characters', s.character_in_frame))}</span>` : ''}
+          ${s.location ? `<span class="tag-mini" title="场景">📍 ${esc(assetName('settings', s.location))}</span>` : ''}
+          ${(s.props_in_frame || []).length ? `<span class="tag-mini" title="关键道具">🔑 ${esc(namesOf('props', s.props_in_frame))}</span>` : ''}
+          ${s.dialogue_text ? `<span style="color:var(--accent2)" title="${esc(s.dialogue_speaker)}">💬 ${esc(speakerName(s.dialogue_speaker))}</span>` : ''}
         </div>
         <div>${esc(s.visual_description)}</div>
         ${s.video_prompt ? `<div class="prompt">${esc(s.video_prompt)}</div>` : ''}
@@ -2249,7 +2272,7 @@ function stopAudioPolling() {
 function speakerLabel(clip) {
   if (clip.speaker_name) return clip.speaker_name;
   if (clip.speaker === 'narrator') return '旁白';
-  return clip.speaker || '未知';
+  return clip.speaker ? speakerName(clip.speaker) : '未知';
 }
 
 function audioHint(status) {

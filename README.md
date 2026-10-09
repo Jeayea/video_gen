@@ -76,16 +76,59 @@ python -m videogen.tools.demo_bgm     # 可选：生成 4 首演示 BGM 到 ./as
 
 ## 使用 Web 工作台
 
-1. **新建项目**：首页右上角「新建项目」，选输入方式（主题 / 大纲 / 剧本 / 小说），填内容、画面比例、目标时长
-2. **圣经与资产**：生成故事圣经；在资产卡片上为角色生成定妆照、为场景/道具生成参考图（或上传自己的图）
-3. **剧本**：生成剧本（长篇 / 小说项目在章节列表里勾选要拍的章），检查校验报告后确认
-4. **分镜**：生成分镜，按段落查看、逐镜编辑后确认
-5. **视频**：先看预估花费，再生成视频片段；失败的片段可单独重试
-6. **配音**：选择音色与配音文案模式，生成配音
-7. **成片与配乐**：生成配乐、调整字幕与响度选项，合成并下载成片
+启动后打开 `http://127.0.0.1:8001`。下面的截图来自一个离线演示项目（mock 视频是纯色画面加扫过的白条，
+资产图是示意插画），接入真实模型后这些位置显示的就是真实画面。
 
-左侧阶段导航显示每个阶段的完成情况，状态推进后会自动跳到下一步。每个 `*_REVIEW` 阶段都需要人工确认；
-确认后想改，用「退回」按钮回到上一阶段（下游媒体会随之作废）。
+### 1. 新建项目
+
+首页列出所有项目，可按状态筛选、搜索。点右上角「新建项目」：
+
+![项目首页](docs/screenshots/01-home.png)
+
+选一种输入方式，填标题、内容、画面比例和目标时长。选「小说原文」时直接粘贴整本或几章原文，系统会自动切章：
+
+![新建项目](docs/screenshots/02-create.png)
+
+### 2. 故事圣经与剧集资产
+
+进入项目后，左侧是阶段导航：每个阶段显示完成情况和摘要，状态推进后会自动跳到下一步。
+第一步「生成圣经」（小说项目可设置先抽取前几章）。生成后，角色、场景、关键道具以卡片列出，
+每张卡片可以 **AI 生成** 参考图（角色是定妆照、场景是无人背景板、道具是白底单品图）或 **上传** 自己的图。
+配了图的资产会在生成视频时一起送给视频模型，保持跨镜头一致：
+
+![圣经与资产](docs/screenshots/03-assets.png)
+
+### 3. 剧本
+
+普通项目直接点「生成剧本」。长篇项目和小说项目会先显示章节列表：勾选要拍的章，按钮上会显示预计时长和视频费，
+点「生成选中章节的剧本」即可（小说里没抽取过的章会先抽取、增量并进圣经）。生成后检查剧本和校验报告，
+没问题就「确认剧本」：
+
+![剧本与章节](docs/screenshots/04-script.png)
+
+### 4. 分镜
+
+「生成分镜」后，镜头按**段落**分组显示：同一段的镜头会在一次视频生成里完成、段内硬切。
+每个镜头标出景别运镜、时长、出镜角色、台词和英文视频 prompt，可以逐镜编辑。确认后进入视频阶段：
+
+![分镜](docs/screenshots/05-storyboard.png)
+
+### 5. 视频
+
+点生成前会先显示预估花费（按模型计费档位算的秒数和金额），确认后在后台生成，页面显示进度。
+每个镜头一个片段，可直接播放；失败的片段可以单独重试：
+
+![视频片段](docs/screenshots/06-video.png)
+
+### 6. 配音、配乐与成片
+
+「配音」阶段选择音色和配音文案模式后生成配音；「成片与配乐」阶段生成配乐、调整字幕和响度选项，
+然后合成。成片可以在页面里带字幕预览，并下载 MP4 和字幕文件：
+
+![成片](docs/screenshots/07-compose.png)
+
+每个确认过的阶段都可以用「退回」按钮回到上一步修改，下游已生成的媒体会随之作废。右上角 ◐ 切换明暗主题；
+顶部「批量生产」页可以一次提交多个主题。
 
 ## 输入方式
 
@@ -244,48 +287,9 @@ curl -X POST localhost:8001/api/projects/$PID/cost/reconcile   # 补记漏记的
 
 ## API
 
-接口文档：启动后访问 `/docs`。
-
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| GET | `/api/health` | 健康检查（LLM key 是否配置、ffmpeg 能力；不返回密钥） |
-| GET | `/api/models` | 可选模型、单价、预算、音色表、默认章数 |
-| POST/GET | `/api/projects` | 创建 / 列表 |
-| GET/PUT/DELETE | `/api/projects/{id}` | 详情 / 修改 / 删除 |
-| POST | `/api/projects/{id}/bible/generate` | 生成故事圣经（小说项目可带 `novel_chapters`） |
-| GET/PUT | `/api/projects/{id}/bible` | 读取 / 全量覆盖（剧本确认前） |
-| GET | `/api/projects/{id}/novel` | 小说切章结果（不含原文） |
-| POST | `/api/projects/{id}/novel/extract` | 抽取选中章并合并进圣经（`chapters:[...]`） |
-| GET | `/api/projects/{id}/assets` | 剧集资产总览 |
-| POST/GET/DELETE | `/api/projects/{id}/assets/{kind}/{aid}/reference` | 资产参考图上传 / 下载 / 删除（`kind` = characters / settings / props） |
-| POST | `/api/projects/{id}/assets/{kind}/{aid}/reference/generate` | AI 生成资产参考图 |
-| GET | `/api/projects/{id}/characters/references/plan` | 角色图计划与预估花费（不调 API） |
-| POST | `/api/projects/{id}/characters/references/generate` | 批量补齐角色图 |
-| POST/GET | `/api/projects/{id}/story-outline/generate` · `/story-outline` | 长篇剧集大纲 |
-| POST | `/api/projects/{id}/script/generate` | 生成剧本（可带 `chapters`、`force`） |
-| GET/PUT | `/api/projects/{id}/script` | 读取 / 全量覆盖（确认前） |
-| POST | `/api/projects/{id}/script/confirm` · `/reopen` | 确认 / 退回剧本阶段 |
-| POST | `/api/projects/{id}/storyboard/generate` | 生成分镜 |
-| GET/PUT | `/api/projects/{id}/storyboard` | 读取 / 全量覆盖（确认前） |
-| POST | `/api/projects/{id}/storyboard/confirm` · `/reopen` | 确认 / 退回分镜阶段 |
-| POST | `/api/projects/{id}/storyboard/merge-shots` | 合并短镜头（默认只预览） |
-| GET | `/api/projects/{id}/outline` · `/world-state` · `/consistency` | 分场大纲 / 世界状态 / 一致性报告 |
-| GET | `/api/projects/{id}/preflight` | 花钱前的预估 |
-| POST | `/api/projects/{id}/video/generate` · `/cancel` | 提交 / 取消视频任务（后台任务） |
-| GET | `/api/projects/{id}/video/status` · `/video/manifest` | 视频进度 / 片段清单 |
-| GET | `/api/projects/{id}/clips/{shot_id}` | 下载单个片段 |
-| POST | `/api/projects/{id}/audio/generate` · `/cancel` · `/reopen` | 提交 / 取消配音任务 / 退回配音阶段 |
-| GET | `/api/projects/{id}/audio/status` · `/audio/manifest` · `/voices` | 配音进度 / 清单 / 选角 |
-| GET/POST | `/api/projects/{id}/music` | 查看 / 生成配乐 |
-| POST | `/api/projects/{id}/compose` · `/compose/cancel` | 提交 / 取消合成任务 |
-| GET | `/api/projects/{id}/compose/status` | 合成进度与报告 |
-| GET | `/api/projects/{id}/final` · `/subtitles` · `/subtitles.vtt` | 下载成片 / 字幕 |
-| GET | `/api/projects/{id}/cost` · POST `/cost/reconcile` | 成本账本 / 补记 |
-| POST/GET | `/api/batches` · `/api/batches/{id}` · POST `/api/batches/{id}/cancel` | 批量生产 |
-| GET | `/api/projects/{id}/jobs` · `/api/jobs/{job_id}` | 任务列表 / 单任务状态 |
-
-设置了 `API_TOKEN` 时，写接口只认 `X-API-Token` 请求头；只读的产物地址（成片、字幕、片段、参考图）
-额外接受 `?token=`，方便 `<video>` / `<img>` 直接引用。
+所有界面操作都有对应的 REST 接口，启动后访问 `/docs` 查看完整接口文档；上面各节的 `curl` 示例覆盖了常用流程。
+设置了 `API_TOKEN` 时，写接口需要带 `X-API-Token` 请求头；只读的产物地址（成片、字幕、片段、参考图）
+也接受 `?token=`，方便 `<video>` / `<img>` 直接引用。
 
 ## 代码结构
 
