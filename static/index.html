@@ -127,7 +127,7 @@ body {
 .music-sections th { color: var(--text2); font-weight: 500; text-align: left; padding: 2px 6px; }
 .music-sections td { padding: 2px 6px; border-top: 1px solid var(--border); color: var(--text2); }
 .music-sections td.label { color: var(--text); }
-.music-sections .accents { font-size: 11px; color: var(--text2); line-height: 1.6; }
+.music-sections .accents, .accents { font-size: 11px; font-weight: 400; color: var(--text2); line-height: 1.6; }
 .tag-mini {
   font-size: 11px; padding: 1px 6px; border-radius: 4px;
   background: var(--bg); border: 1px solid var(--border); color: var(--text2);
@@ -398,13 +398,14 @@ body {
 }
 .project-card:hover { transform: translateY(-2px); border-color: var(--accent); }
 .project-cover {
-  height: 120px; position: relative; display: grid; place-items: center;
+  height: 168px; position: relative; display: grid; place-items: center;
   background:
     radial-gradient(120% 90% at 0% 0%, color-mix(in srgb, var(--accent) 30%, transparent), transparent 60%),
     radial-gradient(120% 90% at 100% 100%, color-mix(in srgb, var(--violet) 26%, transparent), transparent 60%),
     var(--surface2);
 }
-.project-cover img { width: 100%; height: 100%; object-fit: cover; }
+.project-cover img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; object-position: center 42%; }
+.project-cover .corner, .project-cover .ratio { z-index: 1; }
 .project-cover .cover-icon { font-size: 26px; opacity: .55; }
 .project-cover .corner { position: absolute; top: 8px; left: 8px; }
 .project-cover .ratio {
@@ -828,6 +829,8 @@ function renderProjectGrid() {
     <div class="project-card" onclick="selectProject('${p.id}')">
       <div class="project-cover">
         <span class="cover-icon">${p.input_mode === 'novel' ? '📖' : '🎬'}</span>
+        <img class="cover-img" alt="" loading="lazy" onerror="this.remove()"
+             src="${withToken(`/api/projects/${p.id}/assets/characters/char_1/reference`)}">
         <span class="corner">${statusTag(p.status)}</span>
         <span class="ratio">${esc(p.aspect_ratio)}</span>
       </div>
@@ -1909,17 +1912,22 @@ function storyboardTierHint(sb) {
   const tier = sb.duration_tier;
   const plan = (currentPreflight && currentPreflight.video) || null;
   const rows = [];
+  const segmented = (sb.shots || []).some(x => x.segment_id);
   if (tier && tier.min_sec > 1) {
     const span = tier.max_sec ? `${tier.min_sec}~${tier.max_sec}s` : `≥${tier.min_sec}s`;
-    rows.push(`视频档位 ${esc(span)}（${tier.source === 'provider' ? '来自模型' : '来自配置'}）：
-      每个镜头都不短于最短计费时长，所以不会出现「买 ${tier.min_sec} 秒只剪 3 秒」`);
-  } else if (sb.shots && sb.shots.length) {
-    rows.push('当前视频 provider 没有最短时长档位（mock 按真实秒数），分镜不受档位约束');
+    const source = tier.source === 'provider' ? '来自模型' : '来自配置';
+    rows.push(segmented
+      ? `视频档位 ${esc(span)}（${source}）：按段计费，段内的短镜头不会各自被抬到最短档位`
+      : `视频档位 ${esc(span)}（${source}）：每个镜头都不短于最短计费时长，所以不会出现「买 ${tier.min_sec} 秒只剪 3 秒」`);
   }
   if (plan && plan.shots_total) {
-    rows.push(`本片 ${plan.shots_total} 个镜头 · 预计计费 ${plan.billed_seconds}s × $${plan.price_per_second}/s ≈ ${usd(plan.estimated_usd)}` +
-      (plan.merge_plan && plan.merge_plan.worth_it
-        ? `；还可以合并短镜头省 ≈ ${usd(plan.merge_plan.saving_usd)}` : ''));
+    const unit = plan.segment_mode ? `（编成 ${plan.segments_total} 段生成）` : '';
+    rows.push(plan.to_generate
+      ? `本次要生成 ${plan.to_generate} 个镜头${unit} · 预计计费 ${plan.billed_seconds}s × $${plan.price_per_second}/s ≈ ${usd(plan.estimated_usd)}`
+      : `本片 ${plan.shots_total} 个镜头${unit}已全部生成 · 整片计费约 ${plan.billed_seconds_if_all}s × $${plan.price_per_second}/s ≈ ${usd(plan.estimated_usd_if_all)}`);
+    if (plan.merge_plan && plan.merge_plan.worth_it) {
+      rows.push(`还可以合并短镜头省 ≈ ${usd(plan.merge_plan.saving_usd)}`);
+    }
   }
   const warnings = sb.tier_warnings || [];
   const warn = warnings.length
