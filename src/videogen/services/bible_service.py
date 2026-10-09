@@ -59,8 +59,9 @@ BIBLE_GEN_SYSTEM = """你是一位资深短剧策划。根据用户输入生成�
 要求：
 - 角色 3-6 个，有明确冲突关系
 - **名字、地区、外貌三者必须对齐**：这是一部哪个国家的戏，全剧组就用那个国家的名字与长相
-  （`region` 填 cn/jp/kr/west/other）。中文名 → `region="cn"` 并给中国人长相；
-  日文名（含假名/日本姓氏）→ `region="jp"`；韩文名 → `region="kr"`；英文名 → `region="west"`。
+  （`region` 填 cn/jp/kr/west/india/mideast/africa/latam/sea/other）。中文名 → `region="cn"`
+  并给中国人长相；日文名（含假名/日本姓氏）→ `region="jp"`；韩文名 → `region="kr"`；
+  英文名 → `region="west"`；印度/中东/非洲/拉美/东南亚的故事分别填 india/mideast/africa/latam/sea。
   用户输入里写明了国家/城市/语言时，以用户输入为准，**不要混国籍**
 - visual_prompt 必须是英文，适合 AI 视频生成（只描述外貌/服装/气质，不要写角色 id），
   并且**外貌要和 region 一致**（例：region=cn 就写 Chinese woman, East Asian features…），
@@ -90,6 +91,26 @@ _REGION_BRIEF = {
         "欧美。名字用英文名（例：Emily Carter、John Smith、Sarah Miller），"
         "长相是欧美人（European or North American features）"
     ),
+    "india": (
+        "南亚/印度。名字用印度名（例：Priya Sharma、Arjun Patel、Ananya Rao），"
+        "长相是南亚人（South Asian features）"
+    ),
+    "mideast": (
+        "中东/北非。名字用阿拉伯或波斯名（例：Layla Haddad、Omar Khalil、Darius Karimi），"
+        "长相是中东人（Middle Eastern features）"
+    ),
+    "africa": (
+        "撒哈拉以南非洲。名字用当地常见名（例：Amara Okafor、Kwame Mensah、Wanjiru Kamau），"
+        "长相是非洲人（Black African features）"
+    ),
+    "latam": (
+        "拉丁美洲。名字用西班牙语/葡萄牙语名（例：Sofía Ramírez、Mateo González、Lucas Silva），"
+        "长相是拉美人（Latin American features）"
+    ),
+    "sea": (
+        "东南亚。名字用当地名（例：Nguyen Thi Lan、Somchai Wongsa、Maria Santos），"
+        "长相是东南亚人（Southeast Asian features）"
+    ),
     "other": "不限定国家/地区，按剧情自洽即可",
 }
 
@@ -102,7 +123,8 @@ def constraint_block(project: Project) -> str:
         lines += [
             "## 国家/地区限定（硬要求，优先级高于你自己的偏好）",
             f"- 整部戏：{brief}",
-            "- **每个角色都要填 `region` 字段**，值用 cn/jp/kr/west/other，默认全部填同一个值",
+            f"- **每个角色都要填 `region` 字段**，值用 {region.REGION_KEYS_TEXT}，"
+            "默认全部填同一个值",
             "- 名字必须和这个国家一致；不要出现混国籍的剧组",
             "- 如果剧情确实需要一个外国人（留学生/外企高管等），在 description 里写明他的国籍，"
             "并且只给这个角色填不同的 region",

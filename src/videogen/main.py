@@ -230,7 +230,8 @@ class UpdateProjectRequest(BaseModel):
     target_duration_sec: int | None = Field(default=None, ge=5, le=600)
     #: 为空表示不改；给空字符串表示恢复默认模型
     llm_model: str | None = None
-    #: 整片的国家/地区限定（cn/jp/kr/west/other；空 = 按名字自动判断）
+    #: 整片的国家/地区限定（cn/jp/kr/west/india/mideast/africa/latam/sea/other；
+    #: 空 = 按名字自动判断）
     cast_region: str | None = None
     #: 生成圣经时的额外要求（人物设定 / 世界观 / 年代 / 语言…）
     bible_notes: str | None = None

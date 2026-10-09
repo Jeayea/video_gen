@@ -32,6 +32,8 @@ import re
 from dataclasses import dataclass
 
 __all__ = [
+    "DECLARED_ONLY",
+    "REGION_KEYS_TEXT",
     "REGION_LABELS",
     "RegionGuess",
     "describe_region",
@@ -49,9 +51,21 @@ REGION_LABELS = {
     "cn": "中国/华语",
     "jp": "日本",
     "kr": "韩国",
-    "west": "欧美",
+    "west": "欧美（欧洲/北美）",
+    "india": "南亚/印度",
+    "mideast": "中东/北非",
+    "africa": "撒哈拉以南非洲",
+    "latam": "拉丁美洲",
+    "sea": "东南亚",
     "other": "其它/不限定",
 }
+
+#: 只能**显式声明**的地区（角色 region / 圣经 cast_region / 配置）：名字推断不会得出它们 ——
+#: 这些地区的名字译成中文或拉丁字母后没有可靠线索，猜错比不猜更糟
+DECLARED_ONLY = frozenset({"india", "mideast", "africa", "latam", "sea"})
+
+#: 给提示词用的取值列表：cn/jp/kr/west/india/mideast/africa/latam/sea/other
+REGION_KEYS_TEXT = "/".join(REGION_LABELS)
 
 #: 判断用的置信度门槛：低于它就跟整个剧组走
 FOLLOW_PROJECT_BELOW = 0.5
@@ -78,6 +92,32 @@ REGION_ANCHORS = {
     "west": (
         "Western cast — European or North American features of a typical Western TV drama "
         "lead, an average everyday Western face"
+    ),
+    # 下面这些地区内部差异都很大：锚点只写最基本的外貌，不写服饰/宗教/职业这类容易变成
+    # 刻板印象的东西 —— 服装与年代交给角色自己的 visual_prompt
+    "india": (
+        "South Asian cast — features of a typical Indian television drama lead, an average "
+        "everyday South Asian face (dark hair, dark brown eyes, light-brown to brown skin), "
+        "not Westernised"
+    ),
+    "mideast": (
+        "Middle Eastern cast — features of a typical Arab, Persian or North African television "
+        "drama lead, an average everyday Middle Eastern face (dark hair, dark brown eyes, "
+        "olive to light-brown skin), not Westernised"
+    ),
+    "africa": (
+        "Sub-Saharan African cast — features of a typical African television drama lead, an "
+        "average everyday Black African face (dark brown to deep brown skin, dark brown eyes, "
+        "natural Afro-textured hair), not mixed-race"
+    ),
+    "latam": (
+        "Latin American cast — features of a typical Latin American telenovela lead, an "
+        "average everyday Latin American face (dark hair, brown eyes, light-tan to brown skin)"
+    ),
+    "sea": (
+        "Southeast Asian cast — features of a typical Southeast Asian television drama lead, "
+        "an average everyday Southeast Asian face (straight black hair, dark brown eyes, "
+        "light-tan to brown skin), not Westernised"
     ),
     "other": "",
 }
@@ -242,6 +282,22 @@ def normalize_region(value: object) -> str:
         "west": "west", "western": "west", "us": "west", "usa": "west", "uk": "west",
         "europe": "west", "european": "west", "caucasian": "west", "american": "west",
         "欧美": "west", "美国": "west", "英国": "west", "欧洲": "west", "白人": "west",
+        "india": "india", "indian": "india", "south asia": "india", "south asian": "india",
+        "印度": "india", "南亚": "india", "巴基斯坦": "india", "孟加拉": "india",
+        "斯里兰卡": "india",
+        "mideast": "mideast", "middle east": "mideast", "middle eastern": "mideast",
+        "arab": "mideast", "arabic": "mideast", "persian": "mideast", "iran": "mideast",
+        "north africa": "mideast", "中东": "mideast", "阿拉伯": "mideast", "波斯": "mideast",
+        "伊朗": "mideast", "土耳其": "mideast", "埃及": "mideast", "北非": "mideast",
+        "africa": "africa", "african": "africa", "sub-saharan africa": "africa",
+        "非洲": "africa", "撒哈拉以南非洲": "africa", "尼日利亚": "africa", "肯尼亚": "africa",
+        "埃塞俄比亚": "africa", "加纳": "africa",
+        "latam": "latam", "latin america": "latam", "latin american": "latam",
+        "latino": "latam", "latina": "latam", "拉美": "latam", "拉丁美洲": "latam",
+        "墨西哥": "latam", "巴西": "latam", "阿根廷": "latam", "哥伦比亚": "latam",
+        "sea": "sea", "southeast asia": "sea", "southeast asian": "sea", "东南亚": "sea",
+        "泰国": "sea", "越南": "sea", "菲律宾": "sea", "印尼": "sea", "印度尼西亚": "sea",
+        "马来西亚": "sea",
         "other": "other", "其它": "other", "其他": "other", "不限": "other",
     }
     return aliases.get(text, "")
@@ -422,7 +478,8 @@ def resolve_region(
         # 声明过就照声明来（用户比启发式可靠）；但名字明显指向别的国家时要**报出来** ——
         # 这多半是圣经把名字起错了，让用户能看见并去改名/改 region
         note = ""
-        if own.confident and own.region != declared:
+        weak = declared in DECLARED_ONLY and own.source.startswith("latin")
+        if own.confident and own.region != declared and not weak:
             note = f"(名字像{describe_region(own.region)}:{own.source})"
         return RegionGuess(declared, 1.0, f"bible:cast_region{note}")
     if own.confident:
@@ -448,6 +505,8 @@ def region_conflict(character, declared: str) -> str:
     )
     if not own.confident or own.region == target or own.region == "other":
         return ""
+    if target in DECLARED_ONLY and own.source.startswith("latin"):
+        return ""  # Priya Sharma 被姓氏表兜底成「欧美」不是证据
     return (
         f"名字「{getattr(character, 'name', '')}」看起来是{describe_region(own.region)}名，"
         f"但整片按{describe_region(target)}来 —— 建议改名字或单独给这个角色填 region"
@@ -464,6 +523,7 @@ _MENTION_MARKERS = (
     "chinese", "japanese", "korean", "asian", "east asian", "caucasian", "western",
     "european", "american", "white", "black", "african", "latina", "hispanic",
     "middle eastern", "south asian", "mixed-race", "biracial", "mongolian", "tibetan",
+    "indian", "arab", "persian", "latin american", "latino", "telenovela",
     "uyghur", "thai", "vietnamese", "filipino",
 )
 

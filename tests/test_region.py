@@ -386,3 +386,47 @@ def test_cast_declared_other_gets_no_default_face(settings):
     shot = Shot(id="s1", scene_id="scene_1", shot_no=1, character_in_frame=["char_2"])
     assert "cast look" not in video_service.appearance_anchor(shot, bible, settings=settings)
 
+
+
+# ── 只能显式声明的地区：南亚 / 中东 / 非洲 / 拉美 / 东南亚 ───────────────────
+
+
+@pytest.mark.parametrize(
+    ("raw", "key"),
+    [
+        ("印度", "india"), ("South Asian", "india"), ("中东", "mideast"), ("Arab", "mideast"),
+        ("非洲", "africa"), ("African", "africa"), ("拉美", "latam"), ("Latino", "latam"),
+        ("东南亚", "sea"), ("越南", "sea"), ("mideast", "mideast"),
+    ],
+)
+def test_new_regions_normalize(raw, key):
+    assert region.normalize_region(raw) == key
+    assert region.region_anchor(key)  # 每个新地区都有外貌锚点
+
+
+def test_new_regions_are_declared_only_never_guessed_from_names():
+    for name in ("Priya Sharma", "Omar Khalil", "Kwame Mensah", "Sofía Ramírez", "Nguyen Thi Lan",
+                 "普丽娅", "奥马尔"):
+        assert region.guess_region(name).region not in region.DECLARED_ONLY
+
+
+def test_declared_india_cast_drives_face_without_false_conflict(settings):
+    bible = StoryBible(cast_region="india", characters=[
+        Character(id="char_1", name="Priya Sharma", role="主角",
+                  visual_prompt="a young woman in a cotton kurta"),
+    ])
+    character = bible.characters[0]
+    assert region.resolve_region(character, bible).region == "india"
+    assert "名字像" not in region.resolve_region(character, bible).source
+    assert region.region_conflict(character, "india") == ""
+    shot = Shot(id="s1", scene_id="scene_1", shot_no=1, character_in_frame=["char_1"])
+    assert "South Asian cast" in video_service.appearance_anchor(shot, bible, settings=settings)
+
+
+def test_bible_prompt_lists_new_regions():
+    from videogen.models.project import Project
+    from videogen.services import bible_service
+
+    block = bible_service.constraint_block(Project(title="t", cast_region="mideast"))
+    assert "中东/北非" in block and region.REGION_KEYS_TEXT in block
+    assert "india" in region.REGION_KEYS_TEXT and "sea" in region.REGION_KEYS_TEXT

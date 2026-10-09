@@ -313,7 +313,7 @@ class Settings(BaseSettings):
     image_prompt_suffix: str = ""
     #: 名字 → 国家 → 外貌锚点：中文名给中国脸、日文名给日本脸（详见 utils/region.py）
     image_region_auto: bool = True
-    #: 名字看不出国籍时的兜底国家（cn/jp/kr/west/other）
+    #: 名字看不出国籍时的兜底国家（cn/jp/kr/west/india/mideast/africa/latam/sea/other）
     image_region_default: str = "cn"
     #: 强制整片按某个国家来（留空 = 自动；填 cn/jp/kr/west 可压过自动判断）
     image_region_override: str = ""

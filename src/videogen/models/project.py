@@ -77,7 +77,8 @@ class Project(BaseModel):
     input_text: str = ""
     #: 该项目的 LLM 模型（空 = 用 .env 里的默认）。多模型切换用。
     llm_model: str = ""
-    #: **整片的国家/地区限定**（cn/jp/kr/west/other；空 = 按角色名字自动推断）。
+    #: **整片的国家/地区限定**（cn/jp/kr/west/india/mideast/africa/latam/sea/other；
+    #: 空 = 按角色名字自动推断）。
     #: 生成圣经时会写进提示词（所有角色用该国名字 + 该国长相），并写进圣经的
     #: `cast_region` 作为下游（定妆照/视频）的**权威依据** —— 比按名字猜可靠得多。
     cast_region: str = ""

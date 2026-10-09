@@ -20,7 +20,8 @@ class Character(BaseModel):
     #: male / female / 空（未知）：配音选角优先认它，空时才从描述里的性别词推断
     gender: str = ""
     role: str = ""  # 主角/反派/配角
-    #: 角色所属国家/地区（cn/jp/kr/west/other）：决定参考图往哪国人脸上靠。
+    #: 角色所属国家/地区（cn/jp/kr/west/india/mideast/africa/latam/sea/other）：
+    #: 决定参考图往哪国人脸上靠。india 及之后的地区只能显式声明，名字推断不会得出它们。
     #: 留空就按**名字**推断（详见 utils/region.py），推不出来就跟整个剧组一致
     region: str = ""
     description: str = ""
