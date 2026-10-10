@@ -30,6 +30,8 @@ class ComposeSegment(BaseModel):
     gain_db: float = 0.0
     #: 画外音：画面里没人开口，不做「配音对齐到开口」
     voice_offscreen: bool = False
+    #: 配音放在镜头里的第几秒（原声引导算出来的；>0 时不再做起点探测，也不做逐帧口型）
+    voice_offset_sec: float = 0.0
 
 
 class ComposeReport(BaseModel):

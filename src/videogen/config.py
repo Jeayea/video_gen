@@ -84,6 +84,12 @@ class Settings(BaseSettings):
     openrouter_tts_model: str = "openai/gpt-audio-mini"
     #: 云端配音的落盘格式。**只能是 wav**：流式接口只返回 pcm16，我们自己封 WAV 头
     tts_audio_format: str = "wav"
+    #: 配音参照视频原声（`off` | `native`）。`native`：视频模型自己念过一遍台词
+    #: （需要 `VIDEO_GENERATE_AUDIO=true`），从原声里找出这句话的起止，云端 TTS 听着原声
+    #: 用角色自己的音色重念（节奏/停顿/情绪照原声），时长微调到与原声一致后放回原位置
+    audio_dub_guide: str = "off"
+    #: 重念的配音与原声时长不一致时，变速（不变调）的最大倍率；超出部分不再硬拉
+    audio_dub_fit_max_ratio: float = 1.25
     #: 没有逐条念法时的兜底念法（只对云端 TTS 生效）
     tts_default_instruction: str = (
         "自然的中文口语，像真人对话，句间有呼吸和停顿，不要播音腔"
@@ -282,6 +288,9 @@ class Settings(BaseSettings):
     video_asset_references: bool = True
     #: 单个镜头最多带几张参考图（角色 + 场景 + 道具合计）
     video_max_reference_images: int = 4
+    #: 只认首帧、不收参考图的模型（Kling / Wan）怎么锁角色：`auto` = 每段开拍前用图片模型
+    #: 把「定妆照 + 场景图 + 第一个镜头」画成一张开场关键帧当首帧（按张计费）；`off` = 不画
+    video_keyframe: str = "auto"
 
     # 批量生产
     batch_max_items: int = 20
@@ -427,6 +436,12 @@ class Settings(BaseSettings):
         """逐帧口型引擎，非法值一律当成 none（绝不因为配置笔误偷偷改画面）。"""
         engine = (self.lipsync_engine or "none").strip().lower()
         return engine if engine in {"none", "wav2lip-onnx", "cli"} else "none"
+
+    @property
+    def dub_guide_mode(self) -> str:
+        """配音参照原声的模式，非法值一律当 off（绝不因为笔误改变配音的位置）。"""
+        mode = (self.audio_dub_guide or "off").strip().lower()
+        return mode if mode in {"off", "native"} else "off"
 
     @property
     def lipsync_scope_mode(self) -> str:

@@ -333,8 +333,12 @@ def _ffmpeg_binary() -> str:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="方案 B：真跑 N 个镜头的端到端")
-    parser.add_argument("--source", default="e8e40d3d9d29")
-    parser.add_argument("--id", default="e2eb00000001", help="新项目 id（必须是没用过的）")
+    parser.add_argument("--source", default="20260911-一个合照被裁掉的女孩从默默无名")
+    parser.add_argument(
+        "--id",
+        default="20260911-方案-b-真跑-3-镜-mock-之外的第一次真链路",
+        help="新项目 id（必须是没用过的）",
+    )
     parser.add_argument("--shots", default="", help="逗号分隔的 shot_id（要真花钱的）")
     parser.add_argument("--base-url", default="http://127.0.0.1:8001")
     parser.add_argument("--yes", action="store_true", help="确认花钱，缺省只播种 + 看账")

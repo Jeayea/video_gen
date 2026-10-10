@@ -1189,3 +1189,15 @@ def test_ui_exposes_music_controls(client):
     assert "renderMusic" in html
     assert "music-sections" in html
     assert "bgm_engine" in html
+
+
+def test_api_create_uses_readable_id(client):
+    response = client.post(
+        "/api/projects",
+        json={"title": "", "input_mode": "novel", "input_text": "变形记\n\n一天早晨"},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["id"].endswith("-变形记")
+    assert body["title"] == "变形记"
+    assert client.get(f"/api/projects/{body['id']}").json()["title"] == "变形记"

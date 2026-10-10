@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Awaitable, Callable
 
 from videogen.config import Settings, get_settings
 from videogen.models.audio import AudioManifest
@@ -29,6 +30,7 @@ from videogen.services import (
     storyboard_service,
     video_service,
 )
+from videogen.services.storyboard_service import Segment
 from videogen.utils.text import count_speech_chars
 
 logger = logging.getLogger(__name__)
@@ -61,6 +63,9 @@ class UnavailableVideoProvider(VideoProvider):
 ACTIONS = ("all", "video", "audio", "compose")
 
 
+#: 「这几段要画几张关键帧、多少钱」——由 pipeline 注入（它知道项目、圣经与目录）
+KeyframeEstimator = Callable[[list[Segment]], Awaitable[dict]]
+
 def budget_projection(report, upcoming_usd: float) -> dict:
     """预算投影：已花 + 本次预估 vs 预算，差多少。"""
     total = report.total_usd
@@ -88,8 +93,13 @@ async def video_plan(
     settings: Settings | None = None,
     *,
     price_per_second: float | None = None,
+    keyframe_estimator: KeyframeEstimator | None = None,
 ) -> dict:
-    """算清楚这次「生成视频片段」会买多少秒、花多少钱，以及合并镜头能省多少。"""
+    """算清楚这次「生成视频片段」会买多少秒、花多少钱，以及合并镜头能省多少。
+
+    `keyframe_estimator`：只认首帧的模型要先画开场关键帧（按张计费），这笔钱算进
+    `estimated_usd`，明细在 `keyframes`。
+    """
     settings = settings or get_settings()
     prices = cost_service.PriceTable.from_settings(settings)
     shots = storyboard.shots if storyboard else []
@@ -128,16 +138,17 @@ async def video_plan(
     pending_ids = {shot.id for shot in pending}
     billed_all = 0.0
     billed_pending = 0.0
-    segments_pending = 0
+    pending_segments: list[Segment] = []
     for segment in segments:
         seconds = await _planned(provider, segment.duration_sec)
         billed_all += seconds
         if any(sid in pending_ids for sid in segment.shot_ids):
             billed_pending += seconds
-            segments_pending += 1
+            pending_segments.append(segment)
     if switched:
         billed_pending = billed_all
-        segments_pending = len(segments)
+        pending_segments = list(segments)
+    segments_pending = len(pending_segments)
     segment_mode = any(len(seg.shots) > 1 for seg in segments)
     if not switched:
         # 段里缺一个镜头，整段都要重生成：待生成镜头按「整段」展开
@@ -195,6 +206,22 @@ async def video_plan(
             f"provider / 模型变了（{plan['regenerate_reason']}），"
             f"已就绪的 {len(ready)} 个片段会全部重新生成"
         )
+
+    plan["keyframes"] = {}
+    if keyframe_estimator is not None and pending_segments:
+        try:
+            keyframes = dict(await keyframe_estimator(pending_segments))
+        except Exception:  # 估不出关键帧不该让「看一眼要花多少」失败
+            logger.warning("关键帧预估失败", exc_info=True)
+            keyframes = {}
+        plan["keyframes"] = keyframes
+        extra_usd = float(keyframes.get("estimated_usd") or 0.0)
+        if keyframes.get("to_generate"):
+            plan["estimated_usd"] = round(plan["estimated_usd"] + extra_usd, 6)
+            plan["warnings"].append(
+                f"模型只认首帧：先画 {keyframes['to_generate']} 张开场关键帧（定妆照 + 场景图）"
+                f" ≈ ${extra_usd:.2f}，计入本次预估"
+            )
 
     # 段落分镜已经把短镜头按段计费了，「合并短镜头」不再省钱，也不该再劝人合并
     plan["merge_plan"] = {} if segment_mode else _merge_plan(
@@ -362,6 +389,7 @@ async def preflight(
     settings: Settings | None = None,
     action: str = "all",
     script_mode: str = "",
+    keyframe_estimator: KeyframeEstimator | None = None,
 ) -> dict:
     """把各阶段的预估拼成一份「动手前的账单」。"""
     settings = settings or get_settings()
@@ -373,7 +401,9 @@ async def preflight(
     audio_part = None
     compose_part = None
     if action in {"all", "video"}:
-        video_part = await video_plan(storyboard, video, provider, settings)
+        video_part = await video_plan(
+            storyboard, video, provider, settings, keyframe_estimator=keyframe_estimator
+        )
     if action in {"all", "audio"}:
         audio_part = audio_plan(storyboard, audio, settings, script_mode=script_mode)
     if action in {"all", "compose"}:

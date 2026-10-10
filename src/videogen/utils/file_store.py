@@ -28,13 +28,14 @@ from videogen.models.script import Script, ScriptOutline, StoryOutline
 from videogen.models.storyboard import Storyboard
 from videogen.models.video import VideoManifest
 from videogen.models.world_state import WorldState
+from videogen.utils.naming import derive_title, project_slug
 
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T", bound=BaseModel)
 
-#: 项目 id 只允许这几种字符，避免 `..` 之类的路径穿越
-_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+#: 项目 id = 目录名：只允许字母 / 数字（含中文）/ `_` / `-`，没有 `.` 和 `/`，避免路径穿越
+_ID_RE = re.compile(r"\w[\w-]{0,63}")
 
 
 class FileStore:
@@ -52,10 +53,24 @@ class FileStore:
 
     @staticmethod
     def is_valid_id(project_id: str) -> bool:
-        return bool(project_id and _ID_RE.match(project_id))
+        return bool(project_id and _ID_RE.fullmatch(project_id))
 
     def project_dir(self, project_id: str) -> Path:
         return self.base / project_id
+
+    def allocate_id(self, base: str) -> str:
+        """按名字占一个新目录：`base`、`base-2`、`base-3`…（mkdir 独占创建，并发建项不撞名）。"""
+        base = base[:60].rstrip("-_") or "project"
+        for n in range(1, 1000):
+            candidate = base if n == 1 else f"{base}-{n}"
+            if not self.is_valid_id(candidate):
+                raise ValueError(f"非法项目 id: {candidate!r}")
+            try:
+                self.project_dir(candidate).mkdir(parents=True, exist_ok=False)
+            except FileExistsError:
+                continue
+            return candidate
+        raise RuntimeError(f"同名项目太多：{base!r}")
 
     def ensure_project_dir(self, project_id: str) -> Path:
         if not self.is_valid_id(project_id):
@@ -119,6 +134,15 @@ class FileStore:
         )
 
     # --- Project ---
+    def create_project(self, project: Project) -> Project:
+        """新建项目：标题没填就从原文里取，目录名按「日期-标题」起（见 utils/naming.py）。"""
+        project.title = derive_title(project.title, project.input_text, project.input_mode.value)
+        project.id = self.allocate_id(
+            project_slug(project.title, project.created_at, project.input_mode.value)
+        )
+        self.save_project(project)
+        return project
+
     def save_project(self, project: Project) -> None:
         self._save(project.id, "meta", project)
 

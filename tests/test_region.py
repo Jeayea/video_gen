@@ -253,6 +253,30 @@ def test_video_anchor_skips_cast_look_when_already_mentioned():
     assert "cast look" not in anchor
 
 
+
+def test_video_anchor_keeps_cast_look_when_appearance_already_copied():
+    # 真实事故：分镜 LLM 把外貌抄进了 prompt → 外貌被跳过 → 人种锚点跟着丢，Kling 画成东亚脸
+    bible = _cast()
+    shot = Shot(
+        id="s1", scene_id="sc", shot_no=1, duration_sec=3, character_in_frame=["char_1"]
+    )
+    base = "A young woman in a beige trench coat stands by white sheets"
+    anchor = video_service.appearance_anchor(shot, bible, base)
+    assert anchor.startswith("cast look:")
+    assert "average everyday Chinese face" in anchor
+
+
+def test_video_anchor_needs_someone_in_frame():
+    shot = Shot(id="s1", scene_id="sc", shot_no=1, duration_sec=3)
+    assert video_service.appearance_anchor(shot, _cast(), "close-up of an alarm clock") == ""
+
+
+def test_colour_words_are_not_ethnicity():
+    assert not region.region_mentioned("a man with black hair on white sheets")
+    assert not region.region_mentioned("Americana diner")  # 整词匹配
+    assert region.region_mentioned("a Black woman in her 30s")
+    assert region.region_mentioned("an American tourist")
+
 # ── 圣经模型 ──────────────────────────────────────────
 
 

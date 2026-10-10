@@ -53,6 +53,9 @@ class VideoRequest(BaseModel):
     #: 角色一致性：画面里每个配了参考图的角色各一张（provider 不支持时为空）。
     #: 双人镜头要同时锁住两个人，所以这里是**列表**而不是单张。
     reference_images: list[Path] = Field(default_factory=list)
+    #: 首帧图（只认首帧、不收参考图的模型用，例如 Kling / Wan）。必须是**一帧画面**
+    #: （关键帧），不能是定妆照 —— 否则每段都从一张证件照开场
+    first_frame: Path | None = None
     #: 固定 seed（provider 支持时才有用；H3 是 `seed: false`，带上会 400）
     seed: int | None = None
 
@@ -120,6 +123,11 @@ class VideoProvider(ABC):
     async def price_per_second(self, *, resolution: str = "") -> float | None:
         """向 provider 问单价（USD/秒）；问不到返回 None，让上层用配置的单价。"""
         return None
+
+    async def frame_mode(self) -> str:
+        """模型怎么吃图：`references`（全程参考图，如 H3）/ `first_frame`（只认首帧，
+        如 Kling / Wan）/ `none`。`first_frame` 时上层可以先画一张关键帧当首帧。"""
+        return "references" if self.supports_reference_image else "none"
 
     async def aclose(self) -> None:
         """释放资源（HTTP 客户端等），默认什么都不做。"""

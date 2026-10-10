@@ -6,7 +6,7 @@ build/
 .venv/
 venv/
 .env
-projects/
+/projects/
 .ruff_cache/
 .pytest_cache/
 *.mp4

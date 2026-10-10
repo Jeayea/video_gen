@@ -91,6 +91,10 @@ python -m videogen.tools.demo_bgm     # 可选：生成 4 首演示 BGM 到 ./as
 
 ![新建项目](docs/screenshots/02-create.png)
 
+项目的产物目录（也是项目 id）按「建项日期-标题」命名，例如 `projects/20261010-孔乙己-第一场试拍/`；
+标题不填时从内容里取（小说取书名那一行，其它取第一句），同名项目自动加 `-2`、`-3`。
+老版本的随机目录名（如 `2fabf66fbb35`）可以用 `tools/projects/rename_legacy.py` 一次改完（默认只预览）。
+
 ### 2. 故事圣经与剧集资产
 
 进入项目后，左侧是阶段导航：每个阶段显示完成情况和摘要，状态推进后会自动跳到下一步。
@@ -240,6 +244,9 @@ BUDGET_USD=12                              # 强烈建议先设预算
   `imageio-ffmpeg` 自带的那个）。成片旁边总会导出 `subtitles.srt` 和 `subtitles.vtt`
 - **变速**：`COMPOSE_SPEED`（0.5~4），也可以在合成时单次指定 `{"speed": 2}`
 - **逐帧口型**（可选）：`tools/lipsync/install.sh` 装好独立环境后设 `LIPSYNC_ENGINE=wav2lip-onnx`
+- **原声引导配音**（可选）：`VIDEO_GENERATE_AUDIO=true` + `AUDIO_DUB_GUIDE=native`。视频模型先把台词念一遍，
+  云端 TTS 听着这段原声、用角色自己的音色重念，并放回原声的位置、对齐原声的长度。
+  嘴本来就在念这句，所以这些镜头不再做逐帧口型；搭配 `OPENROUTER_TTS_MODEL=openai/gpt-audio` 效果最好
 
 ## 成本控制
 

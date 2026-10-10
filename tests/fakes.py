@@ -583,6 +583,7 @@ class FakeTTSProvider(TTSProvider):
         self.sec_per_char = sec_per_char
         self.media_kind = media_kind
         self.calls: list[str] = []
+        self.requests: list[TTSRequest] = []
         self.voices: dict[str, str] = {}
         self.active = 0
         self.max_active = 0
@@ -593,6 +594,7 @@ class FakeTTSProvider(TTSProvider):
 
     async def synthesize(self, request: TTSRequest) -> GeneratedAudio:
         self.calls.append(request.clip_id)
+        self.requests.append(request)
         self.voices[request.clip_id] = request.voice
         self.active += 1
         self.max_active = max(self.max_active, self.active)

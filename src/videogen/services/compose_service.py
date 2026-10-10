@@ -1061,7 +1061,12 @@ async def _render_all(
             # 口型对齐：画面里的人几秒开口，配音就延后几秒（只用本地计算，不重新烧视频）。
             # 逐帧口型已经让嘴跟着配音走了，再叠加延后会把嘴和声音错开。
             delay_ms = 0
-            if (
+            if lipsynced is None and segment.voice_offset_sec > 0 and audio_path is not None:
+                # 原声引导算好的位置：直接用，不再做起点探测
+                delay_ms = round(segment.voice_offset_sec * 1000)
+                async with lock:
+                    delays[segment.shot_id] = segment.voice_offset_sec
+            elif (
                 lipsynced is None
                 and align_mouth
                 and not segment.voice_offscreen
@@ -1087,7 +1092,7 @@ async def _render_all(
             marker = segments_dir / f"{segment.shot_id}.params"
             params = (
                 f"ambient={'on' if use_ambient else 'off'}"
-                f" mouth={'on' if delay_ms > 0 else 'off'}"
+                f" mouth={delay_ms if delay_ms > 0 else 'off'}"
                 f" lipsync={'on' if lipsynced is not None else 'off'}"
                 f" gain={gain_db:+.1f}"
             )
@@ -1158,6 +1163,9 @@ async def _lipsync_all(
         if not segment.audio_path:
             continue
         if not lipsync_service.shot_eligible(shots.get(segment.shot_id), scope=scope):
+            continue
+        if segment.voice_offset_sec > 0:
+            # 原声引导：配音已经按画面里那张嘴的时间放好了（嘴本来就在念这句），不用重画
             continue
         if settings.lipsync_max_sec > 0 and segment.duration_sec > settings.lipsync_max_sec:
             continue

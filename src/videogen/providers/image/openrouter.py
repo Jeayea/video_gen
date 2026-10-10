@@ -114,15 +114,12 @@ class OpenRouterImageProvider(ImageProvider):
             payload["aspect_ratio"] = request.aspect_ratio
         if request.resolution:
             payload["resolution"] = request.resolution
-        if self.supports_reference_image and request.reference_image:
-            path = Path(request.reference_image)
-            if path.is_file():
-                payload["input_references"] = [
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": _data_url(path)},
-                    }
-                ]
+        references = request.all_references() if self.supports_reference_image else []
+        if references:
+            payload["input_references"] = [
+                {"type": "image_url", "image_url": {"url": _data_url(path)}}
+                for path in references
+            ]
         return payload
 
     async def _post(self, payload: dict[str, Any]) -> dict[str, Any]:

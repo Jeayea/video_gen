@@ -232,7 +232,7 @@ class BatchManager:
                     aspect_ratio=batch.aspect_ratio,
                     target_duration_sec=batch.target_duration_sec,
                 )
-                pipeline.store.save_project(project)
+                pipeline.store.create_project(project)
                 item.project_id = project.id
                 try:
                     await pipeline.run_chain(

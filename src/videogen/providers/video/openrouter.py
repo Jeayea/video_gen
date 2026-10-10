@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+import re
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +33,11 @@ _RETRY_STATUS = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
 
 #: 单次下载图片/视频的分块大小
 _CHUNK = 1024 * 256
+
+#: 提示词长度上限（字符）。能力表里没有这一项，只能按模型前缀写死：
+#: Kling 超过 2500 直接 FAIL（`ret:1201, prompt: size must be between 0 and 2500`），
+#: 而且失败发生在轮询阶段，重试 3 次照样失败。前缀越长越优先
+_PROMPT_LIMITS: tuple[tuple[str, int], ...] = (("kwaivgi/", 2500),)
 
 
 def clear_video_capability_cache() -> None:
@@ -174,23 +180,39 @@ class OpenRouterVideoProvider(VideoProvider):
             return None
 
         wanted = (resolution or self.resolution).strip().lower()
+        if not wanted:
+            # 不指定分辨率时提交用的是模型列表里的第一档，单价也按它算
+            wanted = _pick_from("", caps.get("supported_resolutions")).lower()
+        # 带音频 / 不带音频两档价（Kling、Veo）：按是否真的生成音轨取对应那档，
+        # 否则开了音轨却按低价预估（Kling 少算 1/3）
+        audio = "with_audio" if self.generate_audio and caps.get("generate_audio") else ""
+        audio_tags = [audio, ""] if audio else ["without_audio", ""]
         candidates: list[str] = []
         for key in ("duration_seconds", "per-video-second", "per_video_second"):
-            if wanted:
-                candidates += [f"{key}_{wanted}", f"{key}-{wanted}"]
-            candidates.append(key)
+            for tag in audio_tags:
+                base = f"{key}_{tag}" if tag else key
+                if wanted:
+                    candidates += [f"{base}_{wanted}", f"{base}-{wanted}"]
+                candidates.append(base)
         for key in candidates:
             if key in skus:
                 value = _as_float(skus[key])
                 if value is not None:
                     return value
-        # 兜底：任何带 second 的 key
+        # 兜底：任何带 second 的 key（跳过另一档音频价）
+        other = "without_audio" if audio else "with_audio"
         for key, raw in skus.items():
-            if "second" in str(key).lower():
+            lowered = str(key).lower()
+            if "second" in lowered and other not in lowered:
                 value = _as_float(raw)
                 if value is not None:
                     return value
         return None
+
+    async def frame_mode(self) -> str:
+        if not self.use_reference_images:
+            return "none"
+        return _frame_mode(await self.capabilities())
 
     async def planned_seconds(self, requested_sec: float) -> float:
         """按模型支持的时长档位，算出**实际会被计费**的秒数。"""
@@ -267,7 +289,7 @@ class OpenRouterVideoProvider(VideoProvider):
         duration = _clamp_duration(float(request.duration_sec), caps.get("supported_durations"))
         payload: dict[str, Any] = {
             "model": self.model,
-            "prompt": request.prompt,
+            "prompt": fit_prompt(request.prompt, prompt_limit(self.model)),
             "duration": round(duration),
         }
         if duration > request.duration_sec:
@@ -322,29 +344,37 @@ class OpenRouterVideoProvider(VideoProvider):
 
         `limit` 用于降级重试时只带前 N 张（模型可能拒绝多张参考图）。
         """
+        if not self.use_reference_images:
+            return {}
         paths = [Path(p) for p in (request.reference_images or [])]
         paths = [p for p in paths if p.is_file()]
-        if not self.use_reference_images or not paths:
-            return {}
         if limit is not None:
             paths = paths[:limit]
-        if not paths:
+        mode = _frame_mode(caps)
+
+        if mode == "references":
+            if not paths:
+                return {}
+            return {"input_references": [_image_url_payload(path) for path in paths]}
+        if mode == "first_frame":
+            first = Path(request.first_frame) if request.first_frame else None
+            if first is not None and first.is_file():
+                frame = {**_image_url_payload(first), "frame_type": "first_frame"}
+                return {"frame_images": [frame]}
+            if paths:
+                # 定妆照（正面半身、干净背景）当首帧 = 每段都从一张证件照开场，宁可不带
+                logger.warning(
+                    "模型 %s 只认首帧、不收参考图：没有关键帧，%d 张参考图不作为首帧发送"
+                    "（VIDEO_KEYFRAME=auto 会先画一张开场关键帧）",
+                    self.model,
+                    len(paths),
+                )
             return {}
 
-        skus = caps.get("pricing_skus") or {}
-        supports_references = any("reference" in str(key).lower() for key in skus)
-        frame_types = caps.get("supported_frame_images") or []
-        images = [_image_url_payload(path) for path in paths]
-
-        if supports_references:
-            return {"input_references": images}
-        if "first_frame" in frame_types:
-            # 首帧图只能一张：多角色镜头退化成「锁第一个角色」
-            return {"frame_images": [{**images[0], "frame_type": "first_frame"}]}
-
-        logger.warning(
-            "模型 %s 不支持参考图/首帧图，已忽略 %d 张参考图", self.model, len(paths)
-        )
+        if paths:
+            logger.warning(
+                "模型 %s 不支持参考图/首帧图，已忽略 %d 张参考图", self.model, len(paths)
+            )
         return {}
 
     async def _submit(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -507,6 +537,65 @@ def _usage_cost(status: dict[str, Any]) -> float | None:
         if value is not None:
             return value
     return None
+
+
+def _frame_mode(caps: dict[str, Any]) -> str:
+    """能力表 → `references` / `first_frame` / `none`（价目里有 reference 计费项才算收参考图）。"""
+    skus = caps.get("pricing_skus") or {}
+    if isinstance(skus, dict) and any("reference" in str(key).lower() for key in skus):
+        return "references"
+    if "first_frame" in (caps.get("supported_frame_images") or []):
+        return "first_frame"
+    return "none"
+
+
+def prompt_limit(model: str) -> int:
+    """该模型的提示词字符上限（0 = 未知 / 不限）。"""
+    for prefix, limit in sorted(_PROMPT_LIMITS, key=lambda item: -len(item[0])):
+        if model.startswith(prefix):
+            return limit
+    return 0
+
+
+def fit_prompt(prompt: str, limit: int) -> str:
+    """把提示词压进模型上限：先去掉全局通用要求（背景 / 表演 / 风格），再按句截断。
+
+    通用要求是给所有镜头的「加分项」，逐镜头的画面与台词才是这一段的内容，所以先砍前者。
+    """
+    if limit <= 0 or len(prompt) <= limit:
+        return prompt
+    settings = get_settings()
+    fitted = prompt
+    for directive in (
+        settings.video_style_prompt,
+        settings.video_performance_directive,
+        settings.video_background_directive,
+    ):
+        directive = (directive or "").strip()
+        if not directive:
+            continue
+        # 整句对不上时（段落 prompt 会删掉其中「不许切」那条）按逗号分句删
+        parts = [directive] if directive in fitted else directive.split(", ")
+        for part in parts:
+            part = part.strip(" ,.;")
+            if part and part in fitted:
+                fitted = fitted.replace(part, "")
+        fitted = re.sub(r"(\s*,)+\s*(?=[,.]|$)", "", fitted).strip(" ,.;")
+        if len(fitted) <= limit:
+            break
+    truncated = len(fitted) > limit
+    if truncated:
+        cut = fitted[:limit]
+        end = max(cut.rfind(". "), cut.rfind('" '))
+        fitted = cut[: end + 1] if end > limit // 2 else cut
+    logger.warning(
+        "提示词 %d 字符超过模型上限 %d：已去掉通用要求%s → %d 字符",
+        len(prompt),
+        limit,
+        "并按句截断" if truncated else "",
+        len(fitted),
+    )
+    return fitted
 
 
 def _as_float(value: Any) -> float | None:

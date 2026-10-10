@@ -519,9 +519,13 @@ def region_anchor(region: str) -> str:
 
 
 #: 描述里已经写了这些词，就说明外貌已经定过调，不要再叠锚点（免得自相矛盾）
+#: 按整词匹配。white / black 只认「white man」这种指人的写法 ——
+#: 单独的 white / black 多半是 white sheets / black hair，不能当成交代过人种
 _MENTION_MARKERS = (
     "chinese", "japanese", "korean", "asian", "east asian", "caucasian", "western",
-    "european", "american", "white", "black", "african", "latina", "hispanic",
+    "european", "american", "african", "latina", "hispanic",
+    "white man", "white woman", "white person", "white people",
+    "black man", "black woman", "black person", "black people",
     "middle eastern", "south asian", "mixed-race", "biracial", "mongolian", "tibetan",
     "indian", "arab", "persian", "latin american", "latino", "telenovela",
     "uyghur", "thai", "vietnamese", "filipino",
@@ -530,5 +534,5 @@ _MENTION_MARKERS = (
 
 def region_mentioned(text: str) -> bool:
     """这段英文描述里是不是已经交代了人种/地区。"""
-    lowered = f" {str(text or '').lower()} "
-    return any(marker in lowered for marker in _MENTION_MARKERS)
+    lowered = str(text or "").lower()
+    return any(re.search(rf"\b{re.escape(marker)}\b", lowered) for marker in _MENTION_MARKERS)

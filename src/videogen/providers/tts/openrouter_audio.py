@@ -59,6 +59,14 @@ _SYSTEM_TEMPLATE = (
     "表演要求（只影响怎么念，不影响念什么）：{instruction}"
 )
 
+#: 有原声参考时追加的表演要求：照原声的节奏和情绪念，但嗓音是自己的
+_GUIDE_TEMPLATE = (
+    "\n用户消息里附了一段**参考录音**，是同一句台词的另一个演员版本。"
+    "照它的节奏、停顿位置、重音、语速和情绪起伏来念，{length}"
+    "但**用你自己的音色**，不要模仿参考录音的嗓音；"
+    "参考录音里的字可能念错，**以台词原文为准**。"
+)
+
 #: 转写明显超出原文这么多字就算「模型自己加戏」（标点/语气词不算）
 _TRANSCRIPT_SLACK_CHARS = 6
 #: 转写长度上限 = 原文长度 × 该系数 + 松弛量
@@ -200,6 +208,21 @@ class OpenRouterTTSProvider(TTSProvider):
                 "这一次只念下面这一句，不要任何多余的字，不要接话，不要念括号里的内容。"
                 + instruction
             )
+        system = _SYSTEM_TEMPLATE.format(instruction=instruction)
+        user: str | list[dict[str, Any]] = text
+        reference = _reference_wav(request.reference_audio)
+        if reference:
+            length = (
+                f"总时长尽量接近 {request.target_sec:.1f} 秒，"
+                if request.target_sec > 0
+                else ""
+            )
+            system += _GUIDE_TEMPLATE.format(length=length)
+            user = [
+                {"type": "text", "text": "参考录音："},
+                {"type": "input_audio", "input_audio": {"data": reference, "format": "wav"}},
+                {"type": "text", "text": text},
+            ]
         return {
             "model": self.model,
             "modalities": ["text", "audio"],
@@ -207,8 +230,8 @@ class OpenRouterTTSProvider(TTSProvider):
             "stream": True,
             "audio": {"voice": request.voice or "nova", "format": _STREAM_AUDIO_FORMAT},
             "messages": [
-                {"role": "system", "content": _SYSTEM_TEMPLATE.format(instruction=instruction)},
-                {"role": "user", "content": text},
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
             ],
             # 让 OpenRouter 回传真实花费，账本不靠估算
             "usage": {"include": True},
@@ -337,6 +360,27 @@ def _transcript_is_verbatim(transcript: str, text: str) -> bool:
     if len(got) > len(want) * _TRANSCRIPT_RATIO + _TRANSCRIPT_SLACK_CHARS:
         return False
     return want in got or got in want
+
+
+#: 参考录音的大小上限：一句台词的 16k 单声道 wav 不到 1MB，超了多半是传错了文件
+_MAX_REFERENCE_BYTES = 4 * 1024 * 1024
+
+
+def _reference_wav(path: Path | None) -> str:
+    """参考录音 → base64（只收 wav；没有 / 太大 / 读不了都当没有，绝不因此失败）。"""
+    if path is None:
+        return ""
+    reference = Path(path)
+    try:
+        if reference.suffix.lower() != ".wav" or not reference.is_file():
+            return ""
+        if reference.stat().st_size > _MAX_REFERENCE_BYTES:
+            logger.warning("参考录音过大，已忽略：%s", reference.name)
+            return ""
+        return base64.b64encode(reference.read_bytes()).decode("ascii")
+    except OSError:
+        logger.warning("参考录音读不了，已忽略：%s", reference.name, exc_info=True)
+        return ""
 
 
 def _write_wav(output: Path, pcm: bytes) -> None:

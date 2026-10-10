@@ -71,6 +71,12 @@ class AudioClip(BaseModel):
     script_source: str = ""
     #: LLM 给的写这句的理由（排查/人工核对用，不参与合成）
     note: str = ""
+    #: 原声引导（`AUDIO_DUB_GUIDE=native`）：原声里这句话的位置（相对镜头开头，秒）与
+    #: 切出来的原声片段（相对项目目录）。配音按 `offset_sec` 放进镜头，不再从 0 秒开始
+    guide_path: str = ""
+    guide_start_sec: float = 0.0
+    guide_end_sec: float = 0.0
+    offset_sec: float = 0.0
     #: provider 报的实际花费（云端 TTS 会报；Edge 免费 = 0）
     provider_usd: float = 0.0
     #: 这条配音的花费是否已经记进账本（重新合成时会清掉，与视频片段同一套规则）

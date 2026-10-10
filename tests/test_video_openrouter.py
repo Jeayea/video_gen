@@ -230,6 +230,50 @@ async def test_price_reads_resolution_specific_sku():
     assert await provider480.price_per_second() == pytest.approx(0.05)
 
 
+KLING_STD = {
+    "id": "kwaivgi/kling-v3.0-std",
+    "supported_resolutions": ["720p"],
+    "supported_durations": list(range(3, 16)),
+    "generate_audio": True,
+    "seed": False,
+    "pricing_skus": {
+        "duration_seconds": "0.084",
+        "duration_seconds_with_audio": "0.126",
+        "text_to_video_duration_seconds_720p": "0.084",
+    },
+}
+VEO_FAST = {
+    "id": "google/veo-3.1-fast",
+    "supported_resolutions": ["720p", "1080p", "4K"],
+    "supported_durations": [4, 6, 8],
+    "generate_audio": True,
+    "pricing_skus": {
+        "duration_seconds_with_audio": "0.12",
+        "duration_seconds_without_audio": "0.10",
+        "duration_seconds_with_audio_720p": "0.10",
+        "duration_seconds_without_audio_720p": "0.08",
+    },
+}
+
+
+@pytest.mark.asyncio
+async def test_price_follows_audio_tier():
+    recorder = Recorder(models=[KLING_STD, VEO_FAST])
+    kling = "kwaivgi/kling-v3.0-std"
+    silent = make_provider(recorder, model=kling, generate_audio=False)
+    assert await silent.price_per_second() == pytest.approx(0.084)
+    voiced = make_provider(recorder, model=kling, generate_audio=True)
+    assert await voiced.price_per_second() == pytest.approx(0.126)
+
+    veo = "google/veo-3.1-fast"
+    veo_silent = make_provider(recorder, model=veo, resolution="720p")
+    assert await veo_silent.price_per_second() == pytest.approx(0.08)
+    veo_voiced = make_provider(recorder, model=veo, resolution="720p", generate_audio=True)
+    assert await veo_voiced.price_per_second() == pytest.approx(0.10)
+    veo_1080 = make_provider(recorder, model=veo, resolution="1080p", generate_audio=True)
+    assert await veo_1080.price_per_second() == pytest.approx(0.12)
+
+
 @pytest.mark.asyncio
 async def test_planned_seconds_clamps_to_model_durations():
     provider = make_provider(Recorder())
@@ -413,11 +457,31 @@ async def test_reference_falls_back_to_first_frame(tmp_path):
     provider = make_provider(recorder)
     provider.poll_interval_sec = 0.01
 
+    assert await provider.frame_mode() == "first_frame"
+    # 只有定妆照、没有关键帧：定妆照绝不当首帧（否则每段都从一张证件照开场）
     await provider.generate(request_for(tmp_path, reference_image=ref))
-
-    frames = recorder.bodies[0]["frame_images"]
-    assert frames[0]["frame_type"] == "first_frame"
+    assert "frame_images" not in recorder.bodies[0]
     assert "input_references" not in recorder.bodies[0]
+
+    # 有关键帧：关键帧当首帧
+    keyframe = tmp_path / "keyframe.png"
+    keyframe.write_bytes(b"fake-keyframe")
+    await provider.generate(request_for(tmp_path, reference_image=ref, first_frame=keyframe))
+    frames = recorder.bodies[1]["frame_images"]
+    assert frames[0]["frame_type"] == "first_frame"
+    assert "input_references" not in recorder.bodies[1]
+
+
+@pytest.mark.asyncio
+async def test_frame_mode_follows_capabilities():
+    recorder = Recorder(models=[HAILUO3, KLING_STD, {"id": "x/no-images"}])
+    assert await make_provider(recorder).frame_mode() == "references"
+    assert await make_provider(recorder, model="kwaivgi/kling-v3.0-std").frame_mode() == "none"
+    kling = {**KLING_STD, "id": "k/frames", "supported_frame_images": ["first_frame"]}
+    recorder = Recorder(models=[kling])
+    assert await make_provider(recorder, model="k/frames").frame_mode() == "first_frame"
+    off = make_provider(recorder, model="k/frames", use_reference_images=False)
+    assert await off.frame_mode() == "none"
 
 
 @pytest.mark.asyncio
@@ -802,3 +866,25 @@ def test_video_entry_prefers_actual_cost():
         "openrouter", "minimax/hailuo-3", 5, 1, price_per_second=0.13
     )
     assert fallback.usd == pytest.approx(0.65)
+
+
+def test_fit_prompt_drops_generic_directives_before_truncating():
+    from videogen.config import get_settings
+    from videogen.providers.video.openrouter import fit_prompt, prompt_limit
+
+    settings = get_settings()
+    shots = 'Shot 1 (0-2s): a man lies on a bed, says: "我起来了。" ' * 30
+    prompt = f"{shots}{settings.video_background_directive} {settings.video_performance_directive}"
+    assert prompt_limit("kwaivgi/kling-v3.0-std") == 2500
+    assert prompt_limit("minimax/hailuo-3") == 0
+    assert fit_prompt(prompt, 0) == prompt
+
+    limit = len(shots) + 20
+    fitted = fit_prompt(prompt, limit)
+    assert len(fitted) <= limit
+    assert settings.video_background_directive not in fitted
+    assert fitted.startswith(shots.strip())  # 逐镜头内容原样保留
+
+    tight = fit_prompt(prompt, 300)
+    assert len(tight) <= 300
+    assert tight.endswith(".") or tight.endswith('"')  # 按句截断，不截半个词

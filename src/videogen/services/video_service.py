@@ -6,6 +6,7 @@ import re
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from videogen.config import Settings, get_settings
 from videogen.models.bible import StoryBible
@@ -17,6 +18,9 @@ from videogen.services.storyboard_service import Segment, segments_of
 from videogen.utils import region
 from videogen.utils.ffmpeg import cut_clip, detect_cuts, ffmpeg_available, probe_duration
 from videogen.utils.redact import scrub_secrets
+
+if TYPE_CHECKING:  # 关键帧服务反过来依赖本模块，这里只用于类型标注
+    from videogen.services.keyframe_service import Keyframer
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +44,7 @@ async def generate_clips(
     seed: int = 0,
     on_progress: ProgressCallback = None,
     retry_backoff_sec: float = DEFAULT_RETRY_BACKOFF_SEC,
+    keyframer: Keyframer | None = None,
 ) -> VideoManifest:
     """逐镜并发生成视频片段。
 
@@ -47,6 +52,7 @@ async def generate_clips(
     - **重试**：单镜失败重试 `max_retries` 次，仍失败只标记该镜头，不影响其他镜头
     - **续跑**：已有 manifest 里 `ready` 且文件仍在的镜头直接跳过（可在失败后重试）
     - **进度**：每完成一个镜头回调一次 `on_progress`，调用方负责落盘/更新任务
+    - **关键帧**：给了 `keyframer`（只认首帧的模型）时，每段先画一张开场关键帧当首帧
     """
     manifest = existing or VideoManifest()
     # 换了 provider / 模型（例如 mock → 真实模型）时，旧片段一律作废重跑，
@@ -136,6 +142,7 @@ async def generate_clips(
                     max_retries=max_retries,
                     retry_backoff_sec=retry_backoff_sec,
                     on_progress=on_progress,
+                    keyframer=keyframer,
                 )
                 _emit(on_progress, manifest)
                 return
@@ -151,6 +158,8 @@ async def generate_clips(
                 max_retries=max_retries,
                 retry_backoff_sec=retry_backoff_sec,
                 on_progress=on_progress,
+                keyframer=keyframer,
+                segment=segment,
             )
             _emit(on_progress, manifest)
 
@@ -174,6 +183,8 @@ async def _generate_one(
     max_retries: int,
     retry_backoff_sec: float,
     on_progress: ProgressCallback,
+    keyframer: Keyframer | None = None,
+    segment: Segment | None = None,
 ) -> None:
     clip = manifest.get(shot.id)
     if clip is None:  # pragma: no cover - 调用方保证已 upsert
@@ -181,6 +192,10 @@ async def _generate_one(
 
     output = clips_dir / f"{shot.id}.mp4"
     references, shot_seed = resolve_references(shot, bible, project_dir, provider, seed)
+    first_frame = None
+    if keyframer is not None:
+        unit = segment or Segment(id=shot.id, scene_id=shot.scene_id, shots=[shot])
+        first_frame = await keyframer.first_frame(unit, provider)
     request = VideoRequest(
         shot_id=shot.id,
         scene_id=shot.scene_id,
@@ -189,6 +204,7 @@ async def _generate_one(
         aspect_ratio=project.aspect_ratio.value,
         output_path=output,
         reference_images=references,
+        first_frame=first_frame,
         seed=shot_seed,
     )
 
@@ -270,6 +286,7 @@ async def _generate_segment(
     retry_backoff_sec: float,
     on_progress: ProgressCallback,
     settings: Settings | None = None,
+    keyframer: Keyframer | None = None,
 ) -> None:
     """一段（多个镜头）一次生成，再按镜头切回单镜片段。
 
@@ -286,6 +303,9 @@ async def _generate_segment(
     references, segment_seed = resolve_segment_references(
         segment.shots, bible, project_dir, provider, seed, settings=settings
     )
+    first_frame = (
+        await keyframer.first_frame(segment, provider) if keyframer is not None else None
+    )
     request = VideoRequest(
         shot_id=segment.id,
         scene_id=segment.scene_id,
@@ -294,6 +314,7 @@ async def _generate_segment(
         aspect_ratio=project.aspect_ratio.value,
         output_path=output,
         reference_images=references,
+        first_frame=first_frame,
         seed=segment_seed,
     )
 
@@ -901,19 +922,21 @@ def appearance_anchor(
         # 名字对人类读者有用，对模型没用 —— 模型只需要「画面里这个人的长相」。
         chunks.append(look[:_APPEARANCE_MAX_CHARS])
         haystack += " " + head
-    if not chunks:
-        return ""
-    clause = "same characters as before, consistent face and hairstyle — " + "; ".join(chunks)
+    clause = ""
+    if chunks:
+        clause = "same characters as before, consistent face and hairstyle — " + "; ".join(chunks)
+    # 人种锚点与外貌描述无关：分镜 LLM 抄过外貌（上面跳过）时也要补。
+    # 真实事故：《变形记》全员 west，但外貌已被抄进 prompt → 锚点跟着丢 → Kling 画成东亚脸
     settings = settings or get_settings()
-    if settings.image_region_auto:
+    if settings.image_region_auto and shot.character_in_frame:
         guess = region.project_region(
             bible,
             override=settings.image_region_override,
             default=settings.image_region_default,
         )
         anchor = region.region_anchor(guess.region)
-        if anchor and not region.region_mentioned(base):
-            clause += f". cast look: {anchor}"
+        if anchor and not region.region_mentioned(f"{base} {clause}"):
+            clause = f"{clause}. cast look: {anchor}" if clause else f"cast look: {anchor}"
     return clause
 
 

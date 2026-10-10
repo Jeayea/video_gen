@@ -39,6 +39,8 @@ from videogen.services import (
     compose_service,
     consistency_service,
     cost_service,
+    dub_guide_service,
+    keyframe_service,
     music_service,
     novel_service,
     preflight_service,
@@ -272,6 +274,28 @@ class Pipeline:
             await provider.aclose()
         unit = prices.video_per_second if price is None else max(0.0, price)
         return round(seconds * unit, 6)
+
+    async def _estimate_keyframe_usd(
+        self, project: Project, shots: list[Shot], storyboard: Storyboard
+    ) -> float:
+        """只认首帧的模型：这次要新画的开场关键帧（与 preflight 同一口径）。"""
+        if not shots:
+            return 0.0
+        wanted = {shot.id for shot in shots}
+        segments = [
+            segment
+            for segment in storyboard_service.segments_of(storyboard)
+            if any(sid in wanted for sid in segment.shot_ids)
+        ]
+        provider = self._video()
+        try:
+            plan = await self._keyframe_estimator(project, provider)(segments)
+        except Exception:  # 估不出就按 0，真正画之前还会逐张查预算
+            logger.warning("关键帧预估失败", exc_info=True)
+            return 0.0
+        finally:
+            await provider.aclose()
+        return float(plan.get("estimated_usd") or 0.0)
 
     async def _apply_segment_mode(
         self,
@@ -1157,10 +1181,29 @@ class Pipeline:
                 settings=get_settings(),
                 action=action,
                 script_mode=script_mode,
+                keyframe_estimator=(
+                    self._keyframe_estimator(project, provider) if provider else None
+                ),
             )
         finally:
             if provider is not None:
                 await provider.aclose()
+
+    def _keyframe_estimator(
+        self, project: Project, provider: VideoProvider
+    ) -> preflight_service.KeyframeEstimator:
+        """preflight / 预算门控共用：这几段要画几张开场关键帧（只认首帧的模型才会画）。"""
+
+        async def estimate(segments: list) -> dict:
+            return await keyframe_service.estimate(
+                segments,
+                project,
+                self.store.load_bible(project.id),
+                self.store.ensure_project_dir(project.id),
+                provider,
+            )
+
+        return estimate
 
     async def merge_short_shots(
         self,
@@ -1311,6 +1354,7 @@ class Pipeline:
             self.store.save_storyboard(project_id, storyboard)
             targets = await self._budget_shots(storyboard, video)
             upcoming = await self._estimate_video_usd(targets, storyboard)
+            upcoming += await self._estimate_keyframe_usd(project, targets, storyboard)
             self._guard_budget(
                 project_id, upcoming_usd=upcoming, action="生成视频片段"
             )
@@ -1379,6 +1423,11 @@ class Pipeline:
         except Exception:
             logger.warning("读取视频单价失败，记账用配置单价", exc_info=True)
             price_per_second = None
+        keyframer = None
+        if await keyframe_service.enabled_for(provider, settings):
+            keyframer = keyframe_service.Keyframer(
+                self.store, project_id, project, bible, settings=settings
+            )
         try:
             manifest = await video_service.generate_clips(
                 project,
@@ -1393,6 +1442,7 @@ class Pipeline:
                 bible=bible,
                 seed=settings.video_seed,
                 on_progress=on_progress,
+                keyframer=keyframer,
             )
         except asyncio.CancelledError:
             # 取消：保留已生成片段，状态退回可重试的位置
@@ -1420,6 +1470,8 @@ class Pipeline:
             raise
         finally:
             await provider.aclose()
+            if keyframer is not None:
+                await keyframer.aclose()
 
         async with self._lock(project_id):
             # 状态可能在生成期间被别处改过（例如用户改了标题），这里重新读一份再落状态
@@ -1735,6 +1787,20 @@ class Pipeline:
             on_progress=on_progress,
         )
 
+        # ── 可选：原声引导（视频模型念过一遍台词，照着它的位置和节奏重配） ──
+        guides: dict = {}
+        if settings.dub_guide_mode == "native":
+            guides = await dub_guide_service.prepare_guides(
+                storyboard, video, project_dir, audio_dir / dub_guide_service.GUIDE_DIR
+            )
+            ctx.note(f"原声引导：{len(guides)} 句台词找到了原声")
+            if not guides:
+                logger.warning(
+                    "原声引导已打开，但没有一个片段带可用的原声（视频要用 "
+                    "VIDEO_GENERATE_AUDIO=true 生成）；按普通配音处理 project=%s",
+                    project_id,
+                )
+
         try:
             manifest = await audio_service.synthesize_all(
                 project,
@@ -1749,6 +1815,7 @@ class Pipeline:
                 retry_backoff_sec=settings.tts_retry_backoff_sec,
                 existing=existing_audio,
                 voice_overrides=voice_overrides,
+                guides=guides,
                 on_progress=on_progress,
             )
         except asyncio.CancelledError:

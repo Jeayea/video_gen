@@ -520,13 +520,13 @@ async def health():
 @app.post("/api/projects")
 async def create_project(req: CreateProjectRequest):
     project = Project(
-        title=req.title.strip() or "未命名项目",
+        title=req.title.strip(),
         input_mode=req.input_mode,
         input_text=req.input_text.strip(),
         aspect_ratio=req.aspect_ratio,
         target_duration_sec=req.target_duration_sec,
     )
-    store.save_project(project)
+    store.create_project(project)
     return project.model_dump()
 
 

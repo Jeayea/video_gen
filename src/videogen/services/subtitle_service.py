@@ -37,6 +37,7 @@ def build_segments(
                 text=text,
                 volume=(audio_clip.volume if audio_clip else "") or "",
                 voice_offscreen=shot.voice_offscreen,
+                voice_offset_sec=audio_clip.offset_sec if audio_clip else 0.0,
             )
         )
     return segments
@@ -126,6 +127,8 @@ def _cues(
         start = cursor
         end = cursor + segment.duration_sec * scale
         cursor = end
+        # 原声引导的配音不从镜头开头说起：字幕跟着开口的那一秒出现
+        start = min(end, start + max(0.0, segment.voice_offset_sec) * scale)
 
         text = segment.text.strip()
         if not text:

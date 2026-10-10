@@ -6,7 +6,7 @@
 
     # 转完直接装成项目的角色定妆照（会覆盖 refs/char_N.jpg）
     .venv/bin/python tools/image/restyle.py --input 剧照/曹操.jpg \\
-        --project 541bf0406fac --character char_1 --base-url http://127.0.0.1:8097
+        --project 20260915-新三国名场面三连-动漫化 --character char_1 --base-url http://127.0.0.1:8097
 
 为什么单独做成工具：角色的 `visual_prompt` 只能「描述长相」，做不到「照着这张脸画」。
 图片 provider 本身支持参考图输入（`input_references`），所以拿照片当参考图 + 风格化提示词，

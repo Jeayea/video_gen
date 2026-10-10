@@ -31,6 +31,7 @@ __all__ = [
     "AssetError",
     "build_prop_prompt",
     "build_setting_prompt",
+    "english_only",
     "generate_asset_image",
     "list_assets",
     "set_reference",
@@ -53,8 +54,12 @@ def _items(bible: StoryBible, kind: str) -> list:
     return getattr(bible, kind)
 
 
-def _english(text: str | None) -> str:
+def english_only(text: str | None) -> str:
+    """剔除中日韩字符（图片模型会把 prompt 里的中文画进画面）。"""
     return " ".join(_CJK_RE.sub(" ", str(text or "")).split()).strip(" ,.;")
+
+
+_english = english_only
 
 
 def build_setting_prompt(setting: Setting, *, aspect_ratio: str = "9:16", extra: str = "") -> str:

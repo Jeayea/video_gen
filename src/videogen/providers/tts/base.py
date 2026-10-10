@@ -30,6 +30,10 @@ class TTSRequest(BaseModel):
     pitch: str = "+0Hz"
     #: 自然语言念法（云端 TTS 用）：例如「压抑的哭腔，语速慢，句尾发颤」。Edge 忽略
     instruction: str = ""
+    #: 参考录音（原声引导）：照它的节奏、停顿、情绪念，但用自己的音色。不支持的 provider 忽略
+    reference_audio: Path | None = None
+    #: 希望念成多长（秒，0 = 不限）。只是提示，最终时长由上层微调
+    target_sec: float = 0.0
     output_path: Path
 
     model_config = {"arbitrary_types_allowed": True}

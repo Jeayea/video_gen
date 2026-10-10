@@ -3,7 +3,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from pathlib import Path
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 __all__ = [
     "GeneratedImage",
@@ -45,7 +45,17 @@ class ImageRequest(BaseModel):
     resolution: str = ""
     #: 参考图（图生图）：用于「基于已有角色图再出一个角度」
     reference_image: Path | None = None
+    #: 多张参考图（关键帧：角色定妆照 + 场景图一起进）；和 `reference_image` 合并后去重
+    reference_images: list[Path] = Field(default_factory=list)
     model_config = {"arbitrary_types_allowed": True}
+
+    def all_references(self) -> list[Path]:
+        """`reference_image` 在前，再是 `reference_images`；只保留存在的文件。"""
+        out: list[Path] = []
+        for item in [self.reference_image, *self.reference_images]:
+            if item is not None and Path(item).is_file() and Path(item) not in out:
+                out.append(Path(item))
+        return out
 
 
 class GeneratedImage(BaseModel):

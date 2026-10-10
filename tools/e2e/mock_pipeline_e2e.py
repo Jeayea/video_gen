@@ -46,7 +46,7 @@ SEED_FILES = (
 #: 服务端口（和 .env 里真实运行时用的 8001 分开，避免误伤）
 DEFAULT_PORT = 8099
 DEFAULT_TOKEN = "e2e-token-2f9c"
-DEFAULT_SOURCE = "e8e40d3d9d29"
+DEFAULT_SOURCE = "20260911-一个合照被裁掉的女孩从默默无名"
 
 
 # ── 基础设施 ────────────────────────────────────────────────

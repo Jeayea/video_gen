@@ -20,7 +20,8 @@ from videogen.models.storyboard import Shot, Storyboard
 from videogen.models.video import ClipStatus, MediaKind
 from videogen.providers.bgm.base import BgmLibrary
 from videogen.providers.tts.base import TTSProvider, TTSProviderError, TTSRequest
-from videogen.services import voice_catalog
+from videogen.services import dub_guide_service, voice_catalog
+from videogen.services.dub_guide_service import Guide
 from videogen.utils.redact import scrub_secrets
 from videogen.utils.text import clean_spoken_text
 
@@ -29,6 +30,8 @@ logger = logging.getLogger(__name__)
 ProgressCallback = Callable[[AudioManifest], None] | None
 
 NARRATOR = "narrator"
+#: 原声引导的配音允许越过镜头末尾这么多（探测余量 + 字尾气声），不为它拉长镜头
+_GUIDED_SLACK_SEC = 0.15
 DEFAULT_RETRY_BACKOFF_SEC = 1.5
 
 #: 音色判定关键词：角色 role / 描述 / 名字里出现这些就判为男声。
@@ -99,9 +102,15 @@ async def synthesize_all(
     retry_backoff_sec: float = DEFAULT_RETRY_BACKOFF_SEC,
     existing: AudioManifest | None = None,
     voice_overrides: dict[str, str] | None = None,
+    guides: dict[str, Guide] | None = None,
     on_progress: ProgressCallback = None,
 ) -> AudioManifest:
-    """逐镜生成配音，失败隔离 + 断点续跑（与视频阶段同构）。"""
+    """逐镜生成配音，失败隔离 + 断点续跑（与视频阶段同构）。
+
+    `guides`（原声引导，见 `dub_guide_service`）：有原声片段的镜头照着原声念、
+    时长对齐原声、放在原声开口的位置。
+    """
+    guides = guides or {}
     settings = settings or get_settings()
     manifest = existing or AudioManifest()
     manifest.provider = provider.name
@@ -146,11 +155,19 @@ async def synthesize_all(
             current.pitch or "",
             current.instruction or "",
         ) != (clip.rate or "", clip.volume or "", clip.pitch or "", clip.instruction or "")
+        guide = guides.get(clip.shot_id)
+        # 原声换了（视频重做 / 开关原声引导）也要重新合成：位置和时长都跟着原声走
+        guide_changed = (
+            current.guide_path,
+            current.guide_start_sec,
+            current.guide_end_sec,
+        ) != _guide_key(guide, project_dir)
         if (
             current.status == ClipStatus.READY
             and not voice_changed
             and not text_changed
             and not delivery_changed
+            and not guide_changed
             and _clip_file_exists(project_dir, current)
         ):
             continue  # 续跑：已经有音频、音色/文案都没变的不重复花额度
@@ -206,6 +223,7 @@ async def synthesize_all(
                 project_dir,
                 manifest,
                 settings,
+                guide=guides.get(clip.shot_id),
                 max_retries=max_retries,
                 retry_backoff_sec=retry_backoff_sec,
                 on_progress=on_progress,
@@ -284,6 +302,7 @@ async def _synthesize_one(
     manifest: AudioManifest,
     settings: Settings,
     *,
+    guide: Guide | None = None,
     max_retries: int,
     retry_backoff_sec: float,
     on_progress: ProgressCallback,
@@ -298,8 +317,14 @@ async def _synthesize_one(
         volume=clip.volume or settings.tts_volume,
         pitch=clip.pitch or settings.tts_pitch,
         # 云端 TTS 用自然语言念法；没有逐条建议时用兜底（去播音腔）
-        instruction=clip.instruction
+        # 有原声参考时只让它「照着原声念」：念法里的快慢要求会和参考录音打架
+        # （实测念成原声的 1.3~2.7 倍长，见 dub_guide_service.GUIDE_INSTRUCTION）
+        instruction=dub_guide_service.GUIDE_INSTRUCTION
+        if guide is not None
+        else clip.instruction
         or (settings.tts_default_instruction if provider.name == "openrouter" else ""),
+        reference_audio=guide.path if guide else None,
+        target_sec=guide.span_sec if guide else 0.0,
         output_path=output,
     )
 
@@ -339,6 +364,27 @@ async def _synthesize_one(
         clip.path = _relative(generated.path, project_dir)
         clip.media_kind = generated.media_kind
         clip.duration_sec = round(generated.duration_sec, 3)
+        clip.guide_path, clip.guide_start_sec, clip.guide_end_sec = _guide_key(
+            guide, project_dir
+        )
+        clip.offset_sec = 0.0
+        if guide is not None and generated.media_kind == MediaKind.AUDIO:
+            fitted, fitted_sec, factor = await dub_guide_service.fit_to_span(
+                Path(generated.path),
+                guide.span_sec,
+                max_ratio=settings.audio_dub_fit_max_ratio,
+            )
+            clip.path = _relative(fitted, project_dir)
+            clip.duration_sec = round(fitted_sec, 3)
+            clip.offset_sec = guide.start_sec
+            logger.info(
+                "配音 %s 按原声对齐：放在 %.2fs，原声 %.2fs，配音 %.2fs（变速 %.2fx）",
+                clip.id,
+                guide.start_sec,
+                guide.span_sec,
+                fitted_sec,
+                factor,
+            )
         clip.voice = generated.voice or clip.voice
         clip.provider_usd = round(max(0.0, generated.usd), 6)
         clip.error = ""
@@ -373,7 +419,12 @@ def align_storyboard(
         clip = manifest.for_shot(shot.id)
         if clip is None or clip.duration_sec <= 0:
             continue
-        required = clip.duration_sec + max(0.0, gap_sec)
+        if clip.guide_path:
+            # 原声引导：配音落在原声说话的区间里（原声本来就在这个镜头之内），
+            # 不再加余量 —— 否则 3.01 秒也会被取整成 4 秒，镜头尾巴多出一秒冻结帧
+            required = max(0.0, clip.offset_sec) + clip.duration_sec - _GUIDED_SLACK_SEC
+        else:
+            required = clip.duration_sec + max(0.0, gap_sec)
         target = max(shot.duration_sec, math.ceil(required))
         if target == shot.duration_sec:
             continue
@@ -431,6 +482,12 @@ def pick_bgm(
 
 
 # ── 工具 ──────────────────────────────────────────────
+
+
+def _guide_key(guide: Guide | None, project_dir: Path) -> tuple[str, float, float]:
+    if guide is None:
+        return ("", 0.0, 0.0)
+    return (_relative(guide.path, project_dir), guide.start_sec, guide.end_sec)
 
 
 def _clip_file_exists(project_dir: Path, clip: AudioClip) -> bool:

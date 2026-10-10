@@ -45,8 +45,8 @@ class MockImageProvider(ImageProvider):
 
     async def generate(self, request: ImageRequest) -> GeneratedImage:
         key = request.subject_id
-        if request.reference_image and Path(request.reference_image).is_file():
-            key = f"{key}:{Path(request.reference_image).read_bytes()!r}"
+        for reference in request.all_references():
+            key = f"{key}:{reference.read_bytes()!r}"
         color = _PALETTE[_stable_index(key, len(_PALETTE))]
 
         output = Path(request.output_path)
