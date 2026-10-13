@@ -163,3 +163,27 @@ def test_english_casting_replaces_a_leftover_chinese_voice():
     assert casting.voice_map["char_1"].startswith("en-US-")
     assert any("不是本片语言" in note for note in casting.notes)
 
+
+
+def test_dialogue_prompt_names_the_speakers_gender_and_age():
+    """不写嗓音时原生音频自己挑：画外的 45 岁女老师被 Seedance 配成了中年男声。"""
+    bible = StoryBible(
+        characters=[
+            Character(id="char_1", name="江浩", gender="male", age=17),
+            Character(id="char_3", name="老师", gender="female", age=45),
+        ]
+    )
+    offscreen = Shot(
+        id="scene_1_shot_1", scene_id="scene_1", shot_no=1, duration_sec=4,
+        dialogue_text="江浩，你听到没有？", dialogue_speaker="char_3", voice_offscreen=True,
+    )
+    text = video_service.dialogue_directive(offscreen, bible)
+    assert "off-screen voice (a middle-aged woman, about 45)" in text
+    assert "exact Mandarin line" in text and "老师" not in text
+    onscreen = offscreen.model_copy(
+        update={"dialogue_speaker": "char_1", "voice_offscreen": False, "dialogue_text": "听到了。"}
+    )
+    text = video_service.dialogue_directive(onscreen, bible)
+    assert "the on-screen speaker (a teenage boy)" in text
+    # 不知道说话人是谁时保持原样
+    assert "the on-screen speaker says" in video_service.dialogue_directive(onscreen)

@@ -14,6 +14,7 @@ from videogen.models.project import Project
 from videogen.models.storyboard import Shot, Storyboard
 from videogen.models.video import ClipStatus, MediaKind, VideoClip, VideoManifest
 from videogen.providers.video.base import VideoProvider, VideoRequest
+from videogen.services import voice_catalog
 from videogen.services.storyboard_service import Segment, segments_of
 from videogen.utils import language, region
 from videogen.utils.ffmpeg import cut_clip, detect_cuts, ffmpeg_available, probe_duration
@@ -936,6 +937,39 @@ def prop_anchor(shot: Shot, bible: StoryBible | None, base: str = "") -> str:
     return f"key props: {'; '.join(looks)}" if looks else ""
 
 
+def speaker_voice(shot: Shot, bible: StoryBible | None) -> str:
+    """说话人是谁（性别 + 年龄段，英文，如 "a middle-aged woman, about 45"）。
+
+    给开着原生音频的视频模型选嗓子用。
+
+    不写时模型自己挑：画外台词没有画面可参照，45 岁的女老师被配成了中年男声
+    （2026-10-13《重回2000》Seedance 试拍）。只写性别年龄、不写名字（理由同下）。
+    """
+    if bible is None or not shot.dialogue_speaker:
+        return ""
+    character = bible.get_character(shot.dialogue_speaker)
+    if character is None:
+        return ""
+    gender, _ = voice_catalog.infer_gender(character)
+    age = character.age
+    if gender is None:
+        return ""
+    if age is not None and age < 13:
+        person = "girl" if gender == "female" else "boy"
+        return f"a young {person}"
+    if age is not None and age < 20:
+        person = "girl" if gender == "female" else "boy"
+        return f"a teenage {person}"
+    person = "woman" if gender == "female" else "man"
+    if age is None:
+        return f"a {person}"
+    if age < 35:
+        return f"a young {person}"
+    if age < 60:
+        return f"a middle-aged {person}, about {age}"
+    return f"an elderly {person}, about {age}"
+
+
 def dialogue_directive(shot: Shot, bible: StoryBible | None = None) -> str:
     """把这一镜的台词交给视频模型，让它按同一句话演口型。
 
@@ -949,15 +983,19 @@ def dialogue_directive(shot: Shot, bible: StoryBible | None = None) -> str:
     text = " ".join(str(shot.dialogue_text or "").split())
     if not text:
         return ""
+    spoken = language.spoken_language_name(text)
+    voice = speaker_voice(shot, bible)
     if shot.voice_offscreen:
         # 说话人在门外/电话里：让模型画「听见声音」，别把说话人硬塞进画面对口型
         return (
-            f'an off-screen voice is heard saying: "{text}" — the speaker is not visible, '
+            f"an off-screen voice{f' ({voice})' if voice else ''} is heard saying this exact "
+            f"{spoken} line: "
+            f'"{text}" — the speaker is not visible, '
             "nobody on screen lip-syncs this line, no on-screen text or captions"
         )
-    spoken = language.spoken_language_name(text)
+    who = f"the on-screen speaker ({voice})" if voice else "the on-screen speaker"
     return (
-        f'the on-screen speaker says this exact {spoken} line: "{text}" — natural lip-sync '
+        f'{who} says this exact {spoken} line: "{text}" — natural lip-sync '
         f"matched to the {spoken} speech, mouth movement and breathing follow the line, "
         "no on-screen text or captions"
     )
