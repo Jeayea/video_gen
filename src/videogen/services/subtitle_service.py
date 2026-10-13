@@ -7,6 +7,7 @@ from videogen.models.audio import AudioKind, AudioManifest
 from videogen.models.bible import StoryBible
 from videogen.models.compose import ComposeSegment
 from videogen.models.storyboard import Storyboard
+from videogen.utils import language
 from videogen.utils.text import clean_spoken_text
 
 logger = logging.getLogger(__name__)
@@ -50,7 +51,8 @@ def _subtitle_text(shot, audio_clip, names: dict[str, str]) -> str:
         if audio_clip.kind == AudioKind.DIALOGUE and audio_clip.speaker:
             name = audio_clip.speaker_name or names.get(audio_clip.speaker, "")
             if name:
-                return f"{name}：{text}"
+                colon = "：" if language.spoken_language_name(text) != "English" else ": "
+                return f"{name}{colon}{text}"
         return text
     return clean_spoken_text(shot.dialogue_text) or clean_spoken_text(shot.narration)
 

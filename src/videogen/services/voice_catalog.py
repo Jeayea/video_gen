@@ -214,7 +214,124 @@ VOICE_CATALOG: tuple[VoiceProfile, ...] = (
         tags=("配角",),
         locale="zh-HK",
     ),
+    # ── 英文项目（`language=en`）用的 en-US 音色 ──
+    VoiceProfile(
+        id="en-US-AriaNeural",
+        label="Aria · 女声（自信、表现力强）",
+        gender="female",
+        age=(22, 35),
+        timbre="自信、明亮",
+        tags=("女主角", "主角", "反派", "配角"),
+        locale="en-US",
+        cloud="nova",
+    ),
+    VoiceProfile(
+        id="en-US-JennyNeural",
+        label="Jenny · 女声（亲切自然）",
+        gender="female",
+        age=(20, 32),
+        timbre="亲切、温暖",
+        tags=("女主角", "主角", "少女", "配角"),
+        locale="en-US",
+        cloud="shimmer",
+    ),
+    VoiceProfile(
+        id="en-US-MichelleNeural",
+        label="Michelle · 女声（沉稳成熟）",
+        gender="female",
+        age=(30, 50),
+        timbre="沉稳、知性",
+        tags=("配角", "长辈", "导师"),
+        locale="en-US",
+        cloud="sage",
+    ),
+    VoiceProfile(
+        id="en-US-EmmaNeural",
+        label="Emma · 女声（轻快）",
+        gender="female",
+        age=(18, 28),
+        timbre="轻快、开朗",
+        tags=("少女", "配角"),
+        locale="en-US",
+        cloud="coral",
+    ),
+    VoiceProfile(
+        id="en-US-AnaNeural",
+        label="Ana · 女声（儿童）",
+        gender="female",
+        age=(6, 12),
+        timbre="稚气",
+        tags=("配角",),
+        locale="en-US",
+        cloud="alloy",
+    ),
+    VoiceProfile(
+        id="en-US-GuyNeural",
+        label="Guy · 男声（有力，旁白）",
+        gender="male",
+        age=(28, 45),
+        timbre="有力、激情",
+        tags=("旁白", "主角", "导师"),
+        locale="en-US",
+        cloud="onyx",
+    ),
+    VoiceProfile(
+        id="en-US-AndrewNeural",
+        label="Andrew · 男声（温暖年轻）",
+        gender="male",
+        age=(20, 32),
+        timbre="温暖、真诚",
+        tags=("男主角", "主角", "少年", "配角"),
+        locale="en-US",
+        cloud="echo",
+    ),
+    VoiceProfile(
+        id="en-US-ChristopherNeural",
+        label="Christopher · 男声（沉稳权威）",
+        gender="male",
+        age=(30, 55),
+        timbre="沉稳、权威",
+        tags=("导师", "配角", "反派", "长辈"),
+        locale="en-US",
+        cloud="ash",
+    ),
+    VoiceProfile(
+        id="en-US-EricNeural",
+        label="Eric · 男声（理性冷静）",
+        gender="male",
+        age=(25, 40),
+        timbre="理性、冷静",
+        tags=("配角", "反派"),
+        locale="en-US",
+        cloud="verse",
+    ),
+    VoiceProfile(
+        id="en-US-RogerNeural",
+        label="Roger · 男声（年长、活泼）",
+        gender="male",
+        age=(45, 70),
+        timbre="年长、爽朗",
+        tags=("长辈", "配角"),
+        locale="en-US",
+        cloud="ballad",
+    ),
 )
+
+#: 语言 → 这门语言的「标准口音」locale（同语言的其他 locale 算口音，扣分）
+PRIMARY_LOCALE = {"zh": "zh-CN", "en": "en-US"}
+#: 旁白默认音色不是这门语言时用它
+_NARRATOR_BY_LANGUAGE = {"zh": "zh-CN-YunjianNeural", "en": "en-US-GuyNeural"}
+
+
+def _lang_of(locale: str) -> str:
+    return str(locale or "").split("-")[0].lower()
+
+
+def voice_language(voice_id: str) -> str:
+    """音色属于哪门语言（云端音色 / 未知音色返回空 = 不限语言）。"""
+    profile = CATALOG_BY_ID.get(voice_id)
+    return _lang_of(profile.locale) if profile else ""
+
 
 CATALOG_BY_ID = {voice.id: voice for voice in VOICE_CATALOG}
 
@@ -449,7 +566,12 @@ class VoiceCasting:
     genders: dict[str, str]
 
 
-def _score(voice: VoiceProfile, character: Character | None, settings: Settings) -> float:
+def _score(
+    voice: VoiceProfile,
+    character: Character | None,
+    settings: Settings,
+    primary: str = "zh-CN",
+) -> float:
     """音色对某个角色的匹配分（越大越好）。"""
     score = 0.0
     role = str(getattr(character, "role", "") or "").strip()
@@ -465,7 +587,7 @@ def _score(voice: VoiceProfile, character: Character | None, settings: Settings)
     elif voice.age[1] <= _CHILD_VOICE_MAX_AGE and not _looks_young(character):
         # 年龄未知时不让童声兜底（实测：没填年龄的「父亲」被配成了 8-16 岁的云夏）
         score -= 5.0
-    if voice.locale != "zh-CN":
+    if voice.locale != primary:
         score -= 6.0  # 同一部戏里混口音很出戏
     if voice.dialect:
         score -= 8.0
@@ -531,19 +653,26 @@ def _best_unused(
     settings: Settings,
     used: dict[str, str],
     gender: str | None,
+    primary: str = "zh-CN",
 ) -> VoiceProfile | None:
     """找一个「空闲 + 同性别 + 明显更合适」的音色；没有就返回 None。"""
     current_profile = CATALOG_BY_ID.get(current)
     if current_profile is None:
         return None
-    pool = [v for v in VOICE_CATALOG if (not gender or v.gender == gender) and v.id not in used]
+    pool = [
+        v
+        for v in VOICE_CATALOG
+        if (not gender or v.gender == gender)
+        and v.id not in used
+        and _lang_of(v.locale) == _lang_of(primary)
+    ]
     if not settings.tts_allow_accent_voices:
-        pool = [v for v in pool if v.locale == "zh-CN" and not v.dialect]
-    baseline = _score(current_profile, character, settings)
-    best = max(pool, key=lambda v: (_score(v, character, settings), v.id), default=None)
+        pool = [v for v in pool if v.locale == primary and not v.dialect]
+    baseline = _score(current_profile, character, settings, primary)
+    best = max(pool, key=lambda v: (_score(v, character, settings, primary), v.id), default=None)
     if best is None:
         return None
-    return best if _score(best, character, settings) - baseline >= 1.0 else None
+    return best if _score(best, character, settings, primary) - baseline >= 1.0 else None
 
 
 #: 云端音色的性别分组（按「像不像主角」排序：越靠前越通用）
@@ -626,6 +755,7 @@ def cast_voice_map(
     *,
     existing: dict[str, str] | None = None,
     target: str = "",
+    language: str = "zh",
 ) -> VoiceCasting:
     """给每个说话人分配音色（确定性：同样的输入永远得到同样的选角）。
 
@@ -636,6 +766,11 @@ def cast_voice_map(
     """
     settings = settings or get_settings()
     cloud = is_cloud_target(target)
+    lang = language if language in PRIMARY_LOCALE else "zh"
+    primary = PRIMARY_LOCALE[lang]
+    narrator_voice = settings.tts_voice_narrator
+    if voice_language(narrator_voice) not in ("", lang):
+        narrator_voice = _NARRATOR_BY_LANGUAGE[lang]
     characters = {c.id: c for c in (bible.characters if bible else [])}
     speakers = _speakers_of(storyboard)
 
@@ -648,9 +783,9 @@ def cast_voice_map(
 
     for speaker in speakers:
         if speaker == NARRATOR:
-            mapping[speaker] = settings.tts_voice_narrator
-            genders[speaker] = voice_gender(settings.tts_voice_narrator) or ""
-            used.setdefault(settings.tts_voice_narrator, NARRATOR)
+            mapping[speaker] = narrator_voice
+            genders[speaker] = voice_gender(narrator_voice) or ""
+            used.setdefault(narrator_voice, NARRATOR)
             continue
 
         character = characters.get(speaker)
@@ -669,6 +804,11 @@ def cast_voice_map(
                 f"（{'云端' if cloud else 'Edge'}），已重新选角"
             )
             candidate = ""
+        if candidate and voice_language(candidate) not in ("", lang):
+            notes.append(
+                f"{name}（{speaker}）原有音色 {candidate} 不是本片语言（{lang}）的音色，已重新选角"
+            )
+            candidate = ""
         if candidate:
             clash = bool(gender) and voice_gender(candidate) not in (None, gender)
             if clash:
@@ -685,7 +825,7 @@ def cast_voice_map(
             elif _age_mismatch(candidate, character):
                 # 年龄明显不匹配（真实样本：45 岁的杂志主编挂着「清朗少年感」的云希）：
                 # 有空闲且更合适的音色就换，没有就保留
-                better = _best_unused(candidate, character, settings, used, gender)
+                better = _best_unused(candidate, character, settings, used, gender, primary)
                 if better is not None:
                     notes.append(
                         f"{name}（{speaker}）原音色 {candidate} 与年龄不符"
@@ -713,13 +853,13 @@ def cast_voice_map(
         pool = [
             voice
             for voice in VOICE_CATALOG
-            if not gender or voice.gender == gender
+            if (not gender or voice.gender == gender) and _lang_of(voice.locale) == lang
         ]
         if not settings.tts_allow_accent_voices:
-            same_locale = [v for v in pool if v.locale == "zh-CN" and not v.dialect]
+            same_locale = [v for v in pool if v.locale == primary and not v.dialect]
             pool = same_locale or pool
         by_score = sorted(
-            pool, key=lambda v: (-_score(v, character, settings), v.id)
+            pool, key=lambda v: (-_score(v, character, settings, primary), v.id)
         )
         if not by_score:
             mapping[speaker] = settings.tts_voice

@@ -45,6 +45,7 @@ def plan_voices(
     *,
     existing: dict[str, str] | None = None,
     target: str = "",
+    language: str = "",
 ) -> voice_catalog.VoiceCasting:
     """给每个说话人选角（音色 + 为区分而复用的念法 + 说明）。
 
@@ -57,6 +58,7 @@ def plan_voices(
         settings,
         existing=existing,
         target=target or settings.tts_provider,
+        language=language or settings.language_for(None),
     )
 
 
@@ -125,7 +127,12 @@ async def synthesize_all(
     manifest.provider = provider.name
     manifest.concurrency = max(1, concurrency)
     casting = plan_voices(
-        storyboard, bible, settings, existing=manifest.voice_map, target=provider.name
+        storyboard,
+        bible,
+        settings,
+        existing=manifest.voice_map,
+        target=provider.name,
+        language=settings.language_for(project),
     )
     manifest.voice_map = casting.voice_map
     if casting.delivery:

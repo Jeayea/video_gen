@@ -20,6 +20,7 @@ from videogen.providers.tts.base import (
     TTSProviderError,
     TTSRequest,
 )
+from videogen.utils import language
 from videogen.utils.ffmpeg import probe_duration
 from videogen.utils.redact import scrub_secrets
 from videogen.utils.text import clean_spoken_text, estimate_speech_sec
@@ -55,7 +56,7 @@ _SYSTEM_TEMPLATE = (
     "那些只是给你的表演要求，不是要念出来的字\n"
     "3. 不要念出「台词」「用户」「朗读」「以下是」这类字样\n"
     "4. 念完最后一个字立刻停止，不要有额外的收尾\n"
-    "5. 用中文普通话朗读，像真人演戏一样自然，带真实的气息、停顿与情绪起伏\n"
+    "5. 用{language}朗读，像真人演戏一样自然，带真实的气息、停顿与情绪起伏\n"
     "表演要求（只影响怎么念，不影响念什么）：{instruction}"
 )
 
@@ -74,6 +75,17 @@ _TRANSCRIPT_RATIO = 1.6
 
 #: 没有逐条念法时的兜底（去播音腔）
 _DEFAULT_INSTRUCTION = "自然的中文口语，像真人对话，句间有呼吸和停顿，不要播音腔"
+_DEFAULT_INSTRUCTION_EN = (
+    "natural conversational English, like real people talking, with breaths and pauses, "
+    "not a newsreader voice"
+)
+#: 按台词原文的语言选朗读语言（英文项目的台词是英文，模型就该用英语念）
+_LANGUAGE_NAMES = {
+    "Mandarin": "中文普通话",
+    "English": "地道的英语（English）",
+    "Japanese": "日语",
+    "Korean": "韩语",
+}
 
 
 class OpenRouterTTSProvider(TTSProvider):
@@ -203,12 +215,20 @@ class OpenRouterTTSProvider(TTSProvider):
         self, request: TTSRequest, text: str, *, stricter: bool = False
     ) -> dict[str, Any]:
         instruction = " ".join(str(request.instruction or "").split()) or _DEFAULT_INSTRUCTION
+        spoken = language.spoken_language_name(text)
+        if spoken == "English" and instruction in {
+            _DEFAULT_INSTRUCTION,
+            " ".join(get_settings().tts_default_instruction.split()),
+        }:
+            instruction = _DEFAULT_INSTRUCTION_EN
         if stricter:
             instruction = (
                 "这一次只念下面这一句，不要任何多余的字，不要接话，不要念括号里的内容。"
                 + instruction
             )
-        system = _SYSTEM_TEMPLATE.format(instruction=instruction)
+        system = _SYSTEM_TEMPLATE.format(
+            instruction=instruction, language=_LANGUAGE_NAMES.get(spoken, "中文普通话")
+        )
         user: str | list[dict[str, Any]] = text
         reference = _reference_wav(request.reference_audio)
         if reference:

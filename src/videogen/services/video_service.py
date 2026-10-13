@@ -15,7 +15,7 @@ from videogen.models.storyboard import Shot, Storyboard
 from videogen.models.video import ClipStatus, MediaKind, VideoClip, VideoManifest
 from videogen.providers.video.base import VideoProvider, VideoRequest
 from videogen.services.storyboard_service import Segment, segments_of
-from videogen.utils import region
+from videogen.utils import language, region
 from videogen.utils.ffmpeg import cut_clip, detect_cuts, ffmpeg_available, probe_duration
 from videogen.utils.redact import scrub_secrets
 
@@ -741,6 +741,8 @@ def camera_directive(camera: str) -> str:
     text = " ".join(str(camera or "").split())
     if not text:
         return ""
+    if text.isascii():
+        return text  # 英文项目的分镜本来就写英文镜头语言
     parts: list[str] = []
     for token, english in _SHOT_SIZE_EN:
         if token in text:
@@ -953,9 +955,10 @@ def dialogue_directive(shot: Shot, bible: StoryBible | None = None) -> str:
             f'an off-screen voice is heard saying: "{text}" — the speaker is not visible, '
             "nobody on screen lip-syncs this line, no on-screen text or captions"
         )
+    spoken = language.spoken_language_name(text)
     return (
-        f'the on-screen speaker says this exact Mandarin line: "{text}" — natural lip-sync '
-        "matched to the Mandarin speech, mouth movement and breathing follow the line, "
+        f'the on-screen speaker says this exact {spoken} line: "{text}" — natural lip-sync '
+        f"matched to the {spoken} speech, mouth movement and breathing follow the line, "
         "no on-screen text or captions"
     )
 
@@ -980,7 +983,10 @@ def narration_directive(shot: Shot, *, settings: Settings | None = None) -> str:
 
 
 def _narration_marker(text: str) -> str:
-    return f'says this exact Mandarin narration off-screen: "{text}"'
+    return (
+        f"says this exact {language.spoken_language_name(text)} narration off-screen: "
+        f'"{text}"'
+    )
 
 
 #: 改了会让已生成的画面不再对应分镜的字段（台词 / 旁白也算：视频 prompt 里有，原声里也念了）

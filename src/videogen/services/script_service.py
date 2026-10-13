@@ -6,6 +6,7 @@ from collections.abc import Callable
 
 from pydantic import BaseModel, Field
 
+from videogen.config import get_settings
 from videogen.models.bible import StoryBible
 from videogen.models.consistency import ConsistencyIssue, IssueSeverity
 from videogen.models.llm_io import (
@@ -35,12 +36,14 @@ from videogen.models.world_state import WorldState
 from videogen.providers.llm.base import LLMMessage, LLMProvider
 from videogen.utils.coerce import coerce_int, ensure_str_list
 from videogen.utils.duration import (
+    DIALOGUE_SHARE,
     SPEECH_CHARS_PER_SEC,
     apply_duration_budget,
     deviation_ratio,
     dialogue_char_budget,
     scale_durations,
 )
+from videogen.utils.language import EN_WORDS_PER_SEC
 
 logger = logging.getLogger(__name__)
 
@@ -130,6 +133,20 @@ def _format_bible(bible: StoryBible) -> str:
     if bible.style.taboo:
         parts.append(f"- 禁忌: {', '.join(bible.style.taboo)}")
     return "\n".join(parts)
+
+
+def _dialogue_budget_line(project: Project, budget: int) -> str:
+    """本场台词量上限：中文按字、英文按词（英文项目的提示词里写「字」模型会数错）。"""
+    if get_settings().language_for(project) == "en":
+        words = int(budget * EN_WORDS_PER_SEC * DIALOGUE_SHARE)
+        return (
+            f"本场全部台词合计不超过 {words} 个英文单词\n"
+            f"（按每秒约 {EN_WORDS_PER_SEC} 个词念，还要给动作和停顿留时间）"
+        )
+    return (
+        f"本场全部台词合计不超过 {dialogue_char_budget(budget)} 字\n"
+        f"（按每秒约 {SPEECH_CHARS_PER_SEC} 字念，还要给动作和停顿留时间）"
+    )
 
 
 def _format_prev_scenes(scenes: list[Scene]) -> str:
@@ -772,8 +789,7 @@ async def generate_scene(
 标题: {outline_scene.title}
 概述: {outline_scene.brief}
 本场时长: 必须为 {budget} 秒（允许 ±2 秒）
-台词总量: 本场全部台词合计不超过 {dialogue_char_budget(budget)} 字
-（按每秒约 {SPEECH_CHARS_PER_SEC} 字念，还要给动作和停顿留时间）；
+台词总量: {_dialogue_budget_line(project, budget)}；
 超了就删句、并句，只留推动剧情的那几句
 全剧预算: 共 {total_scenes} 场，合计 {project.target_duration_sec} 秒
 （这是第 {len(prev_scenes) + 1} 场）

@@ -235,6 +235,7 @@ async def _finish(
     crf: int,
     preset: str,
     burn_file: Path | None = None,
+    sub_language: str = "zho",
     exe: str | None = None,
     bgm_loop: bool = True,
     duck: bool = False,
@@ -369,7 +370,7 @@ async def _finish(
             "-c:s",
             "mov_text",
             "-metadata:s:s:0",
-            "language=zho",
+            f"language={sub_language}",
         ]
 
     args += ["-t", f"{duration:.3f}", "-movflags", "+faststart", output.name]
@@ -831,6 +832,7 @@ async def compose(
         # 变速会把 soft 升级成 burn：传「真正要用的模式」，不是配置里的原值
         mode=SubtitleMode(desired_mode),
         caps=caps,
+        sub_language="eng" if settings.language_for(project) == "en" else "zho",
         exe=burn_exe,
         crf=settings.compose_crf,
         preset=settings.compose_preset,

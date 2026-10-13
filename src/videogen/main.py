@@ -221,6 +221,8 @@ class CreateProjectRequest(BaseModel):
     input_text: str = Field(min_length=1)
     aspect_ratio: AspectRatio = AspectRatio.VERTICAL
     target_duration_sec: int = Field(default=45, ge=5, le=600)
+    #: 成片语言（zh / en；空 = 用 .env 的 PROJECT_LANGUAGE）
+    language: str = Field(default="", pattern="^(zh|en|)$")
 
 
 class UpdateProjectRequest(BaseModel):
@@ -248,6 +250,8 @@ class UpdateProjectRequest(BaseModel):
     subtitle_style: str | None = Field(default=None, pattern="^(soft|box|doc|classic|)$")
     #: 人声来源（native / tts；空字符串 = 恢复默认）
     dub_mode: str | None = Field(default=None, pattern="^(native|tts|)$")
+    #: 成片语言（zh / en；空字符串 = 恢复默认）。只影响之后的生成，已有剧本不会被翻译
+    language: str | None = Field(default=None, pattern="^(zh|en|)$")
 
 
 
@@ -393,6 +397,7 @@ async def list_models():
         # 云端 TTS 有自己的音色表（名字与 Edge 完全不同，不能混用）
         "voices_cloud": voice_catalog.catalog_rows(cloud=True),
         "tts_provider": settings.tts_provider,
+        "project_language": settings.language_for(None),
         "tts_cloud": voice_catalog.is_cloud_target(settings.tts_provider),
         "tts_model": settings.openrouter_tts_model,
         "voice_defaults": {
@@ -443,6 +448,7 @@ async def project_voices(project_id: str):
         bible,
         existing=(manifest.voice_map if manifest else None),
         target=settings.tts_provider,
+        language=settings.language_for(project),
     )
     rows = {row["id"]: row["label"] for row in voice_catalog.catalog_rows(cloud=cloud)}
     names = {c.id: c.name for c in (bible.characters if bible else [])}
@@ -531,6 +537,7 @@ async def create_project(req: CreateProjectRequest):
         input_text=req.input_text.strip(),
         aspect_ratio=req.aspect_ratio,
         target_duration_sec=req.target_duration_sec,
+        language=req.language,
     )
     store.create_project(project)
     return project.model_dump()

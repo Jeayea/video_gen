@@ -1201,3 +1201,14 @@ def test_api_create_uses_readable_id(client):
     assert body["id"].endswith("-变形记")
     assert body["title"] == "变形记"
     assert client.get(f"/api/projects/{body['id']}").json()["title"] == "变形记"
+
+
+def test_api_create_and_update_language(client):
+    created = client.post(
+        "/api/projects", json={"input_text": "A heist in Brooklyn", "language": "en"}
+    ).json()
+    assert created["language"] == "en"
+    updated = client.put(f"/api/projects/{created['id']}", json={"language": "zh"}).json()
+    assert updated["language"] == "zh"
+    bad = client.put(f"/api/projects/{created['id']}", json={"language": "fr"})
+    assert bad.status_code == 422

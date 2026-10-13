@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import math
 
+from videogen.utils import language
+
 __all__ = [
     "SPEECH_CHARS_PER_SEC",
     "apply_duration_budget",
@@ -26,8 +28,8 @@ def speech_chars(text: str) -> int:
 
 
 def speech_seconds(text: str) -> float:
-    """按 `SPEECH_CHARS_PER_SEC` 估算念完这段台词要多少秒。"""
-    return speech_chars(text) / SPEECH_CHARS_PER_SEC
+    """估算念完这段台词要多少秒：汉字按 `SPEECH_CHARS_PER_SEC`，英文按词（见 utils/language）。"""
+    return language.speech_seconds(text)
 
 
 def dialogue_char_budget(duration_sec: int) -> int:

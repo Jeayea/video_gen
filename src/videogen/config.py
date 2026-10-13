@@ -89,13 +89,15 @@ class Settings(BaseSettings):
     openrouter_tts_model: str = "openai/gpt-audio-mini"
     #: 云端配音的落盘格式。**只能是 wav**：流式接口只返回 pcm16，我们自己封 WAV 头
     tts_audio_format: str = "wav"
-    #: 配音参照视频原声（`off` | `native`）。`native`：视频模型自己念过一遍台词
-    #: （需要 `VIDEO_GENERATE_AUDIO=true`），从原声里找出这句话的起止，云端 TTS 听着原声
-    #: 用角色自己的音色重念（节奏/停顿/情绪照原声），时长微调到与原声一致后放回原位置
     #: 成片的人声从哪来：native（默认）= 直接用视频模型原片的声音（对白 / 旁白都由视频模型念，
     #: 配音阶段不调 TTS）；tts = 按镜头 TTS 配音，并启用相关后期（念法文案、原声引导、
     #: 逐帧口型、开口对齐、逐条响度归一）。项目上的 `dub_mode` 优先
     audio_dub_mode: str = "native"
+    #: 新项目默认的成片语言（zh = 普通话 / en = 英语）。项目上的 `language` 优先
+    project_language: str = "zh"
+    #: 配音参照视频原声（`off` | `native`）。`native`：视频模型自己念过一遍台词
+    #: （需要 `VIDEO_GENERATE_AUDIO=true`），从原声里找出这句话的起止，云端 TTS 听着原声
+    #: 用角色自己的音色重念（节奏/停顿/情绪照原声），时长微调到与原声一致后放回原位置
     audio_dub_guide: str = "off"
     #: 重念的配音与原声时长不一致时，变速（不变调）的最大倍率；超出部分不再硬拉
     audio_dub_fit_max_ratio: float = 1.25
@@ -462,6 +464,13 @@ class Settings(BaseSettings):
         """人声来源，非法值当 native（笔误不该偷偷花 TTS 的钱）。"""
         mode = (self.audio_dub_mode or "native").strip().lower()
         return mode if mode in {"native", "tts"} else "native"
+
+    def language_for(self, project: object | None = None) -> str:
+        """成片语言：项目字段 > `PROJECT_LANGUAGE`，认不出来的当中文。"""
+        from videogen.utils.language import normalize_language
+
+        explicit = str(getattr(project, "language", "") or "").strip()
+        return normalize_language(explicit or self.project_language)
 
     @property
     def dub_guide_mode(self) -> str:

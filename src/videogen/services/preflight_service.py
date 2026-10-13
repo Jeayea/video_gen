@@ -31,7 +31,7 @@ from videogen.services import (
     video_service,
 )
 from videogen.services.storyboard_service import Segment
-from videogen.utils.text import count_speech_chars
+from videogen.utils.text import count_speech_chars, estimate_speech_sec
 
 logger = logging.getLogger(__name__)
 
@@ -340,7 +340,7 @@ def audio_plan(
         if text <= 0:
             continue
         # 只是给个「大概几秒」的直觉，不参与计费
-        elapsed += max(0.6, text / 4.5)
+        elapsed += estimate_speech_sec(shot.dialogue_text or shot.narration or "")
 
     script_shots, _skipped = audio_script_service.script_targets(
         storyboard, mode, force=settings.audio_llm_force

@@ -638,6 +638,14 @@ body {
           <label>目标时长（秒）</label>
           <input id="inp-duration" type="number" value="45" min="5" max="600">
         </div>
+        <div>
+          <label>成片语言</label>
+          <select id="inp-language">
+            <option value="">默认（服务端配置）</option>
+            <option value="zh">中文（普通话）</option>
+            <option value="en">English（英语）</option>
+          </select>
+        </div>
       </div>
       <div class="modal-actions">
         <button class="btn btn-outline" onclick="closeCreate()">取消</button>
@@ -694,6 +702,8 @@ let currentOutlineData = null;
 let currentScript = null;
 let currentStoryboard = null;
 let currentProject = null;
+//: 服务端 PROJECT_LANGUAGE（/api/models 下发）
+let DEFAULT_LANGUAGE = 'zh';
 let currentVideo = null;
 let currentAudio = null;
 let currentCompose = null;
@@ -769,7 +779,7 @@ async function loadHealth() {
     try {
       const models = await api('/api/models');
       modelInfo = models;
-      applyVoiceCatalog(models.voices, models.voices_cloud, models.tts_provider);
+      applyVoiceCatalog(models.voices, models.voices_cloud, models.tts_provider, models.project_language);
     } catch (e) { /* 拿不到就用兜底表 */ }
   } catch (e) {
     $('health').textContent = '';
@@ -919,6 +929,7 @@ async function createProject() {
     input_text: $('inp-text').value,
     aspect_ratio: $('inp-aspect').value,
     target_duration_sec: parseInt($('inp-duration').value) || 45,
+    language: $('inp-language').value,
   };
   if (!body.input_text.trim()) { alert('请输入内容'); return; }
   try {
@@ -978,7 +989,7 @@ async function renderProject(id) {
   await loadPreflight('all');
   if (!modelInfo) {
     modelInfo = await safeGet('/api/models');
-    if (modelInfo) applyVoiceCatalog(modelInfo.voices, modelInfo.voices_cloud, modelInfo.tts_provider);
+    if (modelInfo) applyVoiceCatalog(modelInfo.voices, modelInfo.voices_cloud, modelInfo.tts_provider, modelInfo.project_language);
   }
   // 刷新页面后也能看到最近一次批量任务（进行中的继续轮询）
   if (!currentBatch || !currentBatch.is_active) {
@@ -1002,6 +1013,12 @@ async function renderProject(id) {
       </div>
       <span class="spacer"></span>
       <span class="next">下一步：${esc(nextStep(p.status))}</span>
+      <label class="pmeta" style="display:flex;align-items:center;gap:6px" title="剧本 / 台词 / 旁白 / 原声都用这门语言；改了只影响之后的生成">语言
+        <select id="project-language" onchange="onLanguageChange()">
+          <option value="zh" ${projectLanguage() === 'zh' ? 'selected' : ''}>中文</option>
+          <option value="en" ${projectLanguage() === 'en' ? 'selected' : ''}>English</option>
+        </select>
+      </label>
       <label class="pmeta" style="display:flex;align-items:center;gap:6px">LLM
         <select id="project-model"></select>
       </label>
@@ -2319,10 +2336,11 @@ let EDGE_VOICES = [
   ['zh-CN-shaanxi-XiaoniNeural', '晓妮 · 陕西女声'],
 ];
 
-function applyVoiceCatalog(voices, cloudVoices, provider) {
+function applyVoiceCatalog(voices, cloudVoices, provider, language) {
   if (Array.isArray(voices) && voices.length) {
-    EDGE_VOICES = voices.map(v => [v.id, v.label]);
+    EDGE_VOICES = voices.map(v => [v.id, v.label, v.locale || '']);
   }
+  if (language) DEFAULT_LANGUAGE = language;
   if (Array.isArray(cloudVoices) && cloudVoices.length) {
     CLOUD_VOICES = cloudVoices.map(v => [v.id, v.label]);
   }
@@ -2331,7 +2349,11 @@ function applyVoiceCatalog(voices, cloudVoices, provider) {
 
 //: 当前生效的音色表：云端 TTS 与 Edge 的音色名完全不通用
 function activeVoices() {
-  return TTS_PROVIDER === 'openrouter' ? CLOUD_VOICES : EDGE_VOICES;
+  if (TTS_PROVIDER === 'openrouter') return CLOUD_VOICES;
+  // Edge 音色按语言分：英文片只列 en-*，中文片只列 zh-*
+  const lang = projectLanguage();
+  const own = EDGE_VOICES.filter(v => !v[2] || String(v[2]).startsWith(lang));
+  return own.length ? own : EDGE_VOICES;
 }
 
 function stopAudioPolling() {
@@ -3042,6 +3064,24 @@ async function onModelChange() {
       method: 'PUT',
       body: JSON.stringify({ llm_model: model }),
     }));
+}
+
+//: 项目的成片语言（项目没填就用服务端的 PROJECT_LANGUAGE）
+function projectLanguage() {
+  return (currentProject && currentProject.language) || DEFAULT_LANGUAGE;
+}
+
+async function onLanguageChange() {
+  const language = $('project-language').value;
+  const hadScript = !!currentScript;
+  await withBusy('保存成片语言...', () =>
+    api(`/api/projects/${currentProjectId}`, {
+      method: 'PUT',
+      body: JSON.stringify({ language }),
+    }));
+  if (hadScript) {
+    alert('已保存。已经生成的剧本 / 分镜不会被翻译：要换语言的台词，请重新生成剧本和分镜。');
+  }
 }
 
 function currentModel() {

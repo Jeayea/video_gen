@@ -235,7 +235,9 @@ def test_catalog_rows_expose_metadata_for_ui():
     row = next(r for r in rows if r["id"] == "zh-CN-XiaoxiaoNeural")
     assert row["gender"] == "female"
     assert row["age"] and row["timbre"] and row["label"]
-    assert all(r["locale"].startswith("zh") for r in rows)
+    zh = [r for r in rows if r["locale"].startswith("zh")]
+    en = [r for r in rows if r["locale"].startswith("en")]
+    assert len(zh) + len(en) == len(rows) and len(zh) >= 8 and len(en) >= 8
 
 
 # ── 年龄未知 / 圣经里声明的性别（NOVEL 实测：父亲被配成少年音）──────────────

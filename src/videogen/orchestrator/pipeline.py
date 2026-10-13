@@ -48,6 +48,7 @@ from videogen.services import (
     storyboard_service,
     video_service,
 )
+from videogen.utils import language
 from videogen.utils.ffmpeg import ffmpeg_available
 from videogen.utils.file_store import FileStore
 from videogen.utils.redact import scrub_secrets
@@ -214,11 +215,16 @@ class Pipeline:
             self._locks[project_id] = lock
         return lock
 
-    def _llm(self, model: str = "") -> LLMProvider:
-        """拿一个 LLM provider；`model` 非空时切换到指定模型（多模型对比用）。"""
+    def _llm(self, model: str = "", project: Project | None = None) -> LLMProvider:
+        """拿一个 LLM provider；`model` 非空时切换到指定模型（多模型对比用）。
+
+        英文项目会包一层语言覆盖（system prompt 末尾追加「一律用英文写」）。
+        """
         provider = self._llm_factory()
         if model:
-            return provider.with_model(model)
+            provider = provider.with_model(model)
+        if project is not None:
+            provider = language.with_language(provider, get_settings().language_for(project))
         return provider
 
     # ── 成本记账 / 预算 ───────────────────────────────────
@@ -444,7 +450,7 @@ class Pipeline:
             project = self.get_project(project_id)
             self._require(project, GENERATE_BIBLE_STATUSES, "生成故事圣经")
             self._guard_budget(project_id, action="生成故事圣经")
-            llm = self._llm(model)
+            llm = self._llm(model, project)
 
             try:
                 if project.input_mode == InputMode.NOVEL:
@@ -553,7 +559,7 @@ class Pipeline:
             self._require(project, EDIT_BIBLE_STATUSES, "抽取章节资产（需先退回剧本阶段）")
             novel = self._load_novel(project_id)
             self._guard_budget(project_id, action="抽取章节资产")
-            llm = self._llm(model)
+            llm = self._llm(model, project)
             try:
                 _, story = await self._extract_and_merge(project, llm, novel, chapter_ids)
             except PipelineError:
@@ -611,7 +617,7 @@ class Pipeline:
 
             settings = get_settings()
             self._guard_budget(project_id, action="生成长篇大纲")
-            llm = self._llm(model)
+            llm = self._llm(model, project)
             existing = None if force else self.store.load_story_outline(project_id)
             try:
                 outline = await script_service.generate_story_outline(
@@ -675,7 +681,7 @@ class Pipeline:
             novel_mode = project.input_mode == InputMode.NOVEL
             if novel_mode:
                 bible = await self._prepare_novel_chapters(project, chapters, model)
-            llm = self._llm(model)
+            llm = self._llm(model, project)
             review_issues: list = []
             try:
                 script, world_state = await self._run_script_generation(
@@ -740,7 +746,7 @@ class Pipeline:
         if not chapters:
             raise PipelineError("小说模式必须指定要拍的章（chapters），不会默认展开整本书")
         novel = self._load_novel(project.id)
-        llm = self._llm(model)
+        llm = self._llm(model, project)
         try:
             bible, _ = await self._extract_and_merge(project, llm, novel, chapters)
         except PipelineError:
@@ -999,7 +1005,7 @@ class Pipeline:
 
             self._invalidate_media(project_id)
             self._guard_budget(project_id, action="生成分镜")
-            llm = self._llm(model)
+            llm = self._llm(model, project)
             try:
                 storyboard = await self._run_storyboard_generation(project, script, bible, llm)
             except Exception as exc:
@@ -2031,7 +2037,7 @@ class Pipeline:
         """
         if mode == "off":
             return
-        llm = self._llm(settings.audio_llm_model)
+        llm = self._llm(settings.audio_llm_model, project)
         ctx.set_progress(done=0, total=0, message=f"生成配音文案（{mode}）…")
         try:
             outcome = await audio_script_service.apply_voice_script(

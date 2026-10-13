@@ -99,6 +99,9 @@ class Project(BaseModel):
     subtitle_style: str = ""
     #: 人声来源（native = 视频原声 / tts = TTS 配音 + 相关后期；空 = 用 .env 的 AUDIO_DUB_MODE）
     dub_mode: str = ""
+    #: 成片语言（zh = 普通话 / en = 英语；空 = 用 .env 的 PROJECT_LANGUAGE）：剧本、台词、旁白、
+    #: 视频原声与配音音色都按它走
+    language: str = ""
 
     @field_validator("cast_region", mode="before")
     @classmethod

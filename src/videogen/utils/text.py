@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import re
 
+from videogen.utils import language
+
 __all__ = ["clean_spoken_text", "count_speech_chars", "estimate_speech_sec"]
 
 #: 括号里的舞台提示 / 音效提示，配音时不能念出来
@@ -29,7 +31,11 @@ def count_speech_chars(text: str | None) -> int:
 
 def estimate_speech_sec(text: str | None, *, chars_per_sec: float = DEFAULT_CHARS_PER_SEC) -> float:
     """按语速估算语音时长（秒）—— 拿不到真实音频时的兜底。"""
-    chars = count_speech_chars(text)
-    if chars <= 0:
+    cleaned = clean_spoken_text(text)
+    cjk, words = language.speech_units(cleaned)
+    if cjk + words <= 0:
         return 0.0
-    return max(MIN_SPEECH_SEC, round(chars / max(0.5, chars_per_sec), 3))
+    # 英文单词按 2.5 词/秒（与中文语速同比缩放，调用方改 chars_per_sec 时一起变）
+    words_per_sec = language.EN_WORDS_PER_SEC * chars_per_sec / DEFAULT_CHARS_PER_SEC
+    seconds = cjk / max(0.5, chars_per_sec) + words / max(0.3, words_per_sec)
+    return max(MIN_SPEECH_SEC, round(seconds, 3))
