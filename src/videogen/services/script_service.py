@@ -513,8 +513,12 @@ async def expand_chapters(
     *,
     start_index: int = 0,
     sources: dict[str, str] | None = None,
+    previous: list[OutlineScene] | None = None,
+    feedback: str = "",
 ) -> ScriptOutline:
     """把选中的章展开成「分场大纲」（id 由系统分配，续接已有场次编号）。
+
+    `previous` + `feedback`：重做一章时给出上一版的场次和修改意见。
 
     `sources`（章 id → 原文）给了就是**原著改编**：原文进提示词，换用改编口径的
     system prompt，并让模型为每场摘出依据的原文片段（逐场写剧本时据此保留原著对白）。
@@ -566,6 +570,19 @@ async def expand_chapters(
 请逐章展开成分场大纲。场次数量与每场时长按上面给出的预算；
 environment 必须具体到可见细节（不要写「办公室」这种泛称）。只输出 JSON。"""
 
+    if previous is not None:
+        before = "\n".join(
+            f"  - {s.title}（{s.duration_budget_sec} 秒）：{s.brief}" for s in previous
+        ) or "  （无）"
+        note = " ".join(str(feedback or "").split()) or "重新展开一版，场次划分和冲突写得更好"
+        user_prompt += f"""
+
+## 重做这一章（按修改意见）
+上一版的分场：
+{before}
+
+修改意见（优先级最高）：{note}
+意见没提到的部分（章的情节点、钩子、时长预算）保持不变。"""
     adapting = any((sources or {}).get(c.id) for c in chapters)
     if adapting:
         user_prompt += "\n\n这是原著改编：按原文取舍压缩，不要新增情节；每场附上 source_excerpt。"

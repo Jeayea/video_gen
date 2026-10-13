@@ -704,6 +704,8 @@ let currentStoryboard = null;
 let currentProject = null;
 //: 服务端 PROJECT_LANGUAGE（/api/models 下发）
 let DEFAULT_LANGUAGE = 'zh';
+//: 服务端 AUDIO_DUB_MODE（/api/models 下发）
+let DEFAULT_DUB_MODE = 'native';
 let currentVideo = null;
 let currentAudio = null;
 let currentCompose = null;
@@ -779,7 +781,7 @@ async function loadHealth() {
     try {
       const models = await api('/api/models');
       modelInfo = models;
-      applyVoiceCatalog(models.voices, models.voices_cloud, models.tts_provider, models.project_language);
+      applyVoiceCatalog(models.voices, models.voices_cloud, models.tts_provider, models.project_language, models.dub_mode);
     } catch (e) { /* 拿不到就用兜底表 */ }
   } catch (e) {
     $('health').textContent = '';
@@ -989,7 +991,7 @@ async function renderProject(id) {
   await loadPreflight('all');
   if (!modelInfo) {
     modelInfo = await safeGet('/api/models');
-    if (modelInfo) applyVoiceCatalog(modelInfo.voices, modelInfo.voices_cloud, modelInfo.tts_provider, modelInfo.project_language);
+    if (modelInfo) applyVoiceCatalog(modelInfo.voices, modelInfo.voices_cloud, modelInfo.tts_provider, modelInfo.project_language, modelInfo.dub_mode);
   }
   // 刷新页面后也能看到最近一次批量任务（进行中的继续轮询）
   if (!currentBatch || !currentBatch.is_active) {
@@ -1508,6 +1510,10 @@ async function renderAssets() {
                    onchange="uploadAssetReference('${kind}', '${esc(a.id)}', this)" />
           </label>
           ${a.has_reference ? `<button class="btn btn-xs btn-outline" onclick="clearAssetReference('${kind}', '${esc(a.id)}')">清除</button>` : ''}
+          <button class="btn btn-xs btn-outline" title="写一句修改意见，只重写这一条设定（剧本阶段可用）"
+                  onclick="reviseBibleItem('${kind}', '${esc(a.id)}', ${a.has_reference})">按意见重写</button>
+          <button class="btn btn-xs btn-outline" title="自己写英文 prompt 画参考图（按张计费）"
+                  onclick="generateAssetReferenceWithPrompt('${kind}', '${esc(a.id)}', ${a.has_reference})">自定义 prompt 画</button>
         </div>
       </div>
     </div>`;
@@ -1527,6 +1533,32 @@ async function generateAssetReference(kind, id, hasRef) {
   await withBusy(`AI 生成${ASSET_LABEL[kind]}图 ${id}...`, () =>
     api(`/api/projects/${currentProjectId}/assets/${kind}/${encodeURIComponent(id)}/reference/generate`,
       { method: 'POST', body: JSON.stringify({ force: !!hasRef }) }));
+}
+
+async function generateAssetReferenceWithPrompt(kind, id, hasRef) {
+  const prompt = window.prompt(`给 ${id} 写英文 prompt（中文会被画进画面，别写中文）：`, '');
+  if (!prompt || !prompt.trim()) return;
+  await withBusy(`按自定义 prompt 生成 ${id}...`, () =>
+    api(`/api/projects/${currentProjectId}/assets/${kind}/${encodeURIComponent(id)}/reference/generate`,
+      { method: 'POST', body: JSON.stringify({ force: !!hasRef, prompt: prompt.trim() }) }));
+}
+
+// 按修改意见重写一条圣经设定（角色 / 场景 / 道具）；外貌改了且已有参考图时提示重画
+async function reviseBibleItem(kind, id, hasRef) {
+  const feedback = window.prompt(`重写 ${id}：写下修改意见（留空 = 让模型再写一版）`, '');
+  if (feedback === null) return;
+  let result = null;
+  await withBusy(`重写 ${id}...`, async () => {
+    result = await api(`/api/projects/${currentProjectId}/bible/${kind}/${encodeURIComponent(id)}/regenerate`, {
+      method: 'POST', body: JSON.stringify({ feedback, model: currentModel() || null }),
+    });
+  });
+  if (result && result.reference_stale && hasRef
+      && confirm(`${id} 的外貌描述改了，现有参考图已经对不上。现在用 AI 重画一张吗？（按张计费）`)) {
+    await withBusy(`AI 重画 ${id}...`, () =>
+      api(`/api/projects/${currentProjectId}/assets/${kind}/${encodeURIComponent(id)}/reference/generate`,
+        { method: 'POST', body: JSON.stringify({ force: true }) }));
+  }
 }
 
 async function uploadAssetReference(kind, id, input) {
@@ -1571,6 +1603,16 @@ function chapterExpectedSec(ch) {
   return ch.duration_budget_sec || (ch.scene_budget || 3) * 12;
 }
 
+async function redoChapter(chapterId) {
+  const feedback = window.prompt(`重做 ${chapterId}：写下修改意见（留空 = 重新展开一版）。\n这一章的场次和剧本会被替换，其它章不动；已有分镜会作废。`, '');
+  if (feedback === null) return;
+  await withBusy(`重做 ${chapterId}...`, () =>
+    api(`/api/projects/${currentProjectId}/script/generate`, {
+      method: 'POST',
+      body: JSON.stringify({ redo_chapters: [chapterId], feedback, model: currentModel() || null }),
+    }));
+}
+
 function renderStoryOutline() {
   const el = $('story-panel');
   if (!el) return;
@@ -1611,6 +1653,7 @@ function renderStoryOutline() {
                      onchange="toggleChapter('${c.id}', this.checked)">
               <span class="chapter-title">${esc(c.id)} · ${esc(c.title)}</span>
               ${expanded.has(c.id) ? '<span class="tag-mini ok">已展开</span>' : ''}
+              ${expanded.has(c.id) && canEdit ? `<button class="btn btn-xs btn-outline" onclick="event.preventDefault(); redoChapter('${c.id}')" title="按修改意见重新展开这一章（只丢这一章的场次）">按意见重做此章</button>` : ''}
               ${novelMode && !c.source_extracted ? '<span class="tag-mini warn">未抽取</span>' : ''}
               <span class="tag-mini">${c.scene_budget || 3} 场 / 约 ${chapterExpectedSec(c)}s</span>
             </label>
@@ -1759,8 +1802,9 @@ async function loadConsistency(pid) {
   if (!cel) return;
   try {
     const report = await api(`/api/projects/${pid}/consistency`);
+    const again = `<button class="btn btn-xs btn-outline" style="margin-left:6px" onclick="revalidate()" title="按当前剧本 / 分镜重新跑一遍校验（不花钱，LLM 剧本医生除外）">重新校验</button>`;
     if (!report.issues.length) {
-      cel.innerHTML = '<div style="margin-top:10px;font-size:12px;color:var(--text2)">一致性校验：无问题</div>';
+      cel.innerHTML = `<div style="margin-top:10px;font-size:12px;color:var(--text2)">一致性校验：无问题${again}</div>`;
       return;
     }
     const errs = report.issues.filter(i => i.severity === 'error').length;
@@ -1770,7 +1814,7 @@ async function loadConsistency(pid) {
         一致性校验（${esc(report.stage || 'script')}）：
         <span class="tag-mini ${errs ? 'warn' : ''}">${errs} 错误</span>
         <span class="tag-mini ${warns ? 'warn' : ''}">${warns} 警告</span>
-        <span class="tag-mini">${report.issues.length - errs - warns} 提示</span>
+        <span class="tag-mini">${report.issues.length - errs - warns} 提示</span>${again}
       </div>
       <div class="issue-list">
         ${report.issues.map(i => `
@@ -1781,6 +1825,11 @@ async function loadConsistency(pid) {
       </div>
     `;
   } catch (e) { cel.innerHTML = ''; }
+}
+
+async function revalidate() {
+  await withBusy('重新校验...', () =>
+    api(`/api/projects/${currentProjectId}/consistency/revalidate`, { method: 'POST' }));
 }
 
 function toggleSceneEdit(si) {
@@ -2382,11 +2431,12 @@ let EDGE_VOICES = [
   ['zh-CN-shaanxi-XiaoniNeural', '晓妮 · 陕西女声'],
 ];
 
-function applyVoiceCatalog(voices, cloudVoices, provider, language) {
+function applyVoiceCatalog(voices, cloudVoices, provider, language, dubMode) {
   if (Array.isArray(voices) && voices.length) {
     EDGE_VOICES = voices.map(v => [v.id, v.label, v.locale || '']);
   }
   if (language) DEFAULT_LANGUAGE = language;
+  if (dubMode) DEFAULT_DUB_MODE = dubMode;
   if (Array.isArray(cloudVoices) && cloudVoices.length) {
     CLOUD_VOICES = cloudVoices.map(v => [v.id, v.label]);
   }
@@ -2489,6 +2539,7 @@ function renderAudio() {
   const active = !!(job && job.is_active);
   const status = currentProject ? currentProject.status : '';
   const clips = (a.manifest && a.manifest.clips) || [];
+  const ttsMode = projectDubMode() === 'tts';
 
   $('audio-tags').innerHTML = summary
     ? `<span class="tag-mini">${summary.ready}/${summary.total} 条</span>` +
@@ -2544,6 +2595,7 @@ function renderAudio() {
               ? `<audio controls preload="none" src="/api/projects/${currentProjectId}/audio/${encodeURIComponent(c.id)}"></audio>`
               : ''}
             ${c.error ? `<div class="clip-error">${esc(c.error)}</div>` : ''}
+            ${ttsMode && c.shot_id && !active ? `<div class="shot-actions"><button class="btn btn-sm btn-outline" onclick="redubLine('${esc(c.shot_id)}', ${esc(JSON.stringify(c.instruction || ''))})">重配这句</button></div>` : ''}
           </div>`;
       }).join('')}</div>
       ${(a.manifest && a.manifest.warnings && a.manifest.warnings.length)
@@ -2579,6 +2631,14 @@ function renderAudio() {
   if (!buttons.length) {
     buttons.push(`<span class="hint">${esc(audioHint(status))}</span>`);
   }
+  const dub = (currentProject && currentProject.dub_mode) || '';
+  buttons.push(`<label class="pmeta" style="display:inline-flex;align-items:center;gap:6px;margin-left:8px"
+      title="原声 = 直接用视频模型念的台词 / 旁白（不花 TTS 钱）；TTS = 按镜头配音 + 念法 / 口型等后期">人声来源
+    <select onchange="onDubModeChange(this.value)" ${active ? 'disabled' : ''}>
+      <option value="" ${dub === '' ? 'selected' : ''}>默认（${esc(DEFAULT_DUB_MODE === 'tts' ? 'TTS' : '原声')}）</option>
+      <option value="native" ${dub === 'native' ? 'selected' : ''}>视频原声</option>
+      <option value="tts" ${dub === 'tts' ? 'selected' : ''}>TTS 配音</option>
+    </select></label>`);
   actions.innerHTML = buttons.join('');
   renderAudioScript();
 
@@ -2603,8 +2663,39 @@ async function refreshAudioPanel() {
   if (!active && job && job.id === previousJobId) await refresh();
 }
 
-function doGenerateAudio() {
+function projectDubMode() {
+  return (currentProject && currentProject.dub_mode) || DEFAULT_DUB_MODE;
+}
+
+async function onDubModeChange(value) {
+  await withBusy('保存人声来源...', () =>
+    api(`/api/projects/${currentProjectId}`, { method: 'PUT', body: JSON.stringify({ dub_mode: value }) }));
+}
+
+// 成片已完成时先退回配音阶段（成片作废），否则状态机不允许重做配音
+async function reopenAudioIfDone() {
+  if (!currentProject || currentProject.status !== 'done') return true;
+  if (!confirm('成片已经做完。重做配音会退回配音阶段，旧成片作废（之后需要重新合成）。继续？')) return false;
+  await api(`/api/projects/${currentProjectId}/audio/reopen`, { method: 'POST' });
+  return true;
+}
+
+async function redubLine(shotId, currentInstruction) {
+  const instruction = window.prompt(`重配 ${shotId}：念法（自然语言，云端 TTS 生效；不改就直接确定）`, currentInstruction || '');
+  if (instruction === null) return;
+  stopAudioPolling();
+  await withBusy(`重配 ${shotId}...`, () =>
+    api(`/api/projects/${currentProjectId}/audio/redub`, {
+      method: 'POST',
+      body: JSON.stringify({ shots: [shotId], instruction: instruction.trim() === (currentInstruction || '') ? null : instruction.trim() }),
+    }));
+}
+
+async function doGenerateAudio() {
   const voices = currentVoiceOverrides();
+  try {
+    if (!(await reopenAudioIfDone())) return;
+  } catch (e) { alert('退回配音阶段失败：' + e.message); return; }
   stopAudioPolling();
   withBusy('提交配音任务...', () =>
     api(`/api/projects/${currentProjectId}/audio/generate`, {
@@ -2714,6 +2805,15 @@ function renderCompose() {
         <option value="none">none · 只导出 srt / vtt</option>
       </select>
     </label>
+    <label>烧字幕样式（只对 burn 生效，保存在项目上）
+      <select id="compose-subtitle-style" onchange="onSubtitleStyleChange(this.value)">
+        <option value="">默认（服务端配置）</option>
+        <option value="soft">soft · 柔和描边 + 模糊</option>
+        <option value="box">box · 半透明底条</option>
+        <option value="doc">doc · 纪录片宋体</option>
+        <option value="classic">classic · 老样式硬描边</option>
+      </select>
+    </label>
     <div class="row">
       <label>曲库曲目 id（只对「曲库」引擎有意义，留空=按情绪自动选）
         <input id="compose-bgm-id" placeholder="tense_01" />
@@ -2733,6 +2833,8 @@ function renderCompose() {
   `;
   const modeSel = $('compose-subtitle-mode');
   if (modeSel) modeSel.value = (report && report.subtitle_mode) || 'soft';
+  const styleSel = $('compose-subtitle-style');
+  if (styleSel) styleSel.value = (currentProject && currentProject.subtitle_style) || '';
   const bgmInput = $('compose-bgm-id');
   if (bgmInput && report && report.bgm_id) bgmInput.value = report.bgm_id;
   const ambientSel = $('compose-ambient');
@@ -2974,6 +3076,13 @@ async function doShowMusicPrompt() {
   box.appendChild(node);
   node.select();
   try { document.execCommand('copy'); } catch (e) { /* 复制失败就让用户自己选 */ }
+}
+
+async function onSubtitleStyleChange(value) {
+  try {
+    const p = await api(`/api/projects/${currentProjectId}`, { method: 'PUT', body: JSON.stringify({ subtitle_style: value }) });
+    currentProject = p;
+  } catch (e) { alert('保存字幕样式失败：' + e.message); }
 }
 
 function doCompose() {

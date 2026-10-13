@@ -21,7 +21,7 @@ from videogen.models.script import (
     ScriptOutline,
     StoryOutline,
 )
-from videogen.models.storyboard import DurationTier, Shot, Storyboard
+from videogen.models.storyboard import DurationTier, Shot, Storyboard, VoiceDirection
 from videogen.models.video import ClipStatus, VideoManifest
 from videogen.models.world_state import WorldState
 from videogen.orchestrator.jobs import Job, JobContext, JobManager
@@ -599,6 +599,49 @@ class Pipeline:
             self._revalidate(project, bible, self.store.load_script(project_id))
             return bible
 
+    async def regenerate_bible_item(
+        self,
+        project_id: str,
+        kind: str,
+        item_id: str,
+        *,
+        feedback: str = "",
+        model: str = "",
+    ) -> dict:
+        """按修改意见重写圣经里的一个角色 / 场景 / 道具（id、参考图、音色不变）。
+
+        外貌变了而条目已经有参考图时返回 `reference_stale=True`，提示用户重画定妆照 / 场景图。
+        """
+        async with self._lock(project_id):
+            project = self.get_project(project_id)
+            self._require(project, EDIT_BIBLE_STATUSES, "重写圣经条目（需先退回剧本阶段）")
+            bible = self.store.load_bible(project_id)
+            if bible is None:
+                raise PipelineError("故事圣经不存在，请先生成圣经")
+            if bible_service.find_item(bible, kind, item_id) is None:
+                raise PipelineError(f"圣经里没有 {kind}/{item_id}")
+            self._guard_budget(project_id, action="重写圣经条目")
+            llm = self._llm(model, project)
+            try:
+                item, changed_look = await bible_service.regenerate_item(
+                    project, bible, llm, kind, item_id, feedback=feedback
+                )
+            except Exception as exc:
+                raise PipelineError(f"重写圣经条目失败：{exc}") from exc
+            finally:
+                self._record_llm_cost(project_id, CostStage.BIBLE, llm)
+                await llm.aclose()
+            items = getattr(bible, kind)
+            setattr(bible, kind, [item if x.id == item_id else x for x in items])
+            self.store.save_bible(project_id, bible)
+            self._invalidate_media(project_id)
+            self._revalidate(project, bible, self.store.load_script(project_id))
+            return {
+                "kind": kind,
+                "item": item.model_dump(),
+                "reference_stale": bool(changed_look and getattr(item, "reference_image", "")),
+            }
+
     # ── 长篇剧集大纲 ──────────────────────────────────────
 
     async def generate_story_outline(
@@ -677,8 +720,13 @@ class Pipeline:
         *,
         chapters: list[str] | None = None,
         force: bool = False,
+        redo_chapters: list[str] | None = None,
+        feedback: str = "",
     ) -> Script:
         """生成剧本。
+
+        `redo_chapters`：把已经展开过的章按修改意见（`feedback`）重做 —— 只丢这几章的场次，
+        其它章的剧本原样保留（场次编号会重排）。
 
         - 有长篇大纲时：只把**选中的章**展开成场次（`chapters=None` = 全部章），
           已经展开过的章不会重复生成；`force=True` 清空重来
@@ -693,6 +741,9 @@ class Pipeline:
                 raise PipelineError("故事圣经不存在，请先生成圣经")
 
             self._guard_budget(project_id, action="生成剧本")
+            if redo_chapters and not chapters:
+                # 只重做：别把「不选 = 全部章」带出来，一口气展开整本书
+                chapters = list(redo_chapters)
             novel_mode = project.input_mode == InputMode.NOVEL
             if novel_mode:
                 bible = await self._prepare_novel_chapters(project, chapters, model)
@@ -700,7 +751,13 @@ class Pipeline:
             review_issues: list = []
             try:
                 script, world_state = await self._run_script_generation(
-                    project, bible, llm, chapters=chapters, force=force
+                    project,
+                    bible,
+                    llm,
+                    chapters=chapters,
+                    force=force,
+                    redo_chapters=redo_chapters,
+                    feedback=feedback,
                 )
                 # 结构评审：机器判不了的那部分（钩子/转折/高潮/因果）交给 LLM 当剧本医生。
                 # 放在 try 内是为了让 finally 里的记账把两次调用的 token 一起记进 script 阶段；
@@ -782,6 +839,8 @@ class Pipeline:
         *,
         chapters: list[str] | None = None,
         force: bool = False,
+        redo_chapters: list[str] | None = None,
+        feedback: str = "",
     ) -> tuple[Script, WorldState]:
         """逐场生成剧本，每场生成后立即落盘，失败可续跑。
 
@@ -798,7 +857,14 @@ class Pipeline:
             raise PipelineError("小说模式缺少章节大纲：请先生成故事圣经（会切章并抽取）")
         if story and story.chapters:
             outline, script, world_state = await self._expand_selected_chapters(
-                project, bible, llm, story, chapters=chapters, force=force
+                project,
+                bible,
+                llm,
+                story,
+                chapters=chapters,
+                force=force,
+                redo=redo_chapters or [],
+                feedback=feedback,
             )
         else:
             outline = self.store.load_outline(project_id) if resuming else None
@@ -825,19 +891,23 @@ class Pipeline:
                 )
 
         done = script.scene_ids()
+        order = {s.id: i for i, s in enumerate(outline.scenes)}
         for outline_scene in outline.scenes:
             if outline_scene.id in done:
                 continue
+            # 重做中间某一章时，后面的场次已经在剧本里：上下文只给它前面的场次
+            before = [s for s in script.scenes if order.get(s.id, -1) < order[outline_scene.id]]
             scene, response = await script_service.generate_scene(
                 llm,
                 project,
                 bible,
                 outline_scene,
-                script.scenes,
+                before,
                 world_state,
                 len(outline.scenes),
             )
             script.scenes.append(scene)
+            script.scenes.sort(key=lambda s: order.get(s.id, len(order)))
             world_state.apply_delta(response.world_state_delta)
             # 逐场落盘：中途失败也不会丢掉已经生成的场次
             self.store.save_script(project_id, script)
@@ -858,6 +928,8 @@ class Pipeline:
         *,
         chapters: list[str] | None,
         force: bool,
+        redo: list[str] | None = None,
+        feedback: str = "",
     ) -> tuple[ScriptOutline, Script, WorldState]:
         """把选中的章展开成场次（追加语义），并把项目目标时长对齐到已展开的章。"""
         project_id = project.id
@@ -879,11 +951,17 @@ class Pipeline:
             )
             world_state = self.store.load_world_state(project_id) or WorldState()
 
-        existing = outline.chapter_ids()
-        todo = [cid for cid in selected if cid not in existing]
         novel = (
             self.store.load_novel(project_id) if project.input_mode == InputMode.NOVEL else None
         )
+        redone = [cid for cid in dict.fromkeys(redo or []) if cid in outline.chapter_ids()]
+        for cid in redone:
+            await self._redo_chapter(
+                project, bible, llm, story, outline, script, cid, novel=novel, feedback=feedback
+            )
+
+        existing = outline.chapter_ids()
+        todo = [cid for cid in selected if cid not in existing]
         for cid in todo:
             source = novel.get_chapter(cid) if novel else None
             # 一次展开一章：多章挤在一个 prompt 里时模型会漏写后面的章
@@ -902,8 +980,8 @@ class Pipeline:
             self.store.save_outline(project_id, outline)
             self.store.save_script(project_id, script)
 
-        if todo:
-            # 追加了场次：旧分镜/媒体与新剧本不再对应
+        if todo or redone:
+            # 追加/重做了场次：旧分镜/媒体与新剧本不再对应
             self.store.remove_artifact(project_id, "storyboard")
             self._invalidate_media(project_id)
 
@@ -936,6 +1014,54 @@ class Pipeline:
             project.target_duration_sec,
         )
         return outline, script, world_state
+
+    async def _redo_chapter(
+        self,
+        project: Project,
+        bible: StoryBible,
+        llm: LLMProvider,
+        story: StoryOutline,
+        outline: ScriptOutline,
+        script: Script,
+        chapter_id: str,
+        *,
+        novel: NovelSource | None,
+        feedback: str,
+    ) -> None:
+        """重做一章：丢掉它的分场与剧本，按修改意见重新展开，插回原位置并重排场次编号。
+
+        剧本里这一章的场次留空，交给后面的逐场生成补上；别的章的剧本内容不动（只改 id）。
+        """
+        old = [s for s in outline.scenes if s.chapter_id == chapter_id]
+        position = outline.scenes.index(old[0])
+        old_ids = {s.id for s in old}
+        source = novel.get_chapter(chapter_id) if novel else None
+        extra = await script_service.expand_chapters(
+            llm,
+            project,
+            bible,
+            story,
+            [chapter_id],
+            start_index=position,
+            sources={chapter_id: source.text} if source else None,
+            previous=old,
+            feedback=feedback,
+        )
+        # 先给新场次临时 id，避免和后面章节的旧编号撞车，再整体重排
+        for index, scene in enumerate(extra.scenes):
+            scene.id = f"__redo_{index}"
+        rest = [s for s in outline.scenes if s.chapter_id != chapter_id]
+        outline.scenes = rest[:position] + extra.scenes + rest[position:]
+        script.scenes = [s for s in script.scenes if s.id not in old_ids]
+        renamed: dict[str, str] = {}
+        for number, scene in enumerate(outline.scenes, start=1):
+            renamed[scene.id] = f"scene_{number}"
+            scene.id = f"scene_{number}"
+        for scene in script.scenes:
+            scene.id = renamed.get(scene.id, scene.id)
+        logger.info(
+            "重做章 %s：%d 场 -> %d 场（场次编号已重排）", chapter_id, len(old), len(extra.scenes)
+        )
 
     def _is_partial_arc(self, project_id: str) -> bool:
         """当前剧本是否只是长篇剧集里的一段（还有章没展开）。
@@ -1304,6 +1430,54 @@ class Pipeline:
             project.status = ProjectStatus.VIDEO_READY
             self.store.save_project(project)
             return project
+
+    async def redub_lines(
+        self,
+        project_id: str,
+        shot_ids: list[str],
+        *,
+        instruction: str | None = None,
+        script_mode: str | None = None,
+    ) -> Job:
+        """只重配这几句（TTS 模式）：可顺手改念法，其余配音原样复用，再提交配音任务。
+
+        成片已经做完（DONE）时会退回配音阶段 —— 旧成片里还是旧的那句。
+        """
+        async with self._lock(project_id):
+            project = self.get_project(project_id)
+            if video_service.dub_mode_for(project) != "tts":
+                raise PipelineError(
+                    "这个项目用的是视频原声（dub_mode=native），没有 TTS 配音可以重配"
+                )
+            self._require(
+                project, GENERATE_AUDIO_STATUSES | REOPEN_AUDIO_STATUSES, "重配这几句"
+            )
+            manifest = self.store.load_audio_manifest(project_id)
+            storyboard = self.store.load_storyboard(project_id)
+            wanted = set(shot_ids)
+            if storyboard is None or not wanted:
+                raise PipelineError("没有要重配的镜头")
+            unknown = wanted - {s.id for s in storyboard.shots}
+            if unknown:
+                raise PipelineError(f"分镜里没有这些镜头：{'、'.join(sorted(unknown))}")
+            if instruction is not None:
+                # 念法写回分镜：重配时它进 TTS 请求，改了念法本身也会触发重新合成
+                for shot in storyboard.shots:
+                    if shot.id in wanted:
+                        direction = shot.voice_direction or VoiceDirection()
+                        shot.voice_direction = direction.model_copy(
+                            update={"instruction": instruction.strip()}
+                        )
+                self.store.save_storyboard(project_id, storyboard)
+            if manifest is not None:
+                for clip in manifest.clips:
+                    if clip.shot_id in wanted:
+                        clip.status = ClipStatus.PENDING
+                self.store.save_audio_manifest(project_id, manifest)
+            if project.status in REOPEN_AUDIO_STATUSES:
+                project.status = ProjectStatus.VIDEO_READY
+                self.store.save_project(project)
+        return await self.start_audio_generation(project_id, script_mode=script_mode or "off")
 
     async def reopen_storyboard(self, project_id: str) -> Project:
         async with self._lock(project_id):

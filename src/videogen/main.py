@@ -409,6 +409,7 @@ async def list_models():
         "voices_cloud": voice_catalog.catalog_rows(cloud=True),
         "tts_provider": settings.tts_provider,
         "project_language": settings.language_for(None),
+        "dub_mode": settings.dub_mode,
         "tts_cloud": voice_catalog.is_cloud_target(settings.tts_provider),
         "tts_model": settings.openrouter_tts_model,
         "voice_defaults": {
@@ -631,6 +632,19 @@ class NovelExtractRequest(GenerateRequest):
     chapters: list[str] = Field(min_length=1, max_length=200)
 
 
+@app.post("/api/projects/{project_id}/bible/{kind}/{item_id}/regenerate")
+async def regenerate_bible_item(
+    project_id: str, kind: str, item_id: str, req: ReviseRequest | None = None
+):
+    """按修改意见重写一个角色 / 场景 / 道具（kind = characters / settings / props）。"""
+    if kind not in ("characters", "settings", "props"):
+        raise HTTPException(400, "kind 只能是 characters / settings / props")
+    req = req or ReviseRequest()
+    return await pipeline.regenerate_bible_item(
+        project_id, kind, item_id, feedback=req.feedback, model=_model_of(project_id, req)
+    )
+
+
 @app.get("/api/projects/{project_id}/novel")
 async def get_novel(project_id: str):
     """切章结果（不含原文，避免把整本书塞进响应）。"""
@@ -707,6 +721,9 @@ class ScriptGenerateRequest(GenerateRequest):
     chapters: list[str] | None = None
     #: 清空重来（会作废下游分镜与已生成的媒体）
     force: bool = False
+    #: 按修改意见重做这几章（已经展开过的章）：只丢这几章的场次，其它章保留
+    redo_chapters: list[str] | None = None
+    feedback: str = Field(default="", max_length=2000)
 
 
 @app.post("/api/projects/{project_id}/script/generate")
@@ -717,6 +734,8 @@ async def generate_script(project_id: str, req: ScriptGenerateRequest | None = N
         model=_model_of(project_id, body),
         chapters=body.chapters,
         force=body.force,
+        redo_chapters=body.redo_chapters,
+        feedback=body.feedback,
     )
     return script.model_dump()
 
@@ -970,6 +989,19 @@ async def generate_audio(project_id: str, req: AudioGenerateRequest | None = Non
         use_vision=req.use_vision if req else None,
         force_script=req.force_script if req else None,
     )
+    return {"job": job.to_public()}
+
+
+class RedubRequest(BaseModel):
+    shots: list[str] = Field(min_length=1, max_length=200)
+    #: 新念法（自然语言，云端 TTS 用）；不给 = 念法不变，只是再念一遍
+    instruction: str | None = Field(default=None, max_length=500)
+
+
+@app.post("/api/projects/{project_id}/audio/redub", status_code=202)
+async def redub_lines(project_id: str, req: RedubRequest):
+    """只重配这几句（TTS 模式），其余配音复用；成片已完成时会退回配音阶段。"""
+    job = await pipeline.redub_lines(project_id, req.shots, instruction=req.instruction)
     return {"job": job.to_public()}
 
 

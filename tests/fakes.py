@@ -163,6 +163,9 @@ class FakeLLM(LLMProvider):
         user = message_text(messages[-1])
 
         # 用各阶段 system prompt 里独一无二的锚点判断，避免误匹配
+        if "故事圣经条目修订" in system:
+            self._maybe_fail("bible_item")
+            return self._bible_item(user)
         if "资深短剧策划" in system:
             self._maybe_fail("bible")
             return self._bible()
@@ -198,6 +201,18 @@ class FakeLLM(LLMProvider):
             self._maybe_fail("audio_script")
             return self._voice_script(messages)
         return {}
+
+    def _bible_item(self, user: str) -> dict:
+        """单条重写：照抄当前版本，描述 / 外貌加个标记，方便测试断言。"""
+        kind = re.search(r"类型: (\w+)", user).group(1)
+        item_id = re.search(r"条目 id: (\w+)", user).group(1)
+        item = next(x for x in self._bible()[kind] if x["id"] == item_id)
+        return {
+            **item,
+            "description": f"{item.get('description', '')}（已修订）",
+            "visual_prompt": f"{item.get('visual_prompt', '')}, revised",
+            "reference_image": "model-should-not-touch-this",
+        }
 
     def _story_outline(self, system: str, user: str) -> dict:
         """长篇大纲：骨架一次给全，正文按批扩写（id 从用户提示里照抄）。"""

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import logging
 
-from videogen.models.bible import StoryBible
+from pydantic import BaseModel
+
+from videogen.models.bible import Character, Prop, Setting, StoryBible
 from videogen.models.project import InputMode, Project
 from videogen.providers.llm.base import LLMMessage, LLMProvider
 from videogen.utils import region
@@ -203,3 +205,90 @@ def finalize_bible(bible: StoryBible, project: Project) -> StoryBible:
         if not fact.id:
             fact.id = f"fact_{i}"
     return bible
+
+
+# ── 单条重写 ─────────────────────────────────────────────
+
+BIBLE_ITEM_SYSTEM = """你负责故事圣经条目修订：按用户的修改意见，重写故事圣经里的**一个**条目
+（一个角色 / 一个场景 / 一个关键道具），其余条目只是给你看的上下文，不要改它们。
+
+规则：
+- 只输出这一个条目的 JSON 对象（不是数组，不要外层包装），字段和「当前版本」一样
+- id 原样保留；意见没提到的字段尽量保持（尤其是名字、年龄、性别、和其他角色的关系）
+- visual_prompt 必须是英文，只描述外貌 / 服装 / 气质（场景写可见陈设与光线，道具写材质颜色形状），
+  不要写任何 id，外貌要和 region 一致
+- 角色的 age 是数字，gender 填 male / female
+- 只输出 JSON"""
+
+#: kind（URL 里的写法）→ 圣经里的列表字段与条目模型
+ITEM_KINDS: dict[str, type[BaseModel]] = {
+    "characters": Character,
+    "settings": Setting,
+    "props": Prop,
+}
+#: 这些字段不交给模型改：参考图 / seed / 音色是用户或后续步骤定下来的
+_KEEP_FIELDS = ("id", "reference_image", "seed", "voice_id")
+
+
+def find_item(bible: StoryBible, kind: str, item_id: str) -> BaseModel | None:
+    items = getattr(bible, kind, None) if kind in ITEM_KINDS else None
+    return next((item for item in items or [] if item.id == item_id), None)
+
+
+def _context_lines(bible: StoryBible, kind: str, item_id: str) -> str:
+    rows: list[str] = []
+    for c in bible.characters:
+        if not (kind == "characters" and c.id == item_id):
+            rows.append(f"- 角色 {c.id} {c.name}（{c.role}，{c.age or '?'} 岁）：{c.description}")
+    for loc in bible.settings:
+        if not (kind == "settings" and loc.id == item_id):
+            rows.append(f"- 场景 {loc.id} {loc.name}：{loc.description}")
+    for prop in bible.props:
+        if not (kind == "props" and prop.id == item_id):
+            rows.append(f"- 道具 {prop.id} {prop.name}：{prop.description}")
+    style = bible.style
+    rows.append(f"- 风格：{style.genre} / {style.tone} / {style.pacing}")
+    return "\n".join(rows)
+
+
+async def regenerate_item(
+    project: Project,
+    bible: StoryBible,
+    llm: LLMProvider,
+    kind: str,
+    item_id: str,
+    *,
+    feedback: str = "",
+) -> tuple[BaseModel, bool]:
+    """按修改意见重写一个圣经条目，返回 `(新条目, 外貌是否变了)`。不改 `bible` 本身。
+
+    外貌（visual_prompt）变了时，已有的参考图 / 定妆照就和文字对不上了 —— 由调用方提示用户重画。
+    """
+    model = ITEM_KINDS.get(kind)
+    current = find_item(bible, kind, item_id)
+    if model is None or current is None:
+        raise ValueError(f"圣经里没有 {kind}/{item_id}")
+    note = " ".join(str(feedback or "").split()) or "重新写一版，更鲜明、更有辨识度"
+    user_prompt = f"""类型: {kind}
+条目 id: {item_id}
+
+## 当前版本
+{current.model_dump_json(indent=2)}
+
+## 圣经里的其它条目（上下文，不要改）
+{_context_lines(bible, kind, item_id)}
+
+## 修改意见（优先级最高）
+{note}"""
+    constraint = constraint_block(project)
+    if constraint:
+        user_prompt += f"\n\n{constraint}"
+    messages = [
+        LLMMessage(role="system", content=BIBLE_ITEM_SYSTEM),
+        LLMMessage(role="user", content=user_prompt),
+    ]
+    fresh = await llm.chat_json(messages, schema=model, temperature=0.7, max_tokens=2048)
+    fresh = fresh.model_copy(update={field: getattr(current, field) for field in _KEEP_FIELDS
+                                     if hasattr(current, field)})
+    changed_look = " ".join(fresh.visual_prompt.split()) != " ".join(current.visual_prompt.split())
+    return fresh, changed_look

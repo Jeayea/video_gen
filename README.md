@@ -102,7 +102,10 @@ python -m videogen.tools.demo_bgm     # 可选：生成 4 首演示 BGM 到 ./as
 进入项目后，左侧是阶段导航：每个阶段显示完成情况和摘要，状态推进后会自动跳到下一步。
 第一步「生成圣经」（小说项目可设置先抽取前几章）。生成后，角色、场景、关键道具以卡片列出，
 每张卡片可以 **AI 生成** 参考图（角色是定妆照、场景是无人背景板、道具是白底单品图）或 **上传** 自己的图。
-配了图的资产会在生成视频时一起送给视频模型，保持跨镜头一致：
+配了图的资产会在生成视频时一起送给视频模型，保持跨镜头一致。
+卡片上的「按意见重写」只重写这一条设定（id、参考图、音色不变；外貌改了会提示重画参考图，
+`POST /api/projects/{id}/bible/{characters|settings|props}/{item_id}/regenerate`），
+「自定义 prompt 画」用你自己写的英文 prompt 出图：
 
 ![圣经与资产](docs/screenshots/03-assets.jpg)
 
@@ -111,7 +114,9 @@ python -m videogen.tools.demo_bgm     # 可选：生成 4 首演示 BGM 到 ./as
 普通项目直接点「生成剧本」。长篇项目和小说项目会先显示章节列表：勾选要拍的章，按钮上会显示预计时长和视频费，
 点「生成选中章节的剧本」即可（小说里没抽取过的章会先抽取、增量并进圣经）。生成后检查剧本和校验报告，
 没问题就「确认剧本」。某一场不满意时点场次上的「按意见重写」，写一句修改意见（例如「让赵明远更阴险，台词少一半」），
-只重写这一场，其余场次不动（`POST /api/projects/{id}/script/scenes/{scene_id}/regenerate {"feedback": "..."}`）：
+只重写这一场，其余场次不动（`POST /api/projects/{id}/script/scenes/{scene_id}/regenerate {"feedback": "..."}`）。
+长篇 / 小说项目里已经展开过的章可以「按意见重做此章」：只替换这一章的场次和剧本，其它章原样保留、场次编号顺延
+（`POST /api/projects/{id}/script/generate {"redo_chapters": ["ch_2"], "feedback": "..."}`）：
 
 ![剧本与章节](docs/screenshots/04-script.png)
 
@@ -140,6 +145,9 @@ python -m videogen.tools.demo_bgm     # 可选：生成 4 首演示 BGM 到 ./as
 
 「配音」阶段选择音色和配音文案模式后生成配音；「成片与配乐」阶段生成配乐、调整字幕和响度选项，
 然后合成。成片可以在页面里带字幕预览，并下载 MP4 和字幕文件。
+配音面板里可以切「人声来源」（视频原声 / TTS 配音，存在项目上）；TTS 模式下每条配音都有「重配这句」，
+可以顺手改念法，只重新合成这一条（`POST /api/projects/{id}/audio/redub {"shots": [...], "instruction": "..."}`）。
+成片做完后再重做配音会先退回配音阶段（旧成片作废）。烧字幕样式在合成面板里选，也存在项目上。
 旁白由视频模型原生念出的镜头（`VIDEO_PROMPT_NARRATION`）不再用 TTS 配第二遍，合成时按原音量用片段原声。
 截图里就是这样：18 个镜头的旁白都来自 H3 原声，字幕烧进画面，没有配乐：
 
