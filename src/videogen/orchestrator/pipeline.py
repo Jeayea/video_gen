@@ -133,6 +133,13 @@ REOPEN_STORYBOARD_STATUSES = {
 EDIT_BIBLE_STATUSES = {ProjectStatus.DRAFT, ProjectStatus.FAILED, ProjectStatus.SCRIPT_REVIEW}
 EDIT_SCRIPT_STATUSES = {ProjectStatus.DRAFT, ProjectStatus.FAILED, ProjectStatus.SCRIPT_REVIEW}
 EDIT_STORYBOARD_STATUSES = {ProjectStatus.SCRIPT_CONFIRMED, ProjectStatus.STORYBOARD_REVIEW}
+#: 确认之后（甚至成片之后）也能改分镜：只作废受影响的段，其余已生成的片段保留
+EDIT_CONFIRMED_STORYBOARD_STATUSES = {
+    ProjectStatus.STORYBOARD_CONFIRMED,
+    ProjectStatus.VIDEO_READY,
+    ProjectStatus.AUDIO_READY,
+    ProjectStatus.DONE,
+}
 
 #: 视频生成入口：确认分镜后开跑，或在 VIDEO_READY 下补跑失败/未生成的镜头。
 #: 允许 VIDEO_GENERATING 是为了让「任务已死但状态没收拾干净」的项目也能手动重试。
@@ -1129,22 +1136,119 @@ class Pipeline:
             self.store.save_project(project)
             return project
 
+    async def storyboard_impact(self, project_id: str, data: dict) -> dict:
+        """只算不写：按这份分镜保存的话，哪些已生成的段要重做、大概多少钱。"""
+        async with self._lock(project_id):
+            self.get_project(project_id)
+            storyboard = await self._parse_storyboard(data)
+            impact = video_service.storyboard_impact(
+                self.store.load_storyboard(project_id),
+                storyboard,
+                self.store.load_video_manifest(project_id),
+            )
+        preflight = await self.preflight(project_id, action="video")
+        price = ((preflight.get("video") or {}).get("price_per_second")) or 0.0
+        impact["price_per_second"] = price
+        impact["estimated_usd"] = round(impact["stale_seconds"] * price, 4)
+        return impact
+
+    async def _parse_storyboard(self, data: dict) -> Storyboard:
+        try:
+            storyboard = Storyboard.model_validate(data)
+        except Exception as exc:
+            raise PipelineError(f"分镜更新失败：{exc}") from exc
+        # 镜头改了时长/顺序，段落要按新分镜重编（编段按场确定性计算，别的场不受影响）
+        return await self._apply_segment_mode(storyboard)
+
     async def update_storyboard(self, project_id: str, data: dict) -> Storyboard:
+        """更新分镜。已生成的媒体**只作废受影响的段**（`video_service.storyboard_impact`）。"""
         async with self._lock(project_id):
             project = self.get_project(project_id)
-            self._require(project, EDIT_STORYBOARD_STATUSES, "修改分镜")
-            try:
-                storyboard = Storyboard.model_validate(data)
-            except Exception as exc:
-                raise PipelineError(f"分镜更新失败：{exc}") from exc
-            # 镜头改了时长/顺序，段落要按新分镜重编（编段是确定性的）
-            storyboard = await self._apply_segment_mode(storyboard)
+            self._require(
+                project,
+                EDIT_STORYBOARD_STATUSES | EDIT_CONFIRMED_STORYBOARD_STATUSES,
+                "修改分镜",
+            )
+            storyboard = await self._parse_storyboard(data)
+            old = self.store.load_storyboard(project_id)
+            video = self.store.load_video_manifest(project_id)
+            audio = self.store.load_audio_manifest(project_id)
+            impact = video_service.storyboard_impact(old, storyboard, video)
+            project_dir = self.store.ensure_project_dir(project_id)
             self.store.save_storyboard(project_id, storyboard)
-            self._invalidate_media(project_id)
+            if video is not None:
+                video_service.invalidate_clips(video, impact["stale_shots"], project_dir)
+                gone = {c.shot_id for c in video.clips} - {s.id for s in storyboard.shots}
+                video_service.invalidate_clips(video, sorted(gone), project_dir, drop=True)
+                self.store.save_video_manifest(project_id, video)
+            if audio is not None:
+                # 配音按镜头文本做差异：没改字的条目下次配音直接复用；镜头删了的条目丢掉
+                keep = {s.id for s in storyboard.shots}
+                audio.clips = [c for c in audio.clips if c.shot_id in keep]
+                self.store.save_audio_manifest(project_id, audio)
+            self.store.purge_media(project_id, compose=True)
+            if project.status in EDIT_CONFIRMED_STORYBOARD_STATUSES:
+                ready = video is not None and all(
+                    (clip := video.get(s.id)) is not None and clip.status == ClipStatus.READY
+                    for s in storyboard.shots
+                )
+                project.status = (
+                    ProjectStatus.VIDEO_READY if ready else ProjectStatus.STORYBOARD_CONFIRMED
+                )
+                self.store.save_project(project)
+            if impact["stale_segments"] or impact["removed_shots"]:
+                logger.info(
+                    "分镜修改：作废 %d 段（%d 镜）、删除 %d 镜，保留 %d 段 project=%s",
+                    len(impact["stale_segments"]),
+                    len(impact["stale_shots"]),
+                    len(impact["removed_shots"]),
+                    impact["kept_segments"],
+                    project_id,
+                )
             self._revalidate(
                 project, self.store.load_bible(project_id), self.store.load_script(project_id)
             )
             return storyboard
+
+    async def invalidate_video(
+        self, project_id: str, *, segments: list[str] | None = None, shots: list[str] | None = None
+    ) -> dict:
+        """把指定的段（或镜头所在的整段）标回待生成，下次「生成视频片段」只重买这些段。
+
+        段是一次生成的，没法只重做其中一个镜头 —— 给镜头 id 也会扩成它所在的整段。
+        """
+        async with self._lock(project_id):
+            project = self.get_project(project_id)
+            self._require(project, EDIT_CONFIRMED_STORYBOARD_STATUSES, "重做视频片段")
+            storyboard = self.store.load_storyboard(project_id) or Storyboard()
+            video = self.store.load_video_manifest(project_id)
+            if video is None:
+                raise PipelineError("还没有视频片段")
+            wanted_segments = set(segments or [])
+            wanted_shots = set(shots or [])
+            targets: list[dict] = []
+            for segment in storyboard_service.segments_of(storyboard):
+                ids = [s.id for s in segment.shots]
+                if segment.id in wanted_segments or wanted_shots & set(ids):
+                    targets.append(
+                        {
+                            "segment_id": segment.id,
+                            "shots": ids,
+                            "seconds": sum(max(1, int(s.duration_sec)) for s in segment.shots),
+                        }
+                    )
+            if not targets:
+                raise PipelineError("没有找到要重做的段 / 镜头")
+            stale = [i for t in targets for i in t["shots"]]
+            video_service.invalidate_clips(
+                video, stale, self.store.ensure_project_dir(project_id)
+            )
+            self.store.save_video_manifest(project_id, video)
+            self.store.purge_media(project_id, compose=True)
+            project.status = ProjectStatus.STORYBOARD_CONFIRMED
+            self.store.save_project(project)
+            logger.info("手动重做 %d 段（%d 镜）project=%s", len(targets), len(stale), project_id)
+            return {"segments": targets, "shots": stale}
 
     # ── 成本前置（preflight）──────────────────────────────
 

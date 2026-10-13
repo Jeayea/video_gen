@@ -1960,11 +1960,31 @@ async function saveShot(si) {
   shot.narration = $(`sh-${si}-narration`).value || null;
 
   try {
-    await api(`/api/projects/${currentProjectId}/storyboard`, { method: 'PUT', body: JSON.stringify(currentStoryboard) });
-    await refresh();
+    if (await putStoryboard(currentStoryboard)) await refresh();
   } catch (e) {
     alert('保存失败: ' + e.message);
   }
+}
+
+// 保存分镜：已经生成过视频时先算「会作废哪些段、要花多少钱」，确认了才写
+async function putStoryboard(data) {
+  const base = `/api/projects/${currentProjectId}/storyboard`;
+  const impact = await api(`${base}/impact`, { method: 'POST', body: JSON.stringify(data) });
+  const stale = impact.stale_segments || [];
+  const removed = impact.removed_shots || [];
+  if (stale.length || removed.length) {
+    const lines = [];
+    if (stale.length) {
+      lines.push(`将作废 ${stale.length} 段（${impact.stale_shots.length} 个镜头，${impact.stale_seconds} 秒）：`
+        + stale.map(x => x.segment_id).join('、'));
+      lines.push(`重新生成预计 ≈ ${usd(impact.estimated_usd)}（$${impact.price_per_second}/秒）`);
+    }
+    if (removed.length) lines.push(`删除 ${removed.length} 个镜头的片段：${removed.join('、')}`);
+    lines.push(`保留 ${impact.kept_segments} 段已生成的片段；成片需要重新合成。`);
+    if (!confirm(lines.join('\n') + '\n\n确定保存？')) return false;
+  }
+  await api(base, { method: 'PUT', body: JSON.stringify(data) });
+  return true;
 }
 
 async function saveStoryboard() {
@@ -1972,7 +1992,7 @@ async function saveStoryboard() {
   errEl.textContent = '';
   try {
     const data = JSON.parse($('storyboard-json').value);
-    await api(`/api/projects/${currentProjectId}/storyboard`, { method: 'PUT', body: JSON.stringify(data) });
+    if (!(await putStoryboard(data))) return;
     cancelEdit('storyboard');
     await refresh();
   } catch (e) {
@@ -2052,7 +2072,13 @@ function renderVideo() {
   } else {
     const shots = {};
     ((currentStoryboard && currentStoryboard.shots) || []).forEach(s => { shots[s.id] = s; });
+    const canRedo = ['storyboard_confirmed', 'video_ready', 'audio_ready', 'done'].includes(status) && !active;
+    const seenSegments = new Set();
     body.innerHTML = `<div class="clip-grid">${clips.map(c => {
+      // 一段只在第一个镜头上放「重做」按钮（段是一次生成的，只能整段重做）
+      const segKey = c.segment_id || c.shot_id;
+      const redo = canRedo && c.status === 'ready' && !seenSegments.has(segKey);
+      seenSegments.add(segKey);
       const shot = shots[c.shot_id] || {};
       const playable = c.status === 'ready' && c.media_kind === 'video';
       const statusClass = c.status === 'failed' ? 'warn' : c.status === 'ready' ? 'ok' : '';
@@ -2072,6 +2098,8 @@ function renderVideo() {
                 c.media_kind === 'placeholder' ? '未检测到 ffmpeg，仅写了占位文件' : '等待生成…'}</div>`}
           ${c.prompt ? `<div class="clip-prompt">${esc(c.prompt)}</div>` : ''}
           ${c.error ? `<div class="clip-error">${esc(c.error)}</div>` : ''}
+          ${redo ? `<div class="shot-actions"><button class="btn btn-sm btn-outline" onclick="doRedoSegment('${esc(c.shot_id)}')">${
+            c.segment_id ? '重做这段' : '重做此镜'}</button></div>` : ''}
         </div>`;
     }).join('')}</div>`;
   }
@@ -2180,6 +2208,34 @@ function planConfirmText(plan) {
   }
   lines.push('', '确认开始生成吗？');
   return lines.join('\n');
+}
+
+async function doRedoSegment(shotId) {
+  const sb = currentStoryboard || { shots: [] };
+  const shot = sb.shots.find(s => s.id === shotId) || {};
+  const members = shot.segment_id ? sb.shots.filter(s => s.segment_id === shot.segment_id) : [shot];
+  const seconds = members.reduce((a, s) => a + (s.duration_sec || 0), 0);
+  const plan = (currentPreflight && currentPreflight.video) || {};
+  const price = plan.price_per_second || 0;
+  const what = shot.segment_id
+    ? `整段 ${shot.segment_id}（${members.length} 个镜头：${members.map(s => s.id).join('、')}）`
+    : `镜头 ${shotId}`;
+  const cost = price ? `，预计 ≈ ${usd(seconds * price)}（${seconds} 秒 × $${price}/秒）` : '';
+  if (!confirm(`重做${what}${cost}。\n已生成的这段会被删掉，成片需要重新合成。确定？`)) return;
+  // 只确认这一次：确认之后直接提交（第二个确认框里点取消会留下一段已删掉、又没重做的空洞）
+  stopVideoPolling();
+  withBusy('重做中...', async () => {
+    const pre = await loadPreflight('video');
+    const budget = pre && pre.video && pre.video.budget;
+    if (budget && budget.limited && budget.remaining_usd < seconds * price) {
+      alert(`预算不足（剩 ${usd(budget.remaining_usd)}），已取消，原片段保留`);
+      return;
+    }
+    await api(`/api/projects/${currentProjectId}/video/invalidate`, {
+      method: 'POST', body: JSON.stringify({ shots: [shotId] }),
+    });
+    await api(`/api/projects/${currentProjectId}/video/generate`, { method: 'POST' });
+  });
 }
 
 function doGenerateVideo() {

@@ -270,6 +270,11 @@ curl -X POST localhost:8001/api/projects/$PID/cost/reconcile   # 补记漏记的
 - 账本优先使用 provider 实报的扣费；拿不到时按价目表单价 × 模型档位计费秒数估算
 - 单价默认值只是常见值，真实账单请核对并修改 `.env` 里的 `*_PRICE_*`
 - 不用段落分镜时，可用 `POST /api/projects/{id}/storyboard/merge-shots` 合并短镜头省钱（默认只预览）
+- **生成之后也能改分镜**：保存时只作废受影响的段（段 id、镜头顺序、影响画面的字段都没变的段保留），
+  界面会先弹出「作废哪几段、重做约多少钱」；`POST /api/projects/{id}/storyboard/impact` 只算不写
+- **单段重做**：片段卡片上的「重做这段 / 重做此镜」，或 `POST /api/projects/{id}/video/invalidate
+  {"shots":[...]}` 把镜头所在的整段标回待生成，再「生成视频片段」只重买这些段。
+  注意服务要用**生成时的同一个视频模型**启动，换了模型会触发全部重跑
 
 ## 批量生产
 

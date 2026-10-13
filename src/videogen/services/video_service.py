@@ -983,6 +983,108 @@ def _narration_marker(text: str) -> str:
     return f'says this exact Mandarin narration off-screen: "{text}"'
 
 
+#: 改了会让已生成的画面不再对应分镜的字段（台词 / 旁白也算：视频 prompt 里有，原声里也念了）
+_VIDEO_FIELDS = (
+    "scene_id",
+    "duration_sec",
+    "camera",
+    "visual_description",
+    "character_in_frame",
+    "mood",
+    "video_prompt",
+    "location",
+    "props_in_frame",
+    "narration",
+    "dialogue_text",
+    "dialogue_speaker",
+    "voice_offscreen",
+)
+
+
+def shot_signature(shot: Shot) -> tuple:
+    """镜头里影响画面的那部分（念法、LLM 文案标记这类不影响画面的字段不算）。"""
+    return tuple(
+        tuple(value) if isinstance(value := getattr(shot, name), list) else value
+        for name in _VIDEO_FIELDS
+    )
+
+
+def storyboard_impact(
+    old: Storyboard | None, new: Storyboard, manifest: VideoManifest | None
+) -> dict:
+    """新分镜相对旧分镜，哪些**已经生成过**的段要重做、哪些能保留。
+
+    一段能保留 = 段 id 相同、段内镜头与顺序相同、每个镜头影响画面的字段都没变。
+    编段是按场确定性计算的，所以只改一场里的一个镜头，别的场的段不会动。
+    """
+    old_shots = {shot.id: shot for shot in (old.shots if old else [])}
+    old_segments = {seg.id: [s.id for s in seg.shots] for seg in segments_of(old)} if old else {}
+    new_ids = {shot.id for shot in new.shots}
+
+    def generated(shot_id: str) -> bool:
+        clip = manifest.get(shot_id) if manifest else None
+        return clip is not None and clip.status == ClipStatus.READY
+
+    stale: list[dict] = []
+    kept = 0
+    for segment in segments_of(new):
+        ids = [s.id for s in segment.shots]
+        if not any(generated(i) for i in ids):
+            continue  # 本来就没生成过，谈不上作废
+        changed = old_segments.get(segment.id) != ids or any(
+            i not in old_shots or shot_signature(old_shots[i]) != shot_signature(s)
+            for i, s in zip(ids, segment.shots, strict=True)
+        )
+        if changed:
+            stale.append(
+                {
+                    "segment_id": segment.id,
+                    "shots": ids,
+                    "seconds": sum(max(1, int(s.duration_sec)) for s in segment.shots),
+                }
+            )
+        else:
+            kept += 1
+    removed = [i for i in old_shots if i not in new_ids and generated(i)]
+    return {
+        "stale_segments": stale,
+        "stale_shots": [i for seg in stale for i in seg["shots"]],
+        "stale_seconds": sum(seg["seconds"] for seg in stale),
+        "kept_segments": kept,
+        "removed_shots": removed,
+    }
+
+
+def invalidate_clips(
+    manifest: VideoManifest, shot_ids: list[str], project_dir: Path, *, drop: bool = False
+) -> None:
+    """把这些镜头的片段作废（删文件、标回待生成）；`drop=True` 直接从清单里删掉（镜头已不存在）。
+
+    已经花掉的钱早就记过账，这里清掉记账标记，重新生成就是一笔新账。
+    """
+    project_dir = Path(project_dir)
+    targets = set(shot_ids)
+    for clip in list(manifest.clips):
+        if clip.shot_id not in targets:
+            continue
+        for relative in (clip.path, clip.segment_path):
+            if relative:
+                (project_dir / relative).unlink(missing_ok=True)
+        for cached in (project_dir / "frames").glob(f"{clip.shot_id}.*"):
+            cached.unlink(missing_ok=True)
+        if drop:
+            manifest.clips.remove(clip)
+            continue
+        clip.status = ClipStatus.PENDING
+        clip.error = ""
+        clip.task_id = None
+        clip.path = ""
+        clip.segment_path = ""
+        clip.prompt = ""
+        clip.cost_usd = 0.0
+        clip.cost_recorded = False
+
+
 def dub_mode_for(project: Project | None, settings: Settings | None = None) -> str:
     """这个项目的人声来源：项目字段优先，其次 `AUDIO_DUB_MODE`。"""
     settings = settings or get_settings()

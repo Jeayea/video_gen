@@ -234,6 +234,36 @@ async def test_resplit_segments_recuts_without_provider(tmp_path):
     assert length is not None and abs(length - 4.6) < 0.1
 
 
+def test_storyboard_impact_only_flags_the_segment_that_changed():
+    from videogen.models.video import MediaKind
+
+    old = _segmented_storyboard()  # scene_1 三镜一段 + scene_2 一镜一段
+    manifest = VideoManifest(
+        clips=[
+            VideoClip(
+                shot_id=s.id,
+                scene_id=s.scene_id,
+                status=ClipStatus.READY,
+                media_kind=MediaKind.VIDEO,
+                segment_id=s.segment_id,
+            )
+            for s in old.shots
+        ]
+    )
+    new = old.model_copy(deep=True)
+    new.shots[3].video_prompt = "a different take"
+    new.shots[0].voice_script_source = "llm:perform"  # 不影响画面
+    impact = video_service.storyboard_impact(old, new, manifest)
+    assert impact["stale_shots"] == ["scene_2_shot_1"]
+    assert impact["kept_segments"] == 1
+
+    # 段内镜头顺序变了：整段重做
+    swapped = old.model_copy(deep=True)
+    swapped.shots[0], swapped.shots[1] = swapped.shots[1], swapped.shots[0]
+    impact = video_service.storyboard_impact(old, swapped, manifest)
+    assert sorted(impact["stale_shots"]) == ["scene_1_shot_1", "scene_1_shot_2", "scene_1_shot_3"]
+
+
 class CountingMock(MockVideoProvider):
     """真出片（ffmpeg）+ 记录请求 + 模拟 provider 实报扣费。"""
 

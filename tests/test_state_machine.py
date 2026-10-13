@@ -9,7 +9,7 @@ import pytest
 from tests.conftest import wait_for_job
 from tests.fakes import FakeLLM
 from videogen.models.project import Project, ProjectStatus
-from videogen.models.video import VideoManifest
+from videogen.models.video import ClipStatus, VideoManifest
 from videogen.models.world_state import WorldState
 from videogen.orchestrator import pipeline as pipeline_module
 from videogen.orchestrator.pipeline import PipelineError
@@ -507,11 +507,58 @@ async def test_regenerating_bible_after_reopen_invalidates_media(
 
 
 @pytest.mark.asyncio
-async def test_editing_storyboard_invalidates_media(store, media_pipeline, video_ready_project):
-    await media_pipeline.reopen_storyboard(video_ready_project.id)
-    storyboard = store.load_storyboard(video_ready_project.id)
+async def test_editing_storyboard_invalidates_only_the_edited_shot(
+    store, media_pipeline, video_ready_project
+):
+    """改一个镜头只作废这个镜头（单镜生成 = 一镜一段），其余已生成的片段保留。"""
+    pid = video_ready_project.id
+    storyboard = store.load_storyboard(pid)
+    assert len(storyboard.shots) >= 2
     data = storyboard.model_dump()
+    edited, untouched = data["shots"][0]["id"], data["shots"][1]["id"]
     data["shots"][0]["video_prompt"] = "close up, a different shot"
+    # 只改念法（不影响画面）的镜头不算改动
+    data["shots"][1]["voice_script_source"] = "llm:perform"
 
-    await media_pipeline.update_storyboard(video_ready_project.id, data)
-    assert store.load_video_manifest(video_ready_project.id) is None
+    impact = await media_pipeline.storyboard_impact(pid, data)
+    assert impact["stale_shots"] == [edited]
+    assert store.load_video_manifest(pid).get(edited).status == ClipStatus.READY, "预览不写盘"
+
+    # 确认之后直接改（不必先退回分镜阶段）
+    await media_pipeline.update_storyboard(pid, data)
+    video = store.load_video_manifest(pid)
+    assert video.get(edited).status == ClipStatus.PENDING and not video.get(edited).path
+    assert video.get(untouched).status == ClipStatus.READY
+    assert (store.ensure_project_dir(pid) / video.get(untouched).path).is_file()
+    assert store.load_project(pid).status == ProjectStatus.STORYBOARD_CONFIRMED
+    assert store.load_compose_report(pid) is None
+
+
+@pytest.mark.asyncio
+async def test_deleting_a_shot_drops_its_clip(store, media_pipeline, video_ready_project):
+    pid = video_ready_project.id
+    data = store.load_storyboard(pid).model_dump()
+    removed = data["shots"].pop()["id"]
+    await media_pipeline.update_storyboard(pid, data)
+    video = store.load_video_manifest(pid)
+    assert video.get(removed) is None
+    assert all(c.status == ClipStatus.READY for c in video.clips)
+    assert store.load_project(pid).status == ProjectStatus.VIDEO_READY
+
+
+@pytest.mark.asyncio
+async def test_invalidate_video_redoes_only_the_chosen_segment(
+    store, media_pipeline, video_ready_project
+):
+    pid = video_ready_project.id
+    shots = store.load_storyboard(pid).shots
+    target, other = shots[0].id, shots[1].id
+    result = await media_pipeline.invalidate_video(pid, shots=[target])
+    assert result["shots"] == [target]
+    video = store.load_video_manifest(pid)
+    assert video.get(target).status == ClipStatus.PENDING
+    assert video.get(other).status == ClipStatus.READY
+    assert store.load_project(pid).status == ProjectStatus.STORYBOARD_CONFIRMED
+
+    with pytest.raises(PipelineError):
+        await media_pipeline.invalidate_video(pid, shots=["no_such_shot"])

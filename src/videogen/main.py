@@ -749,9 +749,15 @@ async def get_storyboard(project_id: str):
     return storyboard.model_dump()
 
 
+@app.post("/api/projects/{project_id}/storyboard/impact")
+async def storyboard_impact(project_id: str, data: dict):
+    """只算不写：按这份分镜保存，哪些已生成的段要重做、预计多少钱（UI 保存前确认用）。"""
+    return await pipeline.storyboard_impact(project_id, data)
+
+
 @app.put("/api/projects/{project_id}/storyboard")
 async def update_storyboard(project_id: str, data: dict):
-    """全量更新分镜（仅允许在确认之前）。"""
+    """全量更新分镜。确认之后也能改：只作废受影响的段，其余已生成的片段保留。"""
     storyboard = await pipeline.update_storyboard(project_id, data)
     return storyboard.model_dump()
 
@@ -854,6 +860,17 @@ async def generate_video(project_id: str):
     """提交视频生成后台任务（异步，用 video/status 查进度）。"""
     job = await pipeline.start_video_generation(project_id)
     return {"job": job.to_public()}
+
+
+class InvalidateVideoRequest(BaseModel):
+    segments: list[str] = Field(default_factory=list)
+    shots: list[str] = Field(default_factory=list)
+
+
+@app.post("/api/projects/{project_id}/video/invalidate")
+async def invalidate_video(project_id: str, req: InvalidateVideoRequest):
+    """把指定段（或镜头所在的整段）标回待生成；之后点「生成视频片段」只重买这些段。"""
+    return await pipeline.invalidate_video(project_id, segments=req.segments, shots=req.shots)
 
 
 @app.get("/api/projects/{project_id}/video/status")
