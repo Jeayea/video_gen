@@ -54,7 +54,7 @@ README 只讲「这是什么、怎么装、怎么用」。这里记录**项目�
 | 后台任务队列 | ✅ | 提交即返回 job id，进度查询 / 取消 / 单项目互斥 / 重启恢复 |
 | 手工编辑 / 分阶段确认门控 | ✅ | Web UI + REST |
 | **按修改意见重写（单场剧本 / 单镜或整场分镜）** | ✅ | 剧本 `script/scenes/{id}/regenerate`（剧本阶段，直接保存，时长沿用原场）；分镜 `storyboard/revise` 只出提案（单镜沿用 id / 时长 / 段落），前端确认后走 PUT 的作废预览 |
-| **局部重做（圣经单条 / 重做已展开的章 / 单句重配）** | ✅ | `bible/{kind}/{id}/regenerate`（id / 参考图 / 音色不交给模型改，外貌变了返回 `reference_stale`）；`script/generate {"redo_chapters"}`（只替换这一章，场次编号重排，分镜作废）；`audio/redub`（TTS 模式，念法写回分镜，DONE 时自动退回配音阶段）。UI 同时接上了人声来源、烧字幕样式、自定义 prompt 出图、重新校验 |
+| **局部重做（圣经单条 / 重做已展开的章 / 单句重配）** | ✅ | `bible/{kind}/{id}/regenerate`（id / 参考图 / 音色不交给模型改，外貌变了返回 `reference_stale`）；`script/generate {"redo_chapters"}`（只替换这一章，场次编号重排，分镜作废）；`audio/redub`（TTS 模式，念法写回分镜，DONE 时自动退回配音阶段）。UI 同时接上了人声来源、烧字幕样式、按描述出图（任何语言，非英文先经 LLM 翻成英文、残留中文剔除，`services/image_prompt_service.py`）、重新校验 |
 | **成片语言（中文 / 英语）** | ✅ | 项目 `language`（`PROJECT_LANGUAGE`）：英语项目的 LLM 调用都追加英文覆盖指令（`utils/language.LanguageLLM`）；视频 prompt 按台词原文写 Mandarin / English；语速按汉字 4.5 字/秒、英文 2.5 词/秒；Edge 有 en-US 音色。**还没用真实模型跑过英文片** |
 | **改分镜只作废受影响的段 / 单段重做** | ✅ | 确认后甚至成片后也能改分镜；保存前 `storyboard/impact` 预览作废哪几段与重做费用；片段卡片「重做这段」= `video/invalidate`（只能整段） |
 | 成本统计与预算 | ✅ | 按阶段记 token / 秒数 / 字符 → USD 账本，超预算直接拒绝开工 |

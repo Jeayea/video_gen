@@ -163,6 +163,10 @@ class FakeLLM(LLMProvider):
         user = message_text(messages[-1])
 
         # 用各阶段 system prompt 里独一无二的锚点判断，避免误匹配
+        if "图片 prompt 翻译" in system:
+            self._maybe_fail("image_prompt")
+            # 故意留一个中文字符：调用方必须把残留的中文剔掉
+            return {"prompt": f"a weathered wooden desk under warm lamp light 桌 ({len(user)})"}
         if "故事圣经条目修订" in system:
             self._maybe_fail("bible_item")
             return self._bible_item(user)

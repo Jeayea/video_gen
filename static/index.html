@@ -1512,8 +1512,8 @@ async function renderAssets() {
           ${a.has_reference ? `<button class="btn btn-xs btn-outline" onclick="clearAssetReference('${kind}', '${esc(a.id)}')">清除</button>` : ''}
           <button class="btn btn-xs btn-outline" title="写一句修改意见，只重写这一条设定（剧本阶段可用）"
                   onclick="reviseBibleItem('${kind}', '${esc(a.id)}', ${a.has_reference})">按意见重写</button>
-          <button class="btn btn-xs btn-outline" title="自己写英文 prompt 画参考图（按张计费）"
-                  onclick="generateAssetReferenceWithPrompt('${kind}', '${esc(a.id)}', ${a.has_reference})">自定义 prompt 画</button>
+          <button class="btn btn-xs btn-outline" title="用自己的话描述画面来画参考图（任何语言，非英文会自动翻译；按张计费）"
+                  onclick="generateAssetReferenceWithPrompt('${kind}', '${esc(a.id)}', ${a.has_reference})">按描述画</button>
         </div>
       </div>
     </div>`;
@@ -1536,11 +1536,17 @@ async function generateAssetReference(kind, id, hasRef) {
 }
 
 async function generateAssetReferenceWithPrompt(kind, id, hasRef) {
-  const prompt = window.prompt(`给 ${id} 写英文 prompt（中文会被画进画面，别写中文）：`, '');
+  const prompt = window.prompt(`描述 ${id} 想要的画面（任何语言都行，非英文会先自动翻成英文再出图）：`, '');
   if (!prompt || !prompt.trim()) return;
-  await withBusy(`按自定义 prompt 生成 ${id}...`, () =>
-    api(`/api/projects/${currentProjectId}/assets/${kind}/${encodeURIComponent(id)}/reference/generate`,
-      { method: 'POST', body: JSON.stringify({ force: !!hasRef, prompt: prompt.trim() }) }));
+  let result = null;
+  await withBusy(`按自定义描述生成 ${id}...`, async () => {
+    result = await api(`/api/projects/${currentProjectId}/assets/${kind}/${encodeURIComponent(id)}/reference/generate`,
+      { method: 'POST', body: JSON.stringify({ force: !!hasRef, prompt: prompt.trim() }) });
+  });
+  // 翻译过的话把真正发给图片模型的英文给用户看：翻错了能看出来
+  if (result && result.prompt && result.prompt !== prompt.trim()) {
+    alert(`实际发给图片模型的英文 prompt：\n\n${result.prompt}`);
+  }
 }
 
 // 按修改意见重写一条圣经设定（角色 / 场景 / 道具）；外貌改了且已有参考图时提示重画

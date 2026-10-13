@@ -41,6 +41,7 @@ from videogen.services import (
     consistency_service,
     cost_service,
     dub_guide_service,
+    image_prompt_service,
     keyframe_service,
     music_service,
     novel_service,
@@ -598,6 +599,22 @@ class Pipeline:
             self._invalidate_media(project_id)
             self._revalidate(project, bible, self.store.load_script(project_id))
             return bible
+
+    async def english_image_prompt(self, project_id: str, text: str) -> str:
+        """用户手写的出图 prompt → 英文（纯英文原样返回、不调 LLM；LLM 的钱记在 image 阶段）。"""
+        prompt = image_prompt_service.one_line(text)
+        if not prompt or not image_prompt_service.needs_translation(prompt):
+            return prompt
+        project = self.get_project(project_id)
+        self._guard_budget(project_id, action="翻译出图 prompt")
+        llm = self._llm(project.llm_model, project)
+        try:
+            return await image_prompt_service.translate(llm, prompt)
+        except Exception as exc:
+            raise PipelineError(f"出图 prompt 翻译失败，换个说法或直接写英文：{exc}") from exc
+        finally:
+            self._record_llm_cost(project_id, CostStage.IMAGE, llm)
+            await llm.aclose()
 
     async def regenerate_bible_item(
         self,

@@ -10,7 +10,7 @@ from videogen.config import Settings, get_settings
 from videogen.models.bible import Character, StoryBible
 from videogen.providers.image import ImageProvider, get_image_provider
 from videogen.providers.image.base import ImageProviderError, ImageRequest
-from videogen.services import cost_service
+from videogen.services import cost_service, image_prompt_service
 from videogen.utils.file_store import FileStore
 from videogen.utils.redact import scrub_secrets
 from videogen.utils.region import (
@@ -364,7 +364,8 @@ async def generate_character_image(
     )
     reference_image = existing if (want_reference and existing is not None) else None
 
-    prompt = _one_line(prompt_override) or build_portrait_prompt(
+    # 自定义 prompt 由接口层先翻成英文；这里再兜一道，残留的中文绝不进图片 prompt
+    prompt = image_prompt_service.strip_cjk(prompt_override) or build_portrait_prompt(
         character,
         bible,
         aspect_ratio=settings.image_aspect_ratio,

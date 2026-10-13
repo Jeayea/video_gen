@@ -105,7 +105,8 @@ python -m videogen.tools.demo_bgm     # 可选：生成 4 首演示 BGM 到 ./as
 配了图的资产会在生成视频时一起送给视频模型，保持跨镜头一致。
 卡片上的「按意见重写」只重写这一条设定（id、参考图、音色不变；外貌改了会提示重画参考图，
 `POST /api/projects/{id}/bible/{characters|settings|props}/{item_id}/regenerate`），
-「自定义 prompt 画」用你自己写的英文 prompt 出图：
+「按描述画」用你自己的话描述画面出图：任何语言都行，非英文会先由 LLM 翻成英文
+（图片模型会把 prompt 里的中文画成文字），实际发出去的英文 prompt 会显示出来：
 
 ![圣经与资产](docs/screenshots/03-assets.jpg)
 

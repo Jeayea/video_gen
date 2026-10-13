@@ -301,8 +301,8 @@ class GenerateReferenceRequest(BaseModel):
     force: bool = False
     #: 是否把已有参考图作为图生图输入（出「同一角色的另一个角度」）
     use_reference: bool = False
-    #: 自定义 prompt（留空 = 用角色设定自动拼）
-    prompt: str = ""
+    #: 自定义 prompt（任何语言；非英文会先翻成英文再出图。留空 = 用设定自动拼）
+    prompt: str = Field(default="", max_length=2000)
 
 
 class GenerateReferencesRequest(BaseModel):
@@ -1401,6 +1401,7 @@ async def generate_references(project_id: str, req: GenerateReferencesRequest):
 async def generate_reference(project_id: str, char_id: str, req: GenerateReferenceRequest):
     """给一个角色 AI 生成参考图（定妆照）；已有图默认跳过，force=true 才重画。"""
     _load_character(project_id, char_id)
+    prompt = await pipeline.english_image_prompt(project_id, req.prompt)
     try:
         result = await character_image_service.generate_character_image(
             store,
@@ -1408,13 +1409,13 @@ async def generate_reference(project_id: str, char_id: str, req: GenerateReferen
             char_id,
             force=req.force,
             use_reference=req.use_reference,
-            prompt_override=req.prompt,
+            prompt_override=prompt,
         )
     except BudgetExceeded as exc:
         raise HTTPException(402, str(exc)) from exc
     except (CharacterImageError, ImageProviderError) as exc:
         raise HTTPException(400, str(exc)) from exc
-    return {"status": "ok", **result}
+    return {"status": "ok", **result, "prompt_original": req.prompt}
 
 
 # ── 剧集资产（角色 / 场景 / 关键道具）──────────────────────
@@ -1491,15 +1492,16 @@ async def generate_asset_reference(
 ):
     """AI 生成资产参考图（按张计费）：场景 = 无人背景板，道具 = 白底单品，角色 = 定妆照。"""
     _load_asset(project_id, kind, asset_id)
+    prompt = await pipeline.english_image_prompt(project_id, req.prompt)
     try:
         result = await asset_service.generate_asset_image(
-            store, project_id, kind, asset_id, force=req.force, prompt_override=req.prompt
+            store, project_id, kind, asset_id, force=req.force, prompt_override=prompt
         )
     except BudgetExceeded as exc:
         raise HTTPException(402, str(exc)) from exc
     except (CharacterImageError, ImageProviderError) as exc:
         raise HTTPException(400, str(exc)) from exc
-    return {"status": "ok", **result}
+    return {"status": "ok", **result, "prompt_original": req.prompt}
 
 
 # ── 成本 ────────────────────────────────────────────────────

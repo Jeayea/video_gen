@@ -1237,3 +1237,39 @@ def test_api_revise_scene_and_storyboard(client):
     assert "stale_segments" in proposal["impact"]
     saved = client.put(f"/api/projects/{pid}/storyboard", json=proposal["storyboard"])
     assert saved.status_code == 200, saved.text
+
+
+def test_custom_image_prompt_in_any_language_is_translated(client):
+    pid = prepare_confirmed_storyboard(client)
+    llm_calls = lambda: len(client.videogen_pipeline._llm_factory().calls)  # noqa: E731
+    before = llm_calls()
+
+    # 纯英文：原样用，不调 LLM
+    english = client.post(
+        f"/api/projects/{pid}/assets/settings/loc_1/reference/generate",
+        json={"prompt": "an empty  rooftop at dusk"},
+    ).json()
+    assert english["prompt"] == "an empty rooftop at dusk"
+    assert llm_calls() == before
+
+    # 中文：先翻成英文；残留的中文被剔掉，原文一并返回给前端核对
+    chinese = client.post(
+        f"/api/projects/{pid}/characters/char_1/reference/generate",
+        json={"prompt": "林悦坐在旧木桌前，台灯暖光"},
+    ).json()
+    assert llm_calls() == before + 1
+    assert chinese["prompt"].startswith("a weathered wooden desk")
+    assert not any("一" <= ch <= "鿿" for ch in chinese["prompt"])
+    assert chinese["prompt_original"] == "林悦坐在旧木桌前，台灯暖光"
+    assert client.get(f"/api/projects/{pid}/cost").json()["stages"]["image"]["usd"] >= 0
+
+
+def test_custom_image_prompt_translation_failure_is_reported(client):
+    pid = prepare_confirmed_storyboard(client)
+    client.videogen_pipeline._llm_factory().fail_at = "image_prompt"
+    resp = client.post(
+        f"/api/projects/{pid}/assets/settings/loc_1/reference/generate",
+        json={"prompt": "一枚生锈的铜钥匙"},
+    )
+    assert resp.status_code == 400
+    assert "翻译失败" in resp.json()["detail"]
