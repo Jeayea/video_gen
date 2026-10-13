@@ -95,6 +95,8 @@ class Project(BaseModel):
     music_gain_db: float | None = None
     #: 人声闪避（说话时压低音乐；留空 = 用全局 BGM_DUCK）
     music_duck: bool | None = None
+    #: 烧字幕样式（soft/box/doc/classic；空 = 用 .env 的 COMPOSE_SUBTITLE_STYLE）
+    subtitle_style: str = ""
 
     @field_validator("cast_region", mode="before")
     @classmethod

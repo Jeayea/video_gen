@@ -2058,6 +2058,7 @@ class Pipeline:
                     "compose_crf",
                     "compose_preset",
                     "compose_speed",
+                    "compose_subtitle_style",
                     "compose_subtitle_font",
                     "compose_subtitle_font_scale",
                     "compose_ambient_mode",
@@ -2078,6 +2079,11 @@ class Pipeline:
                 if clean:
                     settings = settings.model_copy(update=clean)
                     logger.info("合成参数覆盖：%s", ", ".join(sorted(clean)))
+            # 项目上定的字幕样式压过 .env，单次请求又压过项目
+            if project.subtitle_style and "compose_subtitle_style" not in (overrides or {}):
+                settings = settings.model_copy(
+                    update={"compose_subtitle_style": project.subtitle_style}
+                )
 
             # 配乐在**合成阶段**定：重新合成就能换配乐（本地计算，不用重跑配音）
             music_note = ""

@@ -234,10 +234,7 @@ async def _finish(
     caps: set[str],
     crf: int,
     preset: str,
-    font: str = "",
-    font_scale: float = 0.05,
-    margin_scale: float = 0.04,
-    resolution: tuple[int, int] = (1080, 1920),
+    burn_file: Path | None = None,
     exe: str | None = None,
     bgm_loop: bool = True,
     duck: bool = False,
@@ -253,6 +250,8 @@ async def _finish(
 
     响度归一放在**最后**：它调的是整条混音的增益，各层之间的比例不变
     （逐条配音的音量对齐在前面分段渲染时就做完了）。
+
+    `burn_file` 是烧字幕用的 ASS（带样式）；没给时退回直接烧 `subtitle_file`（libass 默认样式）。
 
     `exe` 只用于**烧字幕**那一趟：主 ffmpeg 没有 libass 时，调用方会传一个
     带 libass 的候选（`resolve_ffmpeg_for({"subtitles"})`）；软字幕/无字幕
@@ -300,13 +299,7 @@ async def _finish(
     if burn:
         # 烧字幕必须重编码视频；顺带把 BGM 混进去，少走一遍
         args = ["-y", "-hide_banner", "-loglevel", "error", "-i", source.name]
-        burn_filter = _burn_filter(
-            subtitle_file.name,
-            font=font,
-            resolution=resolution,
-            font_scale=font_scale,
-            margin_scale=margin_scale,
-        )
+        burn_filter = _burn_filter((burn_file or subtitle_file).name)
         if audio_filter:
             args += _bgm_input(bgm_path, loop=bgm_loop) if bgm_path else []
             args += [
@@ -547,56 +540,10 @@ def bgm_mix_filter(
 
 
 
-def subtitle_style(
-    resolution: tuple[int, int], *, font_scale: float = 0.05, margin_scale: float = 0.04
-) -> tuple[int, int]:
-    """按输出分辨率算字幕字号与下边距（像素）。
-
-    参照 min(宽, 高)：竖屏 1080x1920 与横屏 1920x1080 都能得到合适的字号 ——
-    如果按视频高度算，竖屏字幕会大到溢出画面。
-    """
-    reference = max(240, min(resolution))
-    font_px = round(reference * max(0.01, font_scale))
-    margin_px = round(reference * max(0.0, margin_scale))
-    return max(10, font_px), max(0, margin_px)
-
-
-#: ffmpeg 把 SRT 转成 ASS 时用的默认参考分辨率（libavcodec 的 384x288）。
-#: force_style 里的 FontSize/MarginV 都是**这个参考系**下的单位，
-#: 直接写像素值会导致竖屏字幕被放大到溢出画面。
-ASS_REFERENCE_HEIGHT = 288
-
-
-def script_units(pixels: int, height: int) -> int:
-    """把「想要的像素值」换算成 force_style 的单位。"""
-    height = max(1, height)
-    return max(1, round(pixels * ASS_REFERENCE_HEIGHT / height))
-
-
-def _burn_filter(
-    subtitle_name: str,
-    *,
-    font: str = "",
-    resolution: tuple[int, int] = (1080, 1920),
-    font_scale: float = 0.05,
-    margin_scale: float = 0.04,
-) -> str:
-    font_px, margin_px = subtitle_style(
-        resolution, font_scale=font_scale, margin_scale=margin_scale
-    )
-    font_units = script_units(font_px, resolution[1])
-    margin_units = script_units(margin_px, resolution[1]) if margin_px else 0
-    style = [
-        f"FontSize={font_units}",
-        "Outline=1",
-        "Shadow=0",
-        "Alignment=2",
-        f"MarginV={margin_units}",
-    ]
-    if font:
-        style.insert(0, f"FontName={font}")
+def _burn_filter(subtitle_name: str) -> str:
+    """烧字幕滤镜。样式全在 ASS 文件里（`subtitle_service.build_ass`），这里不再 force_style。"""
     # cwd 就在产物目录，这里只写文件名，避开 subtitles 滤镜的路径转义地狱
-    return f"subtitles={subtitle_name}:force_style='{','.join(style)}'"
+    return f"subtitles={subtitle_name}"
 
 
 async def compose(
@@ -780,6 +727,24 @@ async def compose(
         subtitles_path = None
         warnings.append("没有台词内容，未生成字幕")
 
+    # 烧字幕用 ASS：样式（字体 / 柔化 / 阴影 / 底条）写在文件里，像素单位 = 成片分辨率
+    burn_path: Path | None = None
+    look_name, look = subtitle_service.subtitle_look(settings.compose_subtitle_style)
+    if subtitles_path is not None and desired_mode == SubtitleMode.BURN:
+        burn_path = output_dir / "subtitles.ass"
+        burn_path.write_text(
+            subtitle_service.build_ass(
+                segments,
+                audio_manifest,
+                resolution=(width, height),
+                look=look,
+                font=settings.compose_subtitle_font,
+                font_scale=settings.compose_subtitle_font_scale,
+                margin_scale=settings.compose_subtitle_margin_scale,
+            ),
+            encoding="utf-8",
+        )
+
     bgm = audio_manifest.bgm if audio_manifest else None
     bgm_path: Path | None = None
     if bgm and bgm.path:
@@ -810,15 +775,13 @@ async def compose(
         bgm_gain_db=bgm.gain_db if bgm and bgm.gain_db is not None else settings.bgm_gain_db,
         fade_sec=bgm_fade,
         subtitle_file=subtitles_path,
-        mode=SubtitleMode(settings.subtitle_mode),
+        # 变速会把 soft 升级成 burn：传「真正要用的模式」，不是配置里的原值
+        mode=SubtitleMode(desired_mode),
         caps=caps,
         exe=burn_exe,
         crf=settings.compose_crf,
         preset=settings.compose_preset,
-        font=settings.compose_subtitle_font,
-        font_scale=settings.compose_subtitle_font_scale,
-        margin_scale=settings.compose_subtitle_margin_scale,
-        resolution=(width, height),
+        burn_file=burn_path,
         bgm_loop=bgm_loop,
         duck=duck,
         duck_ratio=settings.bgm_duck_ratio,
@@ -919,6 +882,7 @@ async def compose(
         source_duration_sec=total_duration,
         speed=speed,
         subtitle_mode=SubtitleMode(settings.subtitle_mode),
+        subtitle_style=look_name if effective_mode == SubtitleMode.BURN else "",
         subtitle_mode_effective=effective_mode,
         segments=segments,
         bgm_id=bgm.id if bgm else "",

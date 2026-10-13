@@ -136,7 +136,8 @@
   所以多半是转写模型判错了，**需要人耳确认**。音高只能粗略说明嗓子差不多，判断不了是不是同一个人
 - 字幕：不加配乐，只加字幕，烧进画面（`output/final.mp4` + `output/subtitles.srt` / `.vtt`）。字幕文字就是旁白原文，按镜头时间轴出现；
   字号约为画面宽度的 6%、离底边约 12%（`COMPOSE_SUBTITLE_FONT_SCALE=0.06`、`COMPOSE_SUBTITLE_MARGIN_SCALE=0.21`），
-  避开竖屏平台底部的按钮和标题
+  避开竖屏平台底部的按钮和标题。2026-10-13 起改用 `doc` 样式（宋体加粗、暖白、柔化阴影，项目字段
+  `subtitle_style=doc`），字号 4.4%、离底 12%；改之前的成片留在 `ab_subtitles/final_before_classic.mp4`
 
 ### 旁白声音 A/B（第 1 段，2026-10-13）
 

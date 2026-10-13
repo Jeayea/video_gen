@@ -229,11 +229,15 @@ class Settings(BaseSettings):
     #: **内嵌软字幕（soft）的时间戳不参与变速**，所以变速时会自动改烧字幕。
     compose_speed: float = Field(default=1.0, ge=0.5, le=4.0)
     compose_concurrency: int = 2
+    #: 烧字幕样式：soft（柔和，默认）| box（半透明底条）| doc（宋体纪录片）| classic（老的硬描边）。
+    #: 项目上的 `subtitle_style` 优先于它
+    compose_subtitle_style: str = "soft"
+    #: 字体名（空 = 用样式自带的字体）
     compose_subtitle_font: str = ""
-    #: 字幕字号 = min(宽, 高) * 该比例（0.05 ≈ 1080 宽的竖屏 54px）
-    compose_subtitle_font_scale: float = 0.05
-    #: 字幕距底部 = min(宽, 高) * 该比例
-    compose_subtitle_margin_scale: float = 0.04
+    #: 字幕字号 = min(宽, 高) * 该比例（0 = 用样式自带的值，soft ≈ 4.2%）
+    compose_subtitle_font_scale: float = 0.0
+    #: 字幕距底部 = min(宽, 高) * 该比例（0 = 用样式自带的值）
+    compose_subtitle_margin_scale: float = 0.0
     #: 视频模型自带音轨怎么处理：off = 丢弃（人声最干净）；under = 压低垫在人声下面
     #: 口型对齐：把配音延后到「画面里的人开口」的时刻（只用本地计算，不重烧视频）。
     #: 真实测量：台词进 prompt 后模型说的同一句话比我们的配音晚 ~1.2 秒开口

@@ -1547,3 +1547,17 @@ $0 mock 全链路（COMPOSE_SPEED=2，源项目 15 镜 / 67s）：
 - 一致性检查抓到一处**真穿帮**：母亲在电话里的台词，画面里只有女儿 → 视频模型会让
   画面里的孩子动嘴说母亲的台词，而 Wav2Lip 因「说话人不在画面里」会跳过修嘴，穿帮被锁死。
   改成交叉剪辑（母亲在自己的公寓里打电话）后归零。
+
+## v0.23 · 烧字幕改用 ASS 样式预设 + 变速时字幕丢失
+
+**问题 1：字幕「有点儿硬」**。烧字幕用的是 SRT + `force_style`，只有字号 / `Outline=1` / `Shadow=0`，
+做不了模糊、半透明描边和字间距。改成合成时写 `output/subtitles.ass`，四套预设
+`soft`（默认）/ `box` / `doc` / `classic`，项目字段 `subtitle_style` 与合成请求都能指定。
+《天工开物·杀青》现代版改用 `doc` 重新合成（$0）。
+
+**问题 2：变速时成片没有字幕**（v0.22 起就有）。`COMPOSE_SPEED != 1` 且模式是 soft 时，
+`compose()` 把 `desired_mode` 改成 burn 并写了告警，但调用 `_finish` 时传的是
+`SubtitleMode(settings.subtitle_mode)`（仍是 soft）→ 先挂软轨 → 变速后软轨被丢弃并标成 none。
+修法：传 `desired_mode`。新增集成测试覆盖。
+
+验证：ruff 干净，全量 779 passed（新增 7 个、删掉 3 个 `force_style` 换算的旧用例）。

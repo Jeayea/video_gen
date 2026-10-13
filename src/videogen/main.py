@@ -244,6 +244,8 @@ class UpdateProjectRequest(BaseModel):
     #: 音乐音量（dB）与人声闪避
     music_gain_db: float | None = Field(default=None, ge=-60, le=0)
     music_duck: bool | None = None
+    #: 烧字幕样式（soft/box/doc/classic；空字符串 = 恢复默认）
+    subtitle_style: str | None = Field(default=None, pattern="^(soft|box|doc|classic|)$")
 
 
 
@@ -331,6 +333,8 @@ class ComposeRequest(BaseModel):
     """单次合成的临时覆盖项，不写回全局配置。"""
 
     subtitle_mode: str | None = Field(default=None, pattern="^(soft|burn|none)$")
+    #: 本次烧字幕样式（不写回项目）
+    subtitle_style: str | None = Field(default=None, pattern="^(soft|box|doc|classic)$")
     bgm_id: str | None = None
     bgm_gain_db: float | None = Field(default=None, ge=-60, le=0)
     #: 本次用哪个配乐引擎（library/generate/cli/auto/none）；不改全局配置
@@ -956,6 +960,8 @@ async def compose_project(project_id: str, req: ComposeRequest | None = None):
             overrides["bgm_gain_db"] = req.bgm_gain_db
         if req.crf is not None:
             overrides["compose_crf"] = req.crf
+        if req.subtitle_style is not None:
+            overrides["compose_subtitle_style"] = req.subtitle_style
         if req.subtitle_font_scale is not None:
             overrides["compose_subtitle_font_scale"] = req.subtitle_font_scale
         if req.ambient_mode is not None:

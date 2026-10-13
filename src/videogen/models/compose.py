@@ -53,6 +53,8 @@ class ComposeReport(BaseModel):
     subtitle_mode: SubtitleMode = SubtitleMode.SOFT
     #: 实际生效的字幕模式（请求 burn 但 ffmpeg 没有 libass 时会降级）
     subtitle_mode_effective: SubtitleMode | None = None
+    #: 烧字幕用的样式（soft/box/doc/classic）；没烧字幕时为空
+    subtitle_style: str = ""
     segments: list[ComposeSegment] = Field(default_factory=list)
     bgm_id: str = ""
     bgm_path: str = ""

@@ -248,33 +248,90 @@ async def test_compose_requires_missing_video_manifest(store):
         )
 
 
-def test_subtitle_style_scales_with_reference_side():
-    # 竖屏/横屏都用 min(宽,高) 作参照，字号必须一致
-    portrait = compose_service.subtitle_style((1080, 1920))
-    landscape = compose_service.subtitle_style((1920, 1080))
-    assert portrait == landscape
-    assert portrait[0] == 54, "1080 * 5% = 54px"
-    assert portrait[1] == 43
-    # 极端分辨率也不能崩
-    assert compose_service.subtitle_style((16, 16))[0] >= 10
+def test_ass_uses_output_pixels_and_soft_look_by_default():
+    ass = subtitle_service.build_ass(
+        fake_segments([2.0, 3.0], ["第一句", "第二句"]),
+        resolution=(1080, 1920),
+        look=subtitle_service.subtitle_look("")[1],
+    )
+    assert "PlayResX: 1080" in ass and "PlayResY: 1920" in ass
+    style = next(line for line in ass.splitlines() if line.startswith("Style: "))
+    fields = style[len("Style: ") :].split(",")
+    assert fields[1] == "Hiragino Sans GB"
+    assert fields[2] == "45", "soft 字号 = 1080 * 60/1440"
+    assert fields[7] == "0", "soft 不加粗"
+    assert fields[21] == "230", "竖屏离底边 12%：1920 * 0.12"
+    assert "Dialogue: 0,0:00:00.00,0:00:02.00,Default,,0,0,0,,{\\blur3}第一句" in ass
+    assert "0:00:02.00,0:00:05.00" in ass
 
 
-def test_burn_filter_uses_ass_script_units():
-    """force_style 的字号是 384x288 参考系单位，必须换算，否则竖屏字幕溢出。"""
-    portrait = compose_service._burn_filter("subtitles.srt", resolution=(1080, 1920))
-    # 54px @1920 高 -> 54*288/1920 = 8
-    assert "FontSize=8" in portrait
-    assert "MarginV=6" in portrait
+def test_ass_doc_look_and_overrides():
+    segments = fake_segments([1.0], ["{危险}标签"])
+    doc = subtitle_service.build_ass(
+        segments, resolution=(1440, 2560), look=subtitle_service.SUBTITLE_LOOKS["doc"]
+    )
+    fields = next(x for x in doc.splitlines() if x.startswith("Style: "))[7:].split(",")
+    assert fields[1] == "Songti SC" and fields[7] == "-1" and fields[2] == "64"
+    # 台词里的花括号不能被当成 ASS 样式标签吃掉
+    assert "｛危险｝标签" in doc
 
-    landscape = compose_service._burn_filter("subtitles.srt", resolution=(1920, 1080))
-    # 54px @1080 高 -> 14
-    assert "FontSize=14" in landscape
+    custom = subtitle_service.build_ass(
+        segments,
+        resolution=(1920, 1080),
+        look=subtitle_service.SUBTITLE_LOOKS["box"],
+        font="PingFang SC",
+        font_scale=0.06,
+        margin_scale=0.2,
+    )
+    fields = next(x for x in custom.splitlines() if x.startswith("Style: "))[7:].split(",")
+    assert fields[1] == "PingFang SC"
+    assert fields[2] == "65", "1080 * 0.06"
+    assert fields[15] == "3", "box = 半透明底条"
+    assert fields[21] == "216", "显式 margin_scale 仍按 min(宽,高) 算"
+    assert "\\blur" not in custom
 
 
-def test_script_units_conversion():
-    assert compose_service.script_units(54, 1920) == 8
-    assert compose_service.script_units(54, 1080) == 14
-    assert compose_service.script_units(0, 1920) == 1  # 不能算出 0 让 libass 报错
+def test_unknown_subtitle_look_falls_back_to_soft():
+    assert subtitle_service.subtitle_look("fancy")[0] == "soft"
+    assert subtitle_service.subtitle_look(" DOC ")[0] == "doc"
+
+
+def test_burn_filter_reads_styled_ass():
+    assert compose_service._burn_filter("subtitles.ass") == "subtitles=subtitles.ass"
+
+
+def test_finish_burns_the_ass_file(tmp_path):
+    seen: dict = {}
+
+    async def fake_run(args, *, timeout_sec=0.0, cwd=None, exe=None):
+        seen["args"] = args
+
+    import videogen.services.compose_service as module
+
+    original = module.run_ffmpeg
+    module.run_ffmpeg = fake_run
+    try:
+        effective = asyncio.run(
+            compose_service._finish(
+                Path("base.mp4"),
+                Path("final.mp4"),
+                cwd=tmp_path,
+                duration=10.0,
+                bgm_path=None,
+                bgm_gain_db=-20.0,
+                fade_sec=1.5,
+                subtitle_file=Path("subtitles.srt"),
+                burn_file=Path("subtitles.ass"),
+                mode=SubtitleMode.BURN,
+                caps={"subtitles", "mov_text"},
+                crf=23,
+                preset="veryfast",
+            )
+        )
+    finally:
+        module.run_ffmpeg = original
+    assert effective == SubtitleMode.BURN
+    assert "subtitles=subtitles.ass" in " ".join(seen["args"])
 
 
 def test_segment_freshness_uses_mtime(tmp_path):
@@ -538,6 +595,50 @@ async def test_compose_subtitle_modes(store):
     job = await pipeline.start_compose(project.id, overrides={"compose_subtitle_mode": "soft"})
     await wait_for_job(pipeline, job.id, timeout=120)
     assert store.load_compose_report(project.id).subtitle_mode_effective == SubtitleMode.SOFT
+
+
+@requires_ffmpeg
+@pytest.mark.asyncio
+async def test_compose_burn_uses_project_subtitle_style(store):
+    pipeline = real_pipeline(store)
+    project = await prepare_media(store, pipeline, small_project(store, shots=2))
+    await pipeline.update_project(project.id, {"subtitle_style": "doc"})
+
+    job = await pipeline.start_compose(project.id, overrides={"compose_subtitle_mode": "burn"})
+    finished = await wait_for_job(pipeline, job.id, timeout=180)
+    assert finished.status.value == "succeeded", finished.error
+    report = store.load_compose_report(project.id)
+    if report.subtitle_mode_effective != SubtitleMode.BURN:
+        pytest.skip("本机没有带 libass 的 ffmpeg")
+    assert report.subtitle_style == "doc"
+    ass = (store.output_dir(project.id) / "subtitles.ass").read_text(encoding="utf-8")
+    assert "Songti SC" in ass
+
+    # 单次请求压过项目设置
+    job = await pipeline.start_compose(
+        project.id,
+        overrides={"compose_subtitle_mode": "burn", "compose_subtitle_style": "box"},
+    )
+    await wait_for_job(pipeline, job.id, timeout=180)
+    assert store.load_compose_report(project.id).subtitle_style == "box"
+
+
+@requires_ffmpeg
+@pytest.mark.asyncio
+async def test_speed_change_actually_burns_subtitles(store):
+    """变速时 soft 必须真的改成烧字幕（以前只写了告警，_finish 拿到的仍是 soft）。"""
+    pipeline = real_pipeline(store)
+    project = await prepare_media(store, pipeline, small_project(store, shots=2))
+    job = await pipeline.start_compose(
+        project.id, overrides={"compose_subtitle_mode": "soft", "compose_speed": 2.0}
+    )
+    finished = await wait_for_job(pipeline, job.id, timeout=180)
+    assert finished.status.value == "succeeded", finished.error
+    report = store.load_compose_report(project.id)
+    if not any("自动改为烧字幕" in w for w in report.warnings):
+        pytest.skip("本机没有带 libass 的 ffmpeg")
+    assert report.subtitle_mode_effective == SubtitleMode.BURN
+    assert report.subtitle_style == "soft"
 
 
 # ── 响度（EBU R128）────────────────────────────────────

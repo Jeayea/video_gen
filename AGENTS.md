@@ -878,6 +878,34 @@ curl -s localhost:8001/api/health | python3 -m json.tool | grep ffmpeg
 
 不想要这个自动行为就 `FFMPEG_AUTO_UPGRADE=false`（保持「主 ffmpeg 说不行就不行」）。
 
+#### 烧字幕的样式：ASS 预设（2026-10-13）
+
+以前是 SRT + `force_style`（字号 / `Outline=1` / `Shadow=0`）：纯白粗黑体 + 1 像素硬黑边，用户评价「有点儿硬」。
+`force_style` 做不了模糊，而柔化主要靠模糊。现在烧字幕前先写 `output/subtitles.ass`
+（`subtitle_service.build_ass`），`PlayResX/Y` 就是成片分辨率，字号 / 描边 / 阴影都是真实像素，
+不用再换算到 libass 默认的 384×288 参考系。
+
+| 样式 | 观感 | 用在 |
+|---|---|---|
+| `soft`（默认） | 冬青黑体常规、灰白、半透明描边 + 模糊 + 软阴影，字号 min(宽,高)×4.2% | 通用 |
+| `box` | 同字体 + 半透明黑底条 | 亮背景、平台感 |
+| `doc` | 宋体加粗、暖白、模糊 + 软阴影、字距拉开，字号 4.4% | 《天工开物·杀青》 |
+| `classic` | 老样式：纯白粗体 + 硬描边 | 想回到旧观感 |
+
+- 优先级：合成请求 `subtitle_style` > 项目 `subtitle_style` > `COMPOSE_SUBTITLE_STYLE`；不认识的名字退回 `soft`
+- 下边距不归样式管：竖屏离底 12%（躲开抖音 / 视频号底部的标题和按钮），横屏 7%；
+  `COMPOSE_SUBTITLE_FONT` / `_FONT_SCALE` / `_MARGIN_SCALE` 给了就压过预设（0 / 空 = 用预设）
+- 字体按名字找：macOS 上 libass 走 CoreText，`Hiragino Sans GB` / `Songti SC` 都是系统自带，
+  不需要 `fontsdir`。imageio 版 ffmpeg 一直报的 `Fontconfig error` 不影响 CoreText。
+  Linux 上没有这两个字体时 libass 会退回别的字体，用 `COMPOSE_SUBTITLE_FONT` 指定
+  （例如 `Noto Sans CJK SC`）
+- 对比图：`projects/20261012-天工开物-杀青-现代版/ab_subtitles/`（`sub_compare.png` 四种样式，
+  `before_after_doc.jpg` 杀青改 doc 前后）
+
+顺带修掉一个旧 bug：变速时代码会把 soft 改成烧字幕（`desired_mode`），但传给最后一道
+`_finish` 的仍是配置里的原值，结果没烧上，软轨又在变速后被丢掉 —— **成片没有字幕**，只剩一条
+「已自动改为烧字幕」的告警。现在传的是实际要用的模式（`test_speed_change_actually_burns_subtitles`）。
+
 ### 角色一致性：从「AI 生成定妆照」到每个镜头
 
 真实视频模型（含 H3）**每个镜头都是独立生成**的：不给参考图，它每次都会重新「想」一张脸，

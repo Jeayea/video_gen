@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 
 from videogen.models.audio import AudioKind, AudioManifest
 from videogen.models.bible import StoryBible
@@ -116,12 +117,22 @@ def srt_to_vtt(srt: str) -> str:
 def _cues(
     segments: list[ComposeSegment], audio: AudioManifest | None, *, speed: float = 1.0
 ) -> list[tuple[int, str, str, str]]:
-    """算出每条字幕的 (序号, 起, 止, 文本)，SRT / VTT 共用。
+    """算出每条字幕的 (序号, 起, 止, 文本)，SRT / VTT 共用。"""
+    return [
+        (index, _stamp(start), _stamp(end), text)
+        for index, (start, end, text) in enumerate(_cue_times(segments, audio, speed=speed), 1)
+    ]
+
+
+def _cue_times(
+    segments: list[ComposeSegment], audio: AudioManifest | None, *, speed: float = 1.0
+) -> list[tuple[float, float, str]]:
+    """每条字幕的 (起, 止, 文本)，单位秒。SRT / VTT / ASS 共用同一条时间轴。
 
     `speed > 1`（成片加速）时所有时间戳按 `1/speed` 缩放，跟着画面一起变短。
     """
     scale = 1.0 / max(0.01, float(speed))
-    cues: list[tuple[int, str, str, str]] = []
+    cues: list[tuple[float, float, str]] = []
     cursor = 0.0
     for segment in segments:
         start = cursor
@@ -143,8 +154,206 @@ def _cues(
         if speech > 0:
             end = min(end, start + max(_MIN_CUE_SEC, (speech + _TAIL_HOLD_SEC) * scale))
 
-        cues.append((len(cues) + 1, _stamp(start), _stamp(end), text))
+        cues.append((start, end, text))
     return cues
+
+
+# ── 烧字幕的样式（ASS）────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class SubtitleLook:
+    """一套烧字幕样式。尺寸都是 min(宽, 高) 的比例，横竖屏通用。
+
+    下边距不归样式管（见 `build_ass`）：竖屏要躲开平台底部的按钮和标题，和好不好看无关。
+
+    颜色是 ASS 的 `&HAABBGGRR`（AA=00 不透明，FF 全透明）。
+    """
+
+    font: str
+    bold: bool
+    primary: str
+    outline_colour: str
+    back_colour: str
+    #: 1 = 描边 + 阴影；3 = 半透明底条（outline 当底条内边距用）
+    border_style: int
+    font_scale: float
+    outline: float
+    shadow: float
+    blur: float
+    spacing: float
+
+
+#: 实测对比图：projects/20261012-天工开物-杀青-现代版/ab_subtitles/sub_compare.png
+#: （1440 宽的竖屏上调的值，按 1440 换算成比例）
+SUBTITLE_LOOKS: dict[str, SubtitleLook] = {
+    # 柔和：常规字重、略灰的白、半透明描边 + 模糊 + 软阴影（默认）
+    "soft": SubtitleLook(
+        font="Hiragino Sans GB",
+        bold=False,
+        primary="&H00EDEDED",
+        outline_colour="&H60000000",
+        back_colour="&H80000000",
+        border_style=1,
+        font_scale=60 / 1440,
+        outline=2.5 / 1440,
+        shadow=3 / 1440,
+        blur=4 / 1440,
+        spacing=4 / 1440,
+    ),
+    # 半透明底条：平台感，亮背景上最清楚
+    "box": SubtitleLook(
+        font="Hiragino Sans GB",
+        bold=False,
+        primary="&H00F5F5F5",
+        outline_colour="&H8C000000",
+        back_colour="&H8C000000",
+        border_style=3,
+        font_scale=58 / 1440,
+        outline=14 / 1440,
+        shadow=0.0,
+        blur=0.0,
+        spacing=3 / 1440,
+    ),
+    # 纪录片：宋体加粗、暖白、模糊 + 软阴影、字距拉开
+    "doc": SubtitleLook(
+        font="Songti SC",
+        bold=True,
+        primary="&H00E8F0F2",
+        outline_colour="&H70000000",
+        back_colour="&H90000000",
+        border_style=1,
+        font_scale=64 / 1440,
+        outline=2 / 1440,
+        shadow=2 / 1440,
+        blur=5 / 1440,
+        spacing=6 / 1440,
+    ),
+    # 老样式：纯白粗体 + 硬描边（v0.21 之前的观感）
+    "classic": SubtitleLook(
+        font="",
+        bold=True,
+        primary="&H00FFFFFF",
+        outline_colour="&H00000000",
+        back_colour="&H00000000",
+        border_style=1,
+        font_scale=0.05,
+        outline=1.5 / 1440,
+        shadow=0.0,
+        blur=0.0,
+        spacing=0.0,
+    ),
+}
+DEFAULT_SUBTITLE_LOOK = "soft"
+_PORTRAIT_MARGIN = 0.12
+_LANDSCAPE_MARGIN = 0.07
+
+
+def subtitle_look(name: str) -> tuple[str, SubtitleLook]:
+    """按名字取样式；不认识的名字退回默认（配置笔误不该让合成失败）。"""
+    key = (name or "").strip().lower()
+    if key not in SUBTITLE_LOOKS:
+        key = DEFAULT_SUBTITLE_LOOK
+    return key, SUBTITLE_LOOKS[key]
+
+
+def build_ass(
+    segments: list[ComposeSegment],
+    audio: AudioManifest | None = None,
+    *,
+    resolution: tuple[int, int],
+    look: SubtitleLook,
+    font: str = "",
+    font_scale: float = 0.0,
+    margin_scale: float = 0.0,
+) -> str:
+    """生成烧字幕用的 ASS。
+
+    `PlayResX/Y` 直接等于成片分辨率，所以字号 / 边距 / 描边都是**真实像素**，
+    不用再往 libass 默认的 384x288 参考系里换算。`font` / `font_scale` /
+    `margin_scale` 给了（非空 / >0）就压过样式里的值。
+
+    和 `build_srt` 一样**不接收 speed**：烧字发生在变速之前，用原始时间轴。
+    """
+    width, height = (max(1, int(v)) for v in resolution)
+    reference = max(240, min(width, height))
+
+    def px(ratio: float) -> float:
+        return round(reference * max(0.0, ratio), 1)
+
+    font_px = max(10, round(reference * (font_scale if font_scale > 0 else look.font_scale)))
+    if margin_scale > 0:
+        margin_px = round(reference * margin_scale)
+    else:
+        # 竖屏离底边 12%（躲开抖音 / 视频号底部的标题和按钮），横屏 7%
+        margin_px = round(height * (_PORTRAIT_MARGIN if height > width else _LANDSCAPE_MARGIN))
+    side_px = round(reference * 0.04)
+    style = ",".join(
+        str(v)
+        for v in (
+            "Default",
+            font or look.font or "Arial",
+            font_px,
+            look.primary,
+            look.primary,
+            look.outline_colour,
+            look.back_colour,
+            -1 if look.bold else 0,
+            0,
+            0,
+            0,
+            100,
+            100,
+            px(look.spacing),
+            0,
+            look.border_style,
+            px(look.outline),
+            px(look.shadow),
+            2,
+            side_px,
+            side_px,
+            margin_px,
+            1,
+        )
+    )
+    prefix = f"{{\\blur{px(look.blur):g}}}" if look.blur > 0 else ""
+    events = [
+        f"Dialogue: 0,{_ass_stamp(start)},{_ass_stamp(end)},Default,,0,0,0,,"
+        f"{prefix}{_ass_text(text)}"
+        for start, end, text in _cue_times(segments, audio)
+    ]
+    header = [
+        "[Script Info]",
+        "ScriptType: v4.00+",
+        f"PlayResX: {width}",
+        f"PlayResY: {height}",
+        "WrapStyle: 0",
+        "ScaledBorderAndShadow: yes",
+        "",
+        "[V4+ Styles]",
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, "
+        "BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, "
+        "BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
+        f"Style: {style}",
+        "",
+        "[Events]",
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
+    ]
+    return "\n".join(header + events) + "\n"
+
+
+def _ass_stamp(seconds: float) -> str:
+    total_cs = max(0, round(seconds * 100))
+    hours, remainder = divmod(total_cs, 360_000)
+    minutes, remainder = divmod(remainder, 6_000)
+    secs, centis = divmod(remainder, 100)
+    return f"{hours:d}:{minutes:02d}:{secs:02d}.{centis:02d}"
+
+
+def _ass_text(text: str) -> str:
+    """ASS 里 `{}` 是样式标签、`\\N` 是换行：台词里的花括号换成全角，换行转成 `\\N`。"""
+    cleaned = text.replace("{", "｛").replace("}", "｝").replace("\\", "＼")
+    return "\\N".join(line.strip() for line in cleaned.splitlines() if line.strip())
 
 
 def _stamp(seconds: float) -> str:
@@ -155,4 +364,15 @@ def _stamp(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
 
 
-__all__ = ["build_segments", "build_srt", "build_vtt", "speaker_name_map", "srt_to_vtt"]
+__all__ = [
+    "DEFAULT_SUBTITLE_LOOK",
+    "SUBTITLE_LOOKS",
+    "SubtitleLook",
+    "build_ass",
+    "build_segments",
+    "build_srt",
+    "build_vtt",
+    "speaker_name_map",
+    "srt_to_vtt",
+    "subtitle_look",
+]

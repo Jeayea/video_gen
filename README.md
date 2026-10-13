@@ -245,7 +245,9 @@ BUDGET_USD=12                              # 强烈建议先设预算
 - **音画对齐**：配音比镜头长时拉长镜头、冻结末帧补足，不重新生成视频（`AUDIO_GAP_SEC` 是句后留白）
 - **响度**：逐条配音归一到 `AUDIO_TARGET_LUFS`，成片整体归一到 `COMPOSE_TARGET_LUFS`（默认 -16 LUFS）
 - **字幕**：`COMPOSE_SUBTITLE_MODE=soft|burn|none`；`burn` 需要带 libass 的 ffmpeg（找不到会自动换用
-  `imageio-ffmpeg` 自带的那个）。成片旁边总会导出 `subtitles.srt` 和 `subtitles.vtt`
+  `imageio-ffmpeg` 自带的那个）。成片旁边总会导出 `subtitles.srt` 和 `subtitles.vtt`。
+  烧字幕的样式 `COMPOSE_SUBTITLE_STYLE=soft|box|doc|classic`（柔和 / 半透明底条 / 宋体纪录片 / 老的硬描边），
+  项目上可单独指定（`PUT /api/projects/{id} {"subtitle_style":"doc"}`），合成时也能单次覆盖
 - **变速**：`COMPOSE_SPEED`（0.5~4），也可以在合成时单次指定 `{"speed": 2}`
 - **逐帧口型**（可选）：`tools/lipsync/install.sh` 装好独立环境后设 `LIPSYNC_ENGINE=wav2lip-onnx`
 - **原声引导配音**（可选）：`VIDEO_GENERATE_AUDIO=true` + `AUDIO_DUB_GUIDE=native`。视频模型先把台词念一遍，
