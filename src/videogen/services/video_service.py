@@ -910,10 +910,39 @@ def narration_directive(shot: Shot, *, settings: Settings | None = None) -> str:
         return ""
     voice = " ".join(str(settings.video_narrator_voice or "").split()) or "a calm narrator"
     return (
-        f'documentary voice-over: {voice} says this exact Mandarin narration off-screen: '
-        f'"{text}" — nobody on screen speaks or moves their lips, '
-        "no on-screen text or captions"
+        f"documentary voice-over: {voice} {_narration_marker(text)} — nobody on screen speaks "
+        "or moves their lips, no on-screen text or captions"
     )
+
+
+def _narration_marker(text: str) -> str:
+    return f'says this exact Mandarin narration off-screen: "{text}"'
+
+
+def native_narration_shots(storyboard: Storyboard, manifest: VideoManifest | None) -> set[str]:
+    """哪些镜头的旁白已经由视频模型在原声里念过了（`VIDEO_PROMPT_NARRATION` 生成的片段）。
+
+    判据是**片段生成时实际发出去的 prompt**，不是当前的开关：开关事后改了，
+    已经生成好的片段里那句旁白也还在。这些镜头配音阶段不再用 TTS 念一遍
+    （否则成片里是两层旁白），合成时按原音量用片段原声。
+    """
+    if manifest is None:
+        return set()
+    shots: set[str] = set()
+    for shot in storyboard.shots:
+        if str(shot.dialogue_text or "").strip():
+            continue
+        text = " ".join(str(shot.narration or "").split())
+        clip = manifest.get(shot.id)
+        if (
+            text
+            and clip is not None
+            and clip.status == ClipStatus.READY
+            and clip.media_kind == MediaKind.VIDEO
+            and _narration_marker(text) in (clip.prompt or "")
+        ):
+            shots.add(shot.id)
+    return shots
 
 
 def appearance_anchor(

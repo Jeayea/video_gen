@@ -60,6 +60,10 @@ def plan_voices(
     )
 
 
+#: 「旁白由视频原声直出」提示的前缀（重跑时按它去重）
+_NATIVE_NOTE_PREFIX = "原声旁白："
+
+
 def build_voice_map(
     storyboard: Storyboard,
     bible: StoryBible | None,
@@ -103,14 +107,19 @@ async def synthesize_all(
     existing: AudioManifest | None = None,
     voice_overrides: dict[str, str] | None = None,
     guides: dict[str, Guide] | None = None,
+    native_narration: set[str] | None = None,
     on_progress: ProgressCallback = None,
 ) -> AudioManifest:
     """逐镜生成配音，失败隔离 + 断点续跑（与视频阶段同构）。
 
     `guides`（原声引导，见 `dub_guide_service`）：有原声片段的镜头照着原声念、
     时长对齐原声、放在原声开口的位置。
+
+    `native_narration`（见 `video_service.native_narration_shots`）：这些镜头的旁白
+    视频模型已经在原声里念过了，不再用 TTS 念第二遍，合成时直接用片段原声。
     """
     guides = guides or {}
+    native_narration = native_narration or set()
     settings = settings or get_settings()
     manifest = existing or AudioManifest()
     manifest.provider = provider.name
@@ -130,12 +139,27 @@ async def synthesize_all(
     for speaker, voice in (voice_overrides or {}).items():
         if voice:
             manifest.voice_map[speaker] = voice
-    manifest.warnings = [w for w in manifest.warnings if not w.startswith("跳过镜头")]
+    manifest.warnings = [
+        w
+        for w in manifest.warnings
+        if not w.startswith(("跳过镜头", _NATIVE_NOTE_PREFIX, "分镜里没有任何台词"))
+    ]
 
-    lines = _collect_lines(storyboard, bible, manifest)
+    lines = [
+        line
+        for line in _collect_lines(storyboard, bible, manifest)
+        if not (line.kind == AudioKind.NARRATION and line.shot_id in native_narration)
+    ]
+    if native_narration:
+        # 以前用 TTS 配过的旧条目作废：留着会和原声叠成两层旁白
+        manifest.clips = [c for c in manifest.clips if c.shot_id not in native_narration]
+        manifest.warnings.append(
+            f"{_NATIVE_NOTE_PREFIX}{len(native_narration)} 个镜头的旁白由视频原声直出，不另配音"
+        )
     if not lines:
-        # 没有台词也是合法的：直接产出一条无声成片，不报错
-        manifest.warnings.append("分镜里没有任何台词或旁白，本次没有配音")
+        # 没有台词也是合法的：直接产出一条无声成片（或全靠原声），不报错
+        if not native_narration:
+            manifest.warnings.append("分镜里没有任何台词或旁白，本次没有配音")
         logger.info("分镜没有可配音内容（project=%s）", project.id)
         _emit(on_progress, manifest)
         return manifest

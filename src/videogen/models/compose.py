@@ -32,6 +32,9 @@ class ComposeSegment(BaseModel):
     voice_offscreen: bool = False
     #: 配音放在镜头里的第几秒（原声引导算出来的；>0 时不再做起点探测，也不做逐帧口型）
     voice_offset_sec: float = 0.0
+    #: 这一镜的旁白视频模型已经在原声里念过了（`VIDEO_PROMPT_NARRATION`）：
+    #: 没有配音文件，原声按原音量进成片，而不是当环境音压低
+    native_voice: bool = False
 
 
 class ComposeReport(BaseModel):

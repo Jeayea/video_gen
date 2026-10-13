@@ -309,16 +309,23 @@ def audio_plan(
     *,
     script_mode: str = "",
     tts_provider: str = "",
+    native_narration: set[str] | None = None,
 ) -> dict:
-    """配音花多少：TTS 按字符（edge-tts 免费）+ 可选的 LLM 文案 token。"""
+    """配音花多少：TTS 按字符（edge-tts 免费）+ 可选的 LLM 文案 token。
+
+    `native_narration` 里的镜头旁白由视频原声直出，不走 TTS，不计字符。
+    """
     settings = settings or get_settings()
     prices = cost_service.PriceTable.from_settings(settings)
     shots = storyboard.shots if storyboard else []
     mode = audio_script_service.normalize_mode(script_mode or settings.audio_script_mode)
 
+    native_narration = native_narration or set()
     chars = 0
     elapsed = 0.0
     for shot in shots:
+        if shot.id in native_narration:
+            continue
         text = count_speech_chars(shot.dialogue_text or "") or count_speech_chars(
             shot.narration or ""
         )
@@ -358,6 +365,10 @@ def audio_plan(
         plan["warnings"].append(
             f"配音文案（{mode}）：预计 {script_count} 个镜头、抽 {frames} 帧 ≈ "
             f"${script_usd:.4f}（LLM token）"
+        )
+    if native_narration:
+        plan["warnings"].append(
+            f"{len(native_narration)} 个镜头的旁白由视频原声直出，不另配音、不计 TTS 费用"
         )
     if chars == 0 and not shots:
         plan["warnings"].append("还没有分镜，无法预估配音")
@@ -405,7 +416,15 @@ async def preflight(
             storyboard, video, provider, settings, keyframe_estimator=keyframe_estimator
         )
     if action in {"all", "audio"}:
-        audio_part = audio_plan(storyboard, audio, settings, script_mode=script_mode)
+        audio_part = audio_plan(
+            storyboard,
+            audio,
+            settings,
+            script_mode=script_mode,
+            native_narration=video_service.native_narration_shots(storyboard, video)
+            if storyboard
+            else None,
+        )
     if action in {"all", "compose"}:
         compose_part = compose_plan(settings)
 

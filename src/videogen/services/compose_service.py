@@ -13,7 +13,7 @@ from videogen.models.compose import ComposeReport, ComposeSegment, SubtitleMode
 from videogen.models.project import Project
 from videogen.models.storyboard import Storyboard
 from videogen.models.video import VideoManifest
-from videogen.services import lipsync_service, subtitle_service
+from videogen.services import lipsync_service, subtitle_service, video_service
 from videogen.utils import loudness as loudness_utils
 from videogen.utils.audio_align import mouth_align_delay
 from videogen.utils.av_sync import check_av_sync, format_sync_warning
@@ -635,15 +635,21 @@ async def compose(
             f"{len(audio_manifest.clips)}，失败 {len(audio_manifest.failed_clips)}），"
             "请先补齐配音再合成"
         )
-    if audio_manifest is None or not audio_manifest.clips:
-        warnings.append("没有配音，成片为纯画面（无声）")
     if not storyboard.shots:
         raise ComposeError("分镜为空，无法合成")
+    native = video_service.native_narration_shots(storyboard, video_manifest)
+    if (audio_manifest is None or not audio_manifest.clips) and not native:
+        warnings.append("没有配音，成片为纯画面（无声）")
 
     segments = subtitle_service.build_segments(
         storyboard, audio_manifest, speaker_names=subtitle_service.speaker_name_map(bible)
     )
     segments = [s for s in segments if _bind_video(s, video_manifest, project_dir, warnings)]
+    for segment in segments:
+        segment.native_voice = segment.shot_id in native and not segment.audio_path
+    native_count = sum(1 for s in segments if s.native_voice)
+    if native_count:
+        warnings.append(f"原声旁白：{native_count} 个镜头的旁白用视频原声（按原音量，不另配音）")
     if not segments:
         raise ComposeError("没有任何可用的视频片段")
     total_duration = round(sum(s.duration_sec for s in segments), 3)
@@ -1058,6 +1064,11 @@ async def _render_all(
             audio_path = project_dir / segment.audio_path if segment.audio_path else None
             gain_db = await voice_gain(segment)
             use_ambient = ambient and await has_ambient(video_path)
+            # 原声里就是这一镜的旁白：原音量进成片（不是环境音那样压到 -20dB）
+            native = segment.native_voice and await has_ambient(video_path)
+            segment_ambient_db = ambient_gain_db
+            if native:
+                use_ambient, segment_ambient_db = True, 0.0
             # 口型对齐：画面里的人几秒开口，配音就延后几秒（只用本地计算，不重新烧视频）。
             # 逐帧口型已经让嘴跟着配音走了，再叠加延后会把嘴和声音错开。
             delay_ms = 0
@@ -1095,6 +1106,7 @@ async def _render_all(
                 f" mouth={delay_ms if delay_ms > 0 else 'off'}"
                 f" lipsync={'on' if lipsynced is not None else 'off'}"
                 f" gain={gain_db:+.1f}"
+                f" native={'on' if native else 'off'}"
             )
             if (
                 reuse
@@ -1114,7 +1126,7 @@ async def _render_all(
                     crf=crf,
                     preset=preset,
                     ambient=use_ambient,
-                    ambient_gain_db=ambient_gain_db,
+                    ambient_gain_db=segment_ambient_db,
                     voice_delay_ms=delay_ms,
                     voice_gain_db=gain_db,
                 )

@@ -1816,6 +1816,7 @@ class Pipeline:
                 existing=existing_audio,
                 voice_overrides=voice_overrides,
                 guides=guides,
+                native_narration=video_service.native_narration_shots(storyboard, video),
                 on_progress=on_progress,
             )
         except asyncio.CancelledError:
