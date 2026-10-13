@@ -507,6 +507,9 @@ def build_segment_prompt(
             spoken = dialogue_directive(shot, bible)
             if spoken:
                 parts.append(spoken)
+        narrated = narration_directive(shot, settings=settings)
+        if narrated:
+            parts.append(narrated)
         body = ", ".join(p for p in parts if p)
         lines.append(f"Shot {index} ({start}-{end}s): {body}")
         start = end
@@ -781,6 +784,9 @@ def build_prompt(
         spoken = dialogue_directive(shot, bible)
         if spoken:
             parts.append(spoken)
+    narrated = narration_directive(shot, settings=settings)
+    if narrated:
+        parts.append(narrated)
     # 背景丰富度：分镜只写 "in an office" 时模型会画空墙，这段是统一的最低要求
     background = " ".join(str(settings.video_background_directive or "").split())
     if background:
@@ -886,6 +892,26 @@ def dialogue_directive(shot: Shot, bible: StoryBible | None = None) -> str:
     return (
         f'the on-screen speaker says this exact Mandarin line: "{text}" — natural lip-sync '
         "matched to the Mandarin speech, mouth movement and breathing follow the line, "
+        "no on-screen text or captions"
+    )
+
+
+def narration_directive(shot: Shot, *, settings: Settings | None = None) -> str:
+    """把这一镜的旁白交给开着原生音频的视频模型念（`VIDEO_PROMPT_NARRATION`）。
+
+    旁白是画外音：必须写明「画面里没人说话、没人动嘴」，否则模型会让画面里的人对着旁白
+    动嘴（和画外台词一个道理）。有台词的镜头不写旁白 —— 一个镜头只有一条声音（已知限制 3）。
+    """
+    settings = settings or get_settings()
+    if not settings.video_prompt_narration or str(shot.dialogue_text or "").strip():
+        return ""
+    text = " ".join(str(shot.narration or "").split())
+    if not text:
+        return ""
+    voice = " ".join(str(settings.video_narrator_voice or "").split()) or "a calm narrator"
+    return (
+        f'documentary voice-over: {voice} says this exact Mandarin narration off-screen: '
+        f'"{text}" — nobody on screen speaks or moves their lips, '
         "no on-screen text or captions"
     )
 

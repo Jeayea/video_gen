@@ -73,6 +73,11 @@ class Settings(BaseSettings):
     #: 是否把台词写进视频 prompt。视频模型会按同一句话演口型；不写它就自己编一段话
     #: 在说（嘴按它自己的话动），我们再叠 TTS 上去 —— 口型必然对不上
     video_prompt_dialogue: bool = True
+    #: 是否把旁白也写进视频 prompt，让开着原生音频的视频模型自己念（画外音，没人对口型）。
+    #: 默认关：旁白一般由 TTS 配，模型自己再念一遍就成了两层旁白。只在「原生直出」时打开
+    video_prompt_narration: bool = False
+    #: 原生旁白的声音（英文描述，进 prompt）
+    video_narrator_voice: str = "a calm, warm adult female narrator"
     video_max_retries: int = 2
     video_retry_backoff_sec: float = 1.5
     video_fps: int = 24

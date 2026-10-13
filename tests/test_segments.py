@@ -345,3 +345,23 @@ def test_offscreen_voice_is_not_lip_synced_on_screen(settings):
     prompt = video_service.build_segment_prompt([shot], Project(title="t"), StoryBible())
     assert "off-screen voice" in prompt and "on-screen speaker" not in prompt
     assert "格里高！快开门！" in prompt
+
+
+def test_narration_goes_to_video_model_only_when_enabled(settings, monkeypatch):
+    """原生直出：旁白写进 prompt 让模型念（画外音、没人动嘴）；默认关，避免和 TTS 旁白叠两层。"""
+    shot = _shot("s1", "scene_1", 3, video_prompt="a papermaker at a vat",
+                 narration="两手持帘入水一荡。")
+    talk = _shot("s2", "scene_1", 3, video_prompt="he speaks", dialogue_text="对呀对呀！",
+                 narration="不该被念")
+    prompt = video_service.build_segment_prompt([shot, talk], Project(title="t"), StoryBible())
+    assert "两手持帘入水一荡" not in prompt
+
+    monkeypatch.setattr(settings, "video_prompt_narration", True)
+    monkeypatch.setattr(settings, "video_narrator_voice", "a calm female narrator")
+    prompt = video_service.build_segment_prompt([shot, talk], Project(title="t"), StoryBible())
+    said = 'a calm female narrator says this exact Mandarin narration off-screen: "两手持帘入水'
+    assert said in prompt
+    assert "nobody on screen speaks" in prompt
+    assert "不该被念" not in prompt  # 有台词的镜头只念台词
+    single = video_service.build_prompt(shot, Project(title="t"), StoryBible())
+    assert "两手持帘入水一荡" in single
