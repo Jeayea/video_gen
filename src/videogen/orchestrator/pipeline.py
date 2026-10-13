@@ -1753,6 +1753,7 @@ class Pipeline:
             )
             existing_audio = self.store.load_audio_manifest(project_id) or AudioManifest()
             existing_audio.script_mode = mode
+            dub_mode = video_service.dub_mode_for(project, settings)
 
         def on_progress(manifest: AudioManifest) -> None:
             # 同步回调 + 原子落盘，不需要持项目锁（同 _run_video_job）
@@ -1770,72 +1771,85 @@ class Pipeline:
                 else "配音文案准备中…",
             )
 
-        # ── 可选：让 LLM 看着真实画面写/改配音文案 ──
-        await self._apply_voice_script(
-            ctx,
-            project,
-            storyboard,
-            script,
-            bible,
-            video,
-            project_dir=project_dir,
-            settings=settings,
-            mode=mode,
-            use_vision=use_vision,
-            force=force_script,
-            manifest=existing_audio,
-            on_progress=on_progress,
-        )
-
-        # ── 可选：原声引导（视频模型念过一遍台词，照着它的位置和节奏重配） ──
-        guides: dict = {}
-        if settings.dub_guide_mode == "native":
-            guides = await dub_guide_service.prepare_guides(
-                storyboard, video, project_dir, audio_dir / dub_guide_service.GUIDE_DIR
+        if dub_mode == "native":
+            # 原声模式：对白 / 旁白都用视频模型原片里的声音，不调 TTS、不写念法、不花钱
+            await provider.aclose()
+            manifest = AudioManifest(
+                provider="native",
+                voice_map=existing_audio.voice_map,
+                warnings=[
+                    "原声模式（AUDIO_DUB_MODE=native）：不做 TTS 配音，所有镜头用视频原声；"
+                    "要按镜头配音改成 tts"
+                ],
             )
-            ctx.note(f"原声引导：{len(guides)} 句台词找到了原声")
-            if not guides:
-                logger.warning(
-                    "原声引导已打开，但没有一个片段带可用的原声（视频要用 "
-                    "VIDEO_GENERATE_AUDIO=true 生成）；按普通配音处理 project=%s",
-                    project_id,
-                )
-
-        try:
-            manifest = await audio_service.synthesize_all(
+            ctx.note("原声模式：跳过 TTS 配音")
+        else:
+            # ── 可选：让 LLM 看着真实画面写/改配音文案 ──
+            await self._apply_voice_script(
+                ctx,
                 project,
                 storyboard,
+                script,
                 bible,
-                provider,
-                audio_dir,
-                project_dir,
+                video,
+                project_dir=project_dir,
                 settings=settings,
-                concurrency=settings.tts_concurrency,
-                max_retries=settings.tts_max_retries,
-                retry_backoff_sec=settings.tts_retry_backoff_sec,
-                existing=existing_audio,
-                voice_overrides=voice_overrides,
-                guides=guides,
-                native_narration=video_service.native_narration_shots(storyboard, video),
+                mode=mode,
+                use_vision=use_vision,
+                force=force_script,
+                manifest=existing_audio,
                 on_progress=on_progress,
             )
-        except asyncio.CancelledError:
-            async with self._lock(project_id):
-                # 取消也要记账（理由同 `_run_video_job`）：已经合成的配音 TTS 已经计过费
-                cancelled = self.store.load_audio_manifest(project_id)
-                if cancelled is not None:
-                    recorded = self._record_audio_cost(project_id, cancelled)
-                    if recorded:
-                        self.store.save_audio_manifest(project_id, cancelled)
-                        logger.info("配音任务被取消，已为已生成条目补记账 $%.4f", recorded)
-                self._settle_audio_status(
-                    self.get_project(project_id),
-                    self.store.load_audio_manifest(project_id),
-                    self.store.load_video_manifest(project_id),
+
+            # ── 可选：原声引导（视频模型念过一遍台词，照着它的位置和节奏重配） ──
+            guides: dict = {}
+            if settings.dub_guide_mode == "native":
+                guides = await dub_guide_service.prepare_guides(
+                    storyboard, video, project_dir, audio_dir / dub_guide_service.GUIDE_DIR
                 )
-            raise
-        finally:
-            await provider.aclose()
+                ctx.note(f"原声引导：{len(guides)} 句台词找到了原声")
+                if not guides:
+                    logger.warning(
+                        "原声引导已打开，但没有一个片段带可用的原声（视频要用 "
+                        "VIDEO_GENERATE_AUDIO=true 生成）；按普通配音处理 project=%s",
+                        project_id,
+                    )
+
+            try:
+                manifest = await audio_service.synthesize_all(
+                    project,
+                    storyboard,
+                    bible,
+                    provider,
+                    audio_dir,
+                    project_dir,
+                    settings=settings,
+                    concurrency=settings.tts_concurrency,
+                    max_retries=settings.tts_max_retries,
+                    retry_backoff_sec=settings.tts_retry_backoff_sec,
+                    existing=existing_audio,
+                    voice_overrides=voice_overrides,
+                    guides=guides,
+                    native_narration=video_service.native_narration_shots(storyboard, video),
+                    on_progress=on_progress,
+                )
+            except asyncio.CancelledError:
+                async with self._lock(project_id):
+                    # 取消也要记账（理由同 `_run_video_job`）：已经合成的配音 TTS 已经计过费
+                    cancelled = self.store.load_audio_manifest(project_id)
+                    if cancelled is not None:
+                        recorded = self._record_audio_cost(project_id, cancelled)
+                        if recorded:
+                            self.store.save_audio_manifest(project_id, cancelled)
+                            logger.info("配音任务被取消，已为已生成条目补记账 $%.4f", recorded)
+                    self._settle_audio_status(
+                        self.get_project(project_id),
+                        self.store.load_audio_manifest(project_id),
+                        self.store.load_video_manifest(project_id),
+                    )
+                raise
+            finally:
+                await provider.aclose()
 
         async with self._lock(project_id):
             # 状态可能在生成期间被别处改过，重新读一份再落
@@ -1856,7 +1870,9 @@ class Pipeline:
             # 与视频同一套规则：按条目上的「已记账」标记记，而不是和上次清单做集合差
             # （否则「文案被 LLM 改写后重新合成」这种同 id 重跑会漏记）
             self._record_audio_cost(project_id, manifest)
-            if manifest.ready_clips and settings.bgm_engine_mode == "library":
+            if (manifest.ready_clips or dub_mode == "native") and (
+                settings.bgm_engine_mode == "library"
+            ):
                 # 曲库选曲很便宜（只读元数据），配音阶段先选好，UI 能提前看到用哪首。
                 # 生成类引擎（generate / cli / auto）留到**合成**阶段：那时才有画面运动实测，
                 # 而且「重新合成」就能换配乐，不用重跑配音（配音要花钱，配乐不用）。

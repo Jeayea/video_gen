@@ -310,15 +310,22 @@ def audio_plan(
     script_mode: str = "",
     tts_provider: str = "",
     native_narration: set[str] | None = None,
+    dub_mode: str = "tts",
 ) -> dict:
     """配音花多少：TTS 按字符（edge-tts 免费）+ 可选的 LLM 文案 token。
 
     `native_narration` 里的镜头旁白由视频原声直出，不走 TTS，不计字符。
+    `dub_mode="native"`：整片用视频原声，配音阶段不调 TTS、不写文案，$0。
     """
     settings = settings or get_settings()
     prices = cost_service.PriceTable.from_settings(settings)
-    shots = storyboard.shots if storyboard else []
-    mode = audio_script_service.normalize_mode(script_mode or settings.audio_script_mode)
+    native_mode = dub_mode == "native"
+    shots = [] if native_mode else (storyboard.shots if storyboard else [])
+    mode = (
+        "off"
+        if native_mode
+        else audio_script_service.normalize_mode(script_mode or settings.audio_script_mode)
+    )
 
     native_narration = native_narration or set()
     chars = 0
@@ -370,7 +377,10 @@ def audio_plan(
         plan["warnings"].append(
             f"{len(native_narration)} 个镜头的旁白由视频原声直出，不另配音、不计 TTS 费用"
         )
-    if chars == 0 and not shots:
+    plan["dub_mode"] = "native" if native_mode else "tts"
+    if native_mode:
+        plan["warnings"].append("原声模式：对白 / 旁白都用视频原声，不做 TTS 配音，$0")
+    elif chars == 0 and not shots:
         plan["warnings"].append("还没有分镜，无法预估配音")
     return plan
 
@@ -424,6 +434,7 @@ async def preflight(
             native_narration=video_service.native_narration_shots(storyboard, video)
             if storyboard
             else None,
+            dub_mode=video_service.dub_mode_for(project, settings),
         )
     if action in {"all", "compose"}:
         compose_part = compose_plan(settings)

@@ -92,6 +92,10 @@ class Settings(BaseSettings):
     #: 配音参照视频原声（`off` | `native`）。`native`：视频模型自己念过一遍台词
     #: （需要 `VIDEO_GENERATE_AUDIO=true`），从原声里找出这句话的起止，云端 TTS 听着原声
     #: 用角色自己的音色重念（节奏/停顿/情绪照原声），时长微调到与原声一致后放回原位置
+    #: 成片的人声从哪来：native（默认）= 直接用视频模型原片的声音（对白 / 旁白都由视频模型念，
+    #: 配音阶段不调 TTS）；tts = 按镜头 TTS 配音，并启用相关后期（念法文案、原声引导、
+    #: 逐帧口型、开口对齐、逐条响度归一）。项目上的 `dub_mode` 优先
+    audio_dub_mode: str = "native"
     audio_dub_guide: str = "off"
     #: 重念的配音与原声时长不一致时，变速（不变调）的最大倍率；超出部分不再硬拉
     audio_dub_fit_max_ratio: float = 1.25
@@ -246,6 +250,9 @@ class Settings(BaseSettings):
     #: 切点吸附到真实硬切后，片段是 3.21 / 2.88 秒这样的长度；按分镜卡回 3 / 4 秒就会
     #: 砍掉镜头尾巴（连同原声旁白）或冻结补帧。整段加起来不变，所以总时长不变
     compose_follow_clip_length: bool = True
+    #: 整段直通：一段里的镜头都用原声、不需要按镜头处理声音时，直接拿视频模型的整段原片渲一次
+    #: （不经过「切成单镜 → 再逐镜渲染」的两道重编码）
+    compose_segment_passthrough: bool = True
     #: 口型对齐的最大延后量（秒）；超过就不对齐（避免把尾音挤出片段）
     compose_mouth_align_max_sec: float = 1.5
     compose_ambient_mode: str = "off"
@@ -449,6 +456,12 @@ class Settings(BaseSettings):
         """逐帧口型引擎，非法值一律当成 none（绝不因为配置笔误偷偷改画面）。"""
         engine = (self.lipsync_engine or "none").strip().lower()
         return engine if engine in {"none", "wav2lip-onnx", "cli"} else "none"
+
+    @property
+    def dub_mode(self) -> str:
+        """人声来源，非法值当 native（笔误不该偷偷花 TTS 的钱）。"""
+        mode = (self.audio_dub_mode or "native").strip().lower()
+        return mode if mode in {"native", "tts"} else "native"
 
     @property
     def dub_guide_mode(self) -> str:

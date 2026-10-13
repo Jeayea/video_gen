@@ -390,6 +390,97 @@ async def test_segment_mode_full_media_chain_composes(store):
     assert store.load_project(project.id).status == ProjectStatus.DONE
 
 
+class CountingTTS:
+    """记一下有没有人调 TTS（原声模式下一次都不该调）。"""
+
+    calls = 0
+
+    def __init__(self) -> None:
+        from videogen.providers.tts.mock import MockTTSProvider
+
+        self._inner = MockTTSProvider()
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    async def synthesize(self, *args, **kwargs):
+        CountingTTS.calls += 1
+        return await self._inner.synthesize(*args, **kwargs)
+
+
+@requires_ffmpeg
+@pytest.mark.asyncio
+async def test_native_dub_mode_skips_tts_and_passes_segments_through(store, settings, monkeypatch):
+    """默认原声模式：配音阶段不调 TTS、$0；合成整段直通（不切镜重编码）。"""
+    from tests.conftest import wait_for_job
+    from tests.factories import small_project
+    from tests.fakes import FakeBgmLibrary
+
+    monkeypatch.setattr(settings, "audio_dub_mode", "native")
+    monkeypatch.setattr(settings, "compose_keep_segments", True)
+    CountingTTS.calls = 0
+    pipeline = Pipeline(
+        store,
+        llm_factory=FakeLLM,
+        video_factory=lambda: CountingMock(cost=0.0),
+        tts_factory=CountingTTS,
+        bgm_factory=FakeBgmLibrary,
+    )
+    project = small_project(store, shots=3, shot_duration=2, dialogue="好的，我知道了。")
+
+    pre = await pipeline.preflight(project.id, action="audio")
+    assert pre["audio"]["estimated_usd"] == 0 and pre["audio"]["dub_mode"] == "native"
+
+    for step in (pipeline.start_video_generation, pipeline.start_audio_generation):
+        job = await step(project.id)
+        finished = await wait_for_job(pipeline, job.id, timeout=120)
+        assert finished.status.value == "succeeded", finished.error
+    assert CountingTTS.calls == 0
+    audio = store.load_audio_manifest(project.id)
+    assert audio.provider == "native" and not audio.clips
+
+    job = await pipeline.start_compose(project.id)
+    finished = await wait_for_job(pipeline, job.id, timeout=180)
+    assert finished.status.value == "succeeded", finished.error
+    report = store.load_compose_report(project.id)
+    assert any("整段直通：1 段（3 个镜头）" in w for w in report.warnings), report.warnings
+    # mock 片段没有音轨：原声模式必须明说这些镜头是无声的
+    assert any("没有音轨" in w for w in report.warnings), report.warnings
+    rendered = {p.name for p in store.segments_dir(project.id).glob("*.mp4")}
+    assert "scene_1_seg_1.mp4" in rendered and "scene_1_shot_1.mp4" not in rendered
+    final = store.ensure_project_dir(project.id) / report.output_path
+    assert abs((await probe_duration(final)) - report.duration_sec) < 0.2
+
+
+@requires_ffmpeg
+@pytest.mark.asyncio
+async def test_project_can_opt_into_tts_dub_mode(store, settings, monkeypatch):
+    from tests.conftest import wait_for_job
+    from tests.factories import small_project
+    from tests.fakes import FakeBgmLibrary
+
+    monkeypatch.setattr(settings, "audio_dub_mode", "native")
+    CountingTTS.calls = 0
+    pipeline = Pipeline(
+        store,
+        llm_factory=FakeLLM,
+        video_factory=lambda: CountingMock(cost=0.0),
+        tts_factory=CountingTTS,
+        bgm_factory=FakeBgmLibrary,
+    )
+    project = small_project(store, shots=2, shot_duration=2, dialogue="好的，我知道了。")
+    await pipeline.update_project(project.id, {"dub_mode": "tts"})
+    for step in (pipeline.start_video_generation, pipeline.start_audio_generation):
+        job = await step(project.id)
+        finished = await wait_for_job(pipeline, job.id, timeout=120)
+        assert finished.status.value == "succeeded", finished.error
+    assert CountingTTS.calls == 2
+    job = await pipeline.start_compose(project.id)
+    await wait_for_job(pipeline, job.id, timeout=180)
+    report = store.load_compose_report(project.id)
+    assert not any("整段直通" in w for w in report.warnings), "有 TTS 配音的段不能直通"
+
+
 def test_segment_prompt_drops_no_cut_directive_but_keeps_the_rest(settings):
     """单镜表演要求里的「single continuous take with no cuts」和段内硬切自相矛盾。"""
     shots = [_shot("s1", "scene_1", 3, video_prompt="a door"),

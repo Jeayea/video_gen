@@ -225,7 +225,8 @@ BUDGET_USD=12                              # 强烈建议先设预算
 `VIDEO_SEGMENT_MODE=true`（默认）时，同一场里相邻、地点相同的镜头会被编成一段（目标
 `VIDEO_SEGMENT_TARGET_SEC=12` 秒，上限 `VIDEO_SEGMENT_MAX_SEC=15` 秒、`VIDEO_SEGMENT_MAX_SHOTS=4`
 个镜头）。一段只调用一次视频模型，prompt 里逐镜头写时间戳并要求段内硬切；生成后按镜头切回单镜片段
-（`VIDEO_SEGMENT_SNAP_CUTS=true` 时切点吸附到画面里的真实硬切）。配音、口型、合成都按单镜进行，不受影响。
+（`VIDEO_SEGMENT_SNAP_CUTS=true` 时切点吸附到画面里的真实硬切）。全是原声的段落合成时整段直通
+（`COMPOSE_SEGMENT_PASSTHROUGH`）；有 TTS 配音 / 口型的镜头仍按单镜处理。
 
 好处是计费单位变成「段」：例如最短 5 秒计费的模型上，3 个 3 秒镜头逐镜要买 15 秒，编成一段只买 9 秒。
 设 `VIDEO_SEGMENT_MODE=false` 回到一镜一次生成（此时分镜会按模型最短档位安排镜头时长，见
@@ -235,10 +236,13 @@ BUDGET_USD=12                              # 强烈建议先设预算
 
 | 层 | 来源 | 主要配置 |
 |----|------|----------|
-| 对白 | Edge-TTS / 云端 TTS / mock | `TTS_PROVIDER=edge\|openrouter\|mock` |
+| 对白 / 旁白 | **视频模型原声（默认）** 或 TTS 配音 | `AUDIO_DUB_MODE=native\|tts`；tts 时 `TTS_PROVIDER=edge\|openrouter\|mock` |
 | 环境音 | 视频模型自带音轨 | `COMPOSE_AMBIENT_MODE=off\|under`、`COMPOSE_AMBIENT_GAIN_DB` |
 | BGM | 本机按分镜作曲 / 本地曲库 / 外部命令 | `BGM_ENGINE=generate\|library\|cli\|none`、`BGM_GAIN_DB`、`BGM_DUCK` |
 
+- **人声来源**：默认 `AUDIO_DUB_MODE=native`，对白和旁白都用视频模型原片里的声音（视频要带音频生成），
+  配音阶段不调 TTS；全是原声的段落合成时直接用整段原片。要按角色配音就设 `tts`（项目上也能单独设
+  `PUT /api/projects/{id} {"dub_mode":"tts"}`），下面的选角、配音文案、音画对齐、逐帧口型都只在 `tts` 下生效
 - **选角**：按角色性别、定位、年龄自动分配音色并写回圣经，可在界面上改；`GET /api/projects/{id}/voices` 只看选角不花钱
 - **配音文案**：`AUDIO_LLM_SCRIPT=off|narration|polish|full|perform`（补旁白 / 改台词 / 加念法 / 只给念法），
   `AUDIO_LLM_VISION=true` 时把片段抽帧发给多模态 LLM

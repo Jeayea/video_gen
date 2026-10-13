@@ -97,6 +97,8 @@ class Project(BaseModel):
     music_duck: bool | None = None
     #: 烧字幕样式（soft/box/doc/classic；空 = 用 .env 的 COMPOSE_SUBTITLE_STYLE）
     subtitle_style: str = ""
+    #: 人声来源（native = 视频原声 / tts = TTS 配音 + 相关后期；空 = 用 .env 的 AUDIO_DUB_MODE）
+    dub_mode: str = ""
 
     @field_validator("cast_region", mode="before")
     @classmethod

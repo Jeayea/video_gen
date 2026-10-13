@@ -51,6 +51,9 @@ def fast_video_settings(monkeypatch):
     # 段落分镜：老用例按「一镜一次生成」写断言（假 provider 也只写小文件、切不了），
     # 默认关掉；段落相关用例（test_segments.py）自己打开
     monkeypatch.setattr(settings, "video_segment_mode", False)
+    # 人声来源：老用例都在测 TTS 配音链路（默认已改成 native = 视频原声），锁回 tts；
+    # 原声模式的用例自己打开
+    monkeypatch.setattr(settings, "audio_dub_mode", "tts")
     return settings
 
 

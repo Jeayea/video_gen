@@ -41,7 +41,8 @@ README 只讲「这是什么、怎么装、怎么用」。这里记录**项目�
 | 分镜 + 英文 video_prompt | ✅ | 每场 2-5 镜，时长自动对齐剧本 |
 | 分镜档位感知（少而长） | ✅ | 有真实 provider 时按最短计费档位决定每场几个镜头（H3 → 每镜 ≥5 秒），从源头避免浪费 |
 | 视频片段生成 | ✅ | `VideoProvider` 抽象：`mock`（免费占位片段）+ `openrouter`（**真实视频模型**，默认 MiniMax H3） |
-| 配音 TTS | ✅ | `TTSProvider` 抽象：`edge`（免费，音色池小）/ `openrouter`（云端 gpt-audio-mini，**支持自然语言念法**）/ `mock` |
+| **人声来源（默认原声）** | ✅ | `AUDIO_DUB_MODE=native`（默认）：对白 / 旁白都用视频原片的声音，配音阶段不调 TTS，全原声的段落合成整段直通；`tts`：按镜头 TTS + 念法 / 原声引导 / 口型 / 开口对齐 / 逐条归一。项目字段 `dub_mode` 优先 |
+| 配音 TTS（`dub_mode=tts`） | ✅ | `TTSProvider` 抽象：`edge`（免费，音色池小）/ `openrouter`（云端 gpt-audio-mini，**支持自然语言念法**）/ `mock` |
 | 每句念法（情绪表演） | ✅ | LLM 看画面逐镜写念法：`instruction`（云端自然语言）+ `rate/pitch`（Edge），`AUDIO_LLM_SCRIPT=perform` 可只给念法不改台词 |
 | 音画对齐 | ✅ | 配音比镜头长时按配音**拉长镜头**，合成时冻结末帧补足，不重烧视频额度 |
 | 配音文案（LLM 看画面写/改） | ✅ | `AUDIO_LLM_SCRIPT=off\|narration\|polish\|full`，把片段抽帧发给多模态 LLM 写旁白/改台词，结果写回分镜 |
@@ -636,6 +637,10 @@ ffmpeg 会报错的滤镜图。切换这个开关会让分段重新渲染。
   以前合成按分镜整数秒卡：Seedance 版《杀青》18 镜里 10 镜被砍尾巴（合计 3.29 秒，原声旁白一起被砍）
   或冻结补帧（合计 3.04 秒），另有 5 个镜头里混着邻镜画面。改后重切 + 重合成（$0）：17 个硬切全部落在镜头
   边界上、冻结帧 0，成片 60.0 → 60.4 秒。对比片 `projects/20261013-天工开物-杀青-现代版-seedance2/ab_resplit/`
+- **整段直通**（`COMPOSE_SEGMENT_PASSTHROUGH=true`，默认）：段内镜头全用原声、没有配音文件、没做口型时，
+  合成直接拿 `clips/segments/<段>.mp4` 渲一次（长度 = 段内镜头时长之和，字幕仍按镜头累加），
+  少掉「切单镜 → 逐镜渲染」那一道重编码。单镜片段照样切出来（记账 / 重试 / 抽帧用）。
+  Seedance 版《杀青》实测：6 段全部直通，硬切位置与逐镜版一致（≤1 帧），冻结帧 0，音画差 0.04 秒
 - **老项目补救**：`tools/projects/resplit_segments.py <id>`（默认只预览，`--yes` 才切）用已有整段文件重切，
   不调 API；切完重新合成
 - **画外音**（`Shot.voice_offscreen`：门外 / 电话 / 隔墙喊话）：说话人不进画面、视频 prompt 写

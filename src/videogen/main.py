@@ -246,6 +246,8 @@ class UpdateProjectRequest(BaseModel):
     music_duck: bool | None = None
     #: 烧字幕样式（soft/box/doc/classic；空字符串 = 恢复默认）
     subtitle_style: str | None = Field(default=None, pattern="^(soft|box|doc|classic|)$")
+    #: 人声来源（native / tts；空字符串 = 恢复默认）
+    dub_mode: str | None = Field(default=None, pattern="^(native|tts|)$")
 
 
 

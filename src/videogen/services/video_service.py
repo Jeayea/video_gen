@@ -983,6 +983,34 @@ def _narration_marker(text: str) -> str:
     return f'says this exact Mandarin narration off-screen: "{text}"'
 
 
+def dub_mode_for(project: Project | None, settings: Settings | None = None) -> str:
+    """这个项目的人声来源：项目字段优先，其次 `AUDIO_DUB_MODE`。"""
+    settings = settings or get_settings()
+    mode = (getattr(project, "dub_mode", "") or "").strip().lower()
+    return mode if mode in {"native", "tts"} else settings.dub_mode
+
+
+def native_voice_shots(
+    storyboard: Storyboard, manifest: VideoManifest | None, *, dub_mode: str
+) -> set[str]:
+    """哪些镜头直接用片段原声当人声。
+
+    native 模式：所有有就绪视频片段的镜头（对白 / 旁白都是视频模型念的）；
+    tts 模式：只有生成时把旁白交给视频模型念过的镜头（见 `native_narration_shots`）。
+    """
+    if dub_mode != "native":
+        return native_narration_shots(storyboard, manifest)
+    if manifest is None:
+        return set()
+    return {
+        shot.id
+        for shot in storyboard.shots
+        if (clip := manifest.get(shot.id)) is not None
+        and clip.status == ClipStatus.READY
+        and clip.media_kind == MediaKind.VIDEO
+    }
+
+
 def native_narration_shots(storyboard: Storyboard, manifest: VideoManifest | None) -> set[str]:
     """哪些镜头的旁白已经由视频模型在原声里念过了（`VIDEO_PROMPT_NARRATION` 生成的片段）。
 

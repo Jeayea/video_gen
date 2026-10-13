@@ -576,28 +576,47 @@ async def compose(
             f"{len(video_manifest.clips)}，失败 {len(video_manifest.failed_clips)}，"
             f"占位 {len(video_manifest.placeholder_clips)}），请先补齐再合成"
         )
-    if audio_manifest is not None and not audio_manifest.is_usable:
+    # 原声模式：人声全用视频原片，不读配音清单（切换模式前留下的 TTS 条目也不用）
+    dub_mode = video_service.dub_mode_for(project, settings)
+    voice_audio = audio_manifest if dub_mode == "tts" else None
+    if voice_audio is not None and not voice_audio.is_usable:
         raise ComposeError(
-            f"配音不完整（就绪 {len(audio_manifest.ready_clips)}/"
-            f"{len(audio_manifest.clips)}，失败 {len(audio_manifest.failed_clips)}），"
+            f"配音不完整（就绪 {len(voice_audio.ready_clips)}/"
+            f"{len(voice_audio.clips)}，失败 {len(voice_audio.failed_clips)}），"
             "请先补齐配音再合成"
         )
     if not storyboard.shots:
         raise ComposeError("分镜为空，无法合成")
-    native = video_service.native_narration_shots(storyboard, video_manifest)
-    if (audio_manifest is None or not audio_manifest.clips) and not native:
+    native = video_service.native_voice_shots(storyboard, video_manifest, dub_mode=dub_mode)
+    if (voice_audio is None or not voice_audio.clips) and not native:
         warnings.append("没有配音，成片为纯画面（无声）")
 
     segments = subtitle_service.build_segments(
-        storyboard, audio_manifest, speaker_names=subtitle_service.speaker_name_map(bible)
+        storyboard, voice_audio, speaker_names=subtitle_service.speaker_name_map(bible)
     )
     segments = [s for s in segments if _bind_video(s, video_manifest, project_dir, warnings)]
     if settings.compose_follow_clip_length:
-        await _follow_clip_lengths(segments, video_manifest, audio_manifest, project_dir)
+        await _follow_clip_lengths(segments, video_manifest, voice_audio, project_dir)
     for segment in segments:
         segment.native_voice = segment.shot_id in native and not segment.audio_path
     native_count = sum(1 for s in segments if s.native_voice)
-    if native_count:
+    if dub_mode == "native":
+        silent: list[str] = []
+        for segment in segments:
+            if not segment.native_voice:
+                continue
+            streams = await probe_streams(project_dir / segment.video_path)
+            if streams is not None and "audio" not in streams:  # None = 探测不了，不乱报
+                silent.append(segment.shot_id)
+        if silent:
+            warnings.append(
+                f"原声模式：{len(silent)} 个镜头的视频没有音轨（{', '.join(silent[:5])}"
+                f"{' …' if len(silent) > 5 else ''}），这些镜头是无声的 —— Seedance / Kling / Wan "
+                "要用 VIDEO_GENERATE_AUDIO=true 生成，或改用 AUDIO_DUB_MODE=tts"
+            )
+    if native_count and dub_mode == "native":
+        warnings.append(f"原声模式：{native_count} 个镜头的人声都用视频原声（不做 TTS 配音）")
+    elif native_count:
         warnings.append(f"原声旁白：{native_count} 个镜头的旁白用视频原声（按原音量，不另配音）")
     if not segments:
         raise ComposeError("没有任何可用的视频片段")
@@ -644,7 +663,7 @@ async def compose(
     # 做过口型的镜头**不再**做「把配音整体延后」——嘴已经跟着配音走了，再延后反而错开。
     synced: dict[str, Path] = {}
     lipsync_outcomes: list[lipsync_service.LipsyncOutcome] = []
-    if settings.lipsync_enabled:
+    if settings.lipsync_enabled and dub_mode == "tts":
         synced, lipsync_outcomes = await _lipsync_all(
             segments,
             storyboard,
@@ -664,9 +683,34 @@ async def compose(
             if not item.ok and item.note:
                 warnings.append(f"逐帧口型跳过 {item.shot_id}：{item.note}")
 
+    # 整段直通：一段里全是原声、不需要逐镜处理声音 → 直接拿整段原片渲一次
+    groups = (
+        _passthrough_groups(segments, video_manifest, project_dir, synced)
+        if settings.compose_segment_passthrough
+        else {}
+    )
+    grouped = {s.shot_id for members in groups.values() for s in members}
+    if groups:
+        await _render_passthrough(
+            groups,
+            video_manifest,
+            segments_dir,
+            project_dir,
+            width=width,
+            height=height,
+            fps=fps,
+            crf=settings.compose_crf,
+            preset=settings.compose_preset,
+            reuse=reuse_segments,
+        )
+        warnings.append(
+            f"整段直通：{len(groups)} 段（{len(grouped)} 个镜头）直接用视频模型原片，"
+            "不切镜重编码"
+        )
+
     voice_gains: dict[str, float] = {}
     mouth_delays, voice_gains = await _render_all(
-        segments,
+        [s for s in segments if s.shot_id not in grouped],
         segments_dir,
         project_dir,
         width=width,
@@ -705,7 +749,14 @@ async def compose(
             f"{min(mouth_delays.values()):.2f}~{max(mouth_delays.values()):.2f}s"
         )
 
-    segment_paths = [segments_dir / f"{s.shot_id}.mp4" for s in segments]
+    segment_paths: list[Path] = []
+    for segment in segments:
+        if segment.shot_id not in grouped:
+            segment_paths.append(segments_dir / f"{segment.shot_id}.mp4")
+            continue
+        segment_id = video_manifest.get(segment.shot_id).segment_id
+        if groups[segment_id][0] is segment:
+            segment_paths.append(segments_dir / f"{segment_id}.mp4")
     _notify(on_progress, len(segments), len(segments) + 2, "拼接分段")
 
     base = output_dir / "final_base.mp4"
@@ -717,13 +768,13 @@ async def compose(
     # 同时导出一份 .vtt：浏览器的 <track> 只认 VTT，认不出 SRT / mov_text
     subtitles_path: Path | None = None
     subtitles_vtt_path: Path | None = None
-    srt = subtitle_service.build_srt(segments, audio_manifest)
+    srt = subtitle_service.build_srt(segments, voice_audio)
     if srt.strip():
         subtitles_path = output_dir / "subtitles.srt"
         subtitles_path.write_text(srt, encoding="utf-8")
         subtitles_vtt_path = output_dir / "subtitles.vtt"
         subtitles_vtt_path.write_text(
-            subtitle_service.build_vtt(segments, audio_manifest), encoding="utf-8"
+            subtitle_service.build_vtt(segments, voice_audio), encoding="utf-8"
         )
     else:
         subtitles_path = None
@@ -737,7 +788,7 @@ async def compose(
         burn_path.write_text(
             subtitle_service.build_ass(
                 segments,
-                audio_manifest,
+                voice_audio,
                 resolution=(width, height),
                 look=look,
                 font=settings.compose_subtitle_font,
@@ -843,12 +894,12 @@ async def compose(
         # 侧挂字幕必须跟着变速重算：用户拿它上传平台或用 <track> 预览
         if subtitles_path is not None:
             subtitles_path.write_text(
-                subtitle_service.build_srt(segments, audio_manifest, speed=speed),
+                subtitle_service.build_srt(segments, voice_audio, speed=speed),
                 encoding="utf-8",
             )
             if subtitles_vtt_path is not None:
                 subtitles_vtt_path.write_text(
-                    subtitle_service.build_vtt(segments, audio_manifest, speed=speed),
+                    subtitle_service.build_vtt(segments, voice_audio, speed=speed),
                     encoding="utf-8",
                 )
 
@@ -904,7 +955,7 @@ async def compose(
         final_lufs=final_loudness.integrated,
         final_true_peak_db=final_loudness.true_peak,
         video_provider=video_manifest.provider,
-        tts_provider=audio_manifest.provider if audio_manifest else "",
+        tts_provider=voice_audio.provider if voice_audio else "",
         ffmpeg=resolve_ffmpeg() or "",
         subtitle_ffmpeg=burn_exe if effective_mode == SubtitleMode.BURN else "",
         warnings=warnings,
@@ -1266,6 +1317,80 @@ async def _follow_clip_lengths(
             # 已经按配音拉长过的镜头保留拉长后的时长（尾部冻结帧是有意的）
             need = max(need, segment.duration_sec)
         segment.duration_sec = round(max(length, need), 3)
+
+
+def _passthrough_groups(
+    segments: list[ComposeSegment],
+    manifest: VideoManifest,
+    project_dir: Path,
+    synced: dict[str, Path],
+) -> dict[str, list[ComposeSegment]]:
+    """哪些段落可以整段直通：段内所有镜头都在、连续、都用原声、没有配音文件、没做逐帧口型。
+
+    缺任何一条（某个镜头要配 TTS、被跳过、整段文件不在了）就按单镜渲染。
+    """
+    members: dict[str, list[ComposeSegment]] = {}
+    for segment in segments:
+        clip = manifest.get(segment.shot_id)
+        if clip is not None and clip.segment_id and clip.segment_path:
+            members.setdefault(clip.segment_id, []).append(segment)
+    groups: dict[str, list[ComposeSegment]] = {}
+    for segment_id, group in members.items():
+        expected = [c for c in manifest.clips if c.segment_id == segment_id]
+        indexes = [s.index for s in group]
+        if (
+            len(group) == len(expected)
+            and indexes == list(range(indexes[0], indexes[0] + len(group)))
+            and all(s.native_voice and not s.audio_path for s in group)
+            and not any(s.shot_id in synced for s in group)
+            and (project_dir / expected[0].segment_path).is_file()
+            and manifest.get(group[0].shot_id).segment_offset_sec == 0
+        ):
+            groups[segment_id] = group
+    return groups
+
+
+async def _render_passthrough(
+    groups: dict[str, list[ComposeSegment]],
+    manifest: VideoManifest,
+    segments_dir: Path,
+    project_dir: Path,
+    *,
+    width: int,
+    height: int,
+    fps: int,
+    crf: int,
+    preset: str,
+    reuse: bool,
+) -> None:
+    """整段原片渲一次：长度 = 段内镜头时长之和（字幕时间轴照旧按镜头累加，两边对得上）。"""
+    for segment_id, group in groups.items():
+        source = project_dir / manifest.get(group[0].shot_id).segment_path
+        duration = round(sum(s.duration_sec for s in group), 3)
+        streams = await probe_streams(source)
+        has_audio = bool(streams and "audio" in streams)
+        output = segments_dir / f"{segment_id}.mp4"
+        marker = segments_dir / f"{segment_id}.params"
+        params = f"passthrough audio={'on' if has_audio else 'off'} dur={duration:.3f}"
+        if reuse and _params_match(marker, params) and _segment_is_fresh(output, [source]):
+            continue
+        whole = ComposeSegment(
+            shot_id=segment_id, index=group[0].index, duration_sec=duration, native_voice=True
+        )
+        await render_segment(
+            whole,
+            video_path=source,
+            audio_path=None,
+            output=output,
+            width=width,
+            height=height,
+            fps=fps,
+            crf=crf,
+            preset=preset,
+            ambient=has_audio,
+            ambient_gain_db=0.0,
+        )
+        marker.write_text(params, encoding="utf-8")
 
 
 def _params_match(marker: Path, params: str) -> bool:
