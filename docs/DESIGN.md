@@ -93,8 +93,8 @@
 
 ```
 video_gen/
-├── DESIGN.md
 ├── README.md
+├── docs/DESIGN.md
 ├── pyproject.toml
 ├── .env.example
 ├── src/
@@ -734,6 +734,6 @@ FFMPEG_AUTO_UPGRADE=true      # 主 ffmpeg 缺能力时自动换候选（如烧�
 - **音画同步自检**：`utils/av_sync.py` 在成片阶段核对「音轨时长 ≈ 视频时长」，
   抓「`concat -c copy` 吃掉音频空洞」这类事故（真实事故：对比片漂移 7.154 秒）
 
-> §2.3 的目录结构是目标形态，当前实际结构见 [README.md](README.md#代码结构)；
-> 问题审计与修复记录见 [REVIEW.md](REVIEW.md) 与 [FIXES.md](FIXES.md)。
+> §2.3 的目录结构是目标形态，当前实际结构见 [README.md](../README.md#代码结构)；
+> 修复记录见 [FIXES.md](FIXES.md)。
 

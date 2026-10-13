@@ -19,7 +19,7 @@ FFmpeg 合成：音画对齐 · 人声闪避 · 响度归一 · 字幕 · 变速
 ```
 
 > 项目状态、已知限制、风险和各功能的实测记录见 [AGENTS.md](AGENTS.md)；
-> 设计文档见 [DESIGN.md](DESIGN.md)；逐版修复记录见 [FIXES.md](FIXES.md)。
+> 设计文档见 [DESIGN.md](docs/DESIGN.md)；逐版修复记录见 [FIXES.md](docs/FIXES.md)。
 
 ## 功能
 
