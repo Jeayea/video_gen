@@ -16,6 +16,7 @@ from videogen.models.project import InputMode, Project, ProjectStatus
 from videogen.models.script import (
     DEFAULT_CHAPTER_DURATION_SEC,
     OutlineScene,
+    Scene,
     Script,
     ScriptOutline,
     StoryOutline,
@@ -134,6 +135,20 @@ REOPEN_STORYBOARD_STATUSES = {
 EDIT_BIBLE_STATUSES = {ProjectStatus.DRAFT, ProjectStatus.FAILED, ProjectStatus.SCRIPT_REVIEW}
 EDIT_SCRIPT_STATUSES = {ProjectStatus.DRAFT, ProjectStatus.FAILED, ProjectStatus.SCRIPT_REVIEW}
 EDIT_STORYBOARD_STATUSES = {ProjectStatus.SCRIPT_CONFIRMED, ProjectStatus.STORYBOARD_REVIEW}
+#: 单镜重写时从模型结果里拿哪些字段（id / 时长 / 段落沿用原镜头）
+_REVISABLE_SHOT_FIELDS = (
+    "camera",
+    "visual_description",
+    "character_in_frame",
+    "mood",
+    "video_prompt",
+    "location",
+    "props_in_frame",
+    "narration",
+    "dialogue_text",
+    "dialogue_speaker",
+    "voice_offscreen",
+)
 #: 确认之后（甚至成片之后）也能改分镜：只作废受影响的段，其余已生成的片段保留
 EDIT_CONFIRMED_STORYBOARD_STATUSES = {
     ProjectStatus.STORYBOARD_CONFIRMED,
@@ -982,6 +997,162 @@ class Pipeline:
             self._invalidate_media(project_id)
             self._revalidate(project, self.store.load_bible(project_id), script)
             return script
+
+    def _outline_entry(self, project_id: str, scene_id: str) -> OutlineScene | None:
+        outline = self.store.load_outline(project_id)
+        return next((s for s in (outline.scenes if outline else []) if s.id == scene_id), None)
+
+    async def regenerate_scene(
+        self, project_id: str, scene_id: str, *, feedback: str = "", model: str = ""
+    ) -> Scene:
+        """按修改意见重写剧本里的一场（只花这一场的 LLM 钱，其余场次不动）。
+
+        时长沿用这一场现在的时长（全剧时长已经归一过，单改一场不该把总时长带跑）。
+        """
+        async with self._lock(project_id):
+            project = self.get_project(project_id)
+            self._require(project, EDIT_SCRIPT_STATUSES, "重写这一场（需先退回剧本阶段）")
+            script = self.store.load_script(project_id)
+            bible = self.store.load_bible(project_id)
+            if script is None or bible is None:
+                raise PipelineError("剧本或故事圣经不存在")
+            index = next((i for i, s in enumerate(script.scenes) if s.id == scene_id), -1)
+            if index < 0:
+                raise PipelineError(f"剧本里没有场次 {scene_id}")
+            current = script.scenes[index]
+            entry = self._outline_entry(project_id, scene_id) or OutlineScene(
+                id=scene_id, title=current.heading, brief=current.summary
+            )
+            entry = entry.model_copy(update={"duration_budget_sec": current.duration_sec})
+            # 世界状态是全剧写完后的终态：重写中间的场次时给它会泄露后面的剧情
+            last = index == len(script.scenes) - 1
+            world_state = (
+                self.store.load_world_state(project_id) if last else None
+            ) or WorldState()
+
+            self._guard_budget(project_id, action="重写场次")
+            llm = self._llm(model, project)
+            try:
+                scene, _response = await script_service.generate_scene(
+                    llm,
+                    project,
+                    bible,
+                    entry,
+                    script.scenes[:index],
+                    world_state,
+                    len(script.scenes),
+                    revision=current,
+                    feedback=feedback,
+                )
+            except Exception as exc:
+                raise PipelineError(f"重写场次失败：{exc}") from exc
+            finally:
+                self._record_llm_cost(project_id, CostStage.SCRIPT, llm)
+                await llm.aclose()
+            scene.duration_sec = current.duration_sec
+            script.scenes[index] = scene
+            self.store.save_script(project_id, script)
+            self._invalidate_media(project_id)
+            self._revalidate(project, bible, script)
+            return scene
+
+    async def propose_storyboard_revision(
+        self,
+        project_id: str,
+        *,
+        scene_id: str = "",
+        shot_id: str = "",
+        feedback: str = "",
+        model: str = "",
+    ) -> dict:
+        """按修改意见重写一场的分镜或单个镜头，**只返回提案、不保存**。
+
+        返回 `{"storyboard": 整份新分镜, "changed_shots": [...], "impact": ...}`；
+        前端走和手工编辑一样的「预览作废哪几段 → 确认 → PUT」流程，所以不会在用户没点头时
+        作废已经付过钱的片段。LLM 的钱照记。
+        """
+        async with self._lock(project_id):
+            project = self.get_project(project_id)
+            self._require(
+                project,
+                EDIT_STORYBOARD_STATUSES | EDIT_CONFIRMED_STORYBOARD_STATUSES,
+                "重写分镜",
+            )
+            storyboard = self.store.load_storyboard(project_id)
+            script = self.store.load_script(project_id)
+            bible = self.store.load_bible(project_id)
+            if storyboard is None or script is None or bible is None:
+                raise PipelineError("分镜、剧本或故事圣经不存在")
+            target = next((s for s in storyboard.shots if s.id == shot_id), None)
+            if shot_id and target is None:
+                raise PipelineError(f"分镜里没有镜头 {shot_id}")
+            scene_id = target.scene_id if target is not None else scene_id
+            scene = next((s for s in script.scenes if s.id == scene_id), None)
+            if scene is None:
+                raise PipelineError(f"剧本里没有场次 {scene_id}")
+            current = storyboard.shots_for_scene(scene_id)
+            entry = self._outline_entry(project_id, scene_id)
+            story = self.store.load_story_outline(project_id)
+
+            self._guard_budget(project_id, action="重写分镜")
+            llm = self._llm(model, project)
+            segment_mode = get_settings().video_segment_mode
+            try:
+                tier = None if segment_mode else await self._duration_tier()
+                drafts = await storyboard_service.generate_shots_for_scene(
+                    llm,
+                    project,
+                    bible,
+                    scene,
+                    tier=tier,
+                    environment=entry.environment if entry else "",
+                    story_context=_chapter_context(story, entry),
+                    segment_mode=segment_mode,
+                    revision=current,
+                    feedback=feedback,
+                    target_shot=shot_id,
+                )
+            except Exception as exc:
+                raise PipelineError(f"重写分镜失败：{exc}") from exc
+            finally:
+                self._record_llm_cost(project_id, CostStage.STORYBOARD, llm)
+                await llm.aclose()
+            if not drafts:
+                raise PipelineError("模型没有返回镜头，换个说法再试一次")
+
+            proposal = storyboard.model_copy(deep=True)
+            if target is not None:
+                # 只换内容：id / 时长 / 段落都沿用原镜头，别的镜头一个字都不动
+                draft = drafts[0]
+                fresh = target.model_copy(
+                    update={field: getattr(draft, field) for field in _REVISABLE_SHOT_FIELDS}
+                )
+                proposal.shots = [fresh if s.id == target.id else s for s in proposal.shots]
+                changed = [target.id]
+            else:
+                first = next(i for i, s in enumerate(proposal.shots) if s.scene_id == scene_id)
+                rest = [s for s in proposal.shots if s.scene_id != scene_id]
+                proposal.shots = rest[:first] + drafts + rest[first:]
+                scoped = Script(title=script.title, logline="", scenes=[scene])
+                if tier is not None:
+                    storyboard_service.apply_duration_tier(proposal, scoped, tier)
+                else:
+                    storyboard_service.normalize_storyboard_durations(proposal, scoped)
+                changed = [s.id for s in drafts]
+            proposal, _fixes = consistency_service.repair_storyboard(proposal, script, bible)
+            proposal = await self._apply_segment_mode(proposal)
+            impact = video_service.storyboard_impact(
+                storyboard, proposal, self.store.load_video_manifest(project_id)
+            )
+        preflight = await self.preflight(project_id, action="video")
+        price = ((preflight.get("video") or {}).get("price_per_second")) or 0.0
+        impact["price_per_second"] = price
+        impact["estimated_usd"] = round(impact["stale_seconds"] * price, 4)
+        return {
+            "storyboard": proposal.model_dump(mode="json"),
+            "changed_shots": changed,
+            "impact": impact,
+        }
 
     # ── 分镜 ──────────────────────────────────────────────
 

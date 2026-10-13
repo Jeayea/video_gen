@@ -259,6 +259,17 @@ class GenerateRequest(BaseModel):
     """生成类接口的通用参数：可临时指定 LLM 模型。"""
 
     model: str | None = None
+class ReviseRequest(GenerateRequest):
+    """按修改意见重写：意见留空 = 让模型自己再写一版。"""
+
+    feedback: str = Field(default="", max_length=2000)
+
+
+class StoryboardReviseRequest(ReviseRequest):
+    scene_id: str = ""
+    shot_id: str = ""
+
+
 class BibleGenerateRequest(GenerateRequest):
     """生成故事圣经：可以**顺手**带上国家限定与额外要求（UI 一次请求搞定）。"""
 
@@ -725,6 +736,16 @@ async def update_script(project_id: str, data: dict):
     return script.model_dump()
 
 
+@app.post("/api/projects/{project_id}/script/scenes/{scene_id}/regenerate")
+async def regenerate_scene(project_id: str, scene_id: str, req: ReviseRequest | None = None):
+    """按修改意见重写一场（只花这一场的 LLM 钱；确认剧本之前可用）。"""
+    req = req or ReviseRequest()
+    scene = await pipeline.regenerate_scene(
+        project_id, scene_id, feedback=req.feedback, model=_model_of(project_id, req)
+    )
+    return scene.model_dump()
+
+
 @app.post("/api/projects/{project_id}/script/confirm")
 async def confirm_script(project_id: str, req: ConfirmRequest | None = None):
     """确认剧本。严格模式下有结构 error 会被拦（body `{"force": true}` 可强制）。"""
@@ -760,6 +781,23 @@ async def get_storyboard(project_id: str):
 async def storyboard_impact(project_id: str, data: dict):
     """只算不写：按这份分镜保存，哪些已生成的段要重做、预计多少钱（UI 保存前确认用）。"""
     return await pipeline.storyboard_impact(project_id, data)
+
+
+@app.post("/api/projects/{project_id}/storyboard/revise")
+async def revise_storyboard(project_id: str, req: StoryboardReviseRequest):
+    """按修改意见重写一场的分镜（`scene_id`）或单个镜头（`shot_id`）。
+
+    **不保存**：返回整份新分镜 + 作废影响，前端确认后再 PUT /storyboard。
+    """
+    if not (req.scene_id or req.shot_id):
+        raise HTTPException(400, "需要 scene_id 或 shot_id")
+    return await pipeline.propose_storyboard_revision(
+        project_id,
+        scene_id=req.scene_id,
+        shot_id=req.shot_id,
+        feedback=req.feedback,
+        model=_model_of(project_id, req),
+    )
 
 
 @app.put("/api/projects/{project_id}/storyboard")

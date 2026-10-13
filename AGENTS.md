@@ -53,6 +53,7 @@ README 只讲「这是什么、怎么装、怎么用」。这里记录**项目�
 | FFmpeg 合成 + 字幕 | ✅ | 分段渲染 → concat → BGM 混音（含闪避）→ 响度归一 → 字幕（soft 内嵌 / burn 烧录 / none 只导 srt） |
 | 后台任务队列 | ✅ | 提交即返回 job id，进度查询 / 取消 / 单项目互斥 / 重启恢复 |
 | 手工编辑 / 分阶段确认门控 | ✅ | Web UI + REST |
+| **按修改意见重写（单场剧本 / 单镜或整场分镜）** | ✅ | 剧本 `script/scenes/{id}/regenerate`（剧本阶段，直接保存，时长沿用原场）；分镜 `storyboard/revise` 只出提案（单镜沿用 id / 时长 / 段落），前端确认后走 PUT 的作废预览 |
 | **成片语言（中文 / 英语）** | ✅ | 项目 `language`（`PROJECT_LANGUAGE`）：英语项目的 LLM 调用都追加英文覆盖指令（`utils/language.LanguageLLM`）；视频 prompt 按台词原文写 Mandarin / English；语速按汉字 4.5 字/秒、英文 2.5 词/秒；Edge 有 en-US 音色。**还没用真实模型跑过英文片** |
 | **改分镜只作废受影响的段 / 单段重做** | ✅ | 确认后甚至成片后也能改分镜；保存前 `storyboard/impact` 预览作废哪几段与重做费用；片段卡片「重做这段」= `video/invalidate`（只能整段） |
 | 成本统计与预算 | ✅ | 按阶段记 token / 秒数 / 字符 → USD 账本，超预算直接拒绝开工 |

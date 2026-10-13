@@ -1725,6 +1725,7 @@ function renderScript() {
             <div class="duration">${s.duration_sec}s · ${esc(s.emotion)}</div>
             <div class="scene-actions">
               <button class="btn btn-sm btn-outline" onclick="toggleSceneEdit(${si})">编辑</button>
+              <button class="btn btn-sm btn-outline" onclick="reviseScene('${esc(s.id)}')" title="写一句修改意见，只重写这一场（只花这一场的 LLM 钱）">按意见重写</button>
             </div>
             <div class="edit-form" id="scene-edit-${si}">
               <label>场次标题 (heading)</label>
@@ -1810,6 +1811,17 @@ async function saveScene(si) {
   }
 }
 
+// 按修改意见重写一场剧本：直接保存（剧本阶段没有付过钱的下游产物）
+async function reviseScene(sceneId) {
+  const feedback = prompt(`重写 ${sceneId}：写下修改意见（留空 = 让模型再写一版）`, '');
+  if (feedback === null) return;
+  await withBusy(`重写 ${sceneId}...`, () =>
+    api(`/api/projects/${currentProjectId}/script/scenes/${encodeURIComponent(sceneId)}/regenerate`, {
+      method: 'POST',
+      body: JSON.stringify({ feedback, model: currentModel() || null }),
+    }));
+}
+
 async function saveScript() {
   const errEl = $('script-error');
   errEl.textContent = '';
@@ -1889,6 +1901,8 @@ function shotBlockHtml(s, si) {
         ${s.video_prompt ? `<div class="prompt">${esc(s.video_prompt)}</div>` : ''}
         <div class="shot-actions">
           <button class="btn btn-sm btn-outline" onclick="toggleShotEdit(${si})">编辑</button>
+          <button class="btn btn-sm btn-outline" onclick="reviseStoryboard({shot_id: '${esc(s.id)}'})" title="写一句修改意见，只重写这个镜头（时长不变）">按意见重写此镜</button>
+          <button class="btn btn-sm btn-outline" onclick="reviseStoryboard({scene_id: '${esc(s.scene_id)}'})" title="写一句修改意见，重写 ${esc(s.scene_id)} 的全部镜头">重写本场分镜</button>
         </div>
         <div class="edit-form" id="shot-edit-${si}">
           <div class="row">
@@ -1978,6 +1992,38 @@ async function saveShot(si) {
 
   try {
     if (await putStoryboard(currentStoryboard)) await refresh();
+  } catch (e) {
+    alert('保存失败: ' + e.message);
+  }
+}
+
+// 按修改意见重写分镜（单镜或整场）：服务端只出提案，看过再决定要不要采用
+async function reviseStoryboard(target) {
+  const what = target.shot_id ? `镜头 ${target.shot_id}` : `${target.scene_id} 的全部镜头`;
+  const feedback = prompt(`重写${what}：写下修改意见（留空 = 让模型再写一版）`, '');
+  if (feedback === null) return;
+  $('global-status').innerHTML = `<span class="loading"></span>重写${esc(what)}...`;
+  let result;
+  try {
+    result = await api(`/api/projects/${currentProjectId}/storyboard/revise`, {
+      method: 'POST',
+      body: JSON.stringify({ ...target, feedback, model: currentModel() || null }),
+    });
+  } catch (e) {
+    alert('重写失败：' + e.message);
+    return;
+  } finally {
+    $('global-status').textContent = '';
+  }
+  const changed = new Set(result.changed_shots || []);
+  const preview = result.storyboard.shots.filter(x => changed.has(x.id)).map(x => {
+    const voice = x.dialogue_text ? `\n   💬 ${speakerName(x.dialogue_speaker)}：${x.dialogue_text}`
+      : (x.narration ? `\n   旁白：${x.narration}` : '');
+    return `· ${x.id}（${x.duration_sec}s）${x.camera || ''}\n   ${x.visual_description || ''}${voice}`;
+  }).join('\n');
+  if (!confirm(`新版本：\n${preview}\n\n采用这一版？（取消 = 丢掉，原分镜不变）`)) return;
+  try {
+    if (await putStoryboard(result.storyboard)) await refresh();
   } catch (e) {
     alert('保存失败: ' + e.message);
   }

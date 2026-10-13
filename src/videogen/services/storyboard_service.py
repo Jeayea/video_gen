@@ -166,8 +166,14 @@ async def generate_shots_for_scene(
     environment: str = "",
     story_context: str = "",
     segment_mode: bool = False,
+    revision: list[Shot] | None = None,
+    feedback: str = "",
+    target_shot: str = "",
 ) -> list[Shot]:
     """为一个场景生成镜头列表（id / shot_no / scene_id 由系统分配）。
+
+    `revision` + `feedback`：按修改意见重写这一场已有的镜头；再给 `target_shot`（镜头 id）
+    时只重写那一个镜头，返回只含一个镜头的列表（id / 时长 / 段落由调用方沿用原镜头）。
 
     `tier` 是视频模型的计费档位：给了就把「本场几个镜头、每镜多少秒」写成硬约束，
     让模型一开始就产出「少而长」的分镜（事后合并只能补救，不如一开始就不浪费）。
@@ -204,7 +210,7 @@ async def generate_shots_for_scene(
 时长: {scene.duration_sec} 秒
 对白:
 {dialogue_text}
-{context_block}{env_block}{tier_block}
+{context_block}{env_block}{tier_block}{_revision_block(revision, feedback, target_shot)}
 ## 要求
 - 画面比例: {project.aspect_ratio.value} → {aspect_hint}
 - {shot_count_rule}
@@ -253,6 +259,46 @@ async def generate_shots_for_scene(
             )
         )
     return shots
+
+
+def _shot_brief(shot: Shot) -> str:
+    parts = [
+        f"{shot.id}（{shot.duration_sec} 秒）",
+        f"景别: {shot.camera}" if shot.camera else "",
+        f"画面: {shot.visual_description}" if shot.visual_description else "",
+        f"在画面里: {', '.join(shot.character_in_frame)}" if shot.character_in_frame else "",
+        f"地点: {shot.location}" if shot.location else "",
+        f"台词（{shot.dialogue_speaker}）: {shot.dialogue_text}" if shot.dialogue_text else "",
+        f"旁白: {shot.narration}" if shot.narration else "",
+        f"video_prompt: {shot.video_prompt}" if shot.video_prompt else "",
+    ]
+    return "  - " + "；".join(p for p in parts if p)
+
+
+def _revision_block(revision: list[Shot] | None, feedback: str, target_shot: str) -> str:
+    """重写分镜时：本场当前的镜头 + 修改意见；只重写一个镜头时把输出限制成一个。"""
+    if not revision:
+        return ""
+    note = " ".join(str(feedback or "").split()) or "整体重写一版，画面更有表现力"
+    current = "\n".join(_shot_brief(shot) for shot in revision)
+    target = next((shot for shot in revision if shot.id == target_shot), None)
+    if target is None:
+        scope = "重写本场的全部镜头。意见没提到的部分（台词分配、时长、地点）尽量保持。"
+    else:
+        scope = (
+            f"**只重写镜头 {target.id}**，其余镜头不动，只是给你看上下文。\n"
+            f"输出 {{\"shots\": [...]}} 里**只放这一个镜头**，"
+            f"duration_sec 保持 {target.duration_sec}，台词和说话人除非意见要求否则不改。"
+            "这一条优先于下面关于镜头数的要求。"
+        )
+    return f"""
+## 按修改意见重写
+本场当前的镜头：
+{current}
+
+修改意见（优先级最高）：{note}
+{scope}
+"""
 
 
 def normalize_storyboard_durations(storyboard: Storyboard, script: Script) -> bool:

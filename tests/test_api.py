@@ -1212,3 +1212,28 @@ def test_api_create_and_update_language(client):
     assert updated["language"] == "zh"
     bad = client.put(f"/api/projects/{created['id']}", json={"language": "fr"})
     assert bad.status_code == 422
+
+
+def test_api_revise_scene_and_storyboard(client):
+    pid = create_project(client)["id"]
+    assert client.post(f"/api/projects/{pid}/bible/generate").status_code == 200
+    assert client.post(f"/api/projects/{pid}/script/generate").status_code == 200
+    resp = client.post(
+        f"/api/projects/{pid}/script/scenes/scene_1/regenerate", json={"feedback": "更紧张"}
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["id"] == "scene_1"
+    assert client.post(f"/api/projects/{pid}/script/scenes/nope/regenerate").status_code == 400
+
+    assert client.post(f"/api/projects/{pid}/script/confirm").status_code == 200
+    assert client.post(f"/api/projects/{pid}/storyboard/generate").status_code == 200
+    board = client.get(f"/api/projects/{pid}/storyboard").json()
+    shot_id = board["shots"][0]["id"]
+    assert client.post(f"/api/projects/{pid}/storyboard/revise", json={}).status_code == 400
+    proposal = client.post(
+        f"/api/projects/{pid}/storyboard/revise", json={"shot_id": shot_id, "feedback": "俯拍"}
+    ).json()
+    assert proposal["changed_shots"] == [shot_id]
+    assert "stale_segments" in proposal["impact"]
+    saved = client.put(f"/api/projects/{pid}/storyboard", json=proposal["storyboard"])
+    assert saved.status_code == 200, saved.text

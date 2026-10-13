@@ -772,8 +772,14 @@ async def generate_scene(
     prev_scenes: list[Scene],
     world_state: WorldState,
     total_scenes: int,
+    *,
+    revision: Scene | None = None,
+    feedback: str = "",
 ) -> tuple[Scene, SceneResponse]:
-    """生成单场剧本，返回 (Scene, 原始响应)。"""
+    """生成单场剧本，返回 (Scene, 原始响应)。
+
+    `revision` + `feedback`：按修改意见重写已有的这一场（`prev_scenes` 只给它之前的场次）。
+    """
     budget = outline_scene.duration_budget_sec
     user_prompt = f"""## 故事圣经（只读，不可违反）
 {_format_bible(bible)}
@@ -794,7 +800,7 @@ async def generate_scene(
 全剧预算: 共 {total_scenes} 场，合计 {project.target_duration_sec} 秒
 （这是第 {len(prev_scenes) + 1} 场）
 比例: {project.aspect_ratio.value}（影响构图描述）
-{_source_block(outline_scene)}
+{_source_block(outline_scene)}{_revision_block(revision, feedback)}
 请生成本场完整内容（JSON）。"""
 
     messages = [
@@ -818,6 +824,26 @@ async def generate_scene(
         emotion=response.emotion,
     )
     return scene, response
+
+
+def _revision_block(revision: Scene | None, feedback: str) -> str:
+    """重写一场时：当前版本 + 用户的修改意见（意见没提到的地方尽量保持）。"""
+    if revision is None:
+        return ""
+    lines = "\n".join(f"  {d.speaker}: {d.line}" for d in revision.dialogue) or "  （无对白）"
+    note = " ".join(str(feedback or "").split()) or "整体重写一版，保持剧情走向不变，写得更好"
+    return f"""
+## 重写本场（按修改意见）
+当前版本：
+标题: {revision.heading}
+摘要: {revision.summary}
+情绪: {revision.emotion}
+对白:
+{lines}
+
+修改意见（优先级最高）：{note}
+只按修改意见改；意见没提到的部分（人物、因果、和前后场的衔接、时长）尽量保持。
+"""
 
 
 def _source_block(outline_scene: OutlineScene) -> str:
