@@ -334,6 +334,52 @@ def test_finish_burns_the_ass_file(tmp_path):
     assert "subtitles=subtitles.ass" in " ".join(seen["args"])
 
 
+def test_follow_clip_lengths_uses_actual_length_but_keeps_room_for_voice(tmp_path, monkeypatch):
+    lengths = {"a.mp4": 3.21, "b.mp4": 2.88, "c.mp4": 2.5, "d.mp4": 4.4}
+
+    async def fake_probe(path, **_):
+        return lengths[Path(path).name]
+
+    monkeypatch.setattr(compose_service, "probe_duration", fake_probe)
+    segs = [
+        ComposeSegment(shot_id=sid, index=i, duration_sec=dur, audio_path=audio)
+        for i, (sid, dur, audio) in enumerate(
+            [("a", 3.0, None), ("b", 4.0, "audio/b.wav"), ("c", 3.0, None), ("d", 4.0, None)]
+        )
+    ]
+    manifest = VideoManifest(
+        clips=[
+            VideoClip(
+                shot_id=sid,
+                status=ClipStatus.READY,
+                path=f"{sid}.mp4",
+                segment_id="seg" if sid != "d" else "",
+            )
+            for sid in "abcd"
+        ]
+    )
+    audio = AudioManifest(
+        clips=[
+            AudioClip(
+                id="b",
+                shot_id="b",
+                text="台词",
+                voice="v",
+                status=ClipStatus.READY,
+                path="audio/b.wav",
+                duration_sec=3.4,
+                offset_sec=0.1,
+            )
+        ]
+    )
+    asyncio.run(compose_service._follow_clip_lengths(segs, manifest, audio, tmp_path))
+    by_id = {s.shot_id: s.duration_sec for s in segs}
+    assert by_id["a"] == 3.21, "比分镜长：不再砍尾巴"
+    assert by_id["b"] == 3.5, "片段 2.88 秒但配音要 3.5 秒：按配音"
+    assert by_id["c"] == 2.5, "比分镜短：不再冻结补帧"
+    assert by_id["d"] == 4.0, "单镜生成的片段不动（多出来的是档位尾巴）"
+
+
 def test_segment_freshness_uses_mtime(tmp_path):
     clip = tmp_path / "clip.mp4"
     segment = tmp_path / "seg.mp4"

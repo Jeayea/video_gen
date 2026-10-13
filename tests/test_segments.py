@@ -18,7 +18,7 @@ from tests.fakes import FakeLLM, FakeVideoProvider
 from videogen.models.bible import Character, Setting, StoryBible
 from videogen.models.project import Project, ProjectStatus
 from videogen.models.storyboard import Shot, Storyboard
-from videogen.models.video import ClipStatus
+from videogen.models.video import ClipStatus, VideoClip, VideoManifest
 from videogen.orchestrator.pipeline import Pipeline
 from videogen.providers.video.base import GeneratedClip, VideoRequest
 from videogen.providers.video.mock import MockVideoProvider
@@ -168,6 +168,70 @@ async def test_split_snaps_to_real_cut(tmp_path):
     assert abs(snapped[0][1] - 3.5) < 0.1 and abs(snapped[1][0] - 3.5) < 0.1
     planned = await video_service.split_segment(source, [3, 3], snap=False)
     assert planned[0] == (0.0, 3.0)
+
+
+def test_match_cuts_pairs_in_order_when_counts_agree():
+    # Seedance 实测：计划 4 / 7 秒切，模型切在 2.54 / 5.96 —— 超出 ±1 秒窗口也要对上
+    assert video_service._match_cuts([4.0, 7.0], [2.542, 5.958], 10.0) == [2.542, 5.958]
+    assert video_service._match_cuts([4.0, 7.0], [5.417, 7.333], 10.0) == [5.417, 7.333]
+
+
+def test_match_cuts_falls_back_to_window_when_counts_differ():
+    # 少切一刀：能吸附的吸附，吸附不到的按计划
+    assert video_service._match_cuts([3.0, 7.0], [3.2], 10.0) == [3.2, 7.0]
+    # 多出一个片头闪光（0.1 秒，太靠边被忽略）后数量对上
+    assert video_service._match_cuts([3.0, 7.0], [0.1, 3.1, 7.2], 10.0) == [3.1, 7.2]
+    # 三刀对两个计划切点：窗口吸附，远处那刀不要
+    assert video_service._match_cuts([3.0, 7.0], [3.1, 5.0, 7.2], 10.0) == [3.1, 7.2]
+    assert video_service._match_cuts([3.0, 7.0], [], 10.0) == [3.0, 7.0]
+
+
+@requires_ffmpeg
+@pytest.mark.asyncio
+async def test_split_uses_far_cut_when_it_is_the_only_one(tmp_path):
+    source = tmp_path / "seg.mp4"
+    await _two_color_video(source, 4.6, 1.4)  # 计划 3 秒切，模型 4.6 秒才切
+    pieces = await video_service.split_segment(source, [3, 3], snap=True)
+    assert abs(pieces[0][1] - 4.6) < 0.1 and abs(pieces[1][0] - 4.6) < 0.1
+
+
+@requires_ffmpeg
+@pytest.mark.asyncio
+async def test_resplit_segments_recuts_without_provider(tmp_path):
+    source = tmp_path / "clips" / "segments" / "seg_1.mp4"
+    source.parent.mkdir(parents=True)
+    await _two_color_video(source, 4.6, 1.4)
+    storyboard = Storyboard(
+        shots=[
+            _shot("s1", "scene_1", 3, video_prompt="a"),
+            _shot("s2", "scene_1", 3, video_prompt="b"),
+        ]
+    )
+    manifest = VideoManifest(
+        clips=[
+            VideoClip(
+                shot_id=sid,
+                scene_id="scene_1",
+                status=ClipStatus.READY,
+                path=f"clips/{sid}.mp4",
+                segment_id="seg_1",
+                segment_path="clips/segments/seg_1.mp4",
+                segment_offset_sec=offset,
+            )
+            for sid, offset in (("s1", 0.0), ("s2", 3.0))
+        ]
+    )
+    preview = await video_service.resplit_segments(
+        storyboard, manifest, tmp_path, tmp_path / "clips", dry_run=True
+    )
+    assert abs(preview[1]["new_offset"] - 4.6) < 0.1
+    assert manifest.get("s2").segment_offset_sec == 3.0, "预览不改清单"
+    assert not (tmp_path / "clips" / "s2.mp4").exists()
+
+    await video_service.resplit_segments(storyboard, manifest, tmp_path, tmp_path / "clips")
+    assert abs(manifest.get("s2").segment_offset_sec - 4.6) < 0.1
+    length = await probe_duration(tmp_path / "clips" / "s1.mp4")
+    assert length is not None and abs(length - 4.6) < 0.1
 
 
 class CountingMock(MockVideoProvider):

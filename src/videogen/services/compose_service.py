@@ -592,6 +592,8 @@ async def compose(
         storyboard, audio_manifest, speaker_names=subtitle_service.speaker_name_map(bible)
     )
     segments = [s for s in segments if _bind_video(s, video_manifest, project_dir, warnings)]
+    if settings.compose_follow_clip_length:
+        await _follow_clip_lengths(segments, video_manifest, audio_manifest, project_dir)
     for segment in segments:
         segment.native_voice = segment.shot_id in native and not segment.audio_path
     native_count = sum(1 for s in segments if s.native_voice)
@@ -1071,6 +1073,7 @@ async def _render_all(
                 f" lipsync={'on' if lipsynced is not None else 'off'}"
                 f" gain={gain_db:+.1f}"
                 f" native={'on' if native else 'off'}"
+                f" dur={segment.duration_sec:.3f}"
             )
             if (
                 reuse
@@ -1235,6 +1238,34 @@ def _bind_video(
         return False
     segment.video_path = clip.path
     return True
+
+
+async def _follow_clip_lengths(
+    segments: list[ComposeSegment],
+    manifest: VideoManifest,
+    audio: AudioManifest | None,
+    project_dir: Path,
+) -> None:
+    """段落切出来的镜头：成片时长 = 片段实际长度（但不短于配音需要的长度）。
+
+    单镜生成的片段不动 —— 那里分镜时长就是下单时长，多出来的是档位多买的尾巴。
+    """
+    stretched = {a.shot_id for a in audio.adjustments} if audio else set()
+    for segment in segments:
+        clip = manifest.get(segment.shot_id)
+        if clip is None or not clip.segment_id:
+            continue
+        length = await probe_duration(project_dir / clip.path)
+        if not length:
+            continue
+        need = 0.0
+        voice = audio.for_shot(segment.shot_id) if audio and segment.audio_path else None
+        if voice is not None and voice.duration_sec > 0:
+            need = max(0.0, voice.offset_sec) + voice.duration_sec
+        if segment.shot_id in stretched:
+            # 已经按配音拉长过的镜头保留拉长后的时长（尾部冻结帧是有意的）
+            need = max(need, segment.duration_sec)
+        segment.duration_sec = round(max(length, need), 3)
 
 
 def _params_match(marker: Path, params: str) -> bool:

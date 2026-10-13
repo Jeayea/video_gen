@@ -242,6 +242,10 @@ class Settings(BaseSettings):
     #: 口型对齐：把配音延后到「画面里的人开口」的时刻（只用本地计算，不重烧视频）。
     #: 真实测量：台词进 prompt 后模型说的同一句话比我们的配音晚 ~1.2 秒开口
     compose_align_dub_to_mouth: bool = True
+    #: 段落切出来的镜头按**片段实际长度**进成片，不再卡分镜的整数秒。
+    #: 切点吸附到真实硬切后，片段是 3.21 / 2.88 秒这样的长度；按分镜卡回 3 / 4 秒就会
+    #: 砍掉镜头尾巴（连同原声旁白）或冻结补帧。整段加起来不变，所以总时长不变
+    compose_follow_clip_length: bool = True
     #: 口型对齐的最大延后量（秒）；超过就不对齐（避免把尾音挤出片段）
     compose_mouth_align_max_sec: float = 1.5
     compose_ambient_mode: str = "off"

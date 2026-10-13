@@ -268,8 +268,10 @@ async def _generate_one(
         return
 
 
-#: 计划切点附近多远内的真实硬切会被采用（秒）
+#: 计划切点附近多远内的真实硬切会被采用（秒；硬切数与计划对不上时才用）
 _SNAP_WINDOW_SEC = 1.0
+#: 切出来的单镜片段最短多长（秒）
+_MIN_PIECE_SEC = 0.3
 
 
 async def _generate_segment(
@@ -417,8 +419,12 @@ async def split_segment(
     """算出每个镜头在整段里的 (起点, 时长)。
 
     计划切点 = 镜头时长累加；模型实际出片比计划短时按比例缩（比计划长的尾巴是档位多买的，
-    直接丢掉）。`snap=True` 时把每个计划切点吸附到 ±1 秒内最近的真实硬切 —— 模型很少严格按
-    时间戳切镜，按计划时间硬切会把上一镜的半秒画面带进下一镜。
+    直接丢掉）。`snap=True` 时把计划切点换成模型真实的硬切 —— 模型很少严格按时间戳切镜，
+    按计划时间硬切会把上一镜的半秒画面带进下一镜：
+
+    - 检测到的硬切数量**正好等于**计划切点数：按顺序一一对应，不管偏多远
+      （Seedance 2.0 实测 12 刀全切了，但有 3 刀偏 1.0~1.4 秒，窗口吸附接不住）
+    - 数量对不上（模型少切 / 多切 / 有闪光被误判）：退回「±1 秒内最近的硬切」
     """
     planned_total = float(sum(durations))
     actual = await probe_duration(source)
@@ -431,20 +437,78 @@ async def split_segment(
         bounds.append(acc)
     if snap and bounds:
         cuts = await detect_cuts(source) or []
-        snapped: list[float] = []
-        floor = 0.0
-        for planned in bounds:
-            near = [c for c in cuts if abs(c - planned) <= _SNAP_WINDOW_SEC and c > floor + 0.3]
-            choice = min(near, key=lambda c: abs(c - planned)) if near else planned
-            choice = max(choice, floor + 0.3)
-            snapped.append(choice)
-            floor = choice
-        bounds = snapped
+        bounds = _match_cuts(bounds, cuts, total)
     edges = [0.0, *bounds, total]
     return [
         (round(edges[i], 3), round(max(0.04, edges[i + 1] - edges[i]), 3))
         for i in range(len(durations))
     ]
+
+
+async def resplit_segments(
+    storyboard: Storyboard,
+    manifest: VideoManifest,
+    project_dir: Path,
+    clips_dir: Path,
+    *,
+    snap: bool = True,
+    dry_run: bool = False,
+) -> list[dict]:
+    """用已经买到的整段文件**重新切**单镜片段（不调 API、不花钱）。
+
+    切点规则改了之后给老项目补救用。只动「整段文件还在」的段；返回每个镜头的新旧起点与长度。
+    """
+    order = {shot.id: index for index, shot in enumerate(storyboard.shots)}
+    shots = {shot.id: shot for shot in storyboard.shots}
+    groups: dict[str, list[VideoClip]] = {}
+    for clip in manifest.clips:
+        if clip.segment_id and clip.segment_path and clip.shot_id in shots:
+            groups.setdefault(clip.segment_id, []).append(clip)
+    rows: list[dict] = []
+    for segment_id, clips in groups.items():
+        clips.sort(key=lambda c: order[c.shot_id])
+        source = Path(project_dir) / clips[0].segment_path
+        if not source.is_file():
+            continue
+        pieces = await split_segment(
+            source, [max(1, int(shots[c.shot_id].duration_sec)) for c in clips], snap=snap
+        )
+        for clip, (offset, length) in zip(clips, pieces, strict=True):
+            rows.append(
+                {
+                    "segment_id": segment_id,
+                    "shot_id": clip.shot_id,
+                    "old_offset": clip.segment_offset_sec,
+                    "new_offset": offset,
+                    "length": length,
+                }
+            )
+            if dry_run:
+                continue
+            target = Path(clips_dir) / f"{clip.shot_id}.mp4"
+            await cut_clip(source, target, start=offset, duration=length)
+            clip.path = _relative(target, project_dir)
+            clip.segment_offset_sec = round(offset, 3)
+            clip.duration_sec = max(1, round(length))
+    return rows
+
+
+def _match_cuts(planned: list[float], cuts: list[float], total: float) -> list[float]:
+    """计划切点 → 实际用的切点（升序，相邻至少 `_MIN_PIECE_SEC`）。"""
+    inner = [c for c in cuts if _MIN_PIECE_SEC <= c <= total - _MIN_PIECE_SEC]
+    if len(inner) == len(planned) and all(
+        b - a >= _MIN_PIECE_SEC for a, b in zip([0.0, *inner], [*inner, total], strict=True)
+    ):
+        return inner
+    snapped: list[float] = []
+    floor = 0.0
+    for target in planned:
+        near = [c for c in cuts if abs(c - target) <= _SNAP_WINDOW_SEC and c > floor + 0.3]
+        choice = min(near, key=lambda c: abs(c - target)) if near else target
+        choice = max(choice, floor + 0.3)
+        snapped.append(choice)
+        floor = choice
+    return snapped
 
 
 def resolve_segment_references(
