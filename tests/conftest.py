@@ -54,6 +54,13 @@ def fast_video_settings(monkeypatch):
     # 人声来源：老用例都在测 TTS 配音链路（默认已改成 native = 视频原声），锁回 tts；
     # 原声模式的用例自己打开
     monkeypatch.setattr(settings, "audio_dub_mode", "tts")
+    # 开场关键帧画什么：本机 .env 可能是 scene（Seedance），用例按默认的锁人模式写
+    monkeypatch.setattr(settings, "video_keyframe_subject", "characters")
+    # 同理：跑 Seedance 时 .env 里会有这些，用例按代码默认值写
+    monkeypatch.setattr(settings, "video_prompt_narration", False)
+    monkeypatch.setattr(settings, "video_price_per_second", 0.0)
+    monkeypatch.setattr(settings, "video_generate_audio", False)
+    monkeypatch.setattr(settings, "video_resolution", "")
     return settings
 
 

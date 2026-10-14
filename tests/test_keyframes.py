@@ -405,3 +405,28 @@ def test_appearance_anchor_adds_costume_missing_from_prompt(bible):
     assert "A Chinese male high school student" not in anchor  # 已经写过的不重复
     full = bible.characters[0].visual_prompt.lower()
     assert "tracksuit" not in video_service.appearance_anchor(shot, bible, full)
+
+
+def test_appearance_anchor_never_cuts_costume_mid_word(bible):
+    # 真实事故：180 字符硬截成「royal blue body with white s」，白肩 / 袖条 / 白 T 从没发出去
+    shot = Shot(id="s", scene_id="scene_1", shot_no=1, duration_sec=3,
+                character_in_frame=["char_1"], video_prompt="x")
+    bible.characters[0].visual_prompt = (
+        "A Chinese male high school student, around 17 years old, with an average everyday "
+        "Chinese face, determined expression, short black hair with a slightly messy fringe, "
+        "wears the year-2000 Chinese high school uniform: a loose zip-up tracksuit jacket, "
+        "royal blue body with white shoulders and two white stripes down each sleeve, over a "
+        "plain white T-shirt, matching royal blue track pants, white canvas sneakers"
+    )
+    anchor = video_service.appearance_anchor(shot, bible, "a boy at a desk")
+    for part in ("two white stripes down each sleeve", "plain white T-shirt",
+                 "matching royal blue track pants", "white canvas sneakers"):
+        assert part in anchor
+
+
+def test_clip_clauses_drops_whole_parts_and_keeps_wardrobe():
+    parts = ["a calm and thoughtful young person with a quiet presence", "wears a red scarf",
+             "standing tall", "black hair in a bun"]
+    text = video_service.clip_clauses(parts, limit=45)
+    assert text == "wears a red scarf, black hair in a bun"
+    assert video_service.clip_clauses(["word " * 30], limit=20).endswith("word")

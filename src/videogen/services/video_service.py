@@ -943,8 +943,41 @@ def _strip_prompt_label(text: str) -> str:
     return out
 
 
-#: 每个角色的外貌描述最多带这么多字符，避免 prompt 被圣经挤爆
-_APPEARANCE_MAX_CHARS = 180
+#: 每个角色的外貌描述最多带这么多字符，避免 prompt 被圣经挤爆。
+#: 以前是 180 且按字符硬截：《重回2000》的校服描述被截成「royal blue body with white s」，
+#: 白肩、袖条、白 T 一次都没发出去，第 2 场起校服换了款式
+_APPEARANCE_MAX_CHARS = 360
+
+#: 超长时优先保留的特征（服装 / 眼镜 / 发型 / 配饰）：跨段认人靠的就是这些
+_DISTINCTIVE = re.compile(
+    r"\b(wear|wears|wearing|uniform|jacket|tracksuit|shirt|t-shirt|blouse|cardigan|sweater|"
+    r"sweatshirt|hoodie|coat|dress|skirt|pants|trousers|jeans|shoes|sneakers|glasses|"
+    r"hair|beard|scar|tattoo|hat|cap|stripes?|cigarette)\b",
+    re.IGNORECASE,
+)
+
+
+def clip_clauses(parts: list[str], limit: int = _APPEARANCE_MAX_CHARS) -> str:
+    """把描述片段拼回一句，超长时整段整段地丢（先丢不含服装 / 发型等特征的），绝不截在半个词上。"""
+    parts = [p.strip() for p in parts if p and p.strip()]
+    text = ", ".join(parts)
+    if len(text) <= limit:
+        return text
+    ranked = sorted(range(len(parts)), key=lambda i: (not _DISTINCTIVE.search(parts[i]), i))
+    keep: set[int] = set()
+    used = 0
+    for i in ranked:
+        cost = len(parts[i]) + (2 if keep else 0)
+        if used + cost <= limit:
+            keep.add(i)
+            used += cost
+    if not keep:  # 单独一段就超长：在词边界截
+        return parts[ranked[0]][:limit].rsplit(" ", 1)[0]
+    return ", ".join(parts[i] for i in sorted(keep))
+
+
+def _split_clauses(text: str) -> list[str]:
+    return [part.strip() for part in re.split(r"[,.;]", text) if part.strip()]
 
 
 def location_anchor(shot: Shot, bible: StoryBible | None, base: str = "") -> str:
@@ -968,7 +1001,7 @@ def location_anchor(shot: Shot, bible: StoryBible | None, base: str = "") -> str
     head = look.split(",")[0].strip().lower()
     if head and head in base.lower():
         return ""
-    return f"setting: {look[:_APPEARANCE_MAX_CHARS]}"
+    return f"setting: {clip_clauses(_split_clauses(look))}"
 
 
 def prop_anchor(shot: Shot, bible: StoryBible | None, base: str = "") -> str:
@@ -986,7 +1019,7 @@ def prop_anchor(shot: Shot, bible: StoryBible | None, base: str = "") -> str:
         head = look.split(",")[0].strip().lower()
         if head and head in base.lower():
             continue
-        looks.append(look[:_APPEARANCE_MAX_CHARS])
+        looks.append(clip_clauses(_split_clauses(look)))
     return f"key props: {'; '.join(looks)}" if looks else ""
 
 
@@ -1295,18 +1328,14 @@ def appearance_anchor(
             continue
         # 逐句比：分镜只抄了开头一句（「A Chinese male high school student」）时，后面的服装 / 发型
         # 仍要补上。以前只比第一句，命中就整条跳过 —— 圣经里后加的服装描述永远进不了视频 prompt
-        missing = [
-            part.strip()
-            for part in re.split(r"[,.;]", look)
-            if part.strip() and part.strip().lower() not in haystack
-        ]
+        missing = [part for part in _split_clauses(look) if part.lower() not in haystack]
         if not missing:
             continue
         # 这里**不写角色名**：中文名进 prompt 会被模型画成画面上的文字
         # （真实事故：中文名 + 风格变成海报标题，见 character_image_service 的说明）。
         # 名字对人类读者有用，对模型没用 —— 模型只需要「画面里这个人的长相」。
-        text = ", ".join(missing)
-        chunks.append(text[:_APPEARANCE_MAX_CHARS])
+        text = clip_clauses(missing)
+        chunks.append(text)
         haystack += " " + text.lower()
     clause = ""
     if chunks:
