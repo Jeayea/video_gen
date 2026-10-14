@@ -255,7 +255,9 @@ class OpenRouterVideoProvider(VideoProvider):
             payload.get("resolution", "默认"),
         )
 
-        status = await self._poll(polling_url, job_id=job_id, shot_id=request.shot_id)
+        status = await self._poll(
+            polling_url, job_id=job_id, shot_id=request.shot_id, payload=payload
+        )
         urls = [str(u) for u in (status.get("unsigned_urls") or [])]
 
         output = Path(request.output_path)
@@ -418,8 +420,19 @@ class OpenRouterVideoProvider(VideoProvider):
 
         raise VideoProviderError("提交视频任务失败：重试次数用尽")
 
-    async def _poll(self, polling_url: str, *, job_id: str, shot_id: str) -> dict[str, Any]:
-        """轮询到 completed / failed / 超时。"""
+    async def _poll(
+        self,
+        polling_url: str,
+        *,
+        job_id: str,
+        shot_id: str,
+        payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """轮询到 completed / failed / 超时。
+
+        有的模型不是提交时 400，而是任务跑起来才报图片被拒（MiniMax H3：
+        `input new_sensitive, input image sensitive (1026)`）—— 同样按「带的图被拒」中断，交给用户。
+        """
         loop = asyncio.get_running_loop()
         deadline = loop.time() + self.timeout_sec
         last_status = ""
@@ -435,6 +448,9 @@ class OpenRouterVideoProvider(VideoProvider):
                 return status
             if state in {"failed", "error", "cancelled"}:
                 reason = status.get("error") or status.get("message") or state
+                rejected = _image_rejected_in_job(str(reason), payload or {}, job_id)
+                if rejected is not None:
+                    raise rejected
                 raise VideoProviderError(
                     f"视频生成失败（job={job_id}）：{scrub_secrets(str(reason))[:300]}"
                 )
@@ -537,6 +553,30 @@ def _reference_rejected(
     )
     return VideoReferenceRejected(
         f"视频模型拒收了{label}（{code or 'HTTP 400'}）：{text[:240]}", kind=kind, code=code
+    )
+
+
+#: 任务失败原因里「图被判敏感」的说法（H3：`input image sensitive (1026)`）
+_IMAGE_SENSITIVE = re.compile(r"image\s*sensitive|InputImageSensitive", re.IGNORECASE)
+
+
+def _image_rejected_in_job(
+    reason: str, payload: dict[str, Any], job_id: str
+) -> VideoReferenceRejected | None:
+    """轮询到的失败原因是「带的图被拒」时，转成 `VideoReferenceRejected`；否则 None。"""
+    if not _IMAGE_SENSITIVE.search(reason):
+        return None
+    if not (payload.get("input_references") or payload.get("frame_images")):
+        return None
+    kind = "first_frame" if payload.get("frame_images") else "references"
+    count = len(payload.get("frame_images") or payload.get("input_references") or [])
+    label = "首帧" if kind == "first_frame" else f"{count} 张参考图"
+    match = re.search(r"\((\d+)\)", reason) or _ERROR_CODE.search(reason)
+    code = match.group(1) if match else ""
+    text = scrub_secrets(reason)[:240]
+    logger.warning("视频模型拒收了%s（job=%s，%s），中断等用户决定", label, job_id, text)
+    return VideoReferenceRejected(
+        f"视频模型拒收了{label}（{code or '图片审核'}，job={job_id}）：{text}", kind=kind, code=code
     )
 
 

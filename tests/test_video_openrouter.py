@@ -543,6 +543,28 @@ async def test_rejected_images_raise_instead_of_silently_dropping(tmp_path, use_
     assert len(bodies) == 1, "被拒后不能再提交（不降级、不去图）"
 
 
+@pytest.mark.asyncio
+async def test_image_rejected_while_running_is_a_reference_rejection(tmp_path):
+    """H3 不是提交时 400，而是任务跑起来才报图被拒（2026-10-14，网管定妆照叼着烟）：
+    以前当普通失败重试 3 次、也不问用户，现在和 400 拒收走同一条路。"""
+    image = tmp_path / "img.png"
+    image.write_bytes(b"fake")
+    recorder = Recorder(polls=[{"status": "failed",
+                                "error": "input new_sensitive, input image sensitive (1026)"}])
+    provider = make_provider(recorder)
+    with pytest.raises(VideoReferenceRejected) as exc:
+        await provider.generate(request_for(tmp_path, reference_images=[image]))
+    assert exc.value.retryable is False
+    assert exc.value.kind == "references" and exc.value.code == "1026"
+
+    # 文字被拒（没带图，或原因不是图片）照旧是普通失败
+    plain = make_provider(Recorder(polls=[{"status": "failed",
+                                           "error": "input text sensitive (1026)"}]))
+    with pytest.raises(VideoProviderError) as other:
+        await plain.generate(request_for(tmp_path, reference_images=[image]))
+    assert not isinstance(other.value, VideoReferenceRejected)
+
+
 # ── 工厂 / 与流水线、成本账本的联动 ────────────────────
 
 
