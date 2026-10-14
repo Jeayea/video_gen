@@ -1642,3 +1642,32 @@ ruff 干净，全量 784 passed（新增 5 个）。
 
 **验证**：《重回2000》两段试拍（2026-10-14）：seedance-2.0 $4.095、seedance-2.0-fast $2.457，首帧 0 被拒，
 江浩两段同一身校服（旧版 4 段 4 套）。对比见 AGENTS.md「Seedance：空场景首帧」。
+
+**问题 3**（同日）：整章重拍后第 2 场起校服换成深藏青 + V 字拼色。查实际发出的 prompt：外貌描述按 180 字符**硬截**，
+校服截成「royal blue body with white s」，白肩 / 袖条 / 白 T / 运动裤一次都没发出去，网吧最后一镜连 royal blue 都没了。
+**修法**：`clip_clauses` 只按逗号 / 句号整段丢、绝不截半个词，超长时先保服装 / 眼镜 / 发型等特征；上限放到 360。
+副作用：场景关键帧的 prompt 跟着变，**已有关键帧缓存全部失效**（下次会重画，$0.04/张）。
+另：`tests/conftest.py` 把 `VIDEO_KEYFRAME_SUBJECT` / `VIDEO_PROMPT_NARRATION` / `VIDEO_PRICE_PER_SECOND` 等锁回默认值，
+本机 `.env` 换成 Seedance 配置后有 5 个用例跟着挂。
+**验证**：重做 3 个单元（$2.28），第 2 场两人都是宝蓝白肩运动服 + 白 T，陈宇眼镜全程在。
+
+## v0.28 · 画面里本来就有的中文不再被翻成英文、也不再被剔掉
+
+**问题**：《重回2000》黑板倒计时拍成了「305 days until Gaokao」，网吧招牌成了「New Era Internet Cafe」。两层原因：
+① 分镜 / 圣经 / 小说抽取的规则只说「video_prompt / visual_prompt 必须是英文」，LLM 把画面文字也翻了；
+② 场景图 / 道具图 / 关键帧画图前 `english_only` 剔除全部中文，提示词还写死「no text, no signs with words」——
+这是为了防角色名、风格名被印成海报字（见 v0.13），但把剧情需要的字一起挡掉了，视频模型只能自己编。
+**修法**：5 处「必须英文」规则加例外：画面文字保留原文、加引号。`asset_service.signage_text` 只认**紧跟在
+reads / written / sign / displays / characters 这类词后面**的引号中文（台词 `says …: "…"` 不算），
+`english_only(keep_signage=True)` 保留它们，`text_rule` 把「不许有字」换成「只许有这几个字、照抄」。
+**验证**：Seedream 4.5 重画两张场景图（$0.08）：「距离高考还有305天」「新时代网吧」都一笔不差；
+两侧红色竖幅仍是看不清的假字。视频模型能不能照着写对还没拍过。
+
+## v0.29 · H3 跑到一半才报「图片敏感」时也中断问用户
+
+**问题**：v0.25 的「带的图被拒就中断」只看提交时的 HTTP 400（Seedance）。H3 是提交成功、轮询时才失败：
+`input new_sensitive, input image sensitive (1026)`（《重回2000》网吧镜头，网管定妆照叼着烟）。这条走了普通失败：
+自动重试 3 次（不收费，但白等），也不告诉用户是哪张图、该怎么办。
+**修法**：`_poll` 拿到失败原因时，带了图且原因含 `image sensitive` → 抛 `VideoReferenceRejected(kind, code="1026")`，
+和 400 拒收同一条路（记进 rejections、后续段不开工、面板逐段选）。文本被拒（`input text sensitive`）仍是普通失败。
+**验证**：新增用例；真实复现是同一镜头去掉那张定妆照后一次通过（$0.65）。
