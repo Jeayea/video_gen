@@ -273,11 +273,13 @@ def test_url_token_allowlist():
     assert url_token_allowed("/api/projects/abc/music/audio")
     assert url_token_allowed("/api/projects/abc/clips/scene_1_shot_1")
     assert url_token_allowed("/api/projects/abc/characters/c1/reference")
+    assert url_token_allowed("/api/projects/abc/history/20261014-x/files/output/final.mp4")
     # 写接口与 JSON 接口：只认请求头
     assert not url_token_allowed("/api/projects")
     assert not url_token_allowed("/api/projects/abc")
     assert not url_token_allowed("/api/projects/abc/compose")
     assert not url_token_allowed("/api/projects/abc/music")
+    assert not url_token_allowed("/api/projects/abc/history")
     assert not url_token_allowed("/static/index.html")
 
 
@@ -1273,3 +1275,20 @@ def test_custom_image_prompt_translation_failure_is_reported(client):
     )
     assert resp.status_code == 400
     assert "翻译失败" in resp.json()["detail"]
+
+
+def test_history_list_and_file(client):
+    from videogen.utils import media_history
+
+    pid = create_project(client)["id"]
+    root = client.videogen_store.ensure_project_dir(pid)
+    (root / "output").mkdir(parents=True, exist_ok=True)
+    (root / "output" / "final.mp4").write_bytes(b"old-final")
+    entry = media_history.archive(root, ["output/final.mp4"], reason="重新合成")
+
+    listed = client.get(f"/api/projects/{pid}/history").json()
+    assert [e["reason"] for e in listed["entries"]] == ["重新合成"]
+    base = f"/api/projects/{pid}/history/{entry.name}/files"
+    assert client.get(f"{base}/output/final.mp4").content == b"old-final"
+    assert client.get(f"{base}/history.json").status_code == 404
+    assert client.get(f"{base}/..%2F..%2Fmeta.json").status_code == 404

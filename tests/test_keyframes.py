@@ -10,6 +10,8 @@ from tests.fakes import FakeImageProvider, FakeVideoProvider
 from videogen.models.bible import Setting
 from videogen.models.project import Project
 from videogen.models.storyboard import Shot, Storyboard
+from videogen.orchestrator.pipeline import PipelineError
+from videogen.providers.video.base import VideoReferenceRejected
 from videogen.services import cost_service, keyframe_service, preflight_service, video_service
 from videogen.services.storyboard_service import Segment
 
@@ -251,3 +253,155 @@ async def test_budget_gate_includes_keyframes(
     pipeline = build_pipeline(store, fake_llm, FirstFrameVideo(price_usd_per_sec=0.0))
     with pytest.raises(BudgetExceeded):
         await pipeline.start_video_generation(ready_project.id)
+
+
+# ── 首帧被视频模型拒收：中断、交给用户决定（不自动去图重试）──────────
+
+
+class RejectingFirstFrameVideo(FirstFrameVideo):
+    """像 Seedance：写实人脸的首帧被判成隐私信息，带首帧就 400。"""
+
+    async def generate(self, request):
+        if request.first_frame is not None:
+            self.requests.append(request)
+            raise VideoReferenceRejected(
+                "视频模型拒收了首帧（InputImageSensitiveContentDetected.PrivacyInformation）",
+                kind="first_frame",
+                code="InputImageSensitiveContentDetected.PrivacyInformation",
+            )
+        return await super().generate(request)
+
+
+@pytest.mark.asyncio
+async def test_rejected_first_frame_stops_and_waits_for_user(
+    store, ready_project, fake_llm, settings, monkeypatch
+):
+    from tests.test_video import build_pipeline, wait_job
+
+    _give_everyone_a_portrait(store, ready_project.id)
+    monkeypatch.setattr(settings, "video_concurrency", 1)
+    video = RejectingFirstFrameVideo(price_usd_per_sec=0.0)
+    pipeline = build_pipeline(store, fake_llm, video)
+    pid = ready_project.id
+
+    job = await pipeline.start_video_generation(pid)
+    finished = await wait_job(pipeline, job.id)
+    assert finished.status.value == "failed"
+    assert "拒收" in finished.error
+
+    manifest = store.load_video_manifest(pid)
+    assert len(manifest.rejections) == 1
+    rejection = manifest.rejections[0]
+    assert rejection.kind == "first_frame"
+    assert rejection.code.endswith("PrivacyInformation")
+    assert rejection.images and rejection.images[0].startswith(keyframe_service.KEYFRAME_DIR)
+    # 只提交了一次：同样的图不重试，也没有悄悄去掉首帧再交一次，后面的段也没开工
+    assert len(video.requests) == 1
+    assert all(r.first_frame is not None for r in video.requests)
+    assert not manifest.ready_clips
+
+    # 不处理就不许再开工
+    with pytest.raises(PipelineError):
+        await pipeline.start_video_generation(pid)
+
+    # 用户选「这段不带图」：只有这一段不带首帧
+    unit = rejection.unit_id
+    await pipeline.resolve_reference_rejection(pid, unit, "without_reference")
+    assert store.load_video_manifest(pid).reference_waived == [unit]
+    video.requests.clear()
+    job = await pipeline.start_video_generation(pid)
+    await wait_job(pipeline, job.id)
+    after = store.load_video_manifest(pid)
+    waived_shots = set(rejection.shot_ids)
+    assert all(after.get(sid).status.value == "ready" for sid in waived_shots)
+    assert [r.first_frame for r in video.requests if r.shot_id == unit] == [None]
+    assert unit not in after.reference_waived  # 只管这一次
+    # 下一段照样先带首帧，照样被拒、照样停下来问
+    if len(after.clips) > len(waived_shots):
+        assert [r.unit_id for r in after.rejections] != [unit]
+        others = [r for r in video.requests if r.shot_id != unit]
+        assert others and all(r.first_frame is not None for r in others)
+
+
+@pytest.mark.asyncio
+async def test_resolve_regenerate_keyframe_forgets_cache(
+    store, ready_project, fake_llm, settings, monkeypatch
+):
+    from tests.test_video import build_pipeline, wait_job
+
+    _give_everyone_a_portrait(store, ready_project.id)
+    monkeypatch.setattr(settings, "video_concurrency", 1)
+    pipeline = build_pipeline(store, fake_llm, RejectingFirstFrameVideo(price_usd_per_sec=0.0))
+    pid = ready_project.id
+    await wait_job(pipeline, (await pipeline.start_video_generation(pid)).id)
+    unit = store.load_video_manifest(pid).rejections[0].unit_id
+    frames = store.ensure_project_dir(pid) / keyframe_service.KEYFRAME_DIR
+    assert (frames / f"{unit}.json").is_file()
+
+    with pytest.raises(PipelineError):
+        await pipeline.resolve_reference_rejection(pid, unit, "nonsense")
+    result = await pipeline.resolve_reference_rejection(pid, unit, "regenerate_keyframe")
+    assert result["remaining"] == []
+    assert not (frames / f"{unit}.json").exists()
+    assert not list(frames.glob(f"{unit}.*"))
+    manifest = store.load_video_manifest(pid)
+    assert manifest.rejections == [] and manifest.reference_waived == []
+    # 已经处理过的段不能再处理一次
+    with pytest.raises(PipelineError):
+        await pipeline.resolve_reference_rejection(pid, unit, "retry")
+
+
+# ── 只画场景的开场帧（VIDEO_KEYFRAME_SUBJECT=scene）──────────────
+
+
+def test_scene_only_keyframe_has_no_people(setup, settings, monkeypatch):
+    project, project_dir, bible = setup
+    monkeypatch.setattr(settings, "video_keyframe_subject", "scene")
+    [job] = keyframe_service.plan_jobs([_segment()], project, bible, project_dir, FirstFrameVideo())
+    assert [p.name for p in job.references] == ["loc_1.png"]  # 定妆照一张都不带
+    assert "no people" in job.prompt
+    assert "A young woman" not in job.prompt  # 不用以人为主语的 video_prompt
+    assert not _CJK.search(job.prompt)
+
+    # 没有场景图也照画（按文字锁房间）
+    bible.settings[0].reference_image = ""
+    [job] = keyframe_service.plan_jobs([_segment()], project, bible, project_dir, FirstFrameVideo())
+    assert job.references == []
+
+
+@pytest.mark.asyncio
+async def test_scene_only_first_frame_tells_video_model_people_enter(
+    store, setup, settings, monkeypatch
+):
+    project, project_dir, bible = setup
+    monkeypatch.setattr(settings, "video_segment_mode", True)
+    monkeypatch.setattr(settings, "video_keyframe_subject", "scene")
+    keyframer = keyframe_service.Keyframer(
+        store, project.id, project, bible, image_provider=FakeImageProvider()
+    )
+    video = FirstFrameVideo()
+    await video_service.generate_clips(
+        project, store.load_storyboard(project.id), video, store.clips_dir(project.id),
+        project_dir, bible=bible, retry_backoff_sec=0, keyframer=keyframer,
+    )
+    [request] = video.requests
+    assert request.first_frame is not None
+    assert video_service.SCENE_OPENING_NOTE in request.prompt
+
+    # 默认（锁人）模式不加这句
+    monkeypatch.setattr(settings, "video_keyframe_subject", "characters")
+    assert video_service.with_opening_frame_note("p", request.first_frame) == "p"
+
+
+def test_appearance_anchor_adds_costume_missing_from_prompt(bible):
+    shot = Shot(id="s", scene_id="scene_1", shot_no=1, duration_sec=3,
+                character_in_frame=["char_1"], video_prompt="x")
+    bible.characters[0].visual_prompt = (
+        "A Chinese male high school student, around 17, wearing a blue-and-white tracksuit"
+    )
+    base = "A Chinese male high school student lifts his head"
+    anchor = video_service.appearance_anchor(shot, bible, base.lower())
+    assert "blue-and-white tracksuit" in anchor
+    assert "A Chinese male high school student" not in anchor  # 已经写过的不重复
+    full = bible.characters[0].visual_prompt.lower()
+    assert "tracksuit" not in video_service.appearance_anchor(shot, bible, full)

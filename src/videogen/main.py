@@ -36,6 +36,7 @@ from videogen.services import (
 )
 from videogen.services.character_image_service import CharacterImageError
 from videogen.services.cost_service import BudgetExceeded, PriceTable
+from videogen.utils import media_history
 from videogen.utils import music as music_utils
 from videogen.utils.ffmpeg import (
     ffmpeg_available,
@@ -146,8 +147,15 @@ def _bind_host() -> str:
 
 #: 只能用 URL 传 token 的产物地址 —— `<img>` / `<video>` / `<a download>` 带不了请求头。
 #: 这些路径都是**只读**的产物下载，不接受任何写操作。
-_URL_TOKEN_SUFFIXES = ("/final", "/subtitles", "/subtitles.vtt", "/music/audio")
-_URL_TOKEN_FRAGMENTS = ("/clips/", "/reference")
+_URL_TOKEN_SUFFIXES = (
+    "/final",
+    "/subtitles",
+    "/subtitles.vtt",
+    "/music/audio",
+    "/rejected-image",
+)
+#: `/history/` 下只有 GET（看旧片段 / 旧成片），以后加写接口不能放在这个前缀下
+_URL_TOKEN_FRAGMENTS = ("/clips/", "/reference", "/history/")
 
 
 def url_token_allowed(path: str) -> bool:
@@ -935,6 +943,53 @@ class InvalidateVideoRequest(BaseModel):
 async def invalidate_video(project_id: str, req: InvalidateVideoRequest):
     """把指定段（或镜头所在的整段）标回待生成；之后点「生成视频片段」只重买这些段。"""
     return await pipeline.invalidate_video(project_id, segments=req.segments, shots=req.shots)
+
+
+class ResolveRejectionRequest(BaseModel):
+    #: regenerate_keyframe（重画开场关键帧）/ retry（换过图了，再带图试）/ without_reference
+    action: str
+
+
+@app.post("/api/projects/{project_id}/video/rejections/{unit_id}/resolve")
+async def resolve_reference_rejection(project_id: str, unit_id: str, req: ResolveRejectionRequest):
+    """某段的首帧 / 参考图被视频模型拒收、生成已中断：由用户决定怎么继续（不自动去图重试）。"""
+    return await pipeline.resolve_reference_rejection(project_id, unit_id, req.action)
+
+
+@app.get("/api/projects/{project_id}/video/rejections/{unit_id}/rejected-image")
+async def rejected_image(project_id: str, unit_id: str, index: int = 0):
+    """被视频模型拒收的那张图（给用户判断要不要重画）。"""
+    manifest = pipeline.get_video_manifest(project_id)
+    rejection = next(
+        (r for r in (manifest.rejections if manifest else []) if r.unit_id == unit_id), None
+    )
+    if rejection is None or not 0 <= index < len(rejection.images):
+        raise HTTPException(404, "没有这张被拒的图")
+    path = store.resolve_artifact(project_id, rejection.images[index])
+    if not path:
+        raise HTTPException(404, "图片文件不存在（可能已被重画）")
+    return FileResponse(path)
+
+
+@app.get("/api/projects/{project_id}/history")
+async def media_history_list(project_id: str):
+    """作废 / 被替换下来的旧片段、旧配音、旧成片（最新的在前）。"""
+    pipeline.get_project(project_id)
+    project_dir = store.project_dir(project_id)
+    return {
+        "entries": media_history.list_entries(project_dir),
+        "keep": settings.media_history_keep,
+        "max_mb": settings.media_history_max_mb,
+    }
+
+
+@app.get("/api/projects/{project_id}/history/{entry_id}/files/{relative:path}")
+async def media_history_file(project_id: str, entry_id: str, relative: str):
+    pipeline.get_project(project_id)
+    path = media_history.resolve_file(store.project_dir(project_id), entry_id, relative)
+    if not path:
+        raise HTTPException(404, "历史版本里没有这个文件")
+    return FileResponse(path)
 
 
 @app.get("/api/projects/{project_id}/video/status")

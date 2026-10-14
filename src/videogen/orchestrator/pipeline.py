@@ -195,6 +195,22 @@ VIDEO_JOB_KIND = "video"
 AUDIO_JOB_KIND = "audio"
 COMPOSE_JOB_KIND = "compose"
 
+#: 段的图被视频模型拒收后，用户可选的处理方式（见 `Pipeline.resolve_reference_rejection`）
+REJECTION_ACTIONS = ("regenerate_keyframe", "retry", "without_reference")
+
+
+def _rejection_message(manifest: VideoManifest) -> str:
+    """视频生成被「图被拒」中断时给用户看的话：哪几段、什么原因、可以怎么选。"""
+    parts = [
+        f"{r.unit_id}（{'首帧' if r.kind == 'first_frame' else '参考图'}，{r.code or '被拒'}）"
+        for r in manifest.rejections
+    ]
+    return (
+        f"视频生成已中断：{len(parts)} 段带的图被视频模型拒收 —— {'；'.join(parts)}。"
+        "没有自动去掉图重试（那样角色 / 场景一致性会悄悄丢掉）。请在视频面板逐段选择："
+        "重画开场关键帧 / 换图后重试 / 这一段不带图生成，然后再点「生成视频片段」"
+    )
+
 
 class Pipeline:
     """项目流水线编排：管理阶段流转、人工确认门控和断点续跑。
@@ -403,7 +419,9 @@ class Pipeline:
 
     def _invalidate_media(self, project_id: str) -> None:
         """文本产物变了，下游媒体全部作废（避免用旧分镜去合成）。"""
-        self.store.purge_media(project_id, video=True, audio=True, compose=True)
+        self.store.purge_media(
+            project_id, video=True, audio=True, compose=True, reason="剧本或分镜重新生成"
+        )
 
     def get_project(self, project_id: str) -> Project:
         project = self.store.load_project(project_id)
@@ -1545,16 +1563,20 @@ class Pipeline:
             project_dir = self.store.ensure_project_dir(project_id)
             self.store.save_storyboard(project_id, storyboard)
             if video is not None:
-                video_service.invalidate_clips(video, impact["stale_shots"], project_dir)
+                video_service.invalidate_clips(
+                    video, impact["stale_shots"], project_dir, reason="分镜修改"
+                )
                 gone = {c.shot_id for c in video.clips} - {s.id for s in storyboard.shots}
-                video_service.invalidate_clips(video, sorted(gone), project_dir, drop=True)
+                video_service.invalidate_clips(
+                    video, sorted(gone), project_dir, drop=True, reason="分镜删掉的镜头"
+                )
                 self.store.save_video_manifest(project_id, video)
             if audio is not None:
                 # 配音按镜头文本做差异：没改字的条目下次配音直接复用；镜头删了的条目丢掉
                 keep = {s.id for s in storyboard.shots}
                 audio.clips = [c for c in audio.clips if c.shot_id in keep]
                 self.store.save_audio_manifest(project_id, audio)
-            self.store.purge_media(project_id, compose=True)
+            self.store.purge_media(project_id, compose=True, reason="分镜修改")
             if project.status in EDIT_CONFIRMED_STORYBOARD_STATUSES:
                 ready = video is not None and all(
                     (clip := video.get(s.id)) is not None and clip.status == ClipStatus.READY
@@ -1608,11 +1630,12 @@ class Pipeline:
             if not targets:
                 raise PipelineError("没有找到要重做的段 / 镜头")
             stale = [i for t in targets for i in t["shots"]]
+            label = "重做 " + "、".join(t["segment_id"] for t in targets)
             video_service.invalidate_clips(
-                video, stale, self.store.ensure_project_dir(project_id)
+                video, stale, self.store.ensure_project_dir(project_id), reason=label
             )
             self.store.save_video_manifest(project_id, video)
-            self.store.purge_media(project_id, compose=True)
+            self.store.purge_media(project_id, compose=True, reason=label)
             project.status = ProjectStatus.STORYBOARD_CONFIRMED
             self.store.save_project(project)
             logger.info("手动重做 %d 段（%d 镜）project=%s", len(targets), len(stale), project_id)
@@ -1728,7 +1751,9 @@ class Pipeline:
             if report.to_shots != report.from_shots:
                 self.store.save_storyboard(project_id, storyboard)
                 # 镜头没了/时长变了 -> 片段、配音、成片全部作废
-                self.store.purge_media(project_id, video=True, audio=True, compose=True)
+                self.store.purge_media(
+                    project_id, video=True, audio=True, compose=True, reason="合并短镜头"
+                )
                 was_video_ready = project.status in {
                     ProjectStatus.VIDEO_READY,
                     ProjectStatus.AUDIO_READY,
@@ -1816,6 +1841,7 @@ class Pipeline:
             if not storyboard or not storyboard.shots:
                 raise PipelineError("分镜不存在或为空，无法生成视频")
 
+            self._reject_if_rejections_pending(self.store.load_video_manifest(project_id))
             # 只为「还没生成的那部分」预留预算；真实模型按自己的档位算秒数。
             # 注意：换 provider/模型时旧片段会**全部重跑**，预算必须按全部算 ——
             # 否则「生成缺失片段」会把预算门控绕过去（真实场景：mock → H3 一次 $9.75）。
@@ -1866,6 +1892,8 @@ class Pipeline:
             bible = self.store.load_bible(project_id)
             settings = get_settings()
             existing = self.store.load_video_manifest(project_id)
+            # 批量链路不经过 start_video_generation，这里再兜一次
+            self._reject_if_rejections_pending(existing)
             # 批量链路不经过 start_video_generation，这里再兜一次编段（已编过就不动）
             storyboard = await self._apply_segment_mode(
                 storyboard, video=existing, only_if_missing=True
@@ -1919,7 +1947,7 @@ class Pipeline:
         except asyncio.CancelledError:
             # 取消：保留已生成片段，状态退回可重试的位置
             async with self._lock(project_id):
-                self.store.purge_media(project_id, compose=True)
+                self.store.purge_media(project_id, compose=True, reason="视频生成被取消")
                 # **取消也要记账**：已经落盘的片段 provider 已经按秒计过费了，
                 # 不记的话账本就少一笔（真实事故：取消时 3 个片段共 $1.95 没进账本，
                 # 而片段随后被删掉，连「补记账」的机会都没有了）。
@@ -1964,7 +1992,7 @@ class Pipeline:
                 if c.generated_at and before_generated.get(c.shot_id) != c.generated_at
             ]
             if regenerated:
-                self.store.purge_media(project_id, compose=True)
+                self.store.purge_media(project_id, compose=True, reason="视频片段重新生成")
             self._settle_video_status(
                 project, manifest, self.store.load_audio_manifest(project_id)
             )
@@ -1975,10 +2003,59 @@ class Pipeline:
                 f"完成：成功 {len(manifest.ready_clips)}，失败 {len(manifest.failed_clips)}"
             ),
         )
+        if manifest.rejections:
+            raise PipelineError(_rejection_message(manifest))
         if not manifest.ready_clips:
             raise PipelineError(
                 f"全部 {len(manifest.clips)} 个片段生成失败，请检查 provider 配置 / ffmpeg"
             )
+
+    @staticmethod
+    def _reject_if_rejections_pending(manifest: VideoManifest | None) -> None:
+        if manifest is not None and manifest.rejections:
+            raise PipelineError(_rejection_message(manifest))
+
+    async def resolve_reference_rejection(
+        self, project_id: str, unit_id: str, action: str
+    ) -> dict:
+        """用户对「某段的图被视频模型拒收」做决定，之后再点「生成视频片段」继续。
+
+        - `regenerate_keyframe`：作废这段的开场关键帧缓存，下次生成重画一张（$0.04）再带上
+        - `retry`：图已经换过了（例如重新上传 / 重画了定妆照），原样再带图试一次
+        - `without_reference`：这一段不带任何图生成（一致性只靠文字），只管这一次
+        """
+        if action not in REJECTION_ACTIONS:
+            options = ", ".join(REJECTION_ACTIONS)
+            raise PipelineError(f"不认识的处理方式：{action}（可选 {options}）")
+        self._reject_if_video_running(project_id)
+        async with self._lock(project_id):
+            self.get_project(project_id)
+            manifest = self.store.load_video_manifest(project_id)
+            rejection = next(
+                (r for r in (manifest.rejections if manifest else []) if r.unit_id == unit_id),
+                None,
+            )
+            if manifest is None or rejection is None:
+                raise PipelineError(f"段 {unit_id} 没有待处理的拒收记录")
+            if action == "regenerate_keyframe":
+                if rejection.kind != "first_frame":
+                    raise PipelineError(
+                        "被拒的是参考图（定妆照 / 场景图），不是首帧：请换图后选「重试」"
+                    )
+                keyframe_service.forget(self.store.ensure_project_dir(project_id), unit_id)
+            if action == "without_reference":
+                if unit_id not in manifest.reference_waived:
+                    manifest.reference_waived.append(unit_id)
+            else:
+                manifest.reference_waived = [u for u in manifest.reference_waived if u != unit_id]
+            manifest.rejections = [r for r in manifest.rejections if r.unit_id != unit_id]
+            self.store.save_video_manifest(project_id, manifest)
+            logger.info("段 %s 的拒收已处理：%s project=%s", unit_id, action, project_id)
+            return {
+                "unit_id": unit_id,
+                "action": action,
+                "remaining": [r.unit_id for r in manifest.rejections],
+            }
 
     def _record_video_cost(
         self,
@@ -2362,7 +2439,7 @@ class Pipeline:
             self.store.save_storyboard(project_id, storyboard)
             self.store.save_audio_manifest(project_id, manifest)
             # 镜头时长可能被拉长 -> 旧成片作废
-            self.store.purge_media(project_id, compose=True)
+            self.store.purge_media(project_id, compose=True, reason="重新配音")
             self._settle_audio_status(
                 project, manifest, self.store.load_video_manifest(project_id)
             )
@@ -2582,6 +2659,8 @@ class Pipeline:
             def on_progress(done: int, total: int, message: str) -> None:
                 ctx.set_progress(done=done, total=total, message=message)
 
+            # 上一版成片先留进历史版本（新的这次可能失败，也可能不如旧的）
+            self.store.archive_media(project_id, compose=True, reason="重新合成")
             try:
                 report = await compose_service.compose(
                     project,
@@ -2596,12 +2675,12 @@ class Pipeline:
                     on_progress=on_progress,
                 )
             except asyncio.CancelledError:
-                self.store.purge_media(project_id, compose=True)
+                self.store.purge_media(project_id, compose=True, keep_history=False)
                 self._settle_compose_status(project, audio, video)
                 raise
             except Exception:
-                # 失败的半截成片一律删掉，避免被当成可用产物
-                self.store.purge_media(project_id, compose=True)
+                # 失败的半截成片一律删掉，避免被当成可用产物（旧成片在上面已经留进历史版本）
+                self.store.purge_media(project_id, compose=True, keep_history=False)
                 self._settle_compose_status(project, audio, video)
                 raise
 
@@ -2735,8 +2814,8 @@ class Pipeline:
                 self._settle_video_status(project, manifest, audio)
             elif project.status == ProjectStatus.AUDIO_GENERATING:
                 self._settle_audio_status(project, audio, manifest)
-            else:  # COMPOSING：半截成片已经在合成任务里清掉了
-                self.store.purge_media(project.id, compose=True)
+            else:  # COMPOSING：半截成片（旧成片在开始合成前已留进历史版本）
+                self.store.purge_media(project.id, compose=True, keep_history=False)
                 project.status = (
                     ProjectStatus.AUDIO_READY
                     if audio and audio.is_usable and manifest and manifest.ready_clips

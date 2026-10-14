@@ -287,6 +287,12 @@ class Settings(BaseSettings):
     lipsync_measure: bool = True
     lipsync_concurrency: int = 1
 
+    # 作废的片段 / 配音 / 成片先挪进 projects/<id>/history/ 留一份（utils/media_history.py）
+    #: 最多留几批；0 = 不留存，直接删除（老行为）
+    media_history_keep: int = 20
+    #: 历史版本合计上限（MB），超了从最旧的删；0 = 不按大小限制
+    media_history_max_mb: float = 2048.0
+
     # 成本与预算（单价都可配，第三方价格会变）
     #: 0 = 不限制；单位 USD
     budget_usd: float = 0.0
@@ -313,6 +319,9 @@ class Settings(BaseSettings):
     #: 只认首帧、不收参考图的模型（Kling / Wan）怎么锁角色：`auto` = 每段开拍前用图片模型
     #: 把「定妆照 + 场景图 + 第一个镜头」画成一张开场关键帧当首帧（按张计费）；`off` = 不画
     video_keyframe: str = "auto"
+    #: 开场关键帧画什么：`characters` = 定妆照 + 场景（锁人也锁景）；`scene` = 只画场景和道具、
+    #: 画面里没有人（锁景不锁人）。Seedance 会拒收写实人脸的首帧（已知限制 51），这时用 `scene`
+    video_keyframe_subject: str = "characters"
 
     # 批量生产
     batch_max_items: int = 20

@@ -12,11 +12,17 @@ from videogen.config import Settings, get_settings
 from videogen.models.bible import StoryBible
 from videogen.models.project import Project
 from videogen.models.storyboard import Shot, Storyboard
-from videogen.models.video import ClipStatus, MediaKind, VideoClip, VideoManifest
-from videogen.providers.video.base import VideoProvider, VideoRequest
+from videogen.models.video import (
+    ClipStatus,
+    MediaKind,
+    ReferenceRejection,
+    VideoClip,
+    VideoManifest,
+)
+from videogen.providers.video.base import VideoProvider, VideoReferenceRejected, VideoRequest
 from videogen.services import voice_catalog
 from videogen.services.storyboard_service import Segment, segments_of
-from videogen.utils import language, region
+from videogen.utils import language, media_history, region
 from videogen.utils.ffmpeg import cut_clip, detect_cuts, ffmpeg_available, probe_duration
 from videogen.utils.redact import scrub_secrets
 
@@ -54,6 +60,8 @@ async def generate_clips(
     - **续跑**：已有 manifest 里 `ready` 且文件仍在的镜头直接跳过（可在失败后重试）
     - **进度**：每完成一个镜头回调一次 `on_progress`，调用方负责落盘/更新任务
     - **关键帧**：给了 `keyframer`（只认首帧的模型）时，每段先画一张开场关键帧当首帧
+    - **图被拒就中断**：某段的首帧 / 参考图被视频模型拒收时记进 `manifest.rejections`，
+      之后不再开始新的段（已提交的照常跑完），等用户决定（见 `ReferenceRejection`）
     """
     manifest = existing or VideoManifest()
     # 换了 provider / 模型（例如 mock → 真实模型）时，旧片段一律作废重跑，
@@ -67,6 +75,11 @@ async def generate_clips(
             provider.name,
             provider.model or "?",
             len(manifest.ready_clips),
+        )
+        # 旧片段会在原位置被新片段覆盖：先留进历史版本
+        old = manifest.model or manifest.provider
+        _archive_clips(
+            manifest.clips, project_dir, f"换模型重跑（{old} → {provider.model or provider.name}）"
         )
         for stale in manifest.clips:
             stale.status = ClipStatus.PENDING
@@ -130,6 +143,10 @@ async def generate_clips(
 
     async def run_one(segment: Segment) -> None:
         async with semaphore:
+            if manifest.rejections:
+                # 有段的图被拒了：后面的段先不开工（开工就花钱），等用户决定
+                logger.info("段 %s 未开始：有段的参考图 / 首帧被拒，等用户决定", segment.id)
+                return
             if len(segment.shots) > 1:
                 await _generate_segment(
                     segment,
@@ -192,15 +209,18 @@ async def _generate_one(
         return
 
     output = clips_dir / f"{shot.id}.mp4"
+    unit = segment or Segment(id=shot.id, scene_id=shot.scene_id, shots=[shot])
     references, shot_seed = resolve_references(shot, bible, project_dir, provider, seed)
     first_frame = None
-    if keyframer is not None:
-        unit = segment or Segment(id=shot.id, scene_id=shot.scene_id, shots=[shot])
+    if unit.id in manifest.reference_waived:
+        logger.warning("镜头 %s：用户已同意不带参考图 / 首帧生成", shot.id)
+        references = []
+    elif keyframer is not None:
         first_frame = await keyframer.first_frame(unit, provider)
     request = VideoRequest(
         shot_id=shot.id,
         scene_id=shot.scene_id,
-        prompt=build_prompt(shot, project, bible),
+        prompt=with_opening_frame_note(build_prompt(shot, project, bible), first_frame),
         duration_sec=max(1, shot.duration_sec),
         aspect_ratio=project.aspect_ratio.value,
         output_path=output,
@@ -236,6 +256,8 @@ async def _generate_one(
             if job_id:
                 clip.task_id = job_id
             _cleanup_partial(output)
+            if isinstance(exc, VideoReferenceRejected):
+                _record_rejection(manifest, unit, exc, request, project_dir)
             if attempt < attempts and retryable:
                 logger.warning(
                     "镜头 %s 第 %d/%d 次生成失败，准备重试：%s", shot.id, attempt, attempts, message
@@ -246,7 +268,9 @@ async def _generate_one(
                 continue
             clip.status = ClipStatus.FAILED
             manifest.upsert(clip)
-            if retryable:
+            if isinstance(exc, VideoReferenceRejected):
+                pass  # _record_rejection 已经记过
+            elif retryable:
                 logger.error("镜头 %s 生成失败（已重试 %d 次）：%s", shot.id, max_retries, message)
             else:
                 logger.error(
@@ -266,6 +290,7 @@ async def _generate_one(
         clip.generated_at = datetime.now(UTC).isoformat()
         clip.error = ""
         manifest.upsert(clip)
+        _clear_waiver(manifest, unit.id)
         return
 
 
@@ -306,13 +331,20 @@ async def _generate_segment(
     references, segment_seed = resolve_segment_references(
         segment.shots, bible, project_dir, provider, seed, settings=settings
     )
-    first_frame = (
-        await keyframer.first_frame(segment, provider) if keyframer is not None else None
-    )
+    first_frame = None
+    if segment.id in manifest.reference_waived:
+        logger.warning("段落 %s：用户已同意不带参考图 / 首帧生成", segment.id)
+        references = []
+    elif keyframer is not None:
+        first_frame = await keyframer.first_frame(segment, provider)
     request = VideoRequest(
         shot_id=segment.id,
         scene_id=segment.scene_id,
-        prompt=build_segment_prompt(segment.shots, project, bible, settings=settings),
+        prompt=with_opening_frame_note(
+            build_segment_prompt(segment.shots, project, bible, settings=settings),
+            first_frame,
+            settings=settings,
+        ),
         duration_sec=max(1, segment.duration_sec),
         aspect_ratio=project.aspect_ratio.value,
         output_path=output,
@@ -356,6 +388,8 @@ async def _generate_segment(
                 job_id = str(getattr(exc, "job_id", "") or "")
                 update(error=message, **({"task_id": job_id} if job_id else {}))
                 _cleanup_partial(output)
+                if isinstance(exc, VideoReferenceRejected):
+                    _record_rejection(manifest, segment, exc, request, project_dir)
                 if attempt < attempts and retryable:
                     logger.warning(
                         "段落 %s 第 %d/%d 次生成失败，准备重试：%s",
@@ -379,6 +413,7 @@ async def _generate_segment(
             media_kind=generated.media_kind,
             generated_at=datetime.now(UTC).isoformat(),
         )
+        _clear_waiver(manifest, segment.id)
 
     source = Path(project_dir) / clips[0].segment_path
     if clips[0].media_kind == MediaKind.PLACEHOLDER or not ffmpeg_available():
@@ -606,6 +641,24 @@ def build_segment_prompt(
 
 #: 单镜表演要求里「不许切」的说法：段落 prompt 要求按时间戳硬切，两者自相矛盾
 _NO_CUT = re.compile(r"\b(no cuts?|without cuts?|continuous take|single take|one take)\b", re.I)
+
+
+#: 首帧是空场景（`VIDEO_KEYFRAME_SUBJECT=scene`）时追加：第 0 帧里没有人，人物得自然入画
+SCENE_OPENING_NOTE = (
+    "Opening frame: the video starts exactly on the provided image, which shows the set with "
+    "nobody in it. Bring the characters in naturally — they walk into frame, or the camera moves "
+    "to reveal them — and never morph furniture or objects into people."
+)
+
+
+def with_opening_frame_note(
+    prompt: str, first_frame: Path | None, *, settings: Settings | None = None
+) -> str:
+    """带的首帧只有场景、没有人时，告诉视频模型人物怎么出现（否则容易凭空长出来）。"""
+    settings = settings or get_settings()
+    if first_frame is None or (settings.video_keyframe_subject or "").strip().lower() != "scene":
+        return prompt
+    return f"{prompt} {SCENE_OPENING_NOTE}"
 
 
 def _without_no_cut(directive: str) -> str:
@@ -1100,20 +1153,25 @@ def storyboard_impact(
 
 
 def invalidate_clips(
-    manifest: VideoManifest, shot_ids: list[str], project_dir: Path, *, drop: bool = False
+    manifest: VideoManifest,
+    shot_ids: list[str],
+    project_dir: Path,
+    *,
+    drop: bool = False,
+    reason: str = "片段作废",
 ) -> None:
-    """把这些镜头的片段作废（删文件、标回待生成）；`drop=True` 直接从清单里删掉（镜头已不存在）。
+    """把这些镜头的片段作废（标回待生成）；`drop=True` 直接从清单里删掉（镜头已不存在）。
 
+    旧片段文件不直接删，先挪进 `history/` 留一份（连同当时的 prompt / 扣费），
+    新的生成失败 / 被拒 / 不如旧的时还找得回来。抽帧是缓存，照删。
     已经花掉的钱早就记过账，这里清掉记账标记，重新生成就是一笔新账。
     """
     project_dir = Path(project_dir)
     targets = set(shot_ids)
+    _archive_clips([c for c in manifest.clips if c.shot_id in targets], project_dir, reason)
     for clip in list(manifest.clips):
         if clip.shot_id not in targets:
             continue
-        for relative in (clip.path, clip.segment_path):
-            if relative:
-                (project_dir / relative).unlink(missing_ok=True)
         for cached in (project_dir / "frames").glob(f"{clip.shot_id}.*"):
             cached.unlink(missing_ok=True)
         if drop:
@@ -1127,6 +1185,34 @@ def invalidate_clips(
         clip.prompt = ""
         clip.cost_usd = 0.0
         clip.cost_recorded = False
+
+
+def _archive_clips(clips: list[VideoClip], project_dir: Path, reason: str) -> None:
+    files = [rel for clip in clips for rel in (clip.path, clip.segment_path) if rel]
+    if not files:
+        return
+    media_history.archive(
+        project_dir,
+        files,
+        reason=reason,
+        extra={
+            "clips": [
+                clip.model_dump(
+                    include={
+                        "shot_id",
+                        "segment_id",
+                        "provider",
+                        "task_id",
+                        "cost_usd",
+                        "generated_at",
+                        "prompt",
+                        "duration_sec",
+                    }
+                )
+                for clip in clips
+            ]
+        },
+    )
 
 
 def dub_mode_for(project: Project | None, settings: Settings | None = None) -> str:
@@ -1207,14 +1293,21 @@ def appearance_anchor(
         look = " ".join(str(character.visual_prompt or "").split())
         if not look:
             continue
-        head = look.split(",")[0].strip().lower()
-        if head and head in haystack:
+        # 逐句比：分镜只抄了开头一句（「A Chinese male high school student」）时，后面的服装 / 发型
+        # 仍要补上。以前只比第一句，命中就整条跳过 —— 圣经里后加的服装描述永远进不了视频 prompt
+        missing = [
+            part.strip()
+            for part in re.split(r"[,.;]", look)
+            if part.strip() and part.strip().lower() not in haystack
+        ]
+        if not missing:
             continue
         # 这里**不写角色名**：中文名进 prompt 会被模型画成画面上的文字
         # （真实事故：中文名 + 风格变成海报标题，见 character_image_service 的说明）。
         # 名字对人类读者有用，对模型没用 —— 模型只需要「画面里这个人的长相」。
-        chunks.append(look[:_APPEARANCE_MAX_CHARS])
-        haystack += " " + head
+        text = ", ".join(missing)
+        chunks.append(text[:_APPEARANCE_MAX_CHARS])
+        haystack += " " + text.lower()
     clause = ""
     if chunks:
         clause = "same characters as before, consistent face and hairstyle — " + "; ".join(chunks)
@@ -1236,6 +1329,44 @@ def appearance_anchor(
 def _mentions(text: str, aspect_ratio: str) -> bool:
     compact = text.replace(" ", "")
     return aspect_ratio in compact or aspect_ratio.replace(":", "x") in compact
+
+
+def _record_rejection(
+    manifest: VideoManifest,
+    unit: Segment,
+    exc: VideoReferenceRejected,
+    request: VideoRequest,
+    project_dir: Path,
+) -> None:
+    """把「这一段的图被拒」记进清单，等用户决定（同一段只留最新一条）。"""
+    images = (
+        [request.first_frame]
+        if exc.kind == "first_frame" and request.first_frame
+        else list(request.reference_images)
+    )
+    manifest.rejections = [r for r in manifest.rejections if r.unit_id != unit.id]
+    manifest.rejections.append(
+        ReferenceRejection(
+            unit_id=unit.id,
+            shot_ids=[shot.id for shot in unit.shots],
+            kind=exc.kind,
+            images=[_relative(Path(image), project_dir) for image in images],
+            code=exc.code,
+            message=scrub_secrets(str(exc))[:400],
+        )
+    )
+    logger.error(
+        "段 %s 的%s被视频模型拒收（%s），生成中断，等用户决定",
+        unit.id,
+        "首帧" if exc.kind == "first_frame" else "参考图",
+        exc.code or "无错误码",
+    )
+
+
+def _clear_waiver(manifest: VideoManifest, unit_id: str) -> None:
+    """「不带图」只管这一次：生成成功后清掉，下次重做这一段仍会先带图。"""
+    if unit_id in manifest.reference_waived:
+        manifest.reference_waived = [u for u in manifest.reference_waived if u != unit_id]
 
 
 def _clip_file_exists(project_dir: Path, clip: VideoClip) -> bool:

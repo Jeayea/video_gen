@@ -22,6 +22,7 @@ from videogen.providers.video import clear_video_capability_cache, get_video_pro
 from videogen.providers.video.base import (
     VideoArtifactError,
     VideoProviderError,
+    VideoReferenceRejected,
     VideoRequest,
 )
 from videogen.providers.video.mock import MockVideoProvider
@@ -504,80 +505,42 @@ async def test_multiple_references_are_all_sent(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_multiple_references_degrade_one_then_none(tmp_path):
-    """模型拒绝多张参考图时：先退到只带第一张，再退到不带 —— 每级都不放弃出片。"""
-    ref_a = tmp_path / "char_1.png"
-    ref_a.write_bytes(b"fake-a")
-    ref_b = tmp_path / "char_2.png"
-    ref_b.write_bytes(b"fake-b")
-    seen: list[int] = []
+@pytest.mark.parametrize("use_first_frame", [False, True])
+async def test_rejected_images_raise_instead_of_silently_dropping(tmp_path, use_first_frame):
+    """图被拒（真实事故：Seedance 把写实人脸首帧判成隐私信息）：抛 `VideoReferenceRejected`，
+    不能悄悄去掉图再交一次 —— 那样片子照出、钱照花，一致性却没了。"""
+    image = tmp_path / "img.png"
+    image.write_bytes(b"fake")
+    caps = {**HAILUO3, "pricing_skus": {"duration_seconds": "0.13"}} if use_first_frame else HAILUO3
+    bodies: list[dict] = []
+    # OpenRouter 把上游错误转义后包在 message 里
+    upstream = (
+        'HTTP 400: {"error":{"code":"InputImageSensitiveContentDetected.PrivacyInformation",'
+        '"message":"The request failed because the input image may contain real person."}}'
+    )
 
     def handler(request: httpx.Request) -> httpx.Response:
         path = request.url.path
         if path.endswith("/videos/models"):
-            return httpx.Response(200, json={"data": [HAILUO3]})
+            return httpx.Response(200, json={"data": [caps]})
         if path.endswith("/videos") and request.method == "POST":
-            body = json.loads(request.content)
-            count = len(body.get("input_references") or [])
-            seen.append(count)
-            if count > 1:  # 只接受单张
-                return httpx.Response(400, json={"error": {"message": "too many references"}})
-            return httpx.Response(
-                202,
-                json={"id": "job-1", "polling_url": "https://openrouter.ai/api/v1/videos/job-1"},
-            )
-        if path.endswith("/videos/job-1"):
-            return httpx.Response(
-                200, json={"status": "completed", "unsigned_urls": ["https://cdn/v.mp4"]}
-            )
-        return httpx.Response(200, content=VIDEO_BYTES)
+            bodies.append(json.loads(request.content))
+            return httpx.Response(400, json={"error": {"message": upstream}})
+        raise AssertionError(f"不该走到这里：{path}")
 
     provider = OpenRouterVideoProvider(
         api_key="test-key",
         model="minimax/hailuo-3",
         client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
     )
-    provider.poll_interval_sec = 0.01
+    kwargs = {"first_frame": image} if use_first_frame else {"reference_images": [image, image]}
+    with pytest.raises(VideoReferenceRejected) as exc:
+        await provider.generate(request_for(tmp_path, **kwargs))
 
-    clip = await provider.generate(request_for(tmp_path, reference_images=[ref_a, ref_b]))
-    assert clip.path.is_file()
-    assert seen == [2, 1], "应该先试 2 张、被拒后降级为 1 张"
-
-
-@pytest.mark.asyncio
-async def test_reference_rejected_then_retried_without(tmp_path):
-    """参考图传不进去时不能让整条链路挂掉：退一步不带参考图重试。"""
-    ref = tmp_path / "ref.png"
-    ref.write_bytes(b"fake")
-    calls = {"count": 0}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        path = request.url.path
-        if path.endswith("/videos/models"):
-            return httpx.Response(200, json={"data": [HAILUO3]})
-        if path.endswith("/videos") and request.method == "POST":
-            calls["count"] += 1
-            body = json.loads(request.content)
-            if "input_references" in body:
-                return httpx.Response(400, json={"error": {"message": "references unsupported"}})
-            return httpx.Response(
-                202,
-                json={"id": "job-1", "polling_url": "https://openrouter.ai/api/v1/videos/job-1"},
-            )
-        if path.endswith("/videos/job-1"):
-            return httpx.Response(200, json={"status": "completed", "unsigned_urls": ["https://cdn/v.mp4"]})
-        return httpx.Response(200, content=VIDEO_BYTES)
-
-    provider = OpenRouterVideoProvider(
-        api_key="test-key",
-        model="minimax/hailuo-3",
-        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
-    )
-    provider.poll_interval_sec = 0.01
-
-    clip = await provider.generate(request_for(tmp_path, reference_image=ref))
-    assert clip.path.is_file()
-    assert calls["count"] == 2, "第一次带参考图被拒，第二次应该不带参考图"
+    assert exc.value.retryable is False
+    assert exc.value.kind == ("first_frame" if use_first_frame else "references")
+    assert exc.value.code == "InputImageSensitiveContentDetected.PrivacyInformation"
+    assert len(bodies) == 1, "被拒后不能再提交（不降级、不去图）"
 
 
 # ── 工厂 / 与流水线、成本账本的联动 ────────────────────

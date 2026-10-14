@@ -11,6 +11,8 @@ H3 这类模型收 `input_references`，定妆照全程生效；Kling / Wan 只�
 比不上全程参考图。
 
 - 只在 `VIDEO_KEYFRAME=auto` 且模型是 `first_frame` 模式、第一个镜头有参考图时才画
+- `VIDEO_KEYFRAME_SUBJECT=scene`：只画场景和道具、画面里没有人（Seedance 拒收写实人脸的首帧时用）。
+  只锁景不锁人，人物长相靠文字；视频 prompt 会说明「开场是空场景，人物自然入画」
 - 缓存：prompt + 图片模型 + 参考图内容不变就复用（重跑 / 续跑不重复花钱）
 - 失败一律降级成纯文生视频（记 warning），绝不卡住视频生成
 - 预估（preflight / 预算门控）与真正生成用同一个 `plan_jobs` 口径
@@ -46,6 +48,7 @@ __all__ = [
     "Keyframer",
     "enabled_for",
     "estimate",
+    "forget",
     "keyframe_prompt",
     "plan_jobs",
 ]
@@ -82,6 +85,68 @@ async def enabled_for(provider: VideoProvider, settings: Settings | None = None)
     except Exception:  # 问不到能力就按不画处理，不能卡住生成
         logger.warning("查询视频模型首帧能力失败，不画关键帧", exc_info=True)
         return False
+
+
+_SCENE_RULES = (
+    "The set is empty: no people, no faces, no hands, no human figures, no silhouettes, "
+    "no mannequins, no portraits or photos of people. Keep the room and set dressing exactly "
+    "as in the location reference image if one is given. Photorealistic cinematic film frame, "
+    "natural lighting, one single frame. No text, no captions, no labels, no watermark, "
+    "no split screen, no collage."
+)
+
+
+def scene_only(settings: Settings | None = None) -> bool:
+    """开场关键帧只画场景、不画人（`VIDEO_KEYFRAME_SUBJECT=scene`）。"""
+    settings = settings or get_settings()
+    return (settings.video_keyframe_subject or "").strip().lower() == "scene"
+
+
+def scene_keyframe_prompt(
+    shot: Shot,
+    project: Project,
+    bible: StoryBible | None,
+    *,
+    settings: Settings | None = None,
+) -> str:
+    """只有场景和道具的开场帧：按镜头的景别 + 场景描述 + 道具外观画，画面里不许有人。
+
+    不用分镜的 video_prompt：它的主语就是人（「A student lifts his head…」），删不干净。
+    """
+    parts = [f"A single still frame, the opening frame of a film shot, aspect ratio "
+             f"{project.aspect_ratio.value}"]
+    camera = video_service.camera_directive(shot.camera)
+    if camera:
+        parts.append(f"framing: {camera}")
+    location = video_service.location_anchor(shot, bible)
+    if location:
+        parts.append(location)
+    props = video_service.prop_anchor(shot, bible)
+    if props:
+        parts.append(props)
+    parts.append(_SCENE_RULES)
+    return english_only(". ".join(part.strip().rstrip(".").strip() for part in parts) + ".")
+
+
+def _scene_references(shot: Shot, bible: StoryBible | None, project_dir: Path) -> list[Path]:
+    """只要场景图 + 画面里的道具图（定妆照一张都不带）。"""
+    if not bible:
+        return []
+    assets: list[tuple[str, str]] = []
+    setting = bible.get_setting(shot.location) if shot.location else None
+    if setting is not None and setting.reference_image:
+        assets.append((setting.reference_image, f"场景 {setting.id}"))
+    for prop_id in shot.props_in_frame or []:
+        prop = bible.get_prop(prop_id)
+        if prop is not None and prop.reference_image:
+            assets.append((prop.reference_image, f"道具 {prop.id}"))
+    root = Path(project_dir).resolve()
+    paths: list[Path] = []
+    for relative, label in assets:
+        path = video_service._ref_path(root, project_dir, relative, label)
+        if path is not None and path not in paths:
+            paths.append(path)
+    return paths
 
 
 def keyframe_prompt(
@@ -122,12 +187,17 @@ def plan_jobs(
         if not segment.shots:
             continue
         first = segment.shots[0]
-        references, _ = video_service.resolve_references(
-            first, bible, project_dir, provider, settings=settings
-        )
-        if not references:
-            continue  # 没有任何参考图：画关键帧没有可锁的东西，纯文生视频即可
-        prompt = keyframe_prompt(first, project, bible, settings=settings)
+        if scene_only(settings):
+            # 只画场景：没有场景图也照画（按文字），锁的是房间与陈设
+            references = _scene_references(first, bible, project_dir)
+            prompt = scene_keyframe_prompt(first, project, bible, settings=settings)
+        else:
+            references, _ = video_service.resolve_references(
+                first, bible, project_dir, provider, settings=settings
+            )
+            if not references:
+                continue  # 没有任何参考图：画关键帧没有可锁的东西，纯文生视频即可
+            prompt = keyframe_prompt(first, project, bible, settings=settings)
         digest = hashlib.sha256()
         digest.update(f"{image_model}\n{prompt}\n{project.aspect_ratio.value}".encode())
         for ref in references:
@@ -157,6 +227,20 @@ def plan_jobs(
             )
         )
     return jobs
+
+
+def forget(project_dir: Path, unit_id: str) -> None:
+    """作废这一段的关键帧缓存（用户要求重画，例如视频模型拒收了这张首帧）。"""
+    out_dir = Path(project_dir) / KEYFRAME_DIR
+    meta = out_dir / f"{unit_id}.json"
+    try:
+        saved = json.loads(meta.read_text(encoding="utf-8"))
+        stored = str(saved.get("file") or "")
+    except (OSError, ValueError):
+        stored = ""
+    meta.unlink(missing_ok=True)
+    if stored and Path(stored).name == stored:  # 只删 keyframes/ 目录里的那张
+        (out_dir / stored).unlink(missing_ok=True)
 
 
 async def estimate(

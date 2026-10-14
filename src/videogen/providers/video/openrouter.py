@@ -16,6 +16,7 @@ from videogen.providers.video.base import (
     VideoArtifactError,
     VideoProvider,
     VideoProviderError,
+    VideoReferenceRejected,
     VideoRequest,
 )
 from videogen.utils.ffmpeg import probe_duration
@@ -62,6 +63,7 @@ class OpenRouterVideoProvider(VideoProvider):
     - H3 **不支持 seed**，所以参数里不会带 `seed`（带上会被 400）
     - 角色一致性用 `input_references`（reference-to-video）；不支持时退回
       `frame_images.first_frame`，都不支持就忽略参考图并告警
+    - 带的图被模型拒收（内容审核 / 格式）时抛 `VideoReferenceRejected`，**不**悄悄去掉图重试
     """
 
     name = "openrouter"
@@ -333,23 +335,15 @@ class OpenRouterVideoProvider(VideoProvider):
             payload.update(reference)
         return payload
 
-    def _reference_payload(
-        self,
-        request: VideoRequest,
-        caps: dict[str, Any],
-        *,
-        limit: int | None = None,
-    ) -> dict[str, Any]:
+    def _reference_payload(self, request: VideoRequest, caps: dict[str, Any]) -> dict[str, Any]:
         """角色一致性：优先 reference-to-video（可多张），其次 image-to-video（首帧）。
 
-        `limit` 用于降级重试时只带前 N 张（模型可能拒绝多张参考图）。
+        被拒时不降级（见 `VideoReferenceRejected`）。
         """
         if not self.use_reference_images:
             return {}
         paths = [Path(p) for p in (request.reference_images or [])]
         paths = [p for p in paths if p.is_file()]
-        if limit is not None:
-            paths = paths[:limit]
         mode = _frame_mode(caps)
 
         if mode == "references":
@@ -406,23 +400,8 @@ class OpenRouterVideoProvider(VideoProvider):
             if response.status_code == 400 and (
                 "input_references" in attempt_payload or "frame_images" in attempt_payload
             ):
-                # 参考图传不进去就一级一级退：多张 → 只带第一张 → 完全不带。
-                # 每退一级都先出一版片子，绝不让「一致性」把整条链路卡死。
-                if len(attempt_payload.get("input_references") or []) > 1:
-                    logger.warning(
-                        "带 %d 张参考图提交被拒（%s），降级为只带第一张重试",
-                        len(attempt_payload["input_references"]),
-                        scrub_secrets(response.text[:160]),
-                    )
-                    attempt_payload["input_references"] = attempt_payload["input_references"][:1]
-                    continue
-                logger.warning(
-                    "带参考图提交被拒（%s），改为不带参考图重试",
-                    scrub_secrets(response.text[:160]),
-                )
-                attempt_payload.pop("input_references", None)
-                attempt_payload.pop("frame_images", None)
-                continue
+                # 带的图被拒：不降级成「不带图」悄悄出片（那样一致性就没了），交给上层问用户
+                raise _reference_rejected(response, attempt_payload)
 
             if response.status_code >= 400:
                 raise VideoProviderError(_http_error_message(response, url))
@@ -537,6 +516,28 @@ def _usage_cost(status: dict[str, Any]) -> float | None:
         if value is not None:
             return value
     return None
+
+
+#: 错误体里的错误码，例如 `InputImageSensitiveContentDetected.PrivacyInformation`
+#: （OpenRouter 把上游的 JSON 转义后包在 message 里，所以引号前可能有反斜杠）
+_ERROR_CODE = re.compile(r'\\?"code\\?"\s*:\s*\\?"([A-Za-z][\w.]*)')
+
+
+def _reference_rejected(
+    response: httpx.Response, payload: dict[str, Any]
+) -> VideoReferenceRejected:
+    text = scrub_secrets(response.text or "")
+    match = _ERROR_CODE.search(text)
+    code = match.group(1) if match else ""
+    kind = "first_frame" if "frame_images" in payload else "references"
+    count = len(payload.get("frame_images") or payload.get("input_references") or [])
+    label = "首帧" if kind == "first_frame" else f"{count} 张参考图"
+    logger.warning(
+        "视频模型拒收了%s（%s），中断等用户决定：%s", label, code or "无错误码", text[:200]
+    )
+    return VideoReferenceRejected(
+        f"视频模型拒收了{label}（{code or 'HTTP 400'}）：{text[:240]}", kind=kind, code=code
+    )
 
 
 def _frame_mode(caps: dict[str, Any]) -> str:

@@ -12,6 +12,7 @@ __all__ = [
     "VideoArtifactError",
     "VideoProvider",
     "VideoProviderError",
+    "VideoReferenceRejected",
     "VideoRequest",
 ]
 
@@ -39,6 +40,26 @@ class VideoArtifactError(VideoProviderError):
         super().__init__(message)
         self.job_id = job_id
         self.urls = list(urls or [])
+
+
+class VideoReferenceRejected(VideoProviderError):
+    """视频模型拒收了这次带的图（参考图 / 首帧），例如 Seedance 的
+    `InputImageSensitiveContentDetected.PrivacyInformation`（写实人脸被判成隐私信息）。
+
+    **不自动降级成「不带图」重试**：那样片子照样出、钱照样花，但角色 / 场景一致性悄悄没了
+    （真实事故：《重回2000》6 段里 5 段的首帧被拒，静默降级后每段人物各穿一套衣服）。
+    上层要中断生成、交给用户决定：重画首帧 / 换图重试 / 明确同意这一段不带图。
+    同样的图重试也是被拒，所以不重试。
+    """
+
+    retryable = False
+
+    def __init__(self, message: str, *, kind: str, code: str = ""):
+        super().__init__(message)
+        #: 被拒的是哪种图：`first_frame`（首帧）/ `references`（参考图）
+        self.kind = kind
+        #: provider 的错误码（拿不到时为空）
+        self.code = code
 
 
 class VideoRequest(BaseModel):

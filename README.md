@@ -299,6 +299,14 @@ curl -X POST localhost:8001/api/projects/$PID/cost/reconcile   # 补记漏记的
 - **单段重做**：片段卡片上的「重做这段 / 重做此镜」，或 `POST /api/projects/{id}/video/invalidate
   {"shots":[...]}` 把镜头所在的整段标回待生成，再「生成视频片段」只重买这些段。
   注意服务要用**生成时的同一个视频模型**启动，换了模型会触发全部重跑
+- **旧版本不会丢**：重做段、改分镜、换模型重跑、重新合成时，被替换下来的片段 / 配音 / 成片先挪进
+  `projects/<id>/history/<时间戳>-<原因>/`（附当时的 prompt 与扣费），视频面板底部「历史版本」可直接播放；
+  `GET /api/projects/{id}/history` 列出全部。最多留 `MEDIA_HISTORY_KEEP`（20）批、合计 `MEDIA_HISTORY_MAX_MB`
+  （2048）MB，超了从最旧的删；`MEDIA_HISTORY_KEEP=0` 回到直接删除
+- **首帧 / 参考图被视频模型拒收时会停下来问你**：面板上逐段选「重画开场关键帧 / 已换图，重试 / 这段不带图生成」，
+  不会悄悄去掉图重交（`POST /api/projects/{id}/video/rejections/{段}/resolve`）
+- **Seedance 拒收写实人脸首帧**：设 `VIDEO_KEYFRAME_SUBJECT=scene`，开场关键帧只画空场景（锁景），
+  人物的服装 / 发型 / 年代写进角色设定的外貌描述（锁装）
 
 ## 批量生产
 

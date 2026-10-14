@@ -1580,3 +1580,65 @@ $0 mock 全链路（COMPOSE_SPEED=2，源项目 15 镜 / 67s）：
 
 **验证**：Seedance 项目重切 + 重合成：17 个硬切全部在镜头边界上（改前 5 个不在）、冻结帧 0（改前 3.04 秒）。
 ruff 干净，全量 784 passed（新增 5 个）。
+
+## v0.25 · 参考图 / 首帧被拒不再静默降级（真实事故：《重回2000》Seedance 5/6 段丢了首帧）
+
+**现象**：《重回2000》第一章 Seedance 2.0 版（6 段 / 13 镜，$8.3），段与段之间人物服装、教室、道具位置全变了；
+开场关键帧全是白 T 恤，片段第一帧却是各式校服。
+
+**根因**：服务日志里 6 段有 5 段提交时被拒：`400 InputImageSensitiveContentDetected.PrivacyInformation`
+（Seedance 把写实人脸的关键帧当成隐私信息）。`openrouter._submit` 收到「带图 400」就去掉
+`frame_images` / `input_references` 重交，只打一条 `logger.warning` —— 日志只在终端，项目里没有任何记录。
+片子照出、钱照花，一致性悄悄没了。唯一没被拒的 `scene_3_seg_2` 正是唯一穿白 T 的那段。
+
+**修法**：
+
+- provider：带图 400 一律抛 `VideoReferenceRejected`（`retryable=False`，带 `kind` = first_frame / references
+  和解析出的错误码），删掉「多张 → 一张 → 不带」的降级梯子
+- `video_service`：把拒收记进 `VideoManifest.rejections`（段、镜头、被拒的图、错误码），之后不再开始新的段
+- pipeline：任务以「已中断：N 段的图被拒收……」失败；有未处理的拒收时 `start_video_generation` 直接拒绝；
+  `resolve_reference_rejection` 三选一：`regenerate_keyframe`（作废关键帧缓存，下次重画）/ `retry`（换过图了）/
+  `without_reference`（这一段不带图，写进 `reference_waived`，生成成功后清掉）
+- API：`POST video/rejections/{unit}/resolve`、`GET video/rejections/{unit}/rejected-image`（只读，可用 `?token=`）
+- UI：视频面板顶部红框列出被拒的段、错误码和那张图，逐段三个按钮；没处理完不显示生成按钮
+
+**没改的**：关键帧**本身画失败**（图片模型报错 / 预算不够）时仍然降级成纯文生视频，只记 warning。
+
+**验证**：ruff 干净，全量 819 passed（新增：provider 首帧 / 参考图被拒各一例、流水线中断 → 不许再开工 →
+不带图只作用于这一段 → 下一段仍带图并再次停下、重画关键帧清缓存；删掉 2 个降级用例）。
+`tests/test_segments.py` 有两个用例只在
+「keyframes → video_openrouter → video → segments → api」这个子集顺序下失败，改动前同样失败，与本次无关。
+
+## v0.26 · 作废的媒体先留进历史版本，不再直接删
+
+**问题**：「重做这段」、改分镜作废段、合并短镜头、上游文本重生成，都是**在新片段生成之前**就删掉旧片段
+（`invalidate_clips` 逐个 `unlink`、`purge_media` 整目录 `rmtree`）连同 `output/final.mp4`；换模型重跑、
+重新合成则在原位置直接覆盖。新的一旦失败 / 被拒 / 更差，旧的找不回来。v0.25 之后的那次《重回2000》重跑就是这样：
+6 段里 3 段首帧被拒、3 段没开工，原来的 13 镜和成片是靠事先手动备份（`ab_rejection/before/`）才留下来的。
+
+**修法**：新增 `utils/media_history.py`：
+
+- `invalidate_clips` / `purge_media` / 换模型重跑 / 开始合成前：把片段、整段文件、配音、成片与字幕（连同对应清单）
+  **挪进** `history/<时间戳>-<原因>/`，保留项目内相对路径，`history.json` 记原因、时间、文件、片段当时的
+  prompt / task_id / 扣费。挪不是复制，同盘不占额外空间
+- 合成失败 / 取消的半截成片、重启回收时的半截成片不留（`keep_history=False`）；抽帧、合成中间段、口型产物照删
+- 上限：`MEDIA_HISTORY_KEEP=20` 批、`MEDIA_HISTORY_MAX_MB=2048`，超了从最旧的删，最新一批永远留；`0` = 老行为
+- API：`GET /history`、`GET /history/{批}/files/{路径}`（只读，可 `?token=`）；视频面板底部「历史版本」可播放
+
+**验证**：ruff 干净，全量 826 passed（新增 7 个：移动 + 元数据 + 越界、按批数 / 按大小清理、关闭留存、
+同段文件只留一次、purge 只留交付物不留缓存、重做段后旧片段在历史里且重新生成后仍在、API 列表与文件）。
+
+
+## v0.27 · Seedance 首帧只画空场景；改了的服装进不了视频 prompt
+
+**问题 1**：Seedance 把写实人脸的首帧判成隐私信息拒收（v0.25），重画同样的写实关键帧还会被拒。
+**修法**：新增 `VIDEO_KEYFRAME_SUBJECT`（`characters` 默认 / `scene`）。`scene` 时关键帧只用场景图 + 道具图画空景
+（`keyframe_service.scene_keyframe_prompt`，禁止人、脸、文字），视频 prompt 追加 `SCENE_OPENING_NOTE`
+（人物走进来或运镜带出，不许把家具变成人）。人物交给角色 `visual_prompt` 的文字：服装 / 发型 / 年代写进去。
+
+**问题 2**：给角色补了服装描述，视频 prompt 里却没有。`appearance_anchor` 发现 prompt 已含 `visual_prompt` 的
+首句（分镜 LLM 抄过「A Chinese male high school student…」）就跳过**整条**外貌。
+**修法**：按逗号 / 句号拆开，只补 prompt 里还没有的部分。
+
+**验证**：《重回2000》两段试拍（2026-10-14）：seedance-2.0 $4.095、seedance-2.0-fast $2.457，首帧 0 被拒，
+江浩两段同一身校服（旧版 4 段 4 套）。对比见 AGENTS.md「Seedance：空场景首帧」。

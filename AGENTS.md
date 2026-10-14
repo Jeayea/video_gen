@@ -56,6 +56,7 @@ README 只讲「这是什么、怎么装、怎么用」。这里记录**项目�
 | **按修改意见重写（单场剧本 / 单镜或整场分镜）** | ✅ | 剧本 `script/scenes/{id}/regenerate`（剧本阶段，直接保存，时长沿用原场）；分镜 `storyboard/revise` 只出提案（单镜沿用 id / 时长 / 段落），前端确认后走 PUT 的作废预览 |
 | **局部重做（圣经单条 / 重做已展开的章 / 单句重配）** | ✅ | `bible/{kind}/{id}/regenerate`（id / 参考图 / 音色不交给模型改，外貌变了返回 `reference_stale`）；`script/generate {"redo_chapters"}`（只替换这一章，场次编号重排，分镜作废）；`audio/redub`（TTS 模式，念法写回分镜，DONE 时自动退回配音阶段）。UI 同时接上了人声来源、烧字幕样式、按描述出图（任何语言，非英文先经 LLM 翻成英文、残留中文剔除，`services/image_prompt_service.py`）、重新校验 |
 | **成片语言（中文 / 英语）** | ✅ | 项目 `language`（`PROJECT_LANGUAGE`）：英语项目的 LLM 调用都追加英文覆盖指令（`utils/language.LanguageLLM`）；视频 prompt 按台词原文写 Mandarin / English；语速按汉字 4.5 字/秒、英文 2.5 词/秒；Edge 有 en-US 音色。**还没用真实模型跑过英文片** |
+| **历史版本留存** | ✅ | 重做段 / 改分镜 / 换模型重跑 / 重新合成时，旧片段、配音、成片挪进 `history/<时间戳>-<原因>/`（`utils/media_history.py`，附当时的 prompt / 扣费），面板可播放；按批数 / 总大小自动清理。合成失败的半截成片不留 |
 | **改分镜只作废受影响的段 / 单段重做** | ✅ | 确认后甚至成片后也能改分镜；保存前 `storyboard/impact` 预览作废哪几段与重做费用；片段卡片「重做这段」= `video/invalidate`（只能整段） |
 | 成本统计与预算 | ✅ | 按阶段记 token / 秒数 / 字符 → USD 账本，超预算直接拒绝开工 |
 | 成本前置 preflight | ✅ | 动手前先算账：镜头数 / **按模型档位的真实计费秒数** / 单价 / 预算余额 / 花钱前二次确认 |
@@ -238,7 +239,7 @@ README 只讲「这是什么、怎么装、怎么用」。这里记录**项目�
     $1.44 = 视频 $1.28 + 关键帧 2 张 + 定妆照/场景图各 1 张）：**同一张人脸在两段 4 个镜头里都对得上**，
     床、花被、墙上的女士肖像、布料样品两段一致；但**关键帧只会忠实放大定妆照**——格里高的定妆照
     被画成「一个人背着一只甲虫」，于是片子里人和虫成了两个东西。变形、换装这类有多种形态的角色，
-    定妆照要按「这一段里的样子」准备
+    定妆照要按「这一段里的样子」准备。**Seedance 会拒收写实人脸的首帧**（见第 51 条）
 45. **提示词长度有模型上限**：Kling 超过 2500 字符直接 FAIL（轮询阶段才报、重试也没用）。超长时
     先删通用要求（背景 / 表演 / 风格），还不够才按句截断；上限按模型前缀写在
     `providers/video/openrouter.py` 的 `_PROMPT_LIMITS`，能力表里查不到
@@ -267,6 +268,19 @@ README 只讲「这是什么、怎么装、怎么用」。这里记录**项目�
     （`video_service.speaker_voice`，如 `off-screen voice (a middle-aged woman, about 45)`，不写名字）。
     以前不写，画外台词没有画面可参照 —— 《重回2000》Seedance 试拍里 45 岁女老师被配成了中年男声，加上后重拍是女声。
     同一角色在**不同段**之间嗓子仍可能不一样（每段独立生成）；同一段里两个同龄男生实测能分出两个嗓子（Gemini 听判，未用声纹工具复核）
+
+51. **Seedance 2.0 拒收写实人脸的首帧**：`InputImageSensitiveContentDetected.PrivacyInformation`（把关键帧里的
+    写实人脸判成隐私信息）。《重回2000》第一章（2026-10-13，6 段）5 段被拒，当时代码静默去掉首帧重交，
+    结果每段都是纯文生视频：江浩 4 段穿了 4 套衣服、三段教室三个样、网吧电脑一段 Win7 一段 Win98，
+    只有唯一没被拒的那段穿着定妆照里的白 T。被拒不收费，但这一轮 $8.3 买到的一致性等于没有。
+    现在会中断并让你选（见「真实视频模型」一节第 3 条）。注意**重画同样风格的写实关键帧大概率还会被拒**；
+    换非写实画风的定妆照 / 关键帧是否能过，还没试过。**绕开的办法是首帧不画人**（`VIDEO_KEYFRAME_SUBJECT=scene`）
+    + 把服装 / 发型 / 年代写进角色 `visual_prompt`：首帧锁景、文字锁装，脸只是「近似一致」（实测见「Seedance：空场景首帧」）
+
+52. **历史版本只在本机、只管媒体**：`history/` 和项目在同一个目录，删项目会一起删；超出
+    `MEDIA_HISTORY_KEEP` / `MEDIA_HISTORY_MAX_MB` 时最旧的整批删掉（最新一批永远留）。现在只能看 / 下载，
+    **没有「一键恢复」**——要用旧片段得手工拷回 `clips/` 并改 `video_manifest.json`。抽帧、合成中间段、
+    口型产物是缓存，不留；定妆照 / 场景图被替换时也不留（$0.04/张，按原样直接覆盖）
 
 ## 设计要点
 
@@ -331,8 +345,12 @@ BUDGET_USD=12                              # 强烈建议先设预算（见下�
 2. **不支持 seed**：H3 的 `seed` 能力是 `false`，所以请求里不会带 seed（带了会被 400）。
    角色一致性改用 **参考图**（`input_references`，reference-to-video）：在 UI 的角色卡片上
    传一张图，或 `POST /api/projects/{id}/characters/{cid}/reference`
-3. **参考图被拒会自动降级**：万一服务端不接受参考图，会**去掉参考图重试一次**并告警 ——
-   宁可这次一致性差一点，也不让整条链路挂掉
+3. **参考图 / 首帧被拒就中断，等你决定**（2026-10-13 起，以前是静默去图重试）：服务端 400 拒收带的图时
+   抛 `VideoReferenceRejected`，这一段标失败、记进 `video_manifest.rejections`，**后面的段不再开工**
+   （已提交的照常跑完）。视频面板会列出被拒的段、错误码和那张图，逐段选：
+   「重画开场关键帧」/「已换图，重试」/「这段不带图生成」（只管这一次），
+   API 是 `POST video/rejections/{段 id}/resolve {"action": "regenerate_keyframe|retry|without_reference"}`。
+   没处理完之前「生成视频片段」直接 400。见已知限制 51
 
 预算与对账：账本优先用 OpenRouter 在任务响应里报的**实际扣费**（`usage.cost`，最准）；
 拿不到时才退回「价目表单价 × 模型档位换算后的秒数」
@@ -402,6 +420,35 @@ Wan + 关键帧适合「主角在第一个镜头里」的段落。成片与并�
 ```bash
 OPENROUTER_VIDEO_MODEL=bytedance/seedance-2.0 VIDEO_RESOLUTION=720p VIDEO_GENERATE_AUDIO=true \
 VIDEO_PROMPT_NARRATION=true VIDEO_PRICE_PER_SECOND=0.152 BUDGET_USD=12 ./run.sh
+```
+
+### Seedance：空场景首帧 + 服装写进设定（2026-10-14）
+
+写实人脸的关键帧会被 Seedance 拒收（已知限制 51），所以换个分工：**首帧只画空场景**（场景图 + 道具图，
+`VIDEO_KEYFRAME_SUBJECT=scene`，提示词禁止出现人 / 文字），视频 prompt 末尾追加「开场是空景，人物走进来或运镜带出，
+不许把家具变成人」；**人物靠文字**，把年代校服、发型、配角的标志性打扮写进角色 `visual_prompt`
+（顺带修了 `appearance_anchor`：以前首句命中就整条跳过，改的服装根本到不了视频 prompt）。
+
+《重回2000》第一章两段试拍（教室 12 秒 + 网吧 15 秒，同一批空场景关键帧）：
+
+| | 旧版（首帧被拒 → 纯文生） | seedance-2.0 + 空场景首帧 | **seedance-2.0-fast** + 空场景首帧 |
+|---|---|---|---|
+| 实收 | — | $4.095（$0.152/秒） | **$2.457**（$0.091/秒，preflight $2.449） |
+| 首帧被拒 | 5/6 段 | 0/2 | 0/2 |
+| 江浩服装 | 4 段 4 套 | 两段同一身蓝白运动校服 | 同左 |
+| 场景 | 三段教室三个样 | 跟着关键帧走 | 同左；网吧后段多出一面堆满 CRT 的墙 |
+| 年代细节 | Win7 / Win98 混着 | 网吧第二镜像 XP | 两镜都是 Win98 |
+| 配角 | — | 黄毛、网管对得上 | 更准：黄毛红 T、网管叼烟灰卫衣 |
+| 段内切点 | — | 偏 0.5~2 秒 | 同样偏（网吧第一镜 5 秒拍成 7.5 秒） |
+
+结论：fast 画质没有明显输给 2.0，价格六成，《重回2000》整章改用 fast。没解决的：脸只是近似一致（每段独立生成）；
+场景关键帧里的招牌字照样会出错（「新世代网吧」画成了「新城」）；人物从空景里「出现」的方式取决于模型，要看片确认。
+对比片：`projects/20261014-重回2000-第一章-场景首帧试拍-seedance2fast/ab_compare/compare_old_20AB_fastAB.mp4`
+（左旧版 / 中 2.0 / 右 fast，三条音轨）。
+
+```bash
+OPENROUTER_VIDEO_MODEL=bytedance/seedance-2.0-fast VIDEO_PRICE_PER_SECOND=0.0907 VIDEO_KEYFRAME_SUBJECT=scene \
+VIDEO_RESOLUTION=720p VIDEO_GENERATE_AUDIO=true VIDEO_PROMPT_NARRATION=true ./run.sh
 ```
 
 ### 原声引导配音：视频模型先演，TTS 照着念（2026-10-10）

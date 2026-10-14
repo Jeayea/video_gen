@@ -55,6 +55,25 @@ class VideoClip(BaseModel):
     updated_at: str = Field(default_factory=lambda: datetime.now(UTC).isoformat())
 
 
+class ReferenceRejection(BaseModel):
+    """视频模型拒收了某一段带的图（首帧 / 参考图）：生成已中断，等用户决定怎么办。
+
+    不自动「去掉图重试」—— 那样一致性会悄悄丢掉（见 `VideoReferenceRejected`）。
+    """
+
+    #: 段 id（单镜生成时就是镜头 id）
+    unit_id: str
+    shot_ids: list[str] = Field(default_factory=list)
+    #: `first_frame`（开场关键帧）/ `references`（定妆照 / 场景图 / 道具图）
+    kind: str = ""
+    #: 被拒的图（相对项目目录）
+    images: list[str] = Field(default_factory=list)
+    #: provider 错误码，如 `InputImageSensitiveContentDetected.PrivacyInformation`
+    code: str = ""
+    message: str = ""
+    at: str = Field(default_factory=lambda: datetime.now(UTC).isoformat())
+
+
 class VideoManifest(BaseModel):
     provider: str = ""
     #: provider 实际使用的模型（mock = "mock"；真实模型写 slug，便于对账）
@@ -64,6 +83,10 @@ class VideoManifest(BaseModel):
     updated_at: str = Field(default_factory=lambda: datetime.now(UTC).isoformat())
     #: 生成时的并发度，方便排查
     concurrency: int = 1
+    #: 被视频模型拒收了图、等用户决定的段（有它在就不许再开始生成）
+    rejections: list[ReferenceRejection] = Field(default_factory=list)
+    #: 用户明确同意「不带图生成」的段 id（生成成功后清掉，下次重做仍会先带图）
+    reference_waived: list[str] = Field(default_factory=list)
 
     # ── 统计 ──────────────────────────────────────────
     @property
@@ -121,6 +144,7 @@ class VideoManifest(BaseModel):
             "failed": len(self.failed_clips),
             "pending": len(self.pending_clips),
             "placeholder": len(self.placeholder_clips),
+            "rejected": len(self.rejections),
             "duration_sec": self.total_duration_sec,
             "usable": self.is_usable,
         }

@@ -28,6 +28,7 @@ from videogen.models.script import Script, ScriptOutline, StoryOutline
 from videogen.models.storyboard import Storyboard
 from videogen.models.video import VideoManifest
 from videogen.models.world_state import WorldState
+from videogen.utils import media_history
 from videogen.utils.naming import derive_title, project_slug
 
 logger = logging.getLogger(__name__)
@@ -284,16 +285,23 @@ class FileStore:
         video: bool = False,
         audio: bool = False,
         compose: bool = False,
+        reason: str = "上游内容变了",
+        keep_history: bool = True,
     ) -> None:
         """上游产物变了就作废下游媒体，避免拿着过期分镜的片子去合成。
 
-        只删清单 + 媒体目录，不动 meta/剧本/分镜这些文本产物。
+        只动清单 + 媒体目录，不动 meta/剧本/分镜这些文本产物。片段 / 配音 / 成片与它们的清单
+        先挪进 `history/` 留一份（`utils/media_history.py`），剩下的缓存（抽帧、合成中间段、
+        口型产物）照删。`keep_history=False` 用于「这份产物本身就是坏的」
+        （例如合成失败的半截成片）。
         """
         if not self.is_valid_id(project_id):
             return
         directory = self.project_dir(project_id)
         if not directory.is_dir():
             return
+        if keep_history:
+            self.archive_media(project_id, video=video, audio=audio, compose=compose, reason=reason)
         if video:
             self.remove_artifact(project_id, "video_manifest")
             shutil.rmtree(directory / "clips", ignore_errors=True)
@@ -305,6 +313,36 @@ class FileStore:
         if compose:
             self.remove_artifact(project_id, "compose_report")
             shutil.rmtree(directory / "output", ignore_errors=True)
+
+    def archive_media(
+        self,
+        project_id: str,
+        *,
+        video: bool = False,
+        audio: bool = False,
+        compose: bool = False,
+        reason: str,
+    ) -> Path | None:
+        """把片段 / 配音 / 成片（连同清单）挪进 `history/` 的一批新版本，返回这批的目录。
+
+        成片只留 `output/` 根目录下的交付物（final.mp4、字幕、报告），子目录是合成缓存。
+        """
+        if not self.is_valid_id(project_id):
+            return None
+        directory = self.project_dir(project_id)
+        if not directory.is_dir():
+            return None
+        keep: list[Path] = []
+        if video:
+            keep += _files_under(directory / "clips", recursive=True)
+            keep.append(self._json_path(project_id, "video_manifest"))
+        if audio:
+            keep += _files_under(directory / "audio", recursive=True)
+            keep.append(self._json_path(project_id, "audio_manifest"))
+        if compose:
+            keep += _files_under(directory / "output", recursive=False)
+            keep.append(self._json_path(project_id, "compose_report"))
+        return media_history.archive(directory, keep, reason=reason)
 
     def resolve_artifact(self, project_id: str, relative: str) -> Path | None:
         """把产物相对路径安全地解析成绝对路径（禁止越出项目目录）。"""
@@ -351,3 +389,11 @@ class FileStore:
         d = self.output_dir(project_id) / "segments"
         d.mkdir(exist_ok=True)
         return d
+
+
+def _files_under(directory: Path, *, recursive: bool) -> list[Path]:
+    if not directory.is_dir():
+        return []
+    items = directory.rglob("*") if recursive else directory.iterdir()
+    return sorted(p for p in items if p.is_file())
+
