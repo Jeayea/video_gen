@@ -54,9 +54,61 @@ def _items(bible: StoryBible, kind: str) -> list:
     return getattr(bible, kind)
 
 
-def english_only(text: str | None) -> str:
-    """剔除中日韩字符（图片模型会把 prompt 里的中文画进画面）。"""
-    return " ".join(_CJK_RE.sub(" ", str(text or "")).split()).strip(" ,.;")
+#: 画面里本来就有的字：引号括起来、紧跟在「写着 / 招牌 / 显示」这类词后面
+#: （`the blackboard reads "距离高考还有305天"`）。
+#: 台词 / 旁白虽然也在引号里，但前面是 says / saying，不算
+_SIGNAGE_RE = re.compile(
+    r"\b(?:reads?|reading|written|writes|writing|displays?|displaying|shows?|showing|"
+    r"characters|sign|signboard|signage|banner|slogan|labell?ed|titled|inscribed)\s*[:：]?\s*"
+    r"(?:\"([^\"]+)\"|“([^”]+)”|「([^」]+)」)",
+    re.IGNORECASE,
+)
+
+
+def signage_text(text: str | None) -> list[str]:
+    """prompt 里要求画出来的中文（黑板 / 招牌 / 横幅上的原文），按出现顺序去重。"""
+    found: list[str] = []
+    for match in _SIGNAGE_RE.finditer(str(text or "")):
+        quoted = next(group for group in match.groups() if group is not None).strip()
+        if quoted and _CJK_RE.search(quoted) and quoted not in found:
+            found.append(quoted)
+    return found
+
+
+def english_only(text: str | None, *, keep_signage: bool = False) -> str:
+    """剔除中日韩字符（图片模型会把 prompt 里的中文画进画面：角色名、风格名被印成海报标题）。
+
+    `keep_signage=True` 时，画面里本来就有的字（`signage_text`）原样保留 —— 黑板倒计时、
+    网吧招牌是场景的一部分，删掉它们视频模型就只能自己编（《重回2000》编成了英文）。
+    """
+    raw = str(text or "")
+    if not keep_signage:
+        return " ".join(_CJK_RE.sub(" ", raw).split()).strip(" ,.;")
+    out: list[str] = []
+    last = 0
+    for match in _SIGNAGE_RE.finditer(raw):
+        quoted = next(group for group in match.groups() if group is not None)
+        if not _CJK_RE.search(quoted):
+            continue
+        start = match.start(match.lastindex)
+        out.append(_CJK_RE.sub(" ", raw[last:start - 1]))
+        out.append(f' "{quoted.strip()}"')
+        last = match.end()
+    out.append(_CJK_RE.sub(" ", raw[last:]))
+    return " ".join("".join(out).split()).strip(" ,.;")
+
+
+def text_rule(prompt: str, *, default: str) -> str:
+    """「不许有字」的那句：prompt 里有要画的中文时，改成「只许有这些字、照抄」。"""
+    signs = signage_text(prompt)
+    if not signs:
+        return default
+    quoted = ", ".join(f'"{sign}"' for sign in signs)
+    return (
+        f"The only visible writing is {quoted} in Simplified Chinese characters, written exactly "
+        "as quoted, every stroke correct, clean and legible; no other text, no English words, "
+        "no captions, no watermark"
+    )
 
 
 _english = english_only
@@ -64,13 +116,15 @@ _english = english_only
 
 def build_setting_prompt(setting: Setting, *, aspect_ratio: str = "9:16", extra: str = "") -> str:
     """场景参考图：**没有人**的背景板（人物交给角色图锁，场景图只锁环境）。"""
-    look = _english(setting.visual_prompt) or "a detailed, lived-in real-world location"
+    look = english_only(setting.visual_prompt, keep_signage=True) or (
+        "a detailed, lived-in real-world location"
+    )
     lines = [
         f"Background plate of a single location with no people: {look}",
         "Wide establishing view, natural motivated lighting, rich environmental detail in "
         "foreground and background, photorealistic, cinematic",
-        "Empty scene only — no people, no figures, no text, no letters, no signs with words, "
-        "no logo, no watermark, no border",
+        "Empty scene only — no people, no figures, no logo, no watermark, no border",
+        text_rule(look, default="no text, no letters, no signs with words"),
         f"{aspect_ratio} composition",
     ]
     if _english(extra):
@@ -80,13 +134,13 @@ def build_setting_prompt(setting: Setting, *, aspect_ratio: str = "9:16", extra:
 
 def build_prop_prompt(prop: Prop, *, extra: str = "") -> str:
     """道具参考图：白底单品（只锁物品外观，不带剧情和场景）。"""
-    look = _english(prop.visual_prompt) or "a single everyday object"
+    look = english_only(prop.visual_prompt, keep_signage=True) or "a single everyday object"
     lines = [
         f"Product photograph of one single object: {look}",
         "Isolated on a plain pure white seamless background, centered, soft even studio "
         "lighting, photorealistic, sharp focus, true-to-life materials and wear",
-        "Object only — no people, no hands, no text, no letters, no labels, no logo, "
-        "no watermark, no border",
+        "Object only — no people, no hands, no logo, no watermark, no border",
+        text_rule(look, default="no text, no letters, no labels"),
         "1:1 composition",
     ]
     if _english(extra):

@@ -35,7 +35,7 @@ from videogen.providers.image import ImageProvider, get_image_provider
 from videogen.providers.image.base import ImageProviderError, ImageRequest
 from videogen.providers.video.base import VideoProvider
 from videogen.services import cost_service, video_service
-from videogen.services.asset_service import english_only
+from videogen.services.asset_service import english_only, text_rule
 from videogen.services.storyboard_service import Segment
 from videogen.utils.file_store import FileStore
 from videogen.utils.redact import scrub_secrets
@@ -59,8 +59,7 @@ _STILL_RULES = (
     "Keep every person's face, hairstyle, body and outfit exactly as in the reference images; "
     "the room and set dressing follow the location reference image if one is given. "
     "Photorealistic cinematic film frame, natural lighting, one single frame. "
-    "No text, no captions, no labels, no watermark, no split screen, no collage, "
-    "no character sheet, no plain studio background."
+    "No split screen, no collage, no character sheet, no plain studio background."
 )
 
 
@@ -91,9 +90,11 @@ _SCENE_RULES = (
     "The set is empty: no people, no faces, no hands, no human figures, no silhouettes, "
     "no mannequins, no portraits or photos of people. Keep the room and set dressing exactly "
     "as in the location reference image if one is given. Photorealistic cinematic film frame, "
-    "natural lighting, one single frame. No text, no captions, no labels, no watermark, "
-    "no split screen, no collage."
+    "natural lighting, one single frame. No split screen, no collage."
 )
+
+#: 关键帧里「不许有字」的默认说法；要画黑板 / 招牌上的原文时由 `text_rule` 换掉
+_NO_TEXT = "No text, no captions, no labels, no watermark"
 
 
 def scene_only(settings: Settings | None = None) -> bool:
@@ -125,7 +126,9 @@ def scene_keyframe_prompt(
     if props:
         parts.append(props)
     parts.append(_SCENE_RULES)
-    return english_only(". ".join(part.strip().rstrip(".").strip() for part in parts) + ".")
+    joined = ". ".join(part.strip().rstrip(".").strip() for part in parts)
+    body = english_only(joined, keep_signage=True)
+    return f"{body}. {text_rule(body, default=_NO_TEXT)}."
 
 
 def _scene_references(shot: Shot, bible: StoryBible | None, project_dir: Path) -> list[Path]:
@@ -163,10 +166,12 @@ def keyframe_prompt(
     )
     body = video_service.build_prompt(shot, project, bible, settings=still)
     aspect = project.aspect_ratio.value
-    return english_only(
+    text = english_only(
         f"A single still frame, the opening frame of a film shot, aspect ratio {aspect}. "
-        f"{body}. {_STILL_RULES}"
+        f"{body}. {_STILL_RULES}",
+        keep_signage=True,
     )
+    return f"{text}. {text_rule(text, default=_NO_TEXT)}."
 
 
 def plan_jobs(

@@ -52,7 +52,9 @@ STORYBOARD_SYSTEM = """你是一位专业分镜师。根据剧本场景生成分
 }
 
 要求：
-- video_prompt 必须全英文，面向 AI 视频生成模型
+- video_prompt 必须全英文，面向 AI 视频生成模型；例外：
+  画面里要出现的文字（黑板 / 招牌 / 横幅 / 屏幕）保留原文、用引号括起来，不要翻译
+  （例：the blackboard reads "距离高考还有305天"，不要写成 '305 days until Gaokao'）
 - video_prompt 里禁止出现 char_1 / loc_1 这类内部 id，必须写成具体的外貌/场景描述
 - **背景必须写实、写满**：environment 部分要说清「有什么陈设/道具、什么材质、光从哪来、
   前景与景深里有什么」，至少写到一个**具体的可见物**。
@@ -214,7 +216,8 @@ async def generate_shots_for_scene(
 ## 要求
 - 画面比例: {project.aspect_ratio.value} → {aspect_hint}
 - {shot_count_rule}
-- video_prompt 必须是英文，且不得包含 char_N / loc_N 这类 id
+- video_prompt 必须是英文，且不得包含 char_N / loc_N 这类 id；
+  画面里要出现的文字（黑板 / 招牌 / 横幅 / 屏幕）保留原文、用引号括起来，不要翻译
 - 每个镜头都要填 location（场景 id），video_prompt 的背景要和该场景一致
 - 台词对应的镜头要标记 dialogue_text 和 dialogue_speaker（speaker 用角色 id）
 - **一个镜头只有一个说话人**：dialogue_text 只放 dialogue_speaker 这一个人的话
