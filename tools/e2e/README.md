@@ -1,8 +1,8 @@
 # tools/e2e · 不花钱的端到端冒烟
 
 ```bash
-.venv/bin/python tools/e2e/mock_pipeline_e2e.py          # 跑完自动关服务
-.venv/bin/python tools/e2e/mock_pipeline_e2e.py --keep   # 保留服务，自己去 UI 点
+.venv/bin/python tools/e2e/mock_pipeline_e2e.py --source <已有项目>          # 跑完自动关服务
+.venv/bin/python tools/e2e/mock_pipeline_e2e.py --source <已有项目> --keep   # 保留服务，自己去 UI 点
 .venv/bin/python tools/e2e/mock_pipeline_e2e.py --help   # 源项目 / 端口 / 超时
 ```
 
@@ -18,7 +18,7 @@
 | 合成 / 响度 | 本机 ffmpeg | `output/final.mp4` |
 
 文本链路（圣经 → 剧本 → 分镜）不跑：那要调真 LLM。脚本把 `--source` 项目
-（默认 `20260911-一个合照被裁掉的女孩从默默无名`）的这些产物复制进新项目，并把状态置成 `storyboard_confirmed`，
+（必填，`projects/` 下已有分镜的项目目录名）的这些产物复制进新项目，并把状态置成 `storyboard_confirmed`，
 从「生成视频片段」开始跑完整条媒体链路。
 
 ## 安全边界（不满足就别改）
@@ -49,11 +49,12 @@
 
 ```bash
 # 1) 先看账：复制源项目 + 调 preflight，一分钱不花
-.venv/bin/python tools/e2e/real_shot_e2e.py --shots scene_1_shot_1,scene_2_shot_2,scene_3_shot_2
+.venv/bin/python tools/e2e/real_shot_e2e.py --source <已有项目> --id <新项目> \
+    --shots scene_1_shot_1,scene_2_shot_2,scene_3_shot_2
 # 2) 确认过再真跑（真钱，必须显式 --yes）
-.venv/bin/python tools/e2e/real_shot_e2e.py --shots <同上> --yes --force
+.venv/bin/python tools/e2e/real_shot_e2e.py --source <同上> --id <同上> --shots <同上> --yes --force
 # 3) $0 重量一遍（改过测量口径/想看最新数字时用，不播种、不调任何花钱接口）
-.venv/bin/python tools/e2e/real_shot_e2e.py --verify-only
+.venv/bin/python tools/e2e/real_shot_e2e.py --source <同上> --id <同上> --verify-only
 ```
 
 它补的是 mock 冒烟的盲区：**真 provider 的画面 + 真 TTS**。做法是

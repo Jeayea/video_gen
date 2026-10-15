@@ -1,8 +1,8 @@
 #!/usr/bin/env python
 """端到端验证（$0）：从「已有分镜」一路跑到 final.mp4，全程走真实 HTTP 接口。
 
-    .venv/bin/python tools/e2e/mock_pipeline_e2e.py          # 全自动，跑完关服务
-    .venv/bin/python tools/e2e/mock_pipeline_e2e.py --keep   # 保留服务，方便手点 UI
+    .venv/bin/python tools/e2e/mock_pipeline_e2e.py --source <已有项目>         # 全自动，跑完关服务
+    .venv/bin/python tools/e2e/mock_pipeline_e2e.py --source <已有项目> --keep  # 保留服务
 
 为什么是 $0：
 - `VIDEO_PROVIDER=mock`（ffmpeg 真出 540x960 H.264，纯色背景 + 扫过的白条，肉眼能看出是视频）
@@ -46,7 +46,6 @@ SEED_FILES = (
 #: 服务端口（和 .env 里真实运行时用的 8001 分开，避免误伤）
 DEFAULT_PORT = 8099
 DEFAULT_TOKEN = "e2e-token-2f9c"
-DEFAULT_SOURCE = "20260911-一个合照被裁掉的女孩从默默无名"
 
 
 # ── 基础设施 ────────────────────────────────────────────────
@@ -275,7 +274,9 @@ def wait_job(http: Http, kind: str, project_id: str, report: Report, *, timeout_
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="端到端冒烟（$0，mock 视频/配音）")
-    parser.add_argument("--source", default=DEFAULT_SOURCE, help="复制分镜产物的真实项目 id")
+    parser.add_argument(
+        "--source", required=True, help="复制分镜产物的已有项目 id（projects/ 下的目录名）"
+    )
     parser.add_argument("--projects-dir", default="", help="默认 <repo>/.e2e/projects")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--token", default=DEFAULT_TOKEN)

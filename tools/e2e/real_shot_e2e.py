@@ -2,11 +2,11 @@
 """方案 B：真花钱的小口径端到端 —— 只重生成 N 个镜头，把整条媒体链路跑到底。
 
     # 1) 先看账（只播种 + 调 preflight，一分钱不花）
-    .venv/bin/python tools/e2e/real_shot_e2e.py \\
+    .venv/bin/python tools/e2e/real_shot_e2e.py --source <已有项目> --id <新项目> \\
         --shots scene_1_shot_1,scene_2_shot_2,scene_3_shot_2
 
     # 2) 确认过再真跑（花真钱，必须显式 --yes）
-    .venv/bin/python tools/e2e/real_shot_e2e.py \\
+    .venv/bin/python tools/e2e/real_shot_e2e.py --source <已有项目> --id <新项目> \\
         --shots scene_1_shot_1,scene_2_shot_2,scene_3_shot_2 --yes
 
 为什么不是整片重跑：整片 15 镜 79 秒 ≈ $10.3，而这里要证明的只是
@@ -333,12 +333,10 @@ def _ffmpeg_binary() -> str:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="方案 B：真跑 N 个镜头的端到端")
-    parser.add_argument("--source", default="20260911-一个合照被裁掉的女孩从默默无名")
     parser.add_argument(
-        "--id",
-        default="20260911-方案-b-真跑-3-镜-mock-之外的第一次真链路",
-        help="新项目 id（必须是没用过的）",
+        "--source", required=True, help="复制分镜产物的已有项目 id（projects/ 下的目录名）"
     )
+    parser.add_argument("--id", required=True, help="新项目 id（必须是没用过的）")
     parser.add_argument("--shots", default="", help="逗号分隔的 shot_id（要真花钱的）")
     parser.add_argument("--base-url", default="http://127.0.0.1:8001")
     parser.add_argument("--yes", action="store_true", help="确认花钱，缺省只播种 + 看账")
