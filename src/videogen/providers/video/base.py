@@ -134,6 +134,8 @@ class VideoProvider(ABC):
 
     #: 写进 manifest 的 provider 标识
     name: str = "base"
+    #: 是否真的按秒花钱（单价读不到时，预算门控要拦下来）
+    paid: bool = False
     #: 当前使用的模型（写进 manifest / 成本账本；mock 就是 "mock"）
     model: str = ""
     #: 是否支持参考图（角色一致性用）

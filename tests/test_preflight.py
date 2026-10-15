@@ -300,6 +300,20 @@ async def test_video_plan_falls_back_to_config_price():
 
 
 @pytest.mark.asyncio
+async def test_video_plan_warns_when_paid_model_has_no_price():
+    storyboard = storyboard_of(make_shot("s1", seconds=3))
+    provider = FakeVideoProvider()
+    provider.paid = True
+    plan = await preflight_service.video_plan(storyboard, None, provider)
+    assert plan["price_unknown"] is True
+    assert any("VIDEO_PRICE_PER_SECOND" in w for w in plan["warnings"])
+
+    provider.paid = False  # mock / 假 provider 本来就不花钱，不该告警
+    plan = await preflight_service.video_plan(storyboard, None, provider)
+    assert "price_unknown" not in plan
+
+
+@pytest.mark.asyncio
 async def test_video_plan_handles_unavailable_provider():
     storyboard = storyboard_of(make_shot("s1", seconds=4))
     plan = await preflight_service.video_plan(

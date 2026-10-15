@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
+import shutil
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -27,7 +29,7 @@ from videogen.providers.video.base import (
     VideoRequest,
 )
 from videogen.services import voice_catalog
-from videogen.services.storyboard_service import Segment, segments_of
+from videogen.services.storyboard_service import Segment, chain_predecessors, segments_of
 from videogen.utils import language, media_history, region
 from videogen.utils.ffmpeg import cut_clip, detect_cuts, ffmpeg_available, probe_duration
 from videogen.utils.redact import scrub_secrets
@@ -60,6 +62,8 @@ def legacy_pending_job(clip: VideoClip) -> str:
 
 #: `ReferenceRejection.kind`：开场关键帧没画出来（不是被视频模型拒收）
 KEYFRAME_FAILED = "keyframe_failed"
+#: 接戏帧（上一段的最后一帧）的文件名后缀：`keyframes/<段>.chain.jpg`
+CHAIN_FRAME_SUFFIX = ".chain.jpg"
 
 
 class KeyframeUnavailable(RuntimeError):
@@ -117,7 +121,10 @@ async def generate_clips(
         # 旧片段会在原位置被新片段覆盖：先留进历史版本
         old = manifest.model or manifest.provider
         _archive_clips(
-            manifest.clips, project_dir, f"换模型重跑（{old} → {provider.model or provider.name}）"
+            manifest.clips,
+            project_dir,
+            f"换模型重跑（{old} → {provider.model or provider.name}）",
+            model=manifest.model,
         )
         for stale in manifest.clips:
             stale.status = ClipStatus.PENDING
@@ -187,10 +194,18 @@ async def generate_clips(
     )
 
     semaphore = asyncio.Semaphore(manifest.concurrency)
+    # 接戏帧：同场同地点的下一段等上一段生成完，拿它的最后一帧当首帧
+    chain: dict[str, Segment] = {}
+    if keyframer is not None and get_settings().video_keyframe_chain:
+        chain = chain_predecessors(segments_of(storyboard), waived=manifest.chain_waived)
+    done = {segment.id: asyncio.Event() for segment in todo}
 
     async def run_one(segment: Segment) -> None:
         try:
-            await run_segment(segment)
+            previous = chain.get(segment.id)
+            if previous is not None and previous.id in done:
+                await done[previous.id].wait()  # 等的时候不占并发名额
+            await run_segment(segment, _chain_source(previous, manifest, project_dir))
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # 一段出意外不能把别的段（已在花钱）一起带走
@@ -203,8 +218,10 @@ async def generate_clips(
                     clip.error = message
                     manifest.upsert(clip)
             _emit(on_progress, manifest)
+        finally:
+            done[segment.id].set()
 
-    async def run_segment(segment: Segment) -> None:
+    async def run_segment(segment: Segment, previous: Path | None) -> None:
         async with semaphore:
             if manifest.rejections:
                 # 有段的图被拒了：后面的段先不开工（开工就花钱），等用户决定
@@ -224,6 +241,7 @@ async def generate_clips(
                     retry_backoff_sec=retry_backoff_sec,
                     on_progress=on_progress,
                     keyframer=keyframer,
+                    previous=previous,
                 )
                 _emit(on_progress, manifest)
                 return
@@ -241,6 +259,7 @@ async def generate_clips(
                 on_progress=on_progress,
                 keyframer=keyframer,
                 segment=segment,
+                previous=previous,
             )
             _emit(on_progress, manifest)
 
@@ -266,6 +285,7 @@ async def _generate_one(
     on_progress: ProgressCallback,
     keyframer: Keyframer | None = None,
     segment: Segment | None = None,
+    previous: Path | None = None,
 ) -> None:
     clip = manifest.get(shot.id)
     if clip is None:  # pragma: no cover - 调用方保证已 upsert
@@ -280,7 +300,7 @@ async def _generate_one(
         references = []
     elif keyframer is not None:
         try:
-            first_frame = await keyframer.first_frame(unit, provider)
+            first_frame = await keyframer.first_frame(unit, provider, previous=previous)
         except KeyframeUnavailable as exc:
             _record_keyframe_failure(manifest, unit, exc)
             clip.status = ClipStatus.FAILED
@@ -409,6 +429,7 @@ async def _generate_segment(
     on_progress: ProgressCallback,
     settings: Settings | None = None,
     keyframer: Keyframer | None = None,
+    previous: Path | None = None,
 ) -> None:
     """一段（多个镜头）一次生成，再按镜头切回单镜片段。
 
@@ -431,7 +452,7 @@ async def _generate_segment(
         references = []
     elif keyframer is not None:
         try:
-            first_frame = await keyframer.first_frame(segment, provider)
+            first_frame = await keyframer.first_frame(segment, provider, previous=previous)
         except KeyframeUnavailable as exc:
             _record_keyframe_failure(manifest, segment, exc)
             for clip in clips:
@@ -769,11 +790,21 @@ SCENE_OPENING_NOTE = (
 )
 
 
+CHAIN_OPENING_NOTE = (
+    "Opening frame: the video starts exactly on the provided image, which is the last frame of "
+    "the previous shot. Continue seamlessly from it: same people, same faces, same outfits, "
+    "same room."
+)
+
+
 def with_opening_frame_note(
     prompt: str, first_frame: Path | None, *, settings: Settings | None = None
 ) -> str:
-    """带的首帧只有场景、没有人时，告诉视频模型人物怎么出现（否则容易凭空长出来）。"""
+    """首帧是接戏帧时说明「接着上一段」；只有场景、没有人时，告诉视频模型人物怎么出现
+    （否则容易凭空长出来）。"""
     settings = settings or get_settings()
+    if first_frame is not None and str(first_frame).endswith(CHAIN_FRAME_SUFFIX):
+        return f"{prompt} {CHAIN_OPENING_NOTE}"
     if first_frame is None or (settings.video_keyframe_subject or "").strip().lower() != "scene":
         return prompt
     return f"{prompt} {SCENE_OPENING_NOTE}"
@@ -1327,7 +1358,12 @@ def invalidate_clips(
     """
     project_dir = Path(project_dir)
     targets = set(shot_ids)
-    _archive_clips([c for c in manifest.clips if c.shot_id in targets], project_dir, reason)
+    _archive_clips(
+        [c for c in manifest.clips if c.shot_id in targets],
+        project_dir,
+        reason,
+        model=manifest.model,
+    )
     for clip in list(manifest.clips):
         if clip.shot_id not in targets:
             continue
@@ -1353,7 +1389,29 @@ def invalidate_clips(
         clip.cost_recorded = False
 
 
-def _archive_clips(clips: list[VideoClip], project_dir: Path, reason: str) -> None:
+#: 历史版本里给每个片段记下的字段（够把它原样恢复回清单）
+_ARCHIVED_CLIP_FIELDS = {
+    "shot_id",
+    "scene_id",
+    "segment_id",
+    "provider",
+    "task_id",
+    "cost_usd",
+    "generated_at",
+    "prompt",
+    "duration_sec",
+    "path",
+    "segment_path",
+    "segment_offset_sec",
+    "media_kind",
+    "aspect_ratio",
+}
+
+
+def _archive_clips(
+    clips: list[VideoClip], project_dir: Path, reason: str, *, model: str = ""
+) -> None:
+    clips = [clip for clip in clips if clip.path or clip.segment_path]
     files = [rel for clip in clips for rel in (clip.path, clip.segment_path) if rel]
     if not files:
         return
@@ -1362,23 +1420,152 @@ def _archive_clips(clips: list[VideoClip], project_dir: Path, reason: str) -> No
         files,
         reason=reason,
         extra={
+            "model": model,
             "clips": [
-                clip.model_dump(
-                    include={
-                        "shot_id",
-                        "segment_id",
-                        "provider",
-                        "task_id",
-                        "cost_usd",
-                        "generated_at",
-                        "prompt",
-                        "duration_sec",
-                    }
-                )
+                clip.model_dump(mode="json", include=_ARCHIVED_CLIP_FIELDS)
                 for clip in clips
-            ]
+                if clip.status == ClipStatus.READY
+            ],
         },
     )
+
+
+def restore_clips(
+    manifest: VideoManifest,
+    storyboard: Storyboard,
+    entry: Path,
+    meta: dict,
+    project_dir: Path,
+    *,
+    shot_ids: list[str] | None = None,
+) -> dict:
+    """把一批历史版本里的片段拷回 `clips/`、写回清单（历史里那份留着，可以再恢复）。
+
+    以**段**为单位：段是一次生成的、整段文件按段 id 命名，只恢复其中几个镜头会和
+    现在的整段文件对不上。所以只恢复「现在分镜里这一段的每个镜头在这批里都有、
+    而且当时也是同一段」的段，其余列进 `skipped`。给了 `shot_ids` 就只看这些镜头所在的段。
+    被替换下来的当前片段照样先挪进历史版本。钱早就记过账，恢复不再记。
+    """
+    project_dir = Path(project_dir)
+    old = _archived_clips(entry, meta)
+    wanted = set(shot_ids or [])
+    restored: list[Segment] = []
+    skipped: list[dict] = []
+    for segment in segments_of(storyboard):
+        ids = segment.shot_ids
+        if wanted and not wanted & set(ids):
+            continue
+        reason = _restore_blocker(segment, old, entry)
+        if reason:
+            skipped.append({"segment_id": segment.id, "shots": ids, "reason": reason})
+        else:
+            restored.append(segment)
+    if not restored:
+        return {"restored_segments": [], "restored_shots": [], "skipped": skipped}
+
+    # 先把要拷回来的文件放到旁边（归档当前片段可能触发清理，把这批历史删掉）
+    staged: dict[Path, Path] = {}  # 目标 → 临时文件（同一段的镜头共用一个整段文件）
+    for segment in restored:
+        for shot in segment.shots:
+            clip = old[shot.id]
+            for relative in {clip.path, clip.segment_path} - {""}:
+                target = project_dir / relative
+                if target in staged:
+                    continue
+                temp = target.with_name(target.name + ".restoring")
+                temp.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(entry / relative, temp)
+                staged[target] = temp
+    shots = [shot for segment in restored for shot in segment.shots]
+    targets = {shot.id for shot in shots}
+    current = [c for c in manifest.clips if c.shot_id in targets]
+    for clip in current:
+        if clip.pending_job_id:
+            logger.warning(
+                "镜头 %s 恢复历史版本时还有没取回的任务 %s（服务端可能已扣费），不再接着查",
+                clip.shot_id,
+                clip.pending_job_id,
+            )
+    _archive_clips(current, project_dir, f"恢复 {entry.name} 之前", model=manifest.model)
+    for target, temp in staged.items():
+        os.replace(temp, target)
+    for shot in shots:
+        clip = old[shot.id].model_copy(
+            update={
+                "scene_id": shot.scene_id,
+                "status": ClipStatus.READY,
+                "error": "",
+                "pending_job_id": "",
+                "cost_recorded": True,
+            }
+        )
+        manifest.upsert(clip)
+        for cached in (project_dir / "frames").glob(f"{shot.id}.*"):
+            cached.unlink(missing_ok=True)
+    restored_from = str(meta.get("model") or "")
+    warnings = []
+    if restored_from and manifest.model and restored_from != manifest.model:
+        warnings.append(f"恢复的片段是 {restored_from} 生成的，其余片段是 {manifest.model}")
+    logger.info(
+        "从历史版本 %s 恢复 %d 段（%d 镜）", entry.name, len(restored), len(shots)
+    )
+    return {
+        "restored_segments": [segment.id for segment in restored],
+        "restored_shots": [shot.id for shot in shots],
+        "skipped": skipped,
+        "warnings": warnings,
+    }
+
+
+def _archived_clips(entry: Path, meta: dict) -> dict[str, VideoClip]:
+    """这批历史里的片段：新版本在 history.json 的 `clips` 里；整批归档时用当时的清单。"""
+    clips: dict[str, VideoClip] = {}
+    manifest_file = entry / "video_manifest.json"
+    if manifest_file.is_file():
+        try:
+            saved = VideoManifest.model_validate_json(manifest_file.read_text(encoding="utf-8"))
+            for clip in saved.ready_clips:
+                clips[clip.shot_id] = clip
+        except ValueError:
+            logger.warning("历史版本 %s 的视频清单读不了，只按 history.json 恢复", entry.name)
+    for raw in meta.get("clips") or []:
+        try:
+            clip = VideoClip.model_validate(raw)
+        except ValueError:
+            continue
+        # 老的 history.json 没记路径：按命名规则补上
+        if not clip.path:
+            clip.path = f"clips/{clip.shot_id}.mp4"
+        if not clip.segment_path and clip.segment_id:
+            guess = f"clips/segments/{clip.segment_id}.mp4"
+            if (entry / guess).is_file():
+                clip.segment_path = guess
+        clips.setdefault(clip.shot_id, clip)
+    return clips
+
+
+def _restore_blocker(segment: Segment, old: dict[str, VideoClip], entry: Path) -> str:
+    """这一段为什么不能从这批历史恢复（能恢复返回空串）。"""
+    missing = [shot.id for shot in segment.shots if shot.id not in old]
+    if missing:
+        return f"这批历史里没有 {'、'.join(missing)} 的片段"
+    for shot in segment.shots:
+        clip = old[shot.id]
+        if (clip.segment_id or "") != (shot.segment_id or ""):
+            return "当时和现在的分段不一样（段内镜头换过），整段文件对不上"
+        for relative in {clip.path, clip.segment_path} - {""}:
+            if not _safe_relative(relative) or not (entry / relative).is_file():
+                return f"历史里缺文件 {relative}"
+    if segment.shots[0].segment_id:
+        members = {sid for sid, clip in old.items() if clip.segment_id == segment.id}
+        if members != set(segment.shot_ids):
+            return "当时这一段的镜头和现在不一样，整段文件对不上"
+    return ""
+
+
+def _safe_relative(relative: str) -> bool:
+    path = Path(relative)
+    return not path.is_absolute() and ".." not in path.parts and path.parts[:1] == ("clips",)
 
 
 def dub_mode_for(project: Project | None, settings: Settings | None = None) -> str:
@@ -1512,6 +1699,8 @@ def _record_rejection(
             unit_id=unit.id,
             shot_ids=[shot.id for shot in unit.shots],
             kind=exc.kind,
+            chained=exc.kind == "first_frame"
+            and str(request.first_frame or "").endswith(CHAIN_FRAME_SUFFIX),
             images=[_relative(Path(image), project_dir) for image in images],
             code=exc.code,
             message=scrub_secrets(str(exc))[:400],
@@ -1544,6 +1733,24 @@ def _clear_waiver(manifest: VideoManifest, unit_id: str) -> None:
     """「不带图」只管这一次：生成成功后清掉，下次重做这一段仍会先带图。"""
     if unit_id in manifest.reference_waived:
         manifest.reference_waived = [u for u in manifest.reference_waived if u != unit_id]
+
+
+def _chain_source(
+    previous: Segment | None, manifest: VideoManifest, project_dir: Path
+) -> Path | None:
+    """上一段最后一个镜头的片段（就绪的真视频才算）；没有就返回 None，这一段照常画关键帧。"""
+    if previous is None:
+        return None
+    clip = manifest.get(previous.shots[-1].id)
+    if (
+        clip is None
+        or clip.status != ClipStatus.READY
+        or clip.media_kind != MediaKind.VIDEO
+        or not _clip_file_exists(project_dir, clip)
+    ):
+        logger.info("上一段 %s 没有就绪的片段，下一段不接戏、照常画开场关键帧", previous.id)
+        return None
+    return Path(project_dir) / clip.path
 
 
 def _clip_file_exists(project_dir: Path, clip: VideoClip) -> bool:

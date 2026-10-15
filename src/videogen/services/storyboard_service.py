@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import itertools
 import logging
 import re
 from dataclasses import dataclass, field
@@ -22,6 +23,7 @@ __all__ = [
     "absorb_bucket",
     "apply_duration_tier",
     "assign_segments",
+    "chain_predecessors",
     "generate_shots_for_scene",
     "merge_shots",
     "merge_to_count",
@@ -733,6 +735,25 @@ def assign_segments(
                 shot.segment_id = segment.id
             segments.append(segment)
     return segments
+
+
+def chain_predecessors(
+    segments: list[Segment], *, waived: list[str] | tuple[str, ...] = ()
+) -> dict[str, Segment]:
+    """段 id → 可以接戏的上一段：紧挨着、同一场、交界处的两个镜头在同一个地点。
+
+    `waived`：用户不要接戏的段（接戏帧被拒后选了「改用画的关键帧」）。
+    """
+    found: dict[str, Segment] = {}
+    for previous, current in itertools.pairwise(segments):
+        if current.id in waived or not previous.shots or not current.shots:
+            continue
+        if previous.scene_id != current.scene_id:
+            continue
+        if (previous.shots[-1].location or "") != (current.shots[0].location or ""):
+            continue
+        found[current.id] = previous
+    return found
 
 
 def segments_of(storyboard: Storyboard) -> list[Segment]:

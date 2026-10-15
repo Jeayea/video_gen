@@ -456,3 +456,183 @@ async def test_keyframe_failure_stops_segment(store, setup, monkeypatch, setting
     assert video.requests == [], "关键帧没画出来就不该买视频"
     assert [r.kind for r in manifest.rejections] == [video_service.KEYFRAME_FAILED]
     assert all(c.status.value == "failed" for c in manifest.clips)
+
+
+# ── 接戏帧（VIDEO_KEYFRAME_CHAIN）──────────────────────────
+
+
+def _chain_shots() -> list[Shot]:
+    def shot(shot_id: str, scene: str, no: int, location: str) -> Shot:
+        return Shot(
+            id=shot_id,
+            scene_id=scene,
+            shot_no=no,
+            duration_sec=5,
+            character_in_frame=["char_1"],
+            location=location,
+            video_prompt="A young woman walks across the room",
+        )
+
+    return [
+        shot("scene_1_shot_1", "scene_1", 1, "loc_1"),
+        shot("scene_1_shot_2", "scene_1", 2, "loc_1"),  # 同场同地点 → 接上一段
+        shot("scene_1_shot_3", "scene_1", 3, "loc_2"),  # 换了地点 → 重新画
+        shot("scene_2_shot_1", "scene_2", 1, "loc_1"),  # 换了场 → 重新画
+    ]
+
+
+def test_chain_predecessors_same_scene_same_location():
+    from videogen.services.storyboard_service import chain_predecessors, segments_of
+
+    segments = segments_of(Storyboard(shots=_chain_shots()))
+    chain = chain_predecessors(segments)
+    assert {k: v.id for k, v in chain.items()} == {"scene_1_shot_2": "scene_1_shot_1"}
+    assert chain_predecessors(segments, waived=["scene_1_shot_2"]) == {}
+
+
+@pytest.fixture
+def fake_last_frame(monkeypatch):
+    """假片段不是真视频：抽「最后一帧」时直接写个文件，并记下从哪个片段抽的。"""
+    sources: list[str] = []
+
+    async def extract(video, output):
+        sources.append(video.name)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_bytes(b"last-frame")
+        return output
+
+    monkeypatch.setattr(keyframe_service, "extract_last_frame", extract)
+    return sources
+
+
+async def _run_chain(store, setup, video, settings, monkeypatch):
+    project, project_dir, bible = setup
+    monkeypatch.setattr(settings, "video_keyframe_chain", True)
+    store.save_storyboard(project.id, Storyboard(shots=_chain_shots()))
+    image = FakeImageProvider()
+    keyframer = keyframe_service.Keyframer(
+        store, project.id, project, bible, image_provider=image
+    )
+    manifest = await video_service.generate_clips(
+        project,
+        store.load_storyboard(project.id),
+        video,
+        store.clips_dir(project.id),
+        project_dir,
+        bible=bible,
+        concurrency=4,
+        retry_backoff_sec=0,
+        keyframer=keyframer,
+        existing=store.load_video_manifest(project.id),
+    )
+    store.save_video_manifest(project.id, manifest)
+    return manifest, image
+
+
+@pytest.mark.asyncio
+async def test_chain_uses_previous_last_frame(store, setup, settings, monkeypatch, fake_last_frame):
+    video = FirstFrameVideo(delay=0.02)
+    manifest, image = await _run_chain(store, setup, video, settings, monkeypatch)
+
+    assert all(clip.status.value == "ready" for clip in manifest.clips)
+    frames = {r.shot_id: r.first_frame for r in video.requests}
+    assert frames["scene_1_shot_2"].name == "scene_1_shot_2" + keyframe_service.CHAIN_SUFFIX
+    for drawn in ("scene_1_shot_1", "scene_1_shot_3", "scene_2_shot_1"):
+        assert frames[drawn].suffix == ".png"
+    assert fake_last_frame == ["scene_1_shot_1.mp4"]
+    # 接戏的段等上一段生成完才提交；只画了 3 张，接戏帧不花钱
+    assert video.calls.index("scene_1_shot_2") > video.calls.index("scene_1_shot_1")
+    assert len(image.requests) == 3
+    chained = next(r for r in video.requests if r.shot_id == "scene_1_shot_2")
+    assert video_service.CHAIN_OPENING_NOTE in chained.prompt
+
+
+@pytest.mark.asyncio
+async def test_chain_falls_back_to_drawn_keyframe_when_previous_failed(
+    store, setup, settings, monkeypatch, fake_last_frame
+):
+    video = FirstFrameVideo(fail_shots={"scene_1_shot_1"}, fail_times=99)
+    manifest, _image = await _run_chain(store, setup, video, settings, monkeypatch)
+    assert manifest.get("scene_1_shot_1").status.value == "failed"
+    frames = {r.shot_id: r.first_frame for r in video.requests}
+    assert frames["scene_1_shot_2"].suffix == ".png"  # 上一段没有片段：照常画
+    assert fake_last_frame == []
+
+
+class RejectingChainVideo(FirstFrameVideo):
+    """接戏帧（正脸）被拒，画出来的关键帧能过。"""
+
+    async def generate(self, request):
+        if request.first_frame and request.first_frame.name.endswith(
+            keyframe_service.CHAIN_SUFFIX
+        ):
+            self.requests.append(request)
+            raise VideoReferenceRejected(
+                "视频模型拒收了首帧", kind="first_frame", code="PrivacyInformation"
+            )
+        return await super().generate(request)
+
+
+@pytest.mark.asyncio
+async def test_rejected_chain_frame_can_switch_to_drawn_keyframe(
+    store, setup, settings, monkeypatch, fake_last_frame
+):
+    from tests.test_video import build_pipeline
+
+    project, _project_dir, _bible = setup
+    video = RejectingChainVideo()
+    manifest, _image = await _run_chain(store, setup, video, settings, monkeypatch)
+    rejection = manifest.rejections[0]
+    assert rejection.unit_id == "scene_1_shot_2" and rejection.chained is True
+
+    pipeline = build_pipeline(store, None, video)
+    await pipeline.resolve_reference_rejection(project.id, "scene_1_shot_2", "regenerate_keyframe")
+    assert store.load_video_manifest(project.id).chain_waived == ["scene_1_shot_2"]
+
+    video.requests.clear()
+    manifest, _image = await _run_chain(store, setup, video, settings, monkeypatch)
+    assert manifest.get("scene_1_shot_2").status.value == "ready"
+    redo = [r.first_frame.suffix for r in video.requests if r.shot_id == "scene_1_shot_2"]
+    assert redo == [".png"]  # 不再接戏，改用画的关键帧
+
+
+@pytest.mark.asyncio
+async def test_preflight_does_not_charge_for_chain_frames(
+    store, setup, settings, monkeypatch, fake_llm
+):
+    from tests.test_video import build_pipeline
+
+    project, _project_dir, _bible = setup
+    store.save_storyboard(project.id, Storyboard(shots=_chain_shots()))
+    pipeline = build_pipeline(store, fake_llm, FirstFrameVideo())
+    segments = keyframe_service.video_service.segments_of(store.load_storyboard(project.id))
+
+    plan = await pipeline._keyframe_estimator(project, FirstFrameVideo())(segments)
+    assert plan["to_generate"] == 4
+    monkeypatch.setattr(settings, "video_keyframe_chain", True)
+    plan = await pipeline._keyframe_estimator(project, FirstFrameVideo())(segments)
+    assert plan["to_generate"] == 3 and plan["chained"] == 1
+
+
+@pytest.mark.asyncio
+async def test_extract_last_frame_from_real_video(tmp_path):
+    from videogen.utils.ffmpeg import ffmpeg_available, run_ffmpeg, run_ffmpeg_bytes
+
+    if not ffmpeg_available():
+        pytest.skip("需要 ffmpeg")
+    video = tmp_path / "clip.mp4"
+    # 前 1 秒红、后 1 秒蓝：最后一帧应该是蓝的
+    await run_ffmpeg([
+        "-y", "-f", "lavfi", "-i", "color=red:s=64x64:d=1:r=24",
+        "-f", "lavfi", "-i", "color=blue:s=64x64:d=1:r=24",
+        "-filter_complex", "[0][1]concat=n=2:v=1", "-pix_fmt", "yuv420p", str(video),
+    ])
+    frame = await keyframe_service.extract_last_frame(video, tmp_path / "out" / "x.chain.jpg")
+    assert frame is not None and frame.stat().st_size > 0
+    pixel = await run_ffmpeg_bytes(
+        ["-i", str(frame), "-vf", "scale=1:1", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
+    )
+    red, _green, blue = pixel[:3]
+    assert blue > 150 and red < 80, f"取到的不是最后一帧：rgb={tuple(pixel[:3])}"
+    assert not list((tmp_path / "out").glob("*.part*"))
+    assert await keyframe_service.extract_last_frame(tmp_path / "missing.mp4", frame) is None

@@ -14,8 +14,12 @@ H3 这类模型收 `input_references`，定妆照全程生效；Kling / Wan 只�
 - `VIDEO_KEYFRAME_SUBJECT=scene`：只画场景和道具、画面里没有人（Seedance 拒收写实人脸的首帧时用）。
   只锁景不锁人，人物长相靠文字；视频 prompt 会说明「开场是空场景，人物自然入画」
 - 缓存：prompt + 图片模型 + 参考图内容不变就复用（重跑 / 续跑不重复花钱）
-- 失败一律降级成纯文生视频（记 warning），绝不卡住视频生成
+- 画不出来时这一段不生成，等用户决定（`KeyframeUnavailable`）
 - 预估（preflight / 预算门控）与真正生成用同一个 `plan_jobs` 口径
+
+**接戏帧**（`VIDEO_KEYFRAME_CHAIN=true`）：同一场、同一地点的下一段，直接拿上一段的最后一帧当首帧，
+不再另画（$0）。两段在画面上无缝衔接、同一张脸；代价是这一场的段要按顺序生成（上一段好了才开下一段）。
+场景的第一段、上一段没生成出来、或用户在拒收后选了「改用画的关键帧」时，照常画开场关键帧。
 """
 
 from __future__ import annotations
@@ -37,23 +41,27 @@ from videogen.providers.video.base import VideoProvider
 from videogen.services import cost_service, video_service
 from videogen.services.asset_service import english_only, text_rule
 from videogen.services.storyboard_service import Segment
+from videogen.utils.ffmpeg import FFmpegError, ffmpeg_available, run_ffmpeg
 from videogen.utils.file_store import FileStore
 from videogen.utils.redact import scrub_secrets
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "CHAIN_SUFFIX",
     "KEYFRAME_DIR",
     "KeyframeJob",
     "Keyframer",
     "enabled_for",
     "estimate",
+    "extract_last_frame",
     "forget",
     "keyframe_prompt",
     "plan_jobs",
 ]
 
 KEYFRAME_DIR = "keyframes"
+CHAIN_SUFFIX = video_service.CHAIN_FRAME_SUFFIX
 
 _STILL_RULES = (
     "Keep every person's face, hairstyle, body and outfit exactly as in the reference images; "
@@ -234,6 +242,29 @@ def plan_jobs(
     return jobs
 
 
+async def extract_last_frame(video: Path, output: Path) -> Path | None:
+    """取视频的最后一帧存成 jpg；没有 ffmpeg / 文件坏了返回 None（调用方退回画关键帧）。"""
+    if not ffmpeg_available() or not video.is_file():
+        return None
+    output.parent.mkdir(parents=True, exist_ok=True)
+    partial = output.with_name(output.name + ".part.jpg")
+    try:
+        # 从结尾前 0.5 秒开始解码，每帧覆盖同一个文件，留下的就是最后一帧
+        await run_ffmpeg(
+            ["-y", "-sseof", "-0.5", "-i", str(video), "-update", "1", "-q:v", "2", str(partial)],
+            timeout_sec=60,
+        )
+    except FFmpegError as exc:
+        logger.warning("接戏帧抽取失败（%s）：%s", video.name, exc)
+        partial.unlink(missing_ok=True)
+        return None
+    if not partial.is_file() or partial.stat().st_size == 0:
+        partial.unlink(missing_ok=True)
+        return None
+    partial.replace(output)
+    return output
+
+
 def forget(project_dir: Path, unit_id: str) -> None:
     """作废这一段的关键帧缓存（用户要求重画，例如视频模型拒收了这张首帧）。"""
     out_dir = Path(project_dir) / KEYFRAME_DIR
@@ -246,6 +277,7 @@ def forget(project_dir: Path, unit_id: str) -> None:
     meta.unlink(missing_ok=True)
     if stored and Path(stored).name == stored:  # 只删 keyframes/ 目录里的那张
         (out_dir / stored).unlink(missing_ok=True)
+    (out_dir / f"{unit_id}{CHAIN_SUFFIX}").unlink(missing_ok=True)
 
 
 async def estimate(
@@ -256,13 +288,18 @@ async def estimate(
     provider: VideoProvider,
     *,
     settings: Settings | None = None,
+    chained: set[str] | frozenset[str] = frozenset(),
 ) -> dict[str, object]:
-    """这次要新画几张关键帧、花多少（preflight 与预算门控共用）。"""
+    """这次要新画几张关键帧、花多少（preflight 与预算门控共用）。
+
+    `chained`：会用上一段最后一帧接戏的段，不用画（$0）。
+    """
     settings = settings or get_settings()
     if not await enabled_for(provider, settings):
         return {"enabled": False, "to_generate": 0, "cached": 0, "estimated_usd": 0.0}
+    drawn = [segment for segment in segments if segment.id not in chained]
     jobs = plan_jobs(
-        segments,
+        drawn,
         project,
         bible,
         project_dir,
@@ -275,6 +312,7 @@ async def estimate(
         "enabled": True,
         "to_generate": len(todo),
         "cached": len(jobs) - len(todo),
+        "chained": len(segments) - len(drawn),
         "estimated_usd": cost_service.estimate_image_usd(len(todo)),
     }
 
@@ -308,9 +346,25 @@ class Keyframer:
             self._provider = get_image_provider()
         return self._provider
 
-    async def first_frame(self, segment: Segment, provider: VideoProvider) -> Path | None:
-        """这一段的开场关键帧；不需要时返回 None，需要但画不出来时抛 `KeyframeUnavailable`。"""
+    async def first_frame(
+        self, segment: Segment, provider: VideoProvider, *, previous: Path | None = None
+    ) -> Path | None:
+        """这一段的开场关键帧；不需要时返回 None，需要但画不出来时抛 `KeyframeUnavailable`。
+
+        `previous`：可以接戏的上一段视频（最后一个镜头的片段），给了就先试着取它的最后一帧。
+        """
         project_dir = self.store.ensure_project_dir(self.project_id)
+        if previous is not None:
+            frame = await extract_last_frame(
+                previous, project_dir / KEYFRAME_DIR / f"{segment.id}{CHAIN_SUFFIX}"
+            )
+            if frame is not None:
+                logger.info(
+                    "接戏帧 project=%s 段=%s ← %s 的最后一帧", self.project_id, segment.id,
+                    previous.name,
+                )
+                return frame
+            logger.warning("段 %s 取不到接戏帧，改画开场关键帧", segment.id)
         image = self._image()
         jobs = plan_jobs(
             [segment],

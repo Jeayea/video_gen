@@ -201,6 +201,12 @@ async def video_plan(
                 f"{plan['billed_seconds']:g} 秒，多付 {extra:g} 秒 ≈ "
                 f"${extra * price:.4f}"
             )
+    if price <= 0 and to_generate and provider.paid:
+        plan["price_unknown"] = True
+        plan["warnings"].append(
+            f"读不到 {provider_model} 的单价，预估按 $0 算、预算拦不住："
+            "请在 .env 设置 VIDEO_PRICE_PER_SECOND（USD/秒）"
+        )
     if switched:
         plan["warnings"].append(
             f"provider / 模型变了（{plan['regenerate_reason']}），"

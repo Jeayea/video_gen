@@ -50,7 +50,7 @@ from videogen.services import (
     storyboard_service,
     video_service,
 )
-from videogen.utils import language
+from videogen.utils import language, media_history
 from videogen.utils.ffmpeg import ffmpeg_available
 from videogen.utils.file_store import FileStore
 from videogen.utils.redact import scrub_secrets
@@ -92,6 +92,10 @@ class PipelineError(Exception):
 
 class PipelineNotFound(PipelineError):
     """项目或产物不存在。"""
+
+
+class UnknownVideoPrice(RuntimeError):
+    """真实视频模型读不到单价、配置也没填：预估会是 $0。"""
 
 
 # ── 各操作的入口状态白名单（唯一事实来源）──────────────────
@@ -318,6 +322,11 @@ class Pipeline:
         finally:
             await provider.aclose()
         unit = prices.video_per_second if price is None else max(0.0, price)
+        if unit <= 0 and seconds > 0 and provider.paid:
+            raise UnknownVideoPrice(
+                f"读不到视频模型 {getattr(provider, 'model', provider.name)} 的单价，"
+                "预估会是 $0、预算拦不住。请在 .env 设置 VIDEO_PRICE_PER_SECOND（USD/秒）"
+            )
         return round(seconds * unit, 6)
 
     async def _estimate_keyframe_usd(
@@ -1641,6 +1650,55 @@ class Pipeline:
             logger.info("手动重做 %d 段（%d 镜）project=%s", len(targets), len(stale), project_id)
             return {"segments": targets, "shots": stale}
 
+    async def restore_video_history(
+        self, project_id: str, entry_id: str, *, shots: list[str] | None = None
+    ) -> dict:
+        """把历史版本里的旧片段恢复回来（按段，见 `video_service.restore_clips`）。
+
+        当前片段先挪进历史版本；成片作废（片段变了），状态和改分镜一样重新判定。
+        不调视频模型、不记账。
+        """
+        self._reject_if_video_running(project_id)
+        async with self._lock(project_id):
+            project = self.get_project(project_id)
+            self._require(project, EDIT_CONFIRMED_STORYBOARD_STATUSES, "恢复历史片段")
+            project_dir = self.store.ensure_project_dir(project_id)
+            loaded = media_history.load_entry(project_dir, entry_id)
+            if loaded is None:
+                raise PipelineNotFound(f"没有这批历史版本：{entry_id}")
+            entry, meta = loaded
+            storyboard = self.store.load_storyboard(project_id)
+            if storyboard is None or not storyboard.shots:
+                raise PipelineError("分镜不存在，没法对上历史片段")
+            video = self.store.load_video_manifest(project_id) or VideoManifest(
+                provider=next(
+                    (c.get("provider") for c in meta.get("clips") or [] if c.get("provider")),
+                    "",
+                ),
+                model=str(meta.get("model") or ""),
+                aspect_ratio=project.aspect_ratio.value,
+            )
+            result = video_service.restore_clips(
+                video, storyboard, entry, meta, project_dir, shot_ids=shots
+            )
+            if not result["restored_shots"]:
+                reasons = "；".join(
+                    f"{item['segment_id']}：{item['reason']}" for item in result["skipped"]
+                )
+                raise PipelineError(f"这批历史里没有能恢复的段（{reasons or '没有片段'}）")
+            self.store.save_video_manifest(project_id, video)
+            label = f"恢复历史片段 {entry_id}"
+            self.store.purge_media(project_id, compose=True, reason=label)
+            ready = all(
+                (clip := video.get(s.id)) is not None and clip.status == ClipStatus.READY
+                for s in storyboard.shots
+            )
+            project.status = (
+                ProjectStatus.VIDEO_READY if ready else ProjectStatus.STORYBOARD_CONFIRMED
+            )
+            self.store.save_project(project)
+            return result
+
     # ── 成本前置（preflight）──────────────────────────────
 
     async def preflight(
@@ -1690,12 +1748,23 @@ class Pipeline:
         """preflight / 预算门控共用：这几段要画几张开场关键帧（只认首帧的模型才会画）。"""
 
         async def estimate(segments: list) -> dict:
+            chained: set[str] = set()
+            storyboard = self.store.load_storyboard(project.id)
+            if get_settings().video_keyframe_chain and storyboard is not None:
+                manifest = self.store.load_video_manifest(project.id)
+                chained = set(
+                    storyboard_service.chain_predecessors(
+                        storyboard_service.segments_of(storyboard),
+                        waived=manifest.chain_waived if manifest else [],
+                    )
+                )
             return await keyframe_service.estimate(
                 segments,
                 project,
                 self.store.load_bible(project.id),
                 self.store.ensure_project_dir(project.id),
                 provider,
+                chained=chained,
             )
 
         return estimate
@@ -1851,7 +1920,14 @@ class Pipeline:
             )
             self.store.save_storyboard(project_id, storyboard)
             targets = await self._budget_shots(storyboard, video)
-            upcoming = await self._estimate_video_usd(targets, storyboard)
+            try:
+                upcoming = await self._estimate_video_usd(targets, storyboard)
+            except UnknownVideoPrice as exc:
+                # 设了预算才拦：不设预算等于主动放弃了上限，preflight 里照样会告警
+                if cost_service.load_report(self.store, project_id).budget_usd > 0:
+                    raise cost_service.BudgetExceeded(str(exc)) from exc
+                logger.warning("%s", exc)
+                upcoming = 0.0
             upcoming += await self._estimate_keyframe_usd(project, targets, storyboard)
             self._guard_budget(
                 project_id, upcoming_usd=upcoming, action="生成视频片段"
@@ -2043,7 +2119,8 @@ class Pipeline:
     ) -> dict:
         """用户对「某段的图被视频模型拒收」做决定，之后再点「生成视频片段」继续。
 
-        - `regenerate_keyframe`：作废这段的开场关键帧缓存，下次生成重画一张（$0.04）再带上
+        - `regenerate_keyframe`：作废这段的开场关键帧缓存，下次生成重画一张（$0.04）再带上；
+          被拒的是接戏帧（上一段的最后一帧）时，这一段以后不再接戏、改画开场关键帧
         - `retry`：图已经换过了（例如重新上传 / 重画了定妆照），原样再带图试一次
         - `without_reference`：这一段不带任何图生成（一致性只靠文字），只管这一次
         """
@@ -2066,6 +2143,9 @@ class Pipeline:
                         "被拒的是参考图（定妆照 / 场景图），不是首帧：请换图后选「重试」"
                     )
                 keyframe_service.forget(self.store.ensure_project_dir(project_id), unit_id)
+                if rejection.chained and unit_id not in manifest.chain_waived:
+                    # 被拒的是上一段的最后一帧：这一段以后不接戏，改画开场关键帧
+                    manifest.chain_waived.append(unit_id)
             if action == "without_reference":
                 if unit_id not in manifest.reference_waived:
                     manifest.reference_waived.append(unit_id)

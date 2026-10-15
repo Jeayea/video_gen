@@ -2200,9 +2200,10 @@ function renderVideo() {
   const clips = (v.manifest && v.manifest.clips) || [];
   const rejections = (v.manifest && v.manifest.rejections) || [];
   const rejectHtml = rejectionBox(rejections, active);
+  const canRestore = ['storyboard_confirmed', 'video_ready', 'audio_ready', 'done'].includes(status) && !active;
   if (!clips.length) {
     body.innerHTML = rejectHtml + `<span style="color:var(--text2);font-size:12px">尚未生成${
-      status === 'storyboard_review' ? '（请先确认分镜）' : ''}</span>` + historyBox();
+      status === 'storyboard_review' ? '（请先确认分镜）' : ''}</span>` + historyBox(canRestore);
   } else {
     const shots = {};
     ((currentStoryboard && currentStoryboard.shots) || []).forEach(s => { shots[s.id] = s; });
@@ -2236,7 +2237,7 @@ function renderVideo() {
           ${redo ? `<div class="shot-actions"><button class="btn btn-sm btn-outline" onclick="doRedoSegment(${jsArg(c.shot_id)})">${
             c.segment_id ? '重做这段' : '重做此镜'}</button></div>` : ''}
         </div>`;
-    }).join('')}</div>` + historyBox();
+    }).join('')}</div>` + historyBox(canRestore);
   }
 
   const wrap = $('video-progress');
@@ -2280,7 +2281,7 @@ function renderVideo() {
 let currentHistory = null;
 let currentHistoryPid = null;
 
-function historyBox() {
+function historyBox(canRestore = false) {
   const entries = (currentHistory && currentHistory.entries) || [];
   if (!entries.length) return '';
   const mb = b => `${(b / 1048576).toFixed(1)} MB`;
@@ -2295,10 +2296,26 @@ function historyBox() {
       <div><strong>${esc(e.reason || '替换')}</strong> · ${esc((e.at || '').replace('T', ' ').slice(0, 19))} ·
         ${(e.files || []).length} 个文件 · ${mb(e.bytes || 0)}${paid ? ` · 当时花费 ${usd(paid)}` : ''}</div>
       <div>${links || '<span style="color:var(--text2)">（只有清单文件）</span>'}</div>
+      ${canRestore && media.some(f => /^clips\/[^/]+\.mp4$/i.test(f.path)) ? `<div class="shot-actions">
+        <button class="btn btn-sm btn-outline" title="按段把这批旧片段拷回来；现在的片段先留进历史版本，成片作废，不花钱"
+          onclick="doRestoreHistory(${jsArg(e.id)})">恢复这批片段</button></div>` : ''}
     </div>`;
   }).join('');
   return `<details class="history-box"><summary>历史版本 ${entries.length} 批 · ${mb(total)}
     （最多留 ${currentHistory.keep} 批 / ${currentHistory.max_mb} MB，超出从最旧的删）</summary>${rows}</details>`;
+}
+
+async function doRestoreHistory(entryId) {
+  if (!confirm('把这批历史里的旧片段恢复回来？\n按段恢复：现在分镜里整段都对得上的才恢复，其余跳过。\n现在的片段会先留进历史版本，成片作废（需要重新合成），不调视频模型、不花钱。\n分镜在这之后改过的话，旧片段和现在的分镜可能对不上。')) return;
+  withBusy('恢复中...', async () => {
+    const r = await api(`/api/projects/${currentProjectId}/history/${encodeURIComponent(entryId)}/restore`, {
+      method: 'POST', body: JSON.stringify({}),
+    });
+    const skipped = (r.skipped || []).map(x => `${x.segment_id}：${x.reason}`);
+    const notes = [...(r.warnings || []), ...(skipped.length ? ['跳过：', ...skipped] : [])];
+    currentHistoryPid = null;  // 历史多了一批「恢复之前」，重新拉
+    alert([`已恢复 ${r.restored_segments.length} 段（${r.restored_shots.length} 镜）`, ...notes].join('\n'));
+  });
 }
 
 // 视频模型拒收了某段的首帧 / 参考图：生成已中断，由用户决定（不自动去图重试）
@@ -2307,12 +2324,13 @@ function rejectionBox(rejections, active) {
   const items = rejections.map(r => {
     const isFrame = r.kind === 'first_frame' || r.kind === 'keyframe_failed';
     const what = r.kind === 'keyframe_failed' ? '开场关键帧没画出来'
+      : r.chained ? '被拒的是接戏帧（上一段的最后一帧）'
       : isFrame ? '被拒的是开场关键帧（首帧）' : `被拒的是 ${(r.images || []).length} 张参考图`;
     const img = (r.images || []).length
       ? `<img src="${withToken(`/api/projects/${currentProjectId}/video/rejections/${encodeURIComponent(r.unit_id)}/rejected-image`)}" alt="被拒的图">`
       : '';
     const btn = (action, label, title) => active ? '' :
-      `<button class="btn btn-sm btn-outline" title="${esc(title)}" onclick="doResolveRejection(${jsArg(r.unit_id)},'${action}')">${label}</button>`;
+      `<button class="btn btn-sm btn-outline" title="${esc(title)}" onclick="doResolveRejection(${jsArg(r.unit_id)},'${action}',${r.chained ? 'true' : 'false'})">${label}</button>`;
     return `
       <div class="reject-item">
         ${img}
@@ -2321,7 +2339,8 @@ function rejectionBox(rejections, active) {
             ${what}${r.kind === 'keyframe_failed' ? '' : ` · <code>${esc(r.code || 'HTTP 400')}</code>`}</div>
           <div class="reject-msg">${esc(r.message || '')}</div>
           <div class="shot-actions">
-            ${isFrame ? btn('regenerate_keyframe', '重画开场关键帧', '作废这张关键帧，下次生成时重画一张（约 $0.04）再带上') : ''}
+            ${r.chained ? btn('regenerate_keyframe', '改画开场关键帧', '这一段以后不再接戏：下次生成时画一张开场关键帧（约 $0.04）再带上')
+              : isFrame ? btn('regenerate_keyframe', '重画开场关键帧', '作废这张关键帧，下次生成时重画一张（约 $0.04）再带上') : ''}
             ${btn('retry', '已换图，重试', '定妆照 / 场景图已经换过了，原样再带图试一次')}
             ${btn('without_reference', '这段不带图生成', '只这一次：不带任何图生成这段，角色 / 场景一致性只靠文字描述')}
           </div>
@@ -2333,9 +2352,11 @@ function rejectionBox(rejections, active) {
     ${items}</div>`;
 }
 
-async function doResolveRejection(unitId, action) {
+async function doResolveRejection(unitId, action, chained = false) {
   const text = {
-    regenerate_keyframe: `重画 ${unitId} 的开场关键帧？\n下次生成时会先花约 $0.04 重画，再带上新首帧提交。\n注意：同样风格的写实人脸可能仍会被拒。`,
+    regenerate_keyframe: chained
+      ? `${unitId} 不再用上一段的最后一帧接戏，改画一张开场关键帧？\n下次生成时会先花约 $0.04 画，再带上新首帧提交。`
+      : `重画 ${unitId} 的开场关键帧？\n下次生成时会先花约 $0.04 重画，再带上新首帧提交。\n注意：同样风格的写实人脸可能仍会被拒。`,
     retry: `${unitId} 的图已经换过了，原样再带图提交一次？`,
     without_reference: `${unitId} 这一段不带任何图生成？\n角色 / 场景一致性只靠文字描述，和其它段可能对不上。只对这一次有效。`,
   }[action];

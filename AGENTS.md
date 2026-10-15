@@ -56,7 +56,7 @@ README 只讲「这是什么、怎么装、怎么用」。这里记录**项目�
 | **按修改意见重写（单场剧本 / 单镜或整场分镜）** | ✅ | 剧本 `script/scenes/{id}/regenerate`（剧本阶段，直接保存，时长沿用原场）；分镜 `storyboard/revise` 只出提案（单镜沿用 id / 时长 / 段落），前端确认后走 PUT 的作废预览 |
 | **局部重做（圣经单条 / 重做已展开的章 / 单句重配）** | ✅ | `bible/{kind}/{id}/regenerate`（id / 参考图 / 音色不交给模型改，外貌变了返回 `reference_stale`）；`script/generate {"redo_chapters"}`（只替换这一章，场次编号重排，分镜作废）；`audio/redub`（TTS 模式，念法写回分镜，DONE 时自动退回配音阶段）。UI 同时接上了人声来源、烧字幕样式、按描述出图（任何语言，非英文先经 LLM 翻成英文、残留中文剔除，`services/image_prompt_service.py`）、重新校验 |
 | **成片语言（中文 / 英语）** | ✅ | 项目 `language`（`PROJECT_LANGUAGE`）：英语项目的 LLM 调用都追加英文覆盖指令（`utils/language.LanguageLLM`）；视频 prompt 按台词原文写 Mandarin / English；语速按汉字 4.5 字/秒、英文 2.5 词/秒；Edge 有 en-US 音色。**还没用真实模型跑过英文片** |
-| **历史版本留存** | ✅ | 重做段 / 改分镜 / 换模型重跑 / 重新合成时，旧片段、配音、成片挪进 `history/<时间戳>-<原因>/`（`utils/media_history.py`，附当时的 prompt / 扣费），面板可播放；按批数 / 总大小自动清理。合成失败的半截成片不留 |
+| **历史版本留存** | ✅ | 重做段 / 改分镜 / 换模型重跑 / 重新合成时，旧片段、配音、成片挪进 `history/<时间戳>-<原因>/`（`utils/media_history.py`，附当时的 prompt / 扣费），面板可播放，**视频片段可按段恢复**；按批数 / 总大小自动清理。合成失败的半截成片不留 |
 | **改分镜只作废受影响的段 / 单段重做** | ✅ | 确认后甚至成片后也能改分镜；保存前 `storyboard/impact` 预览作废哪几段与重做费用；片段卡片「重做这段」= `video/invalidate`（只能整段） |
 | 成本统计与预算 | ✅ | 按阶段记 token / 秒数 / 字符 → USD 账本，超预算直接拒绝开工 |
 | 成本前置 preflight | ✅ | 动手前先算账：镜头数 / **按模型档位的真实计费秒数** / 单价 / 预算余额 / 花钱前二次确认 |
@@ -82,11 +82,13 @@ README 只讲「这是什么、怎么装、怎么用」。这里记录**项目�
    小样本试（3 镜约 $1-2）
 2. **按秒计费的花费风险**：`BUDGET_USD=0`（默认）时**没有花费上限**；取消任务只是停止轮询，
    服务端可能仍在跑并计费（job id 已落盘，下次生成会接着查同一个任务、不重新提交；但改了分镜作废的段就不再查了）；段落里任何一个镜头重做都要整段重买；换 provider/模型会让已就绪片段全部重跑
-3. **预估口径对按 token 计费的视频模型不准**：`price_per_second()` 只认 `pricing_skus` 里按秒的价格。
-   Seedance 这类按 `video_tokens` 计费的模型读不到单价，preflight / 预算会退回 `VIDEO_PRICE_PER_SECOND`
-   （默认 0 = **预估 $0、预算拦不住**）。跑 Seedance 前必须手填：实测扣费与「宽×高×24fps×秒÷1024 × token 单价」
-   吻合，`seedance-2.0` 720p 竖屏 = **$0.152/秒**（10 秒段实收 $1.518）。
-   带音频/不带音频两档价（Kling、Veo）已按 `VIDEO_GENERATE_AUDIO` 取对应那档；另外 Wan 3.0 实收
+3. **单价是从价目表换算的，有估算误差**：`price_per_second()` 认三种写法 —— 按秒（`duration_seconds*`）、
+   美分每秒（`cents_per_*second*`，Grok / Runway）、按视频 token（`video_tokens*`，Seedance，
+   按「档位像素 × 24fps ÷ 1024 × token 单价」换算，像素按 16:9 算：720p = 1280×720）。
+   `seedance-2.0` 720p 算出 $0.1512/秒，实收 $0.1518（10 秒段 $1.518）；fast 算出 $0.0907。
+   真实模型仍读不到单价、`VIDEO_PRICE_PER_SECOND` 也没填时：preflight 告警，设了预算就**拒绝开工**
+   （以前是静默按 $0 估、预算拦不住）。
+   带音频/不带音频两档价（Kling、Veo、Seedance 1.5）已按 `VIDEO_GENERATE_AUDIO` 取对应那档；另外 Wan 3.0 实收
    $0.085/秒，比价目表的 $0.10 低，预估偏保守
 4. **视频模型内容审核**：MiniMax H3 会以 `input text sensitive (1026)` 拒掉部分 prompt（不计费，但拿不到片），
    实测是文本触发，见已知限制 35；**参考图也会被拒**（`input image sensitive (1026)`，叼着烟的定妆照，2026-10-14），
@@ -282,11 +284,15 @@ README 只讲「这是什么、怎么装、怎么用」。这里记录**项目�
     换非写实画风的定妆照 / 关键帧是否能过，还没试过。**绕开的办法是首帧不画人**（`VIDEO_KEYFRAME_SUBJECT=scene`）
     + 把服装 / 发型 / 年代写进角色 `visual_prompt`：首帧锁景、文字锁装，脸只是「近似一致」（实测见「Seedance：空场景首帧」）
     另试过「拿上一段里的一帧当下一段首帧」（同一场接戏）：**侧脸那帧通过、正脸那帧被拒**（2026-10-14，各一次，样本太少，不算规律）。
-    通过的那段和上一段无缝衔接，同一张脸。这需要手工把帧放进 `keyframes/<段>.jpg`，代码里没有这个功能
+    通过的那段和上一段无缝衔接，同一张脸。现在是 `VIDEO_KEYFRAME_CHAIN=true`（默认关）：同一场、交界处同一地点的
+    下一段自动拿上一段的最后一帧当首帧（$0），这一场的段因此按顺序生成；接戏帧被拒时照样停下来问，
+    选「改画开场关键帧」后这一段以后不再接戏（`video_manifest.chain_waived`）。**自动接戏还没用真实模型跑过**
 
 52. **历史版本只在本机、只管媒体**：`history/` 和项目在同一个目录，删项目会一起删；超出
-    `MEDIA_HISTORY_KEEP` / `MEDIA_HISTORY_MAX_MB` 时最旧的整批删掉（最新一批永远留）。现在只能看 / 下载，
-    **没有「一键恢复」**——要用旧片段得手工拷回 `clips/` 并改 `video_manifest.json`。抽帧、合成中间段、
+    `MEDIA_HISTORY_KEEP` / `MEDIA_HISTORY_MAX_MB` 时最旧的整批删掉（最新一批永远留）。
+    **只有视频片段能恢复**（「恢复这批片段」/ `POST history/{批}/restore`）：按段恢复，现在分镜里这一段的镜头和当时
+    完全一样才恢复，否则跳过并说明原因；当前片段先进历史、成片作废，不调模型、不记账。分镜在这之后改过画面字段时，
+    旧片段可能和现在的分镜对不上（不做校验）。配音和成片只能看 / 下载。抽帧、合成中间段、
     口型产物是缓存，不留；定妆照 / 场景图被替换时也不留（$0.04/张，按原样直接覆盖）
 
 ## 设计要点
@@ -422,15 +428,15 @@ Wan + 关键帧适合「主角在第一个镜头里」的段落。成片与并�
 穿模也比 H3 少（用户看片的结论），但切点偏得多 —— 镜头时长会和分镜差 0.5~1.5 秒（已不再硬卡，见下）。原生旁白念得对不对没转写核对过。并排对比（左 H3、右 Seedance，双音轨可切换）：
 `projects/20261013-天工开物-杀青-现代版-seedance2/ab_models/compare_h3_vs_seedance.mp4`。
 
-跑 Seedance 的两个坑（都靠环境变量绕开，代码没改）：
+跑 Seedance 的两个坑：
 
 1. **原生音频要显式打开**：Seedance 的能力表里有 `generate_audio`，代码就会把 `VIDEO_GENERATE_AUDIO`
    （默认 false）发过去 —— 不开就出无声片段，原声旁白直通直接失效。H3 能力表里没有这一项，所以从来不用设
-2. **按 token 计费读不到单价**：要手填 `VIDEO_PRICE_PER_SECOND`，否则 preflight 是 $0（见风险 3）
+2. **按 token 计费**：当时读不到单价、要手填 `VIDEO_PRICE_PER_SECOND`；2026-10-15 起按 token 价自动换算（见风险 3），不用再填
 
 ```bash
 OPENROUTER_VIDEO_MODEL=bytedance/seedance-2.0 VIDEO_RESOLUTION=720p VIDEO_GENERATE_AUDIO=true \
-VIDEO_PROMPT_NARRATION=true VIDEO_PRICE_PER_SECOND=0.152 BUDGET_USD=12 ./run.sh
+VIDEO_PROMPT_NARRATION=true BUDGET_USD=12 ./run.sh
 ```
 
 ### 《重回2000》换回 H3：锁人比单价重要（2026-10-14）
@@ -475,7 +481,7 @@ H3 教室开场 12 秒（$1.56）对比 fast：满员的 2000 年教室（国旗
 （左旧版 / 中 2.0 / 右 fast，三条音轨）。
 
 ```bash
-OPENROUTER_VIDEO_MODEL=bytedance/seedance-2.0-fast VIDEO_PRICE_PER_SECOND=0.0907 VIDEO_KEYFRAME_SUBJECT=scene \
+OPENROUTER_VIDEO_MODEL=bytedance/seedance-2.0-fast VIDEO_KEYFRAME_SUBJECT=scene \
 VIDEO_RESOLUTION=720p VIDEO_GENERATE_AUDIO=true VIDEO_PROMPT_NARRATION=true ./run.sh
 ```
 

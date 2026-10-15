@@ -43,7 +43,7 @@ cp .env.example .env          # 填入 OPENROUTER_API_KEY
 3. **剧本**：生成并检查剧本后确认。长篇和小说项目要先勾选要拍的章
 4. **分镜**：生成后可以逐镜编辑，确认后进入视频阶段
    ![分镜](docs/screenshots/05-storyboard.png)
-5. **视频**：先看预估花费，确认后在后台生成。失败的片段可以单独重试，不满意的段可以「重做这段」
+5. **视频**：先看预估花费，确认后在后台生成。失败的片段可以单独重试，不满意的段可以「重做这段」，换下来的旧片段在「历史版本」里可以恢复
 6. **配音、配乐与成片**：生成配音和配乐，选字幕样式后合成，页面里可以预览并下载 MP4 和字幕
    ![成片](docs/screenshots/07-compose.jpg)
 
@@ -68,7 +68,7 @@ curl -s localhost:8001/api/projects/$PID/preflight   # 预估计费秒数、金�
 curl -s localhost:8001/api/projects/$PID/cost        # 实际花费账本
 ```
 
-按 token 计费的模型（如 Seedance）读不到单价，要手填 `VIDEO_PRICE_PER_SECOND`，否则预估为 $0。
+按 token 计费的模型（如 Seedance）会按分辨率自动换算成每秒单价；实在读不到单价时要手填 `VIDEO_PRICE_PER_SECOND`，否则设了预算会拒绝开工。
 各模型的实测对比和注意事项见 [AGENTS.md](AGENTS.md)。
 
 ### 常用配置
@@ -83,6 +83,7 @@ curl -s localhost:8001/api/projects/$PID/cost        # 实际花费账本
 | 字幕 | `COMPOSE_SUBTITLE_MODE=soft\|burn\|none`，样式 `COMPOSE_SUBTITLE_STYLE=soft\|box\|doc\|classic` |
 | 整片变速 | `COMPOSE_SPEED`（0.5~4） |
 | 关掉段落分镜，一镜一次生成 | `VIDEO_SEGMENT_MODE=false` |
+| 同场下一段接着上一段的最后一帧拍（只认首帧的模型） | `VIDEO_KEYFRAME_CHAIN=true` |
 | 逐帧口型 | 先跑 `tools/lipsync/install.sh`，再设 `LIPSYNC_ENGINE=wav2lip-onnx` |
 
 ### API

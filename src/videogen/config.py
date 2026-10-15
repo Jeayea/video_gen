@@ -322,6 +322,9 @@ class Settings(BaseSettings):
     #: 开场关键帧画什么：`characters` = 定妆照 + 场景（锁人也锁景）；`scene` = 只画场景和道具、
     #: 画面里没有人（锁景不锁人）。Seedance 会拒收写实人脸的首帧（已知限制 51），这时用 `scene`
     video_keyframe_subject: str = "characters"
+    #: 接戏帧：同一场、同一地点的下一段直接拿上一段的最后一帧当首帧（$0，两段无缝衔接、同一张脸），
+    #: 代价是这一场的段按顺序生成。只对只认首帧的模型生效（Seedance / Kling / Wan）
+    video_keyframe_chain: bool = False
     #: 模型怎么吃图：`auto` = 按能力表判断（价目里有 reference 计费项 = 全程参考图，
     #: 否则看支不支持首帧）；能力表判断错时手动指定 `references` / `first_frame` / `none`
     video_frame_mode: str = "auto"

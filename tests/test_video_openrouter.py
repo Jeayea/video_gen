@@ -275,6 +275,87 @@ async def test_price_follows_audio_tier():
     assert await veo_1080.price_per_second() == pytest.approx(0.12)
 
 
+SEEDANCE = {
+    "id": "bytedance/seedance-2.0",
+    "supported_resolutions": ["480p", "720p", "1080p", "4K"],
+    "supported_durations": list(range(4, 16)),
+    "generate_audio": True,
+    "pricing_skus": {
+        "video_tokens": "0.000007",
+        "video_tokens_1080p": "0.0000077",
+        "video_tokens_without_audio": "0.000007",
+        "video_tokens_with_video_input": "0.0000043",
+    },
+}
+SEEDANCE_15 = {
+    "id": "bytedance/seedance-1-5-pro",
+    "supported_resolutions": ["480p", "720p", "1080p"],
+    "generate_audio": True,
+    "pricing_skus": {"video_tokens": "0.0000024", "video_tokens_without_audio": "0.0000012"},
+}
+GROK = {
+    "id": "x-ai/grok-imagine-video-1.5",
+    "supported_resolutions": ["480p", "720p", "1080p"],
+    "pricing_skus": {
+        "cents_per_image_input": "1",
+        "cents_per_video_output_second_480p": "8",
+        "cents_per_video_output_second_720p": "14",
+        "cents_per_video_output_second_1080p": "25",
+    },
+}
+RUNWAY = {
+    "id": "runway/aleph-2",
+    "pricing_skus": {"cents_per_second_output": "28", "minimum_cents_per_generation": "56"},
+}
+
+
+@pytest.mark.asyncio
+async def test_price_from_video_tokens():
+    """Seedance 按 token 计费：720p = 1280×720×24/1024 = 21600 token/秒（实收 $1.518 / 10 秒）。"""
+    recorder = Recorder(models=[SEEDANCE, SEEDANCE_15])
+    seedance = make_provider(
+        recorder, model="bytedance/seedance-2.0", resolution="720p", generate_audio=True
+    )
+    assert await seedance.price_per_second() == pytest.approx(0.1512)
+    hd = make_provider(recorder, model="bytedance/seedance-2.0", resolution="1080p")
+    assert await hd.price_per_second() == pytest.approx(1920 * 1080 * 24 / 1024 * 0.0000077)
+
+    old = "bytedance/seedance-1-5-pro"
+    silent = make_provider(recorder, model=old, resolution="720p", generate_audio=False)
+    voiced = make_provider(recorder, model=old, resolution="720p", generate_audio=True)
+    assert await silent.price_per_second() == pytest.approx(21600 * 0.0000012)
+    assert await voiced.price_per_second() == pytest.approx(21600 * 0.0000024)
+
+
+@pytest.mark.asyncio
+async def test_price_from_cents_follows_resolution():
+    """以前兜底会拿到第一个带 second 的 key（480p 的 8 美分）并当成 $8/秒。"""
+    recorder = Recorder(models=[GROK, RUNWAY])
+    grok = make_provider(recorder, model="x-ai/grok-imagine-video-1.5", resolution="720p")
+    assert await grok.price_per_second() == pytest.approx(0.14)
+    runway = make_provider(recorder, model="runway/aleph-2", resolution="")
+    assert await runway.price_per_second() == pytest.approx(0.28)
+
+
+@pytest.mark.asyncio
+async def test_unknown_price_blocks_video_under_budget(store, monkeypatch):
+    model = {**HAILUO3, "pricing_skus": {"some_new_unit": "1"}}
+    recorder = Recorder(models=[model])
+    pipeline = _pipeline_with_openrouter(store, recorder)
+    project = _project(store, shots=1)
+    monkeypatch.setattr(get_settings(), "budget_usd", 10.0)
+
+    with pytest.raises(BudgetExceeded, match="VIDEO_PRICE_PER_SECOND"):
+        await pipeline.start_video_generation(project.id)
+    assert recorder.submits == 0
+
+    # 手填了单价就放行
+    monkeypatch.setattr(get_settings(), "video_price_per_second", 0.1)
+    job = await pipeline.start_video_generation(project.id)
+    await wait_for_job(pipeline, job.id, timeout=30)
+    assert recorder.submits == 1
+
+
 @pytest.mark.asyncio
 async def test_planned_seconds_clamps_to_model_durations():
     provider = make_provider(Recorder())

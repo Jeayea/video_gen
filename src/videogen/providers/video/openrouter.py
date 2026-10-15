@@ -74,6 +74,7 @@ class OpenRouterVideoProvider(VideoProvider):
     """
 
     name = "openrouter"
+    paid = True
     supports_reference_image = True  # 通过参考图（不是 seed）保持角色外观
     requires_ffmpeg = False  # 只下载，不转码
 
@@ -184,7 +185,11 @@ class OpenRouterVideoProvider(VideoProvider):
         return found
 
     async def price_per_second(self, *, resolution: str = "") -> float | None:
-        """从 `pricing_skus` 读单价（USD/秒），读不到就返回 None 让上层用配置值。"""
+        """从 `pricing_skus` 读单价（USD/秒），读不到就返回 None 让上层用配置值。
+
+        三种价目写法都认：按秒（`duration_seconds*`）、按美分每秒（`cents_per_*second*`，
+        Grok / Runway）、按视频 token（`video_tokens*`，Seedance，按分辨率换算成每秒）。
+        """
         caps = await self.capabilities()
         skus = caps.get("pricing_skus") or {}
         if not isinstance(skus, dict) or not skus:
@@ -194,31 +199,13 @@ class OpenRouterVideoProvider(VideoProvider):
         if not wanted:
             # 不指定分辨率时提交用的是模型列表里的第一档，单价也按它算
             wanted = _pick_from("", caps.get("supported_resolutions")).lower()
-        # 带音频 / 不带音频两档价（Kling、Veo）：按是否真的生成音轨取对应那档，
+        # 带音频 / 不带音频两档价（Kling、Veo、Seedance 1.5）：按是否真的生成音轨取对应那档，
         # 否则开了音轨却按低价预估（Kling 少算 1/3）
-        audio = "with_audio" if self.generate_audio and caps.get("generate_audio") else ""
-        audio_tags = [audio, ""] if audio else ["without_audio", ""]
-        candidates: list[str] = []
-        for key in ("duration_seconds", "per-video-second", "per_video_second"):
-            for tag in audio_tags:
-                base = f"{key}_{tag}" if tag else key
-                if wanted:
-                    candidates += [f"{base}_{wanted}", f"{base}-{wanted}"]
-                candidates.append(base)
-        for key in candidates:
-            if key in skus:
-                value = _as_float(skus[key])
-                if value is not None:
-                    return value
-        # 兜底：任何带 second 的 key（跳过另一档音频价）
-        other = "without_audio" if audio else "with_audio"
-        for key, raw in skus.items():
-            lowered = str(key).lower()
-            if "second" in lowered and other not in lowered:
-                value = _as_float(raw)
-                if value is not None:
-                    return value
-        return None
+        with_audio = bool(self.generate_audio and caps.get("generate_audio"))
+        price = _per_second_price(skus, wanted, with_audio)
+        if price is None:
+            price = _token_price(skus, wanted, with_audio)
+        return price
 
     async def frame_mode(self) -> str:
         if not self.use_reference_images:
@@ -587,6 +574,88 @@ class OpenRouterVideoProvider(VideoProvider):
 
 
 # ── 工具 ──────────────────────────────────────────────────
+
+
+
+#: 价目 key 里可能出现的分辨率标记（小写）
+_RESOLUTION_TAGS = ("480p", "720p", "768p", "1080p", "2k", "4k")
+#: 不是「输出每秒单价」的 key：参考图 / 续写 / 起步价 / 图片输入 / 按像素计
+_NOT_OUTPUT_SECOND = (
+    "reference", "continuation", "minimum", "image_input", "megapixel", "video_input",
+)
+
+
+def _per_second_price(skus: dict[str, Any], wanted: str, with_audio: bool) -> float | None:
+    audio_tags = ["with_audio", ""] if with_audio else ["without_audio", ""]
+    candidates: list[str] = []
+    for key in ("duration_seconds", "per-video-second", "per_video_second"):
+        for tag in audio_tags:
+            base = f"{key}_{tag}" if tag else key
+            if wanted:
+                candidates += [f"{base}_{wanted}", f"{base}-{wanted}"]
+            candidates.append(base)
+    for key in candidates:
+        value = _as_float(skus.get(key))
+        if value is not None:
+            return value
+    # 兜底：其它带 second 的 key。分辨率对得上的优先、不带分辨率的其次、别的分辨率不要；
+    # 跳过另一档音频价；`cents_` 开头的是美分
+    other_audio = "without_audio" if with_audio else "with_audio"
+    exact: list[float] = []
+    generic: list[float] = []
+    for key, raw in skus.items():
+        lowered = str(key).lower()
+        if "second" not in lowered or other_audio in lowered:
+            continue
+        if any(word in lowered for word in _NOT_OUTPUT_SECOND):
+            continue
+        value = _as_float(raw)
+        if value is None:
+            continue
+        if lowered.startswith("cents"):
+            value /= 100.0
+        tags = [tag for tag in _RESOLUTION_TAGS if tag in lowered]
+        if not tags:
+            generic.append(value)
+        elif wanted in tags:
+            exact.append(value)
+    if exact:
+        return exact[0]
+    return generic[0] if generic else None
+
+
+#: 按 token 计费时每秒的像素量：各家同一档分辨率换比例时像素量基本不变（720p 竖屏 720×1280、
+#: 1:1 是 960×960），所以按 16:9 的像素数算
+_PIXELS_PER_FRAME = {
+    "480p": 864 * 480,
+    "720p": 1280 * 720,
+    "1080p": 1920 * 1080,
+    "2k": 2560 * 1440,
+    "4k": 3840 * 2160,
+}
+#: 视频 token = 宽 × 高 × 帧率 × 秒数 / 1024（Seedance 实收与此吻合：2.0 720p 10 秒 $1.518）
+_TOKEN_FPS = 24
+_PIXELS_PER_TOKEN = 1024
+
+
+def _token_price(skus: dict[str, Any], wanted: str, with_audio: bool) -> float | None:
+    """`video_tokens*` 价目换算成每秒单价；分辨率不认识就算不出来。"""
+    pixels = _PIXELS_PER_FRAME.get(wanted)
+    if not pixels:
+        return None
+    candidates: list[str] = []
+    if wanted:
+        if not with_audio:
+            candidates.append(f"video_tokens_{wanted}_without_audio")
+        candidates.append(f"video_tokens_{wanted}")
+    if not with_audio:
+        candidates.append("video_tokens_without_audio")
+    candidates.append("video_tokens")
+    for key in candidates:
+        value = _as_float(skus.get(key))
+        if value is not None:
+            return value * pixels * _TOKEN_FPS / _PIXELS_PER_TOKEN
+    return None
 
 
 def _usage_cost(status: dict[str, Any]) -> float | None:

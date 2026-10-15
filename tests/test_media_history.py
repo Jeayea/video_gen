@@ -140,3 +140,126 @@ async def test_redo_segment_keeps_old_clip_in_history(store, video_pipeline, vid
     job = await video_pipeline.start_video_generation(pid)
     await wait_for_job(video_pipeline, job.id)
     assert media_history.resolve_file(root, entries[0]["id"], first.path) is not None
+
+
+# ── 恢复历史片段 ────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_restore_brings_old_clip_back_without_billing(
+    store, video_pipeline, video_ready_project
+):
+    from videogen.models.project import ProjectStatus
+    from videogen.services import cost_service
+
+    pid = video_ready_project.id
+    root = store.ensure_project_dir(pid)
+    manifest = store.load_video_manifest(pid)
+    first = manifest.clips[0]
+    (root / first.path).write_bytes(b"old take")
+    ledger_before = cost_service.load_report(store, pid).total_usd
+
+    await video_pipeline.invalidate_video(pid, shots=[first.shot_id])
+    [redo] = media_history.list_entries(root)
+    job = await video_pipeline.start_video_generation(pid)
+    await wait_for_job(video_pipeline, job.id)
+    assert (root / first.path).read_bytes() != b"old take"
+    ledger_after_redo = cost_service.load_report(store, pid).total_usd
+
+    result = await video_pipeline.restore_video_history(pid, redo["id"])
+    assert result["restored_shots"] == [first.shot_id]
+    assert (root / first.path).read_bytes() == b"old take"
+    clip = store.load_video_manifest(pid).get(first.shot_id)
+    assert clip.status == ClipStatus.READY and clip.cost_recorded
+    assert clip.prompt == first.prompt
+    # 不调视频模型、不记账；历史里那份还在（可以再恢复），被换下的新片段进了新的一批
+    assert cost_service.load_report(store, pid).total_usd == ledger_after_redo >= ledger_before
+    assert media_history.resolve_file(root, redo["id"], first.path) is not None
+    newest = media_history.list_entries(root)[0]
+    assert newest["reason"].startswith("恢复 ") and first.path in [
+        f["path"] for f in newest["files"]
+    ]
+    assert store.load_project(pid).status == ProjectStatus.VIDEO_READY
+
+
+def _seg_manifest(shot_ids, seg="seg_1"):
+    return VideoManifest(
+        clips=[
+            VideoClip(shot_id=sid, status=ClipStatus.READY, path=f"clips/{sid}.mp4",
+                      segment_id=seg, segment_path=f"clips/segments/{seg}.mp4",
+                      prompt=f"prompt {sid}")
+            for sid in shot_ids
+        ]
+    )
+
+
+def _seg_storyboard(shot_ids, seg="seg_1"):
+    from videogen.models.storyboard import Shot, Storyboard
+
+    return Storyboard(shots=[
+        Shot(id=sid, scene_id="scene_1", shot_no=i + 1, duration_sec=3, segment_id=seg)
+        for i, sid in enumerate(shot_ids)
+    ])
+
+
+def test_restore_is_per_segment_and_skips_regrouped_segments(tmp_path):
+    for name in ("clips/a.mp4", "clips/b.mp4", "clips/segments/seg_1.mp4"):
+        _write(tmp_path / name, b"old")
+    old = _seg_manifest(["a", "b"])
+    video_service.invalidate_clips(old, ["a", "b"], tmp_path, reason="重做 seg_1")
+    [entry] = media_history.list_entries(tmp_path)
+    folder, meta = media_history.load_entry(tmp_path, entry["id"])
+
+    # 现在这一段多了一个镜头：整段文件对不上，不恢复
+    manifest = VideoManifest()
+    result = video_service.restore_clips(
+        manifest, _seg_storyboard(["a", "b", "c"]), folder, meta, tmp_path
+    )
+    assert result["restored_shots"] == []
+    assert result["skipped"][0]["segment_id"] == "seg_1"
+    assert not (tmp_path / "clips/a.mp4").exists()
+
+    # 分段没变：整段（含整段文件）恢复
+    result = video_service.restore_clips(
+        manifest, _seg_storyboard(["a", "b"]), folder, meta, tmp_path, shot_ids=["b"]
+    )
+    assert result["restored_shots"] == ["a", "b"]
+    assert (tmp_path / "clips/segments/seg_1.mp4").read_bytes() == b"old"
+    assert manifest.get("a").segment_path == "clips/segments/seg_1.mp4"
+    assert not list(tmp_path.rglob("*.restoring"))
+
+
+def test_restore_reads_legacy_history_without_paths(tmp_path):
+    """老版本的 history.json 只记了 shot_id / prompt 等，没记路径：按命名规则找文件。"""
+    entry = tmp_path / media_history.HISTORY_DIR / "20261014-120000-000-重做-a"
+    _write(entry / "clips/a.mp4", b"legacy")
+    (entry / "history.json").write_text(json.dumps({
+        "reason": "重做 a",
+        "clips": [{"shot_id": "a", "prompt": "p", "cost_usd": 0.65, "duration_sec": 5}],
+    }), encoding="utf-8")
+    folder, meta = media_history.load_entry(tmp_path, entry.name)
+
+    from videogen.models.storyboard import Shot, Storyboard
+
+    manifest = VideoManifest()
+    storyboard = Storyboard(shots=[Shot(id="a", scene_id="scene_1", shot_no=1, duration_sec=5)])
+    result = video_service.restore_clips(manifest, storyboard, folder, meta, tmp_path)
+    assert result["restored_shots"] == ["a"]
+    assert (tmp_path / "clips/a.mp4").read_bytes() == b"legacy"
+    assert manifest.get("a").cost_usd == 0.65 and manifest.get("a").cost_recorded
+
+
+@pytest.mark.asyncio
+async def test_restore_rejects_bad_entry_and_nothing_to_restore(
+    store, video_pipeline, video_ready_project
+):
+    from videogen.orchestrator.pipeline import PipelineError, PipelineNotFound
+
+    pid = video_ready_project.id
+    with pytest.raises(PipelineNotFound):
+        await video_pipeline.restore_video_history(pid, "../etc")
+    root = store.ensure_project_dir(pid)
+    entry = root / media_history.HISTORY_DIR / "20261014-120000-000-空"
+    _write(entry / "output" / "final.mp4")
+    with pytest.raises(PipelineError, match="没有能恢复的段"):
+        await video_pipeline.restore_video_history(pid, entry.name)

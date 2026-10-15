@@ -14,6 +14,7 @@
 - **有上限**：最多留 `MEDIA_HISTORY_KEEP` 批、合计不超过 `MEDIA_HISTORY_MAX_MB`，超了从最旧的删；
   最新的一批永远留着。`MEDIA_HISTORY_KEEP=0` = 关掉留存（回到直接删除）
 - 只留**花钱或费时的产物**（片段 / 配音 / 成片 / 字幕）；抽帧、合成中间缓存照删
+- **能恢复片段**：`video_service.restore_clips` 把一批里的片段拷回 `clips/`（拷贝，历史里那份还在）
 """
 
 from __future__ import annotations
@@ -32,7 +33,7 @@ from videogen.config import Settings, get_settings
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["HISTORY_DIR", "archive", "list_entries", "prune", "resolve_file"]
+__all__ = ["HISTORY_DIR", "archive", "list_entries", "load_entry", "prune", "resolve_file"]
 
 HISTORY_DIR = "history"
 _META = "history.json"
@@ -148,6 +149,20 @@ def list_entries(project_dir: Path) -> list[dict[str, Any]]:
             }
         )
     return result
+
+
+def load_entry(project_dir: Path, entry_id: str) -> tuple[Path, dict[str, Any]] | None:
+    """一批历史版本的目录和 history.json（批名不合法 / 不存在返回 None）。"""
+    if not _ENTRY_NAME.match(entry_id or ""):
+        return None
+    entry = Path(project_dir) / HISTORY_DIR / entry_id
+    if not entry.is_dir():
+        return None
+    try:
+        meta = json.loads((entry / _META).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        meta = {}
+    return entry, meta if isinstance(meta, dict) else {}
 
 
 def resolve_file(project_dir: Path, entry_id: str, relative: str) -> Path | None:

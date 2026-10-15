@@ -1014,6 +1014,17 @@ async def media_history_list(project_id: str):
     }
 
 
+class HistoryRestoreRequest(BaseModel):
+    #: 只恢复这些镜头所在的段；不给 = 这批里能恢复的段全部恢复
+    shots: list[str] | None = None
+
+
+@app.post("/api/projects/{project_id}/history/{entry_id}/restore")
+async def media_history_restore(project_id: str, entry_id: str, req: HistoryRestoreRequest):
+    """把这批历史版本里的旧片段拷回来（按段；当前片段先留进历史，成片作废）。"""
+    return await pipeline.restore_video_history(project_id, entry_id, shots=req.shots)
+
+
 @app.get("/api/projects/{project_id}/history/{entry_id}/files/{relative:path}")
 async def media_history_file(project_id: str, entry_id: str, relative: str):
     pipeline.get_project(project_id)

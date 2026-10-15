@@ -71,6 +71,8 @@ class ReferenceRejection(BaseModel):
     kind: str = ""
     #: 被拒的图（相对项目目录）
     images: list[str] = Field(default_factory=list)
+    #: 被拒的首帧是上一段的最后一帧（接戏帧），不是画出来的关键帧
+    chained: bool = False
     #: provider 错误码，如 `InputImageSensitiveContentDetected.PrivacyInformation`
     code: str = ""
     message: str = ""
@@ -90,6 +92,8 @@ class VideoManifest(BaseModel):
     rejections: list[ReferenceRejection] = Field(default_factory=list)
     #: 用户明确同意「不带图生成」的段 id（生成成功后清掉，下次重做仍会先带图）
     reference_waived: list[str] = Field(default_factory=list)
+    #: 不再接戏的段 id（接戏帧被拒后用户选了「改用画的关键帧」）：一直有效
+    chain_waived: list[str] = Field(default_factory=list)
 
     # ── 统计 ──────────────────────────────────────────
     @property
