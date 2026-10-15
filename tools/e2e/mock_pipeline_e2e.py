@@ -193,6 +193,8 @@ def server_env(projects_dir: Path, token: str, extra: dict[str, str]) -> dict[st
             "API_TOKEN": token,
             "VIDEO_PROVIDER": "mock",
             "TTS_PROVIDER": "mock",
+            # 人声来源默认已改成 native（视频原声、不调 TTS）：冒烟要测的是 TTS 配音链路
+            "AUDIO_DUB_MODE": "tts",
             "LIPSYNC_ENGINE": "none",
             "AUDIO_LLM_SCRIPT": "off",
             "AUDIO_LLM_VISION": "false",
