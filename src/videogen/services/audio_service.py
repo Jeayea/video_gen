@@ -163,6 +163,12 @@ async def synthesize_all(
         manifest.warnings.append(
             f"{_NATIVE_NOTE_PREFIX}{len(native_narration)} 个镜头的旁白由视频原声直出，不另配音"
         )
+    # 镜头还在、台词 / 旁白却被删掉了的旧条目：留着的话合成会照样念那句已删掉的话
+    wanted = {line.id for line in lines}
+    dropped = [c.id for c in manifest.clips if c.id not in wanted]
+    if dropped:
+        logger.info("配音条目 %s 对应的台词已删除，丢掉旧配音", ", ".join(dropped))
+        manifest.clips = [c for c in manifest.clips if c.id in wanted]
     if not lines:
         # 没有台词也是合法的：直接产出一条无声成片（或全靠原声），不报错
         if not native_narration:

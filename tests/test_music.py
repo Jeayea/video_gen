@@ -312,3 +312,13 @@ def test_envelope_decays_and_fades():
     assert max(env) <= 1.0
     assert env[-1] == 0.0
     assert env[SR // 2] > env[-2], "指数衰减：后面应该更小"
+
+
+def test_out_of_range_bpm_and_unknown_key_are_reported_not_ignored():
+    """回归：BPM 超出范围 / 调写错时以前静默用默认值，用户以为设置生效了。"""
+    from videogen.utils import music
+
+    fast = music.build_plan(duration_sec=10, bpm=1000)
+    assert fast.bpm == 180 and any("BPM 1000" in n for n in fast.notes)
+    odd = music.build_plan(duration_sec=10, key="Z#m")
+    assert any("Z#m" in n for n in odd.notes)

@@ -435,6 +435,46 @@ def _hits(text: str, hints: tuple[str, ...]) -> int:
     return count
 
 
+#: 说「别人」的关系词：出现在描述里多半是在讲这个角色的家人 / 对象，不是本人性别
+_RELATION_WORDS = tuple(
+    sorted(
+        {
+            *(w for w in _WEAK_MALE + _WEAK_FEMALE if not w.isascii()),
+            *("女儿", "儿子", "女友", "男友", "女朋友", "男朋友"),
+            *("女主", "男主", "女同学", "男同学"),
+        },
+        key=len,
+        reverse=True,
+    )
+)
+
+
+def _description_hits(description: str) -> tuple[int, int]:
+    """中文描述里关于**本人**的性别线索 `(男分, 女分)`。
+
+    每个分句只看中心语（最后一个「的」之后：「格里高的父亲」→「父亲」，
+    「照顾母亲和妹妹的出租车司机」→「出租车司机」）；关系称谓只有当它**就是**中心语时才算，
+    其余地方的关系词（「为了救女儿四处奔走」）先删掉，再找「男 / 女」这类显式词。
+    """
+    male = female = 0
+    for clause in re.split(r"[，,。；;、！!？?\s]+", description.lower()):
+        head = clause.rsplit("的", 1)[-1]
+        if not head:
+            continue
+        for word in _RELATION_WORDS:
+            # 单字称谓常带尾字（父亲 / 妈妈 / 大姐）：落在中心语最后两个字里就算
+            if head.endswith(word) or (len(word) == 1 and word in head[-2:]):
+                male += _hits(word, _WEAK_MALE)
+                female += _hits(word, _WEAK_FEMALE)
+                head = head[: head.rfind(word)]
+                break
+        for word in _RELATION_WORDS:
+            head = head.replace(word, " ")
+        male += 2 * _hits(head, _STRONG_MALE)
+        female += 2 * _hits(head, _STRONG_FEMALE)
+    return male, female
+
+
 def infer_gender(character: Character | None) -> tuple[str | None, str]:
     """推断角色性别，返回 `(male|female|None, 依据)`。
 
@@ -446,18 +486,21 @@ def infer_gender(character: Character | None) -> tuple[str | None, str]:
     declared = str(getattr(character, "gender", "") or "")
     if declared in ("male", "female"):
         return declared, "圣经 gender 字段"
+    # 名字 / 定位 / 英文外貌描述说的都是这个角色自己
     text = " ".join(
         str(part).lower()
         for part in (
             getattr(character, "role", ""),
-            getattr(character, "description", ""),
             getattr(character, "visual_prompt", ""),
             getattr(character, "name", ""),
-            " ".join(getattr(character, "personality", []) or []),
         )
     )
     male = 2 * _hits(text, _STRONG_MALE) + _hits(text, _WEAK_MALE)
     female = 2 * _hits(text, _STRONG_FEMALE) + _hits(text, _WEAK_FEMALE)
+    # 中文描述里常有别人（「为了救女儿」「照顾母亲和妹妹的司机」），只看说本人的那部分
+    head_male, head_female = _description_hits(str(getattr(character, "description", "") or ""))
+    male += head_male
+    female += head_female
     if male > female:
         return "male", f"文本线索 男{male}:女{female}"
     if female > male:

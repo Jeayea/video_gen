@@ -498,6 +498,11 @@ def _read_hints(section_hint: Sequence[Mapping[str, Any]] | None) -> dict[str, A
     return result
 
 
+#: 能合成的速度范围（太慢拍子拖成一片，太快音符糊在一起）
+_MIN_BPM = 40
+_MAX_BPM = 180
+
+
 def build_plan(
     *,
     shots: Sequence[Any] = (),
@@ -522,9 +527,18 @@ def build_plan(
     hints = _read_hints(section_hint)
     all_moods = [*moods, *hints["moods"]]
     base_color = pick_color(all_moods, note=note, override=color or hints["color"])
+    input_notes: list[str] = []
     key_root = key.strip().upper() or base_color.root
-    root_midi = _ROOT_MIDI.get(key_root, _ROOT_MIDI[base_color.root])
-    tempo = int(bpm) if bpm and 40 <= int(bpm) <= 180 else base_color.bpm
+    if key_root not in _ROOT_MIDI:
+        input_notes.append(f"不认识的调「{key}」，改用色调默认的 {base_color.root}")
+        key_root = base_color.root
+    root_midi = _ROOT_MIDI[key_root]
+    tempo = base_color.bpm
+    if bpm:
+        # 超出能合成的范围时夹到边上并说明（以前是静默忽略，用户以为生效了）
+        tempo = min(_MAX_BPM, max(_MIN_BPM, int(bpm)))
+        if tempo != int(bpm):
+            input_notes.append(f"BPM {bpm} 超出 {_MIN_BPM}~{_MAX_BPM}，按 {tempo} 写")
     bar_sec = round(4 * 60.0 / tempo, 3)
 
     items = _collect_shots(shots, motions, speech_windows, base_color)
@@ -636,7 +650,10 @@ def build_plan(
         sections=sections,
         accents=kept,
         speech_windows=[(round(start, 3), round(end, 3)) for start, end in speech_windows],
-        notes=_plan_notes(base_color, sections, kept, speech_windows, note, motions),
+        notes=[
+            *input_notes,
+            *_plan_notes(base_color, sections, kept, speech_windows, note, motions),
+        ],
     )
     if section_hint:
         plan.notes.append("段落情绪参考了 LLM 的配乐建议（时间轴仍按镜头切）")

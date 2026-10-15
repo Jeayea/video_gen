@@ -24,7 +24,13 @@ from pathlib import Path
 from videogen.models.storyboard import Storyboard
 from videogen.models.video import ClipStatus, VideoManifest
 from videogen.utils.audio_align import speech_span
-from videogen.utils.ffmpeg import FFmpegError, probe_duration, probe_streams, run_ffmpeg
+from videogen.utils.ffmpeg import (
+    FFmpegError,
+    atempo_chain,
+    probe_duration,
+    probe_streams,
+    run_ffmpeg,
+)
 from videogen.utils.text import clean_spoken_text
 
 logger = logging.getLogger(__name__)
@@ -133,20 +139,6 @@ async def _cut(source: Path, target: Path, start: float, end: float) -> bool:
         logger.warning("切原声片段失败：%s", source.name, exc_info=True)
         return False
     return target.is_file() and target.stat().st_size > 0
-
-
-def atempo_chain(factor: float) -> str:
-    """任意倍率 → 每级都在 0.5~2.0 之内的 atempo 级联（老版 ffmpeg 不认更大的倍率）。"""
-    parts: list[str] = []
-    remaining = factor
-    while remaining > 2.0:
-        parts.append("atempo=2.0")
-        remaining /= 2.0
-    while remaining < 0.5:
-        parts.append("atempo=0.5")
-        remaining /= 0.5
-    parts.append(f"atempo={remaining:.4f}")
-    return ",".join(parts)
 
 
 async def fit_to_span(

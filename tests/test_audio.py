@@ -633,3 +633,22 @@ def test_bgm_track_ignores_unknown_preferred_id():
     track = library.pick(["紧张"], preferred_id="不存在的曲子")
     assert isinstance(track, BgmTrack)
     assert track.id == "fake_bgm"
+
+
+@pytest.mark.asyncio
+async def test_deleted_line_drops_old_dub(store, video_ready_project):
+    """回归：镜头还在、台词被删了，旧配音还留在清单里 —— 合成会照样念那句删掉的话。"""
+    provider = FakeTTSProvider()
+    manifest = await run_audio(store, video_ready_project, provider)
+    victim = manifest.clips[0].shot_id
+
+    storyboard = store.load_storyboard(video_ready_project.id)
+    for shot in storyboard.shots:
+        if shot.id == victim:
+            shot.dialogue_text = ""
+            shot.dialogue_speaker = ""
+            shot.narration = ""
+    store.save_storyboard(video_ready_project.id, storyboard)
+
+    again = await run_audio(store, video_ready_project, provider)
+    assert again.for_shot(victim) is None

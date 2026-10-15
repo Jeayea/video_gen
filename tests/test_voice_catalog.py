@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from videogen.models.bible import Character, StoryBible, StyleGuide
 from videogen.models.storyboard import Shot, Storyboard
 from videogen.services import voice_catalog
@@ -270,3 +272,24 @@ def test_young_character_without_age_can_still_get_child_voice():
     )
     casting = cast_voice_map(make_storyboard(["char_1", "char_2"]), bible)
     assert casting.voice_map["char_2"].endswith("YunxiaNeural")
+
+
+@pytest.mark.parametrize(
+    "description",
+    [
+        "退伍军人，为了救女儿四处奔走",
+        "照顾卧病的母亲和妹妹的出租车司机",
+        "女主的青梅竹马，沉默寡言",
+    ],
+)
+def test_relatives_in_description_do_not_decide_gender(description):
+    """回归：描述里提到「女儿 / 母亲 / 女主」时，男角色被判成女声。"""
+    character = Character(id="c", name="某人", role="配角", description=description)
+    assert infer_gender(character)[0] is None
+
+
+def test_kinship_head_noun_still_counts():
+    father = Character(id="c", name="某人", role="配角", description="格里高的父亲")
+    mom = Character(id="d", name="某人", role="配角", description="两个孩子的妈妈")
+    assert infer_gender(father)[0] == "male"
+    assert infer_gender(mom)[0] == "female"

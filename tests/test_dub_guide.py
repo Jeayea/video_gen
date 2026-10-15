@@ -23,9 +23,9 @@ requires_ffmpeg = pytest.mark.skipif(not ffmpeg_available(), reason="没有 ffmp
 
 
 def test_atempo_chain_stays_within_ffmpeg_limits():
-    assert atempo_chain(1.2) == "atempo=1.2000"
-    assert atempo_chain(3.0) == "atempo=2.0,atempo=1.5000"
-    assert atempo_chain(0.3) == "atempo=0.5,atempo=0.6000"
+    assert atempo_chain(1.2) == "atempo=1.2"
+    assert atempo_chain(3.0) == "atempo=2,atempo=1.5"
+    assert atempo_chain(0.3) == "atempo=0.5,atempo=0.6"
 
 
 # ── 云端 TTS：带参考录音 ─────────────────────────────

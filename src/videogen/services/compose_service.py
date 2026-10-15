@@ -17,6 +17,7 @@ from videogen.services import lipsync_service, subtitle_service, video_service
 from videogen.utils import loudness as loudness_utils
 from videogen.utils.audio_align import mouth_align_delay
 from videogen.utils.av_sync import check_av_sync, format_sync_warning
+from videogen.utils.ffmpeg import atempo_chain as ffmpeg_atempo_chain
 from videogen.utils.ffmpeg import (
     ffmpeg_capabilities,
     probe_duration,
@@ -240,7 +241,7 @@ async def _finish(
     bgm_loop: bool = True,
     duck: bool = False,
     duck_ratio: float = 6.0,
-    duck_threshold_db: float = -30.0,
+    duck_threshold_db: float = -40.0,
     duck_attack_ms: float = 25.0,
     duck_release_ms: float = 420.0,
     loudness_normalize: bool = False,
@@ -378,29 +379,12 @@ async def _finish(
     return effective
 
 
-#: atempo 每一级的合法区间。老版 ffmpeg 只认 0.5~2.0，所以任意倍率都拆成多级串联
-_ATEMPO_MIN = 0.5
-_ATEMPO_MAX = 2.0
-
-
 def atempo_chain(speed: float) -> str:
-    """把任意倍速拆成若干级合法 `atempo`（每级都落在 0.5~2.0）。
-
-    直接写 `atempo=4` 在老版 ffmpeg 上会报错，而 `atempo=2,atempo=2` 到处都能跑。
-    """
-    value = float(speed)
-    if value <= 0:
-        raise ComposeError(f"变速倍率必须大于 0（收到 {speed!r}）")
-    factors: list[float] = []
-    remaining = value
-    while remaining > _ATEMPO_MAX:
-        factors.append(_ATEMPO_MAX)
-        remaining /= _ATEMPO_MAX
-    while remaining < _ATEMPO_MIN:
-        factors.append(_ATEMPO_MIN)
-        remaining /= _ATEMPO_MIN
-    factors.append(remaining)
-    return ",".join(f"atempo={factor:g}" for factor in factors)
+    """`utils.ffmpeg.atempo_chain`，非法倍率报成 ComposeError。"""
+    try:
+        return ffmpeg_atempo_chain(speed)
+    except ValueError as exc:
+        raise ComposeError(str(exc)) from exc
 
 
 def speed_filter(speed: float) -> str:
@@ -505,7 +489,7 @@ def bgm_mix_filter(
     duration: float = 0.0,
     duck: bool = False,
     duck_ratio: float = 6.0,
-    duck_threshold_db: float = -30.0,
+    duck_threshold_db: float = -40.0,
     duck_attack_ms: float = 25.0,
     duck_release_ms: float = 420.0,
 ) -> str:
@@ -739,6 +723,11 @@ async def compose(
         )
     if lipsync_outcomes:
         _write_lipsync_report(output_dir, lipsync_outcomes)
+    # 配音被延后到开口那一刻时，字幕也要跟着延后（否则字幕先出、话没说完字就没了）
+    for segment in segments:
+        delay = mouth_delays.get(segment.shot_id, 0.0)
+        if delay > segment.voice_offset_sec:
+            segment.voice_offset_sec = delay
     if mouth_delays:
         logger.info(
             "口型对齐：%d 个镜头的配音已延后到画面开口时刻（最大 %.2fs）",
@@ -1127,6 +1116,7 @@ async def _render_all(
                 f" gain={gain_db:+.1f}"
                 f" native={'on' if native else 'off'}"
                 f" dur={segment.duration_sec:.3f}"
+                f" out={width}x{height}@{fps} crf={crf} preset={preset}"
             )
             if (
                 reuse
@@ -1373,7 +1363,10 @@ async def _render_passthrough(
         has_audio = bool(streams and "audio" in streams)
         output = segments_dir / f"{segment_id}.mp4"
         marker = segments_dir / f"{segment_id}.params"
-        params = f"passthrough audio={'on' if has_audio else 'off'} dur={duration:.3f}"
+        params = (
+            f"passthrough audio={'on' if has_audio else 'off'} dur={duration:.3f}"
+            f" out={width}x{height}@{fps} crf={crf} preset={preset}"
+        )
         if reuse and _params_match(marker, params) and _segment_is_fresh(output, [source]):
             continue
         whole = ComposeSegment(

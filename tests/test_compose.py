@@ -1301,6 +1301,10 @@ async def test_compose_mouth_alignment_is_wired_and_reported(store, settings):
     # 第一镜被延后（其余镜头的 mock 音轨是满的/没有音轨，不触发）
     assert report.warnings, report.model_dump()
     assert any("口型对齐" in w for w in report.warnings), report.warnings
+    # 字幕跟着延后的配音走：第一条字幕不能在开口之前就出现
+    srt = (store.output_dir(project.id) / "subtitles.srt").read_text(encoding="utf-8")
+    first_start = srt.split("\n")[1].split(" --> ")[0]
+    assert first_start > "00:00:00,000", srt[:200]
 
 
 # ── 逐帧口型（用 ffmpeg 当假引擎，验证接线而不是模型质量）──────────

@@ -13,6 +13,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "FFmpegError",
+    "atempo_chain",
     "cut_clip",
     "describe_media",
     "detect_cuts",
@@ -36,6 +37,32 @@ __all__ = [
 
 class FFmpegError(RuntimeError):
     """ffmpeg 不可用或执行失败（消息已脱敏）。"""
+
+
+#: atempo 每一级的合法区间。老版 ffmpeg 只认 0.5~2.0，所以任意倍率都拆成多级串联
+_ATEMPO_MIN = 0.5
+_ATEMPO_MAX = 2.0
+
+
+def atempo_chain(speed: float) -> str:
+    """把任意倍速拆成若干级合法 `atempo`（每级都落在 0.5~2.0），变速不变调。
+
+    直接写 `atempo=4` 在老版 ffmpeg 上会报错，而 `atempo=2,atempo=2` 到处都能跑。
+    整片变速（compose）和配音对齐原声（dub_guide）共用这一份。
+    """
+    value = float(speed)
+    if not value > 0:
+        raise ValueError(f"变速倍率必须大于 0（收到 {speed!r}）")
+    factors: list[float] = []
+    remaining = value
+    while remaining > _ATEMPO_MAX:
+        factors.append(_ATEMPO_MAX)
+        remaining /= _ATEMPO_MAX
+    while remaining < _ATEMPO_MIN:
+        factors.append(_ATEMPO_MIN)
+        remaining /= _ATEMPO_MIN
+    factors.append(remaining)
+    return ",".join(f"atempo={factor:g}" for factor in factors)
 
 
 _resolved: str | None = None
