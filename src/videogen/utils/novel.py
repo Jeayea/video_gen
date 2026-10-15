@@ -15,14 +15,24 @@ import re
 from dataclasses import dataclass
 
 _NUM = r"[0-9０-９零〇一二两三四五六七八九十百千万]+"
-_HEADING_RE = re.compile(
-    rf"""^[ \t　]*(
+_HEADING_TOKEN = rf"""(
         第{_NUM}[章回节卷集部篇]
       | 序章 | 序言 | 序幕 | 楔子 | 引子 | 尾声 | 终章 | 后记 | 番外
       | (?:chapter|CHAPTER|Chapter)[ \t]+(?:\d+|[IVXLC]+)
       | Prologue | Epilogue
-    )
-    # 正文里「第三节课下课了。」这类句子也以「第X节」开头：带句末标点/引号的不算标题
+    )"""
+#: 标题词后面要么直接换行，要么先有分隔符（空格 / 冒号 / 顿号 / 点 / 破折号）再跟标题。
+#: 这样「第十章 逆袭！」这种带感叹号的标题认得出来，
+#: 而正文里的「第三节课下课了」「第三章的内容……」（标题词后面紧跟正文）不会被当成标题
+_HEADING_RE = re.compile(
+    rf"""^[ \t　]*{_HEADING_TOKEN}
+    (?:[ \t　:：、.．·\-—]+[^\n。]{{0,40}})?$""",
+    re.MULTILINE | re.VERBOSE,
+)
+#: 宽松版（整篇一个严格标题都没有时才用）：标题和正文之间不空格的写法「第一章开始」。
+#: 正文里「第三节课下课了。」这类句子也以「第X节」开头：带句末标点/引号的不算标题
+_LOOSE_HEADING_RE = re.compile(
+    rf"""^[ \t　]*{_HEADING_TOKEN}
     (?![^\n]*[。！？!?…“”"])
     [^\n]{{0,40}}$""",
     re.MULTILINE | re.VERBOSE,
@@ -77,7 +87,7 @@ def _pack(paragraphs: list[str], limit: int) -> list[str]:
 
 
 def _by_headings(text: str) -> list[RawChapter]:
-    matches = list(_HEADING_RE.finditer(text))
+    matches = list(_HEADING_RE.finditer(text)) or list(_LOOSE_HEADING_RE.finditer(text))
     if not matches:
         return []
     chapters: list[RawChapter] = []

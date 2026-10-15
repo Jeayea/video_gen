@@ -5,7 +5,7 @@ from pydantic import BaseModel, Field, field_validator
 from videogen.models.script import DialogueLine
 from videogen.models.storyboard import ShotDraft
 from videogen.models.world_state import WorldStateDelta
-from videogen.utils.coerce import coerce_int
+from videogen.utils.coerce import coerce_seconds
 
 __all__ = [
     "ChapterOutlineResponse",
@@ -98,7 +98,7 @@ class SceneResponse(BaseModel):
     @field_validator("duration_sec", mode="before")
     @classmethod
     def _coerce_duration(cls, value: object) -> int:
-        return max(1, coerce_int(value, 10))
+        return max(1, coerce_seconds(value, 10))
 
 
 class ShotsResponse(BaseModel):

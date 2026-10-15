@@ -3,7 +3,7 @@ from __future__ import annotations
 from pydantic import BaseModel, Field, field_validator
 
 from videogen.models.script import MIN_SCENE_DURATION_SEC
-from videogen.utils.coerce import StrList, coerce_int, ensure_optional_str
+from videogen.utils.coerce import StrList, coerce_seconds, ensure_optional_str
 
 DEFAULT_SHOT_DURATION_SEC = 4
 
@@ -64,7 +64,7 @@ class ShotDraft(BaseModel):
     @field_validator("duration_sec", mode="before")
     @classmethod
     def _coerce_duration(cls, value: object) -> int:
-        return max(1, coerce_int(value, DEFAULT_SHOT_DURATION_SEC))
+        return max(1, coerce_seconds(value, DEFAULT_SHOT_DURATION_SEC))
 
     @field_validator("narration", "dialogue_text", "dialogue_speaker", mode="before")
     @classmethod
@@ -113,7 +113,7 @@ class Shot(BaseModel):
     @field_validator("duration_sec", mode="before")
     @classmethod
     def _coerce_duration(cls, value: object) -> int:
-        return max(1, coerce_int(value, DEFAULT_SHOT_DURATION_SEC))
+        return max(1, coerce_seconds(value, DEFAULT_SHOT_DURATION_SEC))
 
     @field_validator("narration", "dialogue_text", "dialogue_speaker", mode="before")
     @classmethod

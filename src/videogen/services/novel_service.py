@@ -47,6 +47,7 @@ from videogen.providers.llm.base import LLMMessage, LLMProvider
 from videogen.services import bible_service
 from videogen.utils.coerce import coerce_int, coerce_optional_int, ensure_str_list
 from videogen.utils.novel import source_fingerprint, split_chapters
+from videogen.utils.text import quote_source
 
 logger = logging.getLogger(__name__)
 
@@ -223,7 +224,7 @@ async def _extract_one(
 已知角色（同一人请沿用这些名字）: {_roster(bible)}
 
 ## 原文
-{chapter.text}"""
+{quote_source(chapter.text)}"""
     messages = [
         LLMMessage(role="system", content=NOVEL_EXTRACT_SYSTEM.format(max_props=max_props)),
         LLMMessage(role="user", content=user_prompt),

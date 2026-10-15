@@ -135,3 +135,13 @@ def test_openrouter_payload_serializes_vision_parts() -> None:
     assert user["content"][1] == {"type": "text", "text": "镜头 s1"}
     assert user["content"][2]["type"] == "image_url"
     assert user["content"][2]["image_url"]["url"].startswith("data:image/jpeg;base64,")
+
+
+def test_trailing_comma_does_not_break_chinese_quotes_in_dialogue():
+    """回归：尾逗号触发修复时，台词里的“”被整篇换成 " —— JSON 反而彻底坏掉。"""
+    from videogen.providers.llm.openrouter import _extract_json
+
+    assert _extract_json('{"line": "他说“走吧”就离开了", "n": 1,}') == {
+        "line": "他说“走吧”就离开了",
+        "n": 1,
+    }

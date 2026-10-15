@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field, field_validator
 
-from videogen.utils.coerce import StrList, coerce_int, ensure_str_list
+from videogen.utils.coerce import StrList, coerce_int, coerce_seconds, ensure_str_list
 
 DEFAULT_SCENE_DURATION_SEC = 10
 MIN_SCENE_DURATION_SEC = 3
@@ -40,7 +40,7 @@ class Scene(BaseModel):
     @field_validator("duration_sec", mode="before")
     @classmethod
     def _coerce_duration(cls, value: object) -> int:
-        return max(MIN_SCENE_DURATION_SEC, coerce_int(value, DEFAULT_SCENE_DURATION_SEC))
+        return max(MIN_SCENE_DURATION_SEC, coerce_seconds(value, DEFAULT_SCENE_DURATION_SEC))
 
 
 class OutlineScene(BaseModel):

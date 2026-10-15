@@ -106,3 +106,28 @@ def test_apply_duration_budget() -> None:
     assert apply_duration_budget(45, 5, 3) == 9
     assert apply_duration_budget(45, 0, 3) == 45
     assert apply_duration_budget(10, 10, 3) == 3
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("1分30秒", 90),
+        ("1.5分钟", 90),
+        ("1:30", 90),
+        ("2min", 120),
+        ("约10秒", 10),
+        ("10-15秒", 10),
+    ],
+)
+def test_duration_fields_understand_units(raw, expected):
+    """回归：「1分30秒」以前只取第一个数，被当成 1 秒。"""
+    from videogen.models.storyboard import Shot
+
+    assert Shot(id="s", scene_id="c", shot_no=1, duration_sec=raw).duration_sec == expected
+
+
+def test_nan_and_infinity_do_not_crash():
+    from videogen.utils.coerce import coerce_optional_int
+
+    assert coerce_optional_int(float("nan")) is None
+    assert coerce_optional_int(float("inf")) is None

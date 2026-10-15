@@ -34,7 +34,7 @@ from videogen.models.script import (
 )
 from videogen.models.world_state import WorldState
 from videogen.providers.llm.base import LLMMessage, LLMProvider
-from videogen.utils.coerce import coerce_int, ensure_str_list
+from videogen.utils.coerce import coerce_int, coerce_seconds, ensure_str_list
 from videogen.utils.duration import (
     DIALOGUE_SHARE,
     SPEECH_CHARS_PER_SEC,
@@ -44,6 +44,7 @@ from videogen.utils.duration import (
     scale_durations,
 )
 from videogen.utils.language import EN_WORDS_PER_SEC
+from videogen.utils.text import quote_source
 
 logger = logging.getLogger(__name__)
 
@@ -260,7 +261,7 @@ CHAPTER_EXPAND_SYSTEM = """你是长篇剧集的总编剧。现在把已经定�
 1. 不得改变骨架里已定的事件顺序与因果关系；只能补充细节
 2. summary 要写清「谁想要什么 → 被什么挡住 → 做了什么选择 → 结果与代价」，
    不要写「她很努力，最后成功了」这类没有具体动作的概括
-3. beats 是 4-8 个**按顺序**的情节点，每个都要有具体动作/对象（例如「赵总把名片推回去」），
+3. beats 是 4-8 个**按顺序**的情节点，每个都要有具体动作/对象（例如「她把名片推了回去」），
    不要写抽象情绪（例如「她很难过」）
 4. hook 是章末钩子：一个让观众必须看下一章的具体悬念
 5. characters / locations 只能填故事圣经里已有的 id
@@ -500,7 +501,7 @@ async def _expand_chapters(
         )
         chapter.duration_budget_sec = max(
             MIN_SCENE_DURATION_SEC,
-            coerce_int(item.get("duration_budget_sec"), chapter.scene_budget * 12),
+            coerce_seconds(item.get("duration_budget_sec"), chapter.scene_budget * 12),
         )
 
 
@@ -546,7 +547,7 @@ async def expand_chapters(
             detail.append(f"关键道具: {', '.join(chapter.props)}")
         source = (sources or {}).get(chapter.id, "")
         if source:
-            detail.append(f"原著原文:\n{source}")
+            detail.append(f"原著原文:\n{quote_source(source)}")
         detail.append(
             f"请展开成 {chapter.scene_budget} 场，合计约 {chapter.duration_budget_sec} 秒"
         )
@@ -631,7 +632,7 @@ environment 必须具体到可见细节（不要写「办公室」这种泛称�
                 title=str(item.get("title") or f"第 {next_no} 场"),
                 brief=str(item.get("brief") or item.get("summary") or ""),
                 duration_budget_sec=max(
-                    MIN_SCENE_DURATION_SEC, coerce_int(item.get("duration_sec"), budget)
+                    MIN_SCENE_DURATION_SEC, coerce_seconds(item.get("duration_sec"), budget)
                 ),
                 chapter_id=cid,
                 environment=str(item.get("environment") or ""),
@@ -870,7 +871,7 @@ def _source_block(outline_scene: OutlineScene) -> str:
         return ""
     return f"""
 ## 原著片段（本场改编依据）
-{excerpt[:SOURCE_EXCERPT_MAX_CHARS]}
+{quote_source(excerpt[:SOURCE_EXCERPT_MAX_CHARS])}
 
 改编要求：台词从原著对白里**挑**最关键的几句（可删减、口语化，不得改变意思），
 总量服从上面的「台词总量」，不要把原文对白整段搬进来；叙述与心理描写改写成

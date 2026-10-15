@@ -288,7 +288,12 @@ def _extract_json(text: str) -> Any:
     last_error: Exception | None = None
     seen: set[str] = set()
     for candidate in candidates:
-        for variant in (candidate, _repair_json(candidate)):
+        variants = (
+            candidate,
+            _repair_json(candidate, smart_quotes=False),
+            _repair_json(candidate),
+        )
+        for variant in variants:
             if variant in seen:
                 continue
             seen.add(variant)
@@ -376,7 +381,7 @@ def _map_outside_strings(text: str, mapping: dict[str, str]) -> str:
     return "".join(out)
 
 
-def _repair_json(text: str) -> str:
+def _repair_json(text: str, *, smart_quotes: bool = True) -> str:
     """最后一搏的修复：中文标点、智能引号、尾逗号。
 
     历史坑：早期版本无脑 `replace("，", ",")`，注释还写着「中文逗号只可能出现在
@@ -385,12 +390,14 @@ def _repair_json(text: str) -> str:
     （模型偶尔吐中文引号 → 触发 repair → 台词里的逗号全变英文逗号）。
     现在中文逗号/冒号只在字符串外替换。
 
-    智能引号是例外：它们**就是**被误用的字符串定界符，必须整篇替换，
-    否则引号根本配不平。
+    智能引号是例外：它们被误用成字符串定界符时必须整篇替换，否则引号根本配不平。
+    但台词里本来就常有「他说“走吧”」—— 所以先试 `smart_quotes=False`（只修尾逗号 /
+    字符串外的中文标点），不行再整篇换引号；否则一个尾逗号就会让整段台词的引号被换坏。
     """
     repaired = text.strip()
-    repaired = repaired.replace("“", '"').replace("”", '"')
-    repaired = repaired.replace("‘", "'").replace("’", "'")
+    if smart_quotes:
+        repaired = repaired.replace("“", '"').replace("”", '"')
+        repaired = repaired.replace("‘", "'").replace("’", "'")
     repaired = _map_outside_strings(repaired, {"，": ",", "：": ":"})
     # 尾逗号清理（`,\s*}` / `,\s*]` 只可能出现在结构里）
     repaired = re.sub(r",(\s*[}\]])", r"\1", repaired)
