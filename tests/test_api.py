@@ -1292,3 +1292,43 @@ def test_history_list_and_file(client):
     assert client.get(f"{base}/output/final.mp4").content == b"old-final"
     assert client.get(f"{base}/history.json").status_code == 404
     assert client.get(f"{base}/..%2F..%2Fmeta.json").status_code == 404
+
+
+def test_url_token_never_authorizes_writes():
+    """回归：`/reference` 前缀下的上传 / 删除 / 付费生成也接受过 `?token=`。"""
+    from videogen.main import url_token_allowed
+
+    path = "/api/projects/abc/characters/c1/reference"
+    assert url_token_allowed(path, "GET")
+    assert not url_token_allowed(path, "POST")
+    assert not url_token_allowed(path, "DELETE")
+    assert not url_token_allowed("/api/projects/abc/characters/references/generate", "POST")
+
+
+def test_cross_site_writes_are_rejected(client):
+    """没设 API_TOKEN 时，别的网站不能借浏览器触发付费生成（CSRF）。"""
+    evil = {"Origin": "https://evil.example"}
+    assert client.post("/api/projects", json={"input_text": "x"}, headers=evil).status_code == 403
+    assert (
+        client.post(
+            "/api/projects", json={"input_text": "x"}, headers={"Sec-Fetch-Site": "cross-site"}
+        ).status_code
+        == 403
+    )
+    # 同源页面 / 不带 Origin 的脚本照常
+    same = {"Origin": "http://testserver"}
+    assert client.post("/api/projects", json={"input_text": "x"}, headers=same).status_code == 200
+    assert client.post("/api/projects", json={"input_text": "x"}).status_code == 200
+    assert client.get("/api/projects", headers=evil).status_code == 200
+
+
+def test_cross_site_check_works_behind_reverse_proxy(client, monkeypatch):
+    """反向代理改写了 Host：按 X-Forwarded-Host 认同源；单独部署的前端可以加白名单。"""
+    proxied = {"Origin": "https://studio.example.com", "X-Forwarded-Host": "studio.example.com"}
+    body = {"input_text": "x"}
+    assert client.post("/api/projects", json=body, headers=proxied).status_code == 200
+
+    other = {"Origin": "https://ui.example.com"}
+    assert client.post("/api/projects", json=body, headers=other).status_code == 403
+    monkeypatch.setattr(main.settings, "api_allowed_origins", "https://ui.example.com/")
+    assert client.post("/api/projects", json=body, headers=other).status_code == 200

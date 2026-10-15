@@ -753,6 +753,10 @@ function esc(s) {
   return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
+// 拼进 onclick="fn(...)" 的参数：先转成 JS 字符串字面量（处理 ' \ 换行），再做 HTML 转义。
+// 只做 esc() 不够 —— 标题里的单引号会提前结束 JS 字符串（标题可能来自小说原文第一行）
+function jsArg(s) { return esc(JSON.stringify(String(s ?? ''))); }
+
 function el(id) { return $(id); }
 
 // ── 通用动作包装：忙提示 + 刷新 ─────────────────────────────────────
@@ -848,7 +852,7 @@ function renderProjectGrid() {
     return;
   }
   list.innerHTML = shown.map(p => `
-    <div class="project-card" onclick="selectProject('${p.id}')">
+    <div class="project-card" onclick="selectProject(${jsArg(p.id)})">
       <div class="project-cover">
         <span class="cover-icon">${p.input_mode === 'novel' ? '📖' : '🎬'}</span>
         <img class="cover-img" alt="" loading="lazy" onerror="this.remove()"
@@ -857,7 +861,7 @@ function renderProjectGrid() {
         <span class="ratio">${esc(p.aspect_ratio)}</span>
       </div>
       <button class="del" title="删除项目"
-              onclick="event.stopPropagation(); deleteProject('${p.id}', '${esc(p.title)}')">✕</button>
+              onclick="event.stopPropagation(); deleteProject(${jsArg(p.id)}, ${jsArg(p.title)})">✕</button>
       <div class="body">
         <div class="title">${esc(p.title) || '未命名'}</div>
         <div class="meta">
@@ -1512,18 +1516,18 @@ async function renderAssets() {
         <div class="asset-usage">${esc(usage)}</div>
         <div class="asset-actions">
           <button class="btn btn-xs btn-green" title="${ASSET_HINT[kind]}（按张计费）"
-                  onclick="generateAssetReference('${kind}', '${esc(a.id)}', ${a.has_reference})">
+                  onclick="generateAssetReference('${kind}', ${jsArg(a.id)}, ${a.has_reference})">
             ${a.has_reference ? 'AI 重画' : 'AI 生成'}
           </button>
           <label class="ref-upload">${a.has_reference ? '换图' : '上传'}
             <input type="file" accept="image/png,image/jpeg,image/webp"
-                   onchange="uploadAssetReference('${kind}', '${esc(a.id)}', this)" />
+                   onchange="uploadAssetReference('${kind}', ${jsArg(a.id)}, this)" />
           </label>
-          ${a.has_reference ? `<button class="btn btn-xs btn-outline" onclick="clearAssetReference('${kind}', '${esc(a.id)}')">清除</button>` : ''}
+          ${a.has_reference ? `<button class="btn btn-xs btn-outline" onclick="clearAssetReference('${kind}', ${jsArg(a.id)})">清除</button>` : ''}
           <button class="btn btn-xs btn-outline" title="写一句修改意见，只重写这一条设定（剧本阶段可用）"
-                  onclick="reviseBibleItem('${kind}', '${esc(a.id)}', ${a.has_reference})">按意见重写</button>
+                  onclick="reviseBibleItem('${kind}', ${jsArg(a.id)}, ${a.has_reference})">按意见重写</button>
           <button class="btn btn-xs btn-outline" title="用自己的话描述画面来画参考图（任何语言，非英文会自动翻译；按张计费）"
-                  onclick="generateAssetReferenceWithPrompt('${kind}', '${esc(a.id)}', ${a.has_reference})">按描述画</button>
+                  onclick="generateAssetReferenceWithPrompt('${kind}', ${jsArg(a.id)}, ${a.has_reference})">按描述画</button>
         </div>
       </div>
     </div>`;
@@ -1784,7 +1788,7 @@ function renderScript() {
             <div class="duration">${s.duration_sec}s · ${esc(s.emotion)}</div>
             <div class="scene-actions">
               <button class="btn btn-sm btn-outline" onclick="toggleSceneEdit(${si})">编辑</button>
-              <button class="btn btn-sm btn-outline" onclick="reviseScene('${esc(s.id)}')" title="写一句修改意见，只重写这一场（只花这一场的 LLM 钱）">按意见重写</button>
+              <button class="btn btn-sm btn-outline" onclick="reviseScene(${jsArg(s.id)})" title="写一句修改意见，只重写这一场（只花这一场的 LLM 钱）">按意见重写</button>
             </div>
             <div class="edit-form" id="scene-edit-${si}">
               <label>场次标题 (heading)</label>
@@ -1966,8 +1970,8 @@ function shotBlockHtml(s, si) {
         ${s.video_prompt ? `<div class="prompt">${esc(s.video_prompt)}</div>` : ''}
         <div class="shot-actions">
           <button class="btn btn-sm btn-outline" onclick="toggleShotEdit(${si})">编辑</button>
-          <button class="btn btn-sm btn-outline" onclick="reviseStoryboard({shot_id: '${esc(s.id)}'})" title="写一句修改意见，只重写这个镜头（时长不变）">按意见重写此镜</button>
-          <button class="btn btn-sm btn-outline" onclick="reviseStoryboard({scene_id: '${esc(s.scene_id)}'})" title="写一句修改意见，重写 ${esc(s.scene_id)} 的全部镜头">重写本场分镜</button>
+          <button class="btn btn-sm btn-outline" onclick="reviseStoryboard({shot_id: ${jsArg(s.id)}})" title="写一句修改意见，只重写这个镜头（时长不变）">按意见重写此镜</button>
+          <button class="btn btn-sm btn-outline" onclick="reviseStoryboard({scene_id: ${jsArg(s.scene_id)}})" title="写一句修改意见，重写 ${esc(s.scene_id)} 的全部镜头">重写本场分镜</button>
         </div>
         <div class="edit-form" id="shot-edit-${si}">
           <div class="row">
@@ -2207,7 +2211,8 @@ function renderVideo() {
     body.innerHTML = rejectHtml + `<div class="clip-grid">${clips.map(c => {
       // 一段只在第一个镜头上放「重做」按钮（段是一次生成的，只能整段重做）
       const segKey = c.segment_id || c.shot_id;
-      const redo = canRedo && c.status === 'ready' && !seenSegments.has(segKey);
+      // 卡在「已提交、没取回」的段也要能放弃（重新生成），否则过期的任务会一直接着查
+      const redo = canRedo && (c.status === 'ready' || !!c.pending_job_id) && !seenSegments.has(segKey);
       seenSegments.add(segKey);
       const shot = shots[c.shot_id] || {};
       const playable = c.status === 'ready' && c.media_kind === 'video';
@@ -2228,7 +2233,7 @@ function renderVideo() {
                 c.media_kind === 'placeholder' ? '未检测到 ffmpeg，仅写了占位文件' : '等待生成…'}</div>`}
           ${c.prompt ? `<div class="clip-prompt">${esc(c.prompt)}</div>` : ''}
           ${c.error ? `<div class="clip-error">${esc(c.error)}</div>` : ''}
-          ${redo ? `<div class="shot-actions"><button class="btn btn-sm btn-outline" onclick="doRedoSegment('${esc(c.shot_id)}')">${
+          ${redo ? `<div class="shot-actions"><button class="btn btn-sm btn-outline" onclick="doRedoSegment(${jsArg(c.shot_id)})">${
             c.segment_id ? '重做这段' : '重做此镜'}</button></div>` : ''}
         </div>`;
     }).join('')}</div>` + historyBox();
@@ -2300,19 +2305,20 @@ function historyBox() {
 function rejectionBox(rejections, active) {
   if (!rejections.length) return '';
   const items = rejections.map(r => {
-    const isFrame = r.kind === 'first_frame';
+    const isFrame = r.kind === 'first_frame' || r.kind === 'keyframe_failed';
+    const what = r.kind === 'keyframe_failed' ? '开场关键帧没画出来'
+      : isFrame ? '被拒的是开场关键帧（首帧）' : `被拒的是 ${(r.images || []).length} 张参考图`;
     const img = (r.images || []).length
       ? `<img src="${withToken(`/api/projects/${currentProjectId}/video/rejections/${encodeURIComponent(r.unit_id)}/rejected-image`)}" alt="被拒的图">`
       : '';
     const btn = (action, label, title) => active ? '' :
-      `<button class="btn btn-sm btn-outline" title="${esc(title)}" onclick="doResolveRejection('${esc(r.unit_id)}','${action}')">${label}</button>`;
+      `<button class="btn btn-sm btn-outline" title="${esc(title)}" onclick="doResolveRejection(${jsArg(r.unit_id)},'${action}')">${label}</button>`;
     return `
       <div class="reject-item">
         ${img}
         <div class="reject-main">
           <div><strong>${esc(r.unit_id)}</strong>（${(r.shot_ids || []).map(esc).join('、')}）·
-            被拒的是${isFrame ? '开场关键帧（首帧）' : `${(r.images || []).length} 张参考图`} ·
-            <code>${esc(r.code || 'HTTP 400')}</code></div>
+            ${what}${r.kind === 'keyframe_failed' ? '' : ` · <code>${esc(r.code || 'HTTP 400')}</code>`}</div>
           <div class="reject-msg">${esc(r.message || '')}</div>
           <div class="shot-actions">
             ${isFrame ? btn('regenerate_keyframe', '重画开场关键帧', '作废这张关键帧，下次生成时重画一张（约 $0.04）再带上') : ''}
@@ -2691,7 +2697,7 @@ function renderAudio() {
               ? `<audio controls preload="none" src="/api/projects/${currentProjectId}/audio/${encodeURIComponent(c.id)}"></audio>`
               : ''}
             ${c.error ? `<div class="clip-error">${esc(c.error)}</div>` : ''}
-            ${ttsMode && c.shot_id && !active ? `<div class="shot-actions"><button class="btn btn-sm btn-outline" onclick="redubLine('${esc(c.shot_id)}', ${esc(JSON.stringify(c.instruction || ''))})">重配这句</button></div>` : ''}
+            ${ttsMode && c.shot_id && !active ? `<div class="shot-actions"><button class="btn btn-sm btn-outline" onclick="redubLine(${jsArg(c.shot_id)}, ${esc(JSON.stringify(c.instruction || ''))})">重配这句</button></div>` : ''}
           </div>`;
       }).join('')}</div>
       ${(a.manifest && a.manifest.warnings && a.manifest.warnings.length)

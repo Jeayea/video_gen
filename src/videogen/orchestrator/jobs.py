@@ -107,6 +107,20 @@ class JobManager:
                 return job
         return None
 
+    def busy_for(self, project_id: str, kind: str | None = None) -> Job | None:
+        """该项目还有没跑完的任务协程吗（**含已标记取消、还在收尾的**）。
+
+        `cancel()` 会立刻把状态置成 CANCELLED（`is_active` 变 False），但协程还要跑完取消路径
+        （记账、落状态）。互斥要看协程，否则新任务会和旧任务的收尾交错（旧收尾覆盖新状态）。
+        """
+        for job_id, task in self._tasks.items():
+            job = self._jobs.get(job_id)
+            if job is None or task.done() or job.project_id != project_id:
+                continue
+            if kind is None or job.kind == kind:
+                return job
+        return None
+
     @property
     def active_count(self) -> int:
         return sum(1 for j in self._jobs.values() if j.is_active)

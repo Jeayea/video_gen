@@ -14,6 +14,7 @@ from videogen.models.video import MediaKind
 from videogen.providers.video.base import (
     GeneratedClip,
     VideoArtifactError,
+    VideoJobPending,
     VideoProvider,
     VideoProviderError,
     VideoReferenceRejected,
@@ -35,15 +36,21 @@ _RETRY_STATUS = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
 #: 单次下载图片/视频的分块大小
 _CHUNK = 1024 * 256
 
-#: 提示词长度上限（字符）。能力表里没有这一项，只能按模型前缀写死：
+#: 运行中从失败原因里学到的提示词上限（模型 slug → 字符数，进程内）。
 #: Kling 超过 2500 直接 FAIL（`ret:1201, prompt: size must be between 0 and 2500`），
-#: 而且失败发生在轮询阶段，重试 3 次照样失败。前缀越长越优先
-_PROMPT_LIMITS: tuple[tuple[str, int], ...] = (("kwaivgi/", 2500),)
+#: 失败发生在轮询阶段；记住上限后，上层的重试就会按它压缩，而不是原样再失败
+_LEARNED_PROMPT_LIMITS: dict[str, int] = {}
+
+#: 失败原因里「提示词太长」的说法：提到 prompt + 长度类字眼，上限取 prompt 之后最大的那个数
+_PROMPT_TOO_LONG = re.compile(
+    r"too\s*long|exceed|at\s*most|max|between|length|size", re.IGNORECASE
+)
 
 
 def clear_video_capability_cache() -> None:
-    """测试用：清掉能力缓存。"""
+    """测试用：清掉能力缓存（含学到的提示词上限）。"""
     _CAP_CACHE.clear()
+    _LEARNED_PROMPT_LIMITS.clear()
 
 
 class OpenRouterVideoProvider(VideoProvider):
@@ -146,7 +153,9 @@ class OpenRouterVideoProvider(VideoProvider):
                 await asyncio.sleep(min(15.0, 2.0 * attempt))
                 continue
             if response.status_code >= 400:
-                raise VideoProviderError(_http_error_message(response, url))
+                error = VideoProviderError(_http_error_message(response, url))
+                error.status_code = response.status_code  # type: ignore[attr-defined]
+                raise error
             try:
                 return response.json()
             except ValueError as exc:
@@ -214,7 +223,7 @@ class OpenRouterVideoProvider(VideoProvider):
     async def frame_mode(self) -> str:
         if not self.use_reference_images:
             return "none"
-        return _frame_mode(await self.capabilities())
+        return _frame_mode(await self.capabilities(), get_settings().video_frame_mode)
 
     async def planned_seconds(self, requested_sec: float) -> float:
         """按模型支持的时长档位，算出**实际会被计费**的秒数。"""
@@ -240,24 +249,54 @@ class OpenRouterVideoProvider(VideoProvider):
         caps = await self.capabilities()
         payload = self._build_payload(request, caps)
 
-        job = await self._submit(payload)
-        job_id = str(job.get("id") or "")
-        polling_url = str(job.get("polling_url") or f"{self.base_url}/videos/{job_id}")
-        if not job_id:
-            raise VideoProviderError(f"OpenRouter 没有返回 job id：{scrub_secrets(str(job))[:200]}")
+        status: dict[str, Any] | None = None
+        job_id = request.resume_job_id
+        if job_id:
+            # 上一次已经提交（取消 / 超时 / 下载失败）：接着轮询同一个任务，不重新买
+            logger.info("接着轮询已提交的视频任务 shot=%s job=%s", request.shot_id, job_id)
+            try:
+                status = await self._poll(
+                    f"{self.base_url}/videos/{job_id}",
+                    job_id=job_id,
+                    shot_id=request.shot_id,
+                    payload=payload,
+                )
+            except VideoReferenceRejected:
+                raise
+            except VideoJobPending:
+                raise
+            except VideoProviderError as exc:
+                # 原任务在服务端已失败（失败不计费）：重新提交一次
+                logger.warning(
+                    "已提交的任务 %s 在服务端失败，重新提交：%s",
+                    job_id,
+                    scrub_secrets(str(exc))[:200],
+                )
+                status = None
 
-        logger.info(
-            "视频任务已提交 shot=%s model=%s job=%s 时长=%ss 分辨率=%s",
-            request.shot_id,
-            self.model,
-            job_id,
-            payload.get("duration", "?"),
-            payload.get("resolution", "默认"),
-        )
+        if status is None:
+            job = await self._submit(payload)
+            job_id = str(job.get("id") or "")
+            polling_url = str(job.get("polling_url") or f"{self.base_url}/videos/{job_id}")
+            if not job_id:
+                raise VideoProviderError(
+                    f"OpenRouter 没有返回 job id：{scrub_secrets(str(job))[:200]}"
+                )
+            if request.on_submitted is not None:
+                request.on_submitted(job_id)
 
-        status = await self._poll(
-            polling_url, job_id=job_id, shot_id=request.shot_id, payload=payload
-        )
+            logger.info(
+                "视频任务已提交 shot=%s model=%s job=%s 时长=%ss 分辨率=%s",
+                request.shot_id,
+                self.model,
+                job_id,
+                payload.get("duration", "?"),
+                payload.get("resolution", "默认"),
+            )
+
+            status = await self._poll(
+                polling_url, job_id=job_id, shot_id=request.shot_id, payload=payload
+            )
         urls = [str(u) for u in (status.get("unsigned_urls") or [])]
 
         output = Path(request.output_path)
@@ -346,7 +385,7 @@ class OpenRouterVideoProvider(VideoProvider):
             return {}
         paths = [Path(p) for p in (request.reference_images or [])]
         paths = [p for p in paths if p.is_file()]
-        mode = _frame_mode(caps)
+        mode = _frame_mode(caps, get_settings().video_frame_mode)
 
         if mode == "references":
             if not paths:
@@ -381,12 +420,21 @@ class OpenRouterVideoProvider(VideoProvider):
         for attempt in range(1, self.max_http_retries + 1):
             try:
                 response = await client.post(url, headers=self._headers(), json=attempt_payload)
-            except httpx.HTTPError as exc:
+            except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as exc:
+                # 连接都没建立：请求肯定没到服务端，重发是安全的
                 if attempt < self.max_http_retries:
                     await asyncio.sleep(min(10.0, 2.0 * attempt))
                     continue
                 raise VideoProviderError(
                     scrub_secrets(f"提交视频任务失败：{type(exc).__name__}: {exc}")
+                ) from exc
+            except httpx.HTTPError as exc:
+                # 请求可能已经到了服务端、任务可能已经建好（只是响应丢了）：重发 = 可能买两次
+                raise VideoJobPending(
+                    scrub_secrets(
+                        f"提交视频任务后没收到响应（{type(exc).__name__}: {exc}），"
+                        "任务可能已在服务端创建并计费；请先到 OpenRouter 后台核对再重试"
+                    )
                 ) from exc
 
             if response.status_code in _RETRY_STATUS and attempt < self.max_http_retries:
@@ -399,14 +447,20 @@ class OpenRouterVideoProvider(VideoProvider):
                 await asyncio.sleep(min(20.0, 3.0 * attempt))
                 continue
 
-            if response.status_code == 400 and (
-                "input_references" in attempt_payload or "frame_images" in attempt_payload
+            if (
+                response.status_code == 400
+                and ("input_references" in attempt_payload or "frame_images" in attempt_payload)
+                and _IMAGE_PROBLEM.search(response.text or "")
             ):
-                # 带的图被拒：不降级成「不带图」悄悄出片（那样一致性就没了），交给上层问用户
+                # 带的图被拒：不降级成「不带图」悄悄出片（那样一致性就没了），交给上层问用户。
+                # 只认「错误在说图」的 400：参数错（时长 / 分辨率）不该让用户去重画图
                 raise _reference_rejected(response, attempt_payload)
 
             if response.status_code >= 400:
-                raise VideoProviderError(_http_error_message(response, url))
+                error = VideoProviderError(_http_error_message(response, url))
+                # 4xx 是请求本身的问题，原样重交只会再错一次
+                error.retryable = response.status_code >= 500
+                raise error
 
             try:
                 data = response.json()
@@ -438,7 +492,20 @@ class OpenRouterVideoProvider(VideoProvider):
         last_status = ""
 
         while True:
-            status = await self._get_json(polling_url)
+            try:
+                status = await self._get_json(polling_url)
+            except VideoProviderError as exc:
+                if getattr(exc, "status_code", 0) in (404, 410):
+                    # 服务端说没有这个任务：没什么可等的，按「生成失败」处理（可重新提交）
+                    raise VideoProviderError(
+                        f"视频任务不存在（job={job_id}）：{scrub_secrets(str(exc))[:200]}"
+                    ) from exc
+                # 任务已经提交：查询失败不等于任务失败，绝不能让上层重新提交
+                raise VideoJobPending(
+                    f"查询视频任务失败（job={job_id}），任务在服务端可能仍在跑；"
+                    f"下次生成会接着查这个任务：{scrub_secrets(str(exc))[:200]}",
+                    job_id=job_id,
+                ) from exc
             state = str(status.get("status") or "")
             if state != last_status:
                 logger.info("视频任务 %s（shot=%s）状态：%s", job_id, shot_id, state or "?")
@@ -451,13 +518,16 @@ class OpenRouterVideoProvider(VideoProvider):
                 rejected = _image_rejected_in_job(str(reason), payload or {}, job_id)
                 if rejected is not None:
                     raise rejected
+                learn_prompt_limit(self.model, str(reason))
                 raise VideoProviderError(
                     f"视频生成失败（job={job_id}）：{scrub_secrets(str(reason))[:300]}"
                 )
             if loop.time() >= deadline:
-                raise VideoProviderError(
+                raise VideoJobPending(
                     f"视频生成超时（job={job_id}，已等 {self.timeout_sec:.0f}s，"
-                    f"最后状态 {last_status or '未知'}）。任务在服务端可能仍在跑。"
+                    f"最后状态 {last_status or '未知'}）。任务在服务端可能仍在跑，"
+                    "下次生成会接着查这个任务，不会重新提交。",
+                    job_id=job_id,
                 )
             await asyncio.sleep(self.poll_interval_sec)
 
@@ -556,6 +626,11 @@ def _reference_rejected(
     )
 
 
+#: 提交时 400 的错误信息在说「带的图有问题」（审核 / 隐私 / 格式 / 尺寸）
+_IMAGE_PROBLEM = re.compile(
+    r"image|frame|reference|picture|photo|sensitive|privacy|real\s*person", re.IGNORECASE
+)
+
 #: 任务失败原因里「图被判敏感」的说法（H3：`input image sensitive (1026)`）
 _IMAGE_SENSITIVE = re.compile(r"image\s*sensitive|InputImageSensitive", re.IGNORECASE)
 
@@ -580,8 +655,14 @@ def _image_rejected_in_job(
     )
 
 
-def _frame_mode(caps: dict[str, Any]) -> str:
-    """能力表 → `references` / `first_frame` / `none`（价目里有 reference 计费项才算收参考图）。"""
+def _frame_mode(caps: dict[str, Any], override: str = "auto") -> str:
+    """能力表 → `references` / `first_frame` / `none`（价目里有 reference 计费项才算收参考图）。
+
+    能力表没有「收不收参考图」这一项，只能从价目推断；推断错时用 `VIDEO_FRAME_MODE` 覆盖。
+    """
+    override = (override or "auto").strip().lower()
+    if override in ("references", "first_frame", "none"):
+        return override
     skus = caps.get("pricing_skus") or {}
     if isinstance(skus, dict) and any("reference" in str(key).lower() for key in skus):
         return "references"
@@ -590,12 +671,38 @@ def _frame_mode(caps: dict[str, Any]) -> str:
     return "none"
 
 
+def _configured_limits(spec: str) -> list[tuple[str, int]]:
+    limits: list[tuple[str, int]] = []
+    for item in (spec or "").split(","):
+        prefix, _, value = item.strip().rpartition("=")
+        if prefix and value.strip().isdigit():
+            limits.append((prefix.strip(), int(value)))
+    return sorted(limits, key=lambda item: -len(item[0]))
+
+
 def prompt_limit(model: str) -> int:
-    """该模型的提示词字符上限（0 = 未知 / 不限）。"""
-    for prefix, limit in sorted(_PROMPT_LIMITS, key=lambda item: -len(item[0])):
+    """该模型的提示词字符上限（0 = 未知 / 不限）：先看运行中学到的，再看 `VIDEO_PROMPT_LIMITS`。"""
+    if model in _LEARNED_PROMPT_LIMITS:
+        return _LEARNED_PROMPT_LIMITS[model]
+    for prefix, limit in _configured_limits(get_settings().video_prompt_limits):
         if model.startswith(prefix):
             return limit
     return 0
+
+
+def learn_prompt_limit(model: str, reason: str) -> int:
+    """失败原因在说「提示词太长」时记住上限（留 5% 余量），返回记住的值（0 = 不是这类失败）。"""
+    lowered = (reason or "").lower()
+    at = lowered.find("prompt")
+    if at < 0 or not model or not _PROMPT_TOO_LONG.search(lowered[at:]):
+        return 0
+    numbers = [int(n) for n in re.findall(r"\d{3,6}", lowered[at:])]
+    if not numbers:
+        return 0
+    limit = int(max(numbers) * 0.95)
+    _LEARNED_PROMPT_LIMITS[model] = limit
+    logger.warning("模型 %s 报提示词超长：记住上限 %d 字符，重试时按它压缩", model, limit)
+    return limit
 
 
 def fit_prompt(prompt: str, limit: int) -> str:

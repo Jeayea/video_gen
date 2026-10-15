@@ -36,6 +36,9 @@ class VideoClip(BaseModel):
     aspect_ratio: str = "9:16"
     provider: str = ""
     task_id: str | None = None
+    #: 已经提交、还没拿到结果的任务 id（取消 / 轮询超时 / 下载失败时留下）。
+    #: 下次生成会接着轮询它，而不是重新提交再买一次
+    pending_job_id: str = ""
     #: provider 报的实际扣费（USD），账本以它为准
     cost_usd: float = 0.0
     #: 这笔花费是否已经记进账本。用标记而不是「和上次清单做集合差」——

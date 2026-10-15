@@ -5,6 +5,7 @@ import os
 import secrets
 from contextlib import asynccontextmanager
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
@@ -158,27 +159,57 @@ _URL_TOKEN_SUFFIXES = (
 _URL_TOKEN_FRAGMENTS = ("/clips/", "/reference", "/history/")
 
 
-def url_token_allowed(path: str) -> bool:
+def url_token_allowed(path: str, method: str = "GET") -> bool:
     """这个路径允许用 `?token=` 鉴权吗？
 
     默认**只认请求头**（query string 会进 access log、浏览器历史和 Referer）。
     只有「浏览器自己发起的产物读取」例外：HTML 里没法给 `<video src>` 加请求头，
     所以这几个只读路径同时接受 `?token=`。写接口一律只认请求头。
     """
-    if not path.startswith("/api/"):
+    if method.upper() not in ("GET", "HEAD") or not path.startswith("/api/"):
+        # 同一个前缀下也有写接口（`.../reference` 的上传 / 删除 / 付费生成）：只放行读
         return False
     if path.endswith(_URL_TOKEN_SUFFIXES):
         return True
     return any(fragment in path for fragment in _URL_TOKEN_FRAGMENTS)
 
 
+def cross_site_write(request: Request) -> bool:
+    """别的网站借浏览器发来的写请求吗？（CSRF）
+
+    没设 API_TOKEN 时（默认），任何网页都能用一个 `<form method=post>` 打到
+    `127.0.0.1:8000/api/projects/<id>/video/generate` —— 不需要请求体，就能触发付费生成。
+    浏览器跨站请求一定带 `Origin`（或 `Sec-Fetch-Site: cross-site`）；curl / 脚本不带，照常放行。
+    """
+    if request.method in ("GET", "HEAD", "OPTIONS"):
+        return False
+    if request.headers.get("sec-fetch-site") == "cross-site":
+        return True
+    origin = request.headers.get("origin")
+    if origin is None:
+        return False
+    if origin == "null":
+        return True
+    # 反向代理会改写 Host，原始的放在 X-Forwarded-Host（浏览器跨站表单带不了这个头，可以信）
+    own = {request.headers.get("host", "")}
+    own.update(
+        h.strip() for h in request.headers.get("x-forwarded-host", "").split(",") if h.strip()
+    )
+    allowed = {
+        o.strip().rstrip("/") for o in settings.api_allowed_origins.split(",") if o.strip()
+    }
+    return urlsplit(origin).netloc not in own and origin.rstrip("/") not in allowed
+
+
 @app.middleware("http")
 async def api_token_middleware(request: Request, call_next):
     token = settings.api_token.strip()
     path = request.url.path
+    if path.startswith("/api") and cross_site_write(request):
+        return JSONResponse({"detail": "拒绝跨站写请求"}, status_code=403)
     if token and path.startswith("/api") and path != "/api/health":
         supplied = request.headers.get("x-api-token") or ""
-        if not supplied and url_token_allowed(path):
+        if not supplied and url_token_allowed(path, request.method):
             supplied = request.query_params.get("token") or ""
         if not secrets.compare_digest(supplied, token):
             return JSONResponse({"detail": "缺少或错误的 API Token"}, status_code=401)

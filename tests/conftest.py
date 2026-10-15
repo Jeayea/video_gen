@@ -61,7 +61,15 @@ def fast_video_settings(monkeypatch):
     monkeypatch.setattr(settings, "video_price_per_second", 0.0)
     monkeypatch.setattr(settings, "video_generate_audio", False)
     monkeypatch.setattr(settings, "video_resolution", "")
-    return settings
+    # 本机 .env 可能为某个模型手调过这两项
+    monkeypatch.setattr(settings, "video_frame_mode", "auto")
+    monkeypatch.setattr(settings, "video_prompt_limits", "kwaivgi/=2500")
+    # 有些用例直接 `settings.xxx = ...` 改全局配置（没走 monkeypatch）：
+    # 用例结束整份还原，否则会串到后面的用例里（真实症状：单跑通过、和别的文件一起跑失败）
+    snapshot = dict(settings.__dict__)
+    yield settings
+    settings.__dict__.clear()
+    settings.__dict__.update(snapshot)
 
 
 @pytest.fixture

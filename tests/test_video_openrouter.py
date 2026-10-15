@@ -873,3 +873,237 @@ def test_fit_prompt_drops_generic_directives_before_truncating():
     tight = fit_prompt(prompt, 300)
     assert len(tight) <= 300
     assert tight.endswith(".") or tight.endswith('"')  # 按句截断，不截半个词
+
+
+# ── 已提交的任务：超时 / 查询失败 / 下载失败后接着查，不重新买 ─────────
+
+
+@pytest.mark.asyncio
+async def test_timeout_is_not_retryable_and_resumes_same_job(store):
+    """回归：轮询超时后上层重试 = 再提交一次（服务端那个任务照样跑、照样扣费）。"""
+    recorder = Recorder(polls=[{"status": "processing"}])
+
+    def factory() -> OpenRouterVideoProvider:
+        provider = make_provider(recorder)
+        provider.poll_interval_sec = 0.01
+        provider.timeout_sec = 0.05
+        return provider
+
+    pipeline = Pipeline(store, llm_factory=lambda: FakeLLM(scenes=1), video_factory=factory)
+    project = _project(store, shots=1)
+
+    job = await pipeline.start_video_generation(project.id)
+    await wait_for_job(pipeline, job.id, timeout=30)
+    assert recorder.submits == 1, "超时不能重新提交"
+    clip = store.load_video_manifest(project.id).clips[0]
+    assert clip.status.value == "failed"
+    assert clip.pending_job_id == "job-1"
+
+    # 服务端其实跑完了：再点一次生成，只是接着查同一个任务
+    recorder.polls = [{"status": "completed", "unsigned_urls": ["https://cdn/v.mp4"]}]
+    job = await pipeline.start_video_generation(project.id)
+    await wait_for_job(pipeline, job.id, timeout=30)
+    assert recorder.submits == 1, "接着查原任务，不再买一次"
+    clip = store.load_video_manifest(project.id).clips[0]
+    assert clip.status.value == "ready"
+    assert clip.pending_job_id == ""
+
+
+@pytest.mark.asyncio
+async def test_download_failure_is_recovered_on_next_run_without_resubmitting(store):
+    recorder = Recorder(content_ok=False)
+    state = {"cdn_ok": False}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "cdn" and not state["cdn_ok"]:
+            return httpx.Response(401, json={"error": {"message": "unauthorized"}})
+        return recorder.handler(request)
+
+    def factory() -> OpenRouterVideoProvider:
+        provider = OpenRouterVideoProvider(
+            api_key="test-key",
+            model="minimax/hailuo-3",
+            client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        )
+        provider.poll_interval_sec = 0.01
+        return provider
+
+    pipeline = Pipeline(store, llm_factory=lambda: FakeLLM(scenes=1), video_factory=factory)
+    project = _project(store, shots=1)
+    job = await pipeline.start_video_generation(project.id)
+    await wait_for_job(pipeline, job.id, timeout=30)
+    assert store.load_video_manifest(project.id).clips[0].pending_job_id == "job-1"
+
+    state["cdn_ok"] = True
+    job = await pipeline.start_video_generation(project.id)
+    await wait_for_job(pipeline, job.id, timeout=30)
+    assert recorder.submits == 1
+    assert store.load_video_manifest(project.id).clips[0].status.value == "ready"
+
+
+@pytest.mark.asyncio
+async def test_poll_network_error_is_pending_not_retryable(tmp_path):
+    from videogen.providers.video.base import VideoJobPending
+
+    recorder = Recorder()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/videos/job-1") and request.method == "GET":
+            raise httpx.ReadError("connection reset")
+        return recorder.handler(request)
+
+    provider = OpenRouterVideoProvider(
+        api_key="test-key",
+        model="minimax/hailuo-3",
+        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+    provider.poll_interval_sec = 0.01
+    provider.max_http_retries = 1
+    with pytest.raises(VideoJobPending) as exc:
+        await provider.generate(request_for(tmp_path))
+    assert exc.value.retryable is False and exc.value.job_id == "job-1"
+    assert recorder.submits == 1
+
+
+@pytest.mark.asyncio
+async def test_submit_read_timeout_is_not_resent(tmp_path):
+    """POST 发出去后没收到响应：任务可能已经建了，重发 = 可能买两次。"""
+    from videogen.providers.video.base import VideoJobPending
+
+    recorder = Recorder()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/videos") and request.method == "POST":
+            recorder.submits += 1
+            raise httpx.ReadTimeout("timed out")
+        return recorder.handler(request)
+
+    provider = OpenRouterVideoProvider(
+        api_key="test-key",
+        model="minimax/hailuo-3",
+        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+    with pytest.raises(VideoJobPending):
+        await provider.generate(request_for(tmp_path))
+    assert recorder.submits == 1
+
+
+@pytest.mark.asyncio
+async def test_resumed_job_failed_on_server_is_resubmitted(tmp_path):
+    recorder = Recorder(
+        polls=[
+            {"status": "failed", "error": "internal"},
+            {"status": "completed", "unsigned_urls": ["https://cdn/v.mp4"]},
+        ]
+    )
+    provider = make_provider(recorder)
+    provider.poll_interval_sec = 0.01
+    clip = await provider.generate(request_for(tmp_path, resume_job_id="job-1"))
+    assert recorder.submits == 1, "原任务失败（不计费）才重新提交"
+    assert clip.task_id == "job-1"
+
+
+@pytest.mark.asyncio
+async def test_submitted_callback_gets_job_id(tmp_path):
+    recorder = Recorder()
+    provider = make_provider(recorder)
+    provider.poll_interval_sec = 0.01
+    seen: list[str] = []
+    await provider.generate(request_for(tmp_path, on_submitted=seen.append))
+    assert seen == ["job-1"]
+
+
+@pytest.mark.asyncio
+async def test_parameter_400_with_images_is_not_reported_as_image_rejection(tmp_path):
+    """带图时的 400 不一定是图被拒：参数错不该让用户去重画图，也不该原样重交。"""
+    image = tmp_path / "img.png"
+    image.write_bytes(b"fake")
+    submits = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/videos/models"):
+            return httpx.Response(200, json={"data": [HAILUO3]})
+        submits.append(1)
+        return httpx.Response(400, json={"error": {"message": "duration must be one of 6, 10"}})
+
+    provider = OpenRouterVideoProvider(
+        api_key="test-key",
+        model="minimax/hailuo-3",
+        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+    with pytest.raises(VideoProviderError) as exc:
+        await provider.generate(request_for(tmp_path, reference_images=[image]))
+    assert not isinstance(exc.value, VideoReferenceRejected)
+    assert exc.value.retryable is False
+    assert len(submits) == 1
+
+
+@pytest.mark.asyncio
+async def test_prompt_limit_is_learned_from_failure_and_applied_on_retry(tmp_path):
+    """能力表里没有提示词上限：模型报超长时记住它，重试按它压缩（不再原样失败 3 次）。"""
+    recorder = Recorder(
+        polls=[
+            {"status": "failed", "error": "ret:1201, prompt: size must be between 0 and 400"},
+            {"status": "completed", "unsigned_urls": ["https://cdn/v.mp4"]},
+        ]
+    )
+    provider = make_provider(recorder, model="minimax/hailuo-3")
+    provider.poll_interval_sec = 0.01
+    long_prompt = "A man walks into the room and sits down by the window. " * 20
+    with pytest.raises(VideoProviderError) as exc:
+        await provider.generate(request_for(tmp_path, prompt=long_prompt))
+    assert exc.value.retryable, "按新上限重试是有意义的"
+    await provider.generate(request_for(tmp_path, prompt=long_prompt))
+    assert len(recorder.bodies[0]["prompt"]) > 400
+    assert len(recorder.bodies[1]["prompt"]) <= 400
+
+
+def test_prompt_limits_come_from_config(monkeypatch):
+    from videogen.providers.video.openrouter import prompt_limit
+
+    monkeypatch.setattr(get_settings(), "video_prompt_limits", "acme/=900, acme/fast=500")
+    assert prompt_limit("acme/fast-v1") == 500, "前缀越长越优先"
+    assert prompt_limit("acme/pro") == 900
+    assert prompt_limit("kwaivgi/kling-v3.0-std") == 0
+
+
+@pytest.mark.asyncio
+async def test_frame_mode_can_be_overridden(monkeypatch):
+    recorder = Recorder(models=[HAILUO3])
+    monkeypatch.setattr(get_settings(), "video_frame_mode", "first_frame")
+    assert await make_provider(recorder).frame_mode() == "first_frame"
+
+
+@pytest.mark.asyncio
+async def test_legacy_timeout_clip_resumes_old_job(store):
+    """老版本超时的片段没记 pending_job_id：从当时的错误文案里捞回 job id，接着查，不再买一份。"""
+    recorder = Recorder()
+
+    def factory() -> OpenRouterVideoProvider:
+        provider = make_provider(recorder)
+        provider.poll_interval_sec = 0.01
+        return provider
+
+    pipeline = Pipeline(store, llm_factory=lambda: FakeLLM(scenes=1), video_factory=factory)
+    project = _project(store, shots=1)
+    from videogen.models.video import ClipStatus, VideoClip, VideoManifest
+
+    shot = store.load_storyboard(project.id).shots[0]
+    store.save_video_manifest(
+        project.id,
+        VideoManifest(
+            provider="openrouter",
+            model="minimax/hailuo-3",
+            clips=[
+                VideoClip(
+                    shot_id=shot.id,
+                    status=ClipStatus.FAILED,
+                    error="VideoProviderError: 视频生成超时（job=job-1，已等 900s）",
+                )
+            ],
+        ),
+    )
+    job = await pipeline.start_video_generation(project.id)
+    await wait_for_job(pipeline, job.id, timeout=30)
+    assert recorder.submits == 0, "原任务其实跑完了：接着查，不重新提交"
+    assert store.load_video_manifest(project.id).clips[0].status.value == "ready"

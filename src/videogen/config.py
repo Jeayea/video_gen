@@ -322,6 +322,12 @@ class Settings(BaseSettings):
     #: 开场关键帧画什么：`characters` = 定妆照 + 场景（锁人也锁景）；`scene` = 只画场景和道具、
     #: 画面里没有人（锁景不锁人）。Seedance 会拒收写实人脸的首帧（已知限制 51），这时用 `scene`
     video_keyframe_subject: str = "characters"
+    #: 模型怎么吃图：`auto` = 按能力表判断（价目里有 reference 计费项 = 全程参考图，
+    #: 否则看支不支持首帧）；能力表判断错时手动指定 `references` / `first_frame` / `none`
+    video_frame_mode: str = "auto"
+    #: 提示词长度上限（字符），`模型前缀=上限` 逗号分隔，前缀越长越优先。能力表里没有这一项；
+    #: 运行中模型报「prompt 超长」时也会自动记住该模型的上限（进程内），重试时按它压缩
+    video_prompt_limits: str = "kwaivgi/=2500"
 
     # 批量生产
     batch_max_items: int = 20
@@ -361,6 +367,9 @@ class Settings(BaseSettings):
     # 安全：留空表示不校验（仅建议在本机 127.0.0.1 上跑）；设置后所有 /api 请求需带
     # X-API-Token 头或 ?token= 查询参数
     api_token: str = Field(default="", repr=False)
+    #: 写接口额外放行的页面来源（逗号分隔，如 `https://studio.example.com`）。
+    #: 同源页面和反向代理（看 X-Forwarded-Host）不用配；前端单独部署在别的域名时才需要
+    api_allowed_origins: str = ""
 
     @property
     def projects_path(self) -> Path:

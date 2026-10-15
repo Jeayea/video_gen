@@ -293,7 +293,9 @@ def test_build_prompt_translates_camera_and_mood_to_english(store, ready_project
     assert not re.search(r"[\u4e00-\u9fff]", outside_quotes), prompt
 
 
-def test_build_prompt_carries_the_spoken_line_for_lip_sync(store, ready_project, settings):
+def test_build_prompt_carries_the_spoken_line_for_lip_sync(
+    store, ready_project, settings, monkeypatch
+):
     """口型对不上的根因：prompt 里没有台词，模型自己编一段话在说。
 
     台词进 prompt 后，原生表演与我们的配音才落在同一句话上。
@@ -307,7 +309,7 @@ def test_build_prompt_carries_the_spoken_line_for_lip_sync(store, ready_project,
     assert "no on-screen text" in prompt
 
     # 可以整体关掉（老行为：模型自己编话）
-    settings.video_prompt_dialogue = False
+    monkeypatch.setattr(settings, "video_prompt_dialogue", False)
     assert "薇儿，为什么？" not in video_service.build_prompt(shot, ready_project)
 
 
@@ -352,7 +354,9 @@ def test_location_anchor_skips_description_already_in_prompt(store, ready_projec
     assert video_service.location_anchor(shot, bible, base) == ""
 
 
-def test_build_prompt_appends_performance_and_style_directive(store, ready_project, settings):
+def test_build_prompt_appends_performance_and_style_directive(
+    store, ready_project, settings, monkeypatch
+):
     """表情自然/动作流畅是靠这段统一规范兜的（可在 .env 覆盖）。"""
     shot = store.load_storyboard(ready_project.id).shots[0]
     prompt = video_service.build_prompt(shot, ready_project)
@@ -360,7 +364,7 @@ def test_build_prompt_appends_performance_and_style_directive(store, ready_proje
     assert "no cuts" in prompt
     assert "no morphing" in prompt
 
-    settings.video_style_prompt = "cinematic realism, muted colors"
+    monkeypatch.setattr(settings, "video_style_prompt", "cinematic realism, muted colors")
     styled = video_service.build_prompt(shot, ready_project)
     assert "cinematic realism" in styled
 
@@ -471,6 +475,23 @@ async def test_cancel_video_job(store, ready_project, fake_llm):
     assert list(store.clips_dir(ready_project.id).glob("*.mp4")) == []  # 不留半截文件
 
 
+@pytest.mark.asyncio
+async def test_new_job_waits_for_cancelled_job_to_finish_cleanup(store, ready_project, fake_llm):
+    """回归：取消后立刻再点生成，新任务和旧任务的收尾交错（旧收尾覆盖新状态）。"""
+    pipeline = build_pipeline(store, fake_llm, FakeVideoProvider(delay=0.3))
+    job = await pipeline.start_video_generation(ready_project.id)
+    await asyncio.sleep(0.05)
+    await pipeline.jobs.cancel(job.id)
+    assert pipeline.jobs.active_for(ready_project.id) is None  # 状态已经是 cancelled
+    with pytest.raises(PipelineError) as exc:
+        await pipeline.start_video_generation(ready_project.id)
+    assert "收尾" in str(exc.value)
+    await wait_job(pipeline, job.id)
+    assert await wait_until(lambda: pipeline.jobs.busy_for(ready_project.id) is None)
+    job2 = await pipeline.start_video_generation(ready_project.id)
+    await wait_job(pipeline, job2.id)
+
+
 async def wait_until(predicate, timeout: float = 10.0) -> bool:
     """等某个条件成立（比固定 sleep 稳：并发度、调度顺序都不影响结论）。"""
     loop = asyncio.get_running_loop()
@@ -517,6 +538,7 @@ async def test_cancelled_video_job_still_records_cost(store, ready_project, fake
 
     # 续跑跑完剩下的镜头：账本只应该多出「新生成的」那部分，不能重复计
     provider.delay = 0.0
+    assert await wait_until(lambda: pipeline.jobs.busy_for(ready_project.id) is None)
     job2 = await pipeline.start_video_generation(ready_project.id)
     await wait_job(pipeline, job2.id)
     assert video_usd() == pytest.approx(len(manifest.clips) * 0.65)
@@ -613,3 +635,26 @@ def test_video_provider_factory(monkeypatch):
     from videogen.providers.video.mock import MockVideoProvider
 
     assert isinstance(get_video_provider(), MockVideoProvider)
+
+
+@pytest.mark.asyncio
+async def test_unexpected_error_in_one_segment_does_not_abort_others(
+    store, ready_project, monkeypatch
+):
+    """回归：某段在提交前抛了意外异常，gather 以前直接抛出 —— 别的段还在跑、
+    客户端却被关了（已扣费的段下载失败），这一轮也不记账。"""
+    storyboard = store.load_storyboard(ready_project.id)
+    bad = storyboard.shots[0].id
+    original = video_service.build_prompt
+
+    def flaky(shot, *args, **kwargs):
+        if shot.id == bad:
+            raise ValueError("boom")
+        return original(shot, *args, **kwargs)
+
+    monkeypatch.setattr(video_service, "build_prompt", flaky)
+    manifest = await run_clips(store, ready_project, FakeVideoProvider())
+    assert manifest.get(bad).status.value == "failed"
+    assert "boom" in manifest.get(bad).error
+    others = [c for c in manifest.clips if c.shot_id != bad]
+    assert others and all(c.status.value == "ready" for c in others)

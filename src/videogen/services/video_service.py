@@ -19,7 +19,13 @@ from videogen.models.video import (
     VideoClip,
     VideoManifest,
 )
-from videogen.providers.video.base import VideoProvider, VideoReferenceRejected, VideoRequest
+from videogen.providers.video.base import (
+    VideoArtifactError,
+    VideoJobPending,
+    VideoProvider,
+    VideoReferenceRejected,
+    VideoRequest,
+)
 from videogen.services import voice_catalog
 from videogen.services.storyboard_service import Segment, segments_of
 from videogen.utils import language, media_history, region
@@ -30,6 +36,32 @@ if TYPE_CHECKING:  # 关键帧服务反过来依赖本模块，这里只用于�
     from videogen.services.keyframe_service import Keyframer
 
 logger = logging.getLogger(__name__)
+
+#: 片段卡在「已提交、没取回」时附在错误后面的提示
+PENDING_HINT = "（下次生成会接着查这个任务、不重新计费；想放弃它重新生成，点这段的「重做这段」）"
+
+#: 老版本的错误文案：轮询超时 / 已生成但下载失败（都带 `job=<id>`）
+_LEGACY_PENDING_RE = re.compile(r"(?:生成超时|已生成但下载失败)（job=([\w.-]+)")
+
+
+def legacy_pending_job(clip: VideoClip) -> str:
+    """老版本失败的片段里还没取回的任务 id（没有就返回空串）。"""
+    if clip.status != ClipStatus.FAILED or clip.pending_job_id or clip.segment_path:
+        return ""
+    match = _LEGACY_PENDING_RE.search(clip.error or "")
+    return match.group(1) if match else ""
+
+
+#: `ReferenceRejection.kind`：开场关键帧没画出来（不是被视频模型拒收）
+KEYFRAME_FAILED = "keyframe_failed"
+
+
+class KeyframeUnavailable(RuntimeError):
+    """这一段需要开场关键帧，但没画出来（图片模型失败 / 预算不够 / 没产出文件）。
+
+    **不退回纯文生视频**：那样钱照花、人物 / 场景一致性悄悄没了（和首帧被拒同一个坑）。
+    上层把它当成「这一段的图有问题」中断，交给用户决定：重画 / 这段不带图。
+    """
 
 ProgressCallback = Callable[[VideoManifest], None] | None
 
@@ -85,6 +117,7 @@ async def generate_clips(
             stale.status = ClipStatus.PENDING
             stale.error = ""
             stale.task_id = None
+            stale.pending_job_id = ""  # 旧模型上没取回的任务不再要了
             stale.segment_path = ""
             # 旧花费已经记过账了，重跑要当成一笔新账（否则新花费永远进不了账本）
             stale.cost_usd = 0.0
@@ -97,6 +130,14 @@ async def generate_clips(
     shots = list(storyboard.shots)
     if not shots:
         raise ValueError("分镜为空，没有可生成的镜头")
+
+    # 老版本留下的「超时 / 下载失败」片段没记 pending_job_id：从当时的错误里把 job id 捞回来，
+    # 这次接着查原任务（服务端可能早已跑完、扣过费），而不是再买一份
+    for clip in manifest.clips:
+        recovered = legacy_pending_job(clip)
+        if recovered:
+            clip.pending_job_id = recovered
+            logger.info("片段 %s：从旧错误里找回未取回的任务 %s，接着查", clip.shot_id, recovered)
 
     # 段落分镜：同一段的镜头一次生成；没编段的镜头各自成段（= 原来的单镜生成）
     todo: list[Segment] = []
@@ -142,6 +183,22 @@ async def generate_clips(
     semaphore = asyncio.Semaphore(manifest.concurrency)
 
     async def run_one(segment: Segment) -> None:
+        try:
+            await run_segment(segment)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # 一段出意外不能把别的段（已在花钱）一起带走
+            message = scrub_secrets(f"{type(exc).__name__}: {exc}")[:400]
+            logger.exception("段 %s 生成时出现意外错误", segment.id)
+            for shot in segment.shots:
+                clip = manifest.get(shot.id)
+                if clip is not None and clip.status != ClipStatus.READY:
+                    clip.status = ClipStatus.FAILED
+                    clip.error = message
+                    manifest.upsert(clip)
+            _emit(on_progress, manifest)
+
+    async def run_segment(segment: Segment) -> None:
         async with semaphore:
             if manifest.rejections:
                 # 有段的图被拒了：后面的段先不开工（开工就花钱），等用户决定
@@ -216,7 +273,14 @@ async def _generate_one(
         logger.warning("镜头 %s：用户已同意不带参考图 / 首帧生成", shot.id)
         references = []
     elif keyframer is not None:
-        first_frame = await keyframer.first_frame(unit, provider)
+        try:
+            first_frame = await keyframer.first_frame(unit, provider)
+        except KeyframeUnavailable as exc:
+            _record_keyframe_failure(manifest, unit, exc)
+            clip.status = ClipStatus.FAILED
+            clip.error = str(exc)
+            manifest.upsert(clip)
+            return
     request = VideoRequest(
         shot_id=shot.id,
         scene_id=shot.scene_id,
@@ -227,7 +291,15 @@ async def _generate_one(
         reference_images=references,
         first_frame=first_frame,
         seed=shot_seed,
+        resume_job_id=clip.pending_job_id,
     )
+
+    def submitted(job_id: str) -> None:
+        clip.pending_job_id = job_id
+        manifest.upsert(clip)
+        _emit(on_progress, manifest)
+
+    request.on_submitted = submitted
 
     # 重新生成 = 重新计费：清掉上一条的金额与「已记账」标记
     clip.status = ClipStatus.GENERATING
@@ -255,6 +327,14 @@ async def _generate_one(
             job_id = str(getattr(exc, "job_id", "") or "")
             if job_id:
                 clip.task_id = job_id
+            # 任务还在服务端（超时 / 查询失败 / 下载失败）：留着 job id，下次接着查；
+            # 其余失败（服务端报失败、图被拒）不计费，下次重新提交
+            clip.pending_job_id = (
+                job_id if isinstance(exc, (VideoJobPending, VideoArtifactError)) else ""
+            )
+            if clip.pending_job_id:
+                clip.error = f"{message}{PENDING_HINT}"
+            request.resume_job_id = ""
             _cleanup_partial(output)
             if isinstance(exc, VideoReferenceRejected):
                 _record_rejection(manifest, unit, exc, request, project_dir)
@@ -286,6 +366,7 @@ async def _generate_one(
         clip.media_kind = generated.media_kind
         clip.duration_sec = generated.duration_sec or request.duration_sec
         clip.task_id = generated.task_id
+        clip.pending_job_id = ""
         clip.cost_usd = round(generated.actual_cost_usd or 0.0, 6)
         clip.generated_at = datetime.now(UTC).isoformat()
         clip.error = ""
@@ -336,7 +417,15 @@ async def _generate_segment(
         logger.warning("段落 %s：用户已同意不带参考图 / 首帧生成", segment.id)
         references = []
     elif keyframer is not None:
-        first_frame = await keyframer.first_frame(segment, provider)
+        try:
+            first_frame = await keyframer.first_frame(segment, provider)
+        except KeyframeUnavailable as exc:
+            _record_keyframe_failure(manifest, segment, exc)
+            for clip in clips:
+                clip.status = ClipStatus.FAILED
+                clip.error = str(exc)
+                manifest.upsert(clip)
+            return
     request = VideoRequest(
         shot_id=segment.id,
         scene_id=segment.scene_id,
@@ -351,6 +440,7 @@ async def _generate_segment(
         reference_images=references,
         first_frame=first_frame,
         seed=segment_seed,
+        resume_job_id=clips[0].pending_job_id,
     )
 
     def update(**fields: object) -> None:
@@ -358,6 +448,12 @@ async def _generate_segment(
             for key, value in fields.items():
                 setattr(clip, key, value)
             manifest.upsert(clip)
+
+    def submitted(job_id: str) -> None:
+        update(pending_job_id=job_id)
+        _emit(on_progress, manifest)
+
+    request.on_submitted = submitted
 
     # 上一轮整段已经买到、只是没切成功：直接重切，不重新提交
     reuse = clips[0].segment_path and (Path(project_dir) / clips[0].segment_path).is_file()
@@ -386,7 +482,15 @@ async def _generate_segment(
                 message = scrub_secrets(f"{type(exc).__name__}: {exc}")[:400]
                 retryable = bool(getattr(exc, "retryable", True))
                 job_id = str(getattr(exc, "job_id", "") or "")
-                update(error=message, **({"task_id": job_id} if job_id else {}))
+                pending = (
+                    job_id if isinstance(exc, (VideoJobPending, VideoArtifactError)) else ""
+                )
+                update(
+                    error=f"{message}{PENDING_HINT}" if pending else message,
+                    pending_job_id=pending,
+                    **({"task_id": job_id} if job_id else {}),
+                )
+                request.resume_job_id = ""
                 _cleanup_partial(output)
                 if isinstance(exc, VideoReferenceRejected):
                     _record_rejection(manifest, segment, exc, request, project_dir)
@@ -409,6 +513,7 @@ async def _generate_segment(
         clips[0].cost_usd = round(generated.actual_cost_usd or 0.0, 6)
         update(
             task_id=generated.task_id,
+            pending_job_id="",
             segment_path=_relative(generated.path, project_dir),
             media_kind=generated.media_kind,
             generated_at=datetime.now(UTC).isoformat(),
@@ -948,13 +1053,21 @@ def _strip_prompt_label(text: str) -> str:
 #: 白肩、袖条、白 T 一次都没发出去，第 2 场起校服换了款式
 _APPEARANCE_MAX_CHARS = 360
 
-#: 超长时优先保留的特征（服装 / 眼镜 / 发型 / 配饰）：跨段认人靠的就是这些
-_DISTINCTIVE = re.compile(
-    r"\b(wear|wears|wearing|uniform|jacket|tracksuit|shirt|t-shirt|blouse|cardigan|sweater|"
-    r"sweatshirt|hoodie|coat|dress|skirt|pants|trousers|jeans|shoes|sneakers|glasses|"
-    r"hair|beard|scar|tattoo|hat|cap|stripes?|cigarette)\b",
-    re.IGNORECASE,
+#: 超长时优先保留的特征：跨段认人靠的是「穿什么、头发脸、戴什么」。
+#: 按类别写通用词表（不针对某部片子的某件衣服），命中任一类的分句优先保留
+_DISTINCTIVE_WORDS = (
+    # 穿着（动词 + 常见上下装 / 外套 / 鞋）
+    "wear|wears|wearing|dressed|outfit|uniform|costume|suit|robe|gown|jacket|coat|shirt|"
+    "t-shirt|blouse|vest|cardigan|sweater|sweatshirt|hoodie|tracksuit|dress|skirt|"
+    "pants|trousers|jeans|shorts|shoes|boots|sneakers|sandals|"
+    # 头发 / 脸上的固定特征
+    "hair|hairstyle|ponytail|braid|braids|bun|bangs|fringe|bald|beard|mustache|moustache|"
+    "stubble|scar|tattoo|freckles|mole|birthmark|"
+    # 配饰 / 图案
+    "glasses|spectacles|sunglasses|hat|cap|scarf|necktie|necklace|earrings|bracelet|"
+    "headband|mask|stripes?|striped|plaid|checkered|polka"
 )
+_DISTINCTIVE = re.compile(rf"\b({_DISTINCTIVE_WORDS})\b", re.IGNORECASE)
 
 
 def clip_clauses(parts: list[str], limit: int = _APPEARANCE_MAX_CHARS) -> str:
@@ -1210,9 +1323,16 @@ def invalidate_clips(
         if drop:
             manifest.clips.remove(clip)
             continue
+        if clip.pending_job_id:
+            logger.warning(
+                "镜头 %s 作废时还有没取回的任务 %s（服务端可能已扣费），不再接着查",
+                clip.shot_id,
+                clip.pending_job_id,
+            )
         clip.status = ClipStatus.PENDING
         clip.error = ""
         clip.task_id = None
+        clip.pending_job_id = ""
         clip.path = ""
         clip.segment_path = ""
         clip.prompt = ""
@@ -1389,6 +1509,21 @@ def _record_rejection(
         unit.id,
         "首帧" if exc.kind == "first_frame" else "参考图",
         exc.code or "无错误码",
+    )
+
+
+def _record_keyframe_failure(
+    manifest: VideoManifest, unit: Segment, exc: KeyframeUnavailable
+) -> None:
+    """开场关键帧没画出来：和「图被拒」一样中断这一段，等用户选重画 / 不带图。"""
+    manifest.rejections = [r for r in manifest.rejections if r.unit_id != unit.id]
+    manifest.rejections.append(
+        ReferenceRejection(
+            unit_id=unit.id,
+            shot_ids=[shot.id for shot in unit.shots],
+            kind=KEYFRAME_FAILED,
+            message=scrub_secrets(str(exc))[:400],
+        )
     )
 
 

@@ -309,7 +309,7 @@ class Keyframer:
         return self._provider
 
     async def first_frame(self, segment: Segment, provider: VideoProvider) -> Path | None:
-        """这一段的开场关键帧；不需要 / 画失败都返回 None（= 纯文生视频）。"""
+        """这一段的开场关键帧；不需要时返回 None，需要但画不出来时抛 `KeyframeUnavailable`。"""
         project_dir = self.store.ensure_project_dir(self.project_id)
         image = self._image()
         jobs = plan_jobs(
@@ -346,17 +346,14 @@ class Keyframer:
                 )
             )
         except (ImageProviderError, cost_service.BudgetExceeded) as exc:
-            logger.warning(
-                "关键帧生成失败，段 %s 改为纯文生视频：%s",
-                job.unit_id,
-                scrub_secrets(str(exc))[:200],
-            )
-            return None
+            message = scrub_secrets(str(exc))[:200]
+            logger.warning("段 %s 的开场关键帧没画出来，这一段先不生成：%s", job.unit_id, message)
+            raise video_service.KeyframeUnavailable(f"开场关键帧没画出来：{message}") from exc
 
         saved = Path(generated.path)
         if not saved.is_file() or saved.stat().st_size == 0:
-            logger.warning("关键帧没有产出有效文件，段 %s 改为纯文生视频", job.unit_id)
-            return None
+            logger.warning("关键帧没有产出有效文件，段 %s 先不生成", job.unit_id)
+            raise video_service.KeyframeUnavailable("开场关键帧没有产出有效文件")
         entry = cost_service.image_entry(
             image.name,
             image.model or self.settings.image_provider,

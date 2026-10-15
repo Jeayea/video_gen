@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from pathlib import Path
 
 from pydantic import BaseModel, Field
@@ -10,6 +11,7 @@ from videogen.models.video import MediaKind
 __all__ = [
     "GeneratedClip",
     "VideoArtifactError",
+    "VideoJobPending",
     "VideoProvider",
     "VideoProviderError",
     "VideoReferenceRejected",
@@ -40,6 +42,21 @@ class VideoArtifactError(VideoProviderError):
         super().__init__(message)
         self.job_id = job_id
         self.urls = list(urls or [])
+
+
+class VideoJobPending(VideoProviderError):
+    """任务已经提交到服务端，但这边没等到结果（轮询超时 / 轮询网络失败 / 提交响应丢了）。
+
+    服务端可能仍在跑、仍会扣费，所以**绝不能重新提交**（那等于同一段买两次）。
+    上层把 `job_id` 记下来，下次生成时带着 `VideoRequest.resume_job_id` 接着轮询同一个任务。
+    `job_id` 为空表示「连任务有没有建成都不知道」（提交请求发出后响应丢了），只能人工核对。
+    """
+
+    retryable = False
+
+    def __init__(self, message: str, *, job_id: str = ""):
+        super().__init__(message)
+        self.job_id = job_id
 
 
 class VideoReferenceRejected(VideoProviderError):
@@ -79,6 +96,12 @@ class VideoRequest(BaseModel):
     first_frame: Path | None = None
     #: 固定 seed（provider 支持时才有用；H3 是 `seed: false`，带上会 400）
     seed: int | None = None
+    #: 接着轮询上一次已经提交的任务（不重新提交、不重新计费）。
+    #: 任务在服务端已失败时 provider 会重新提交
+    resume_job_id: str = ""
+    #: 任务一提交成功就回调（参数是 job id）：上层要立刻把 job id 落盘，
+    #: 之后不管是取消、超时还是进程重启，都能接着轮询而不是再买一次
+    on_submitted: Callable[[str], None] | None = Field(default=None, exclude=True)
 
     model_config = {"arbitrary_types_allowed": True}
 

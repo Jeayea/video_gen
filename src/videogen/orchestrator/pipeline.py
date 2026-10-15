@@ -1870,8 +1870,12 @@ class Pipeline:
 
     def _reject_if_running(self, project_id: str, kind: str, label: str) -> None:
         """同一项目同类型任务只允许一个在跑（在拿项目锁之前调用，避免阻塞）。"""
-        running = self.jobs.active_for(project_id, kind)
+        running = self.jobs.active_for(project_id, kind) or self.jobs.busy_for(project_id, kind)
         if running:
+            if not running.is_active:
+                raise PipelineError(
+                    f"上一个{label}任务已取消、正在收尾，请稍后再试（job={running.id}）"
+                )
             raise PipelineError(f"该项目已有{label}任务在运行（job={running.id}）")
 
     async def _run_video_job(self, ctx: JobContext, project_id: str) -> None:
@@ -1947,13 +1951,18 @@ class Pipeline:
         except asyncio.CancelledError:
             # 取消：保留已生成片段，状态退回可重试的位置
             async with self._lock(project_id):
-                self.store.purge_media(project_id, compose=True, reason="视频生成被取消")
+                cancelled = self.store.load_video_manifest(project_id)
+                # 只有这一轮真的换掉了片段才作废成片（刚点生成就取消时，原来的成片照样能用）
+                if cancelled is not None and any(
+                    c.generated_at and before_generated.get(c.shot_id) != c.generated_at
+                    for c in cancelled.ready_clips
+                ):
+                    self.store.purge_media(project_id, compose=True, reason="视频生成被取消")
                 # **取消也要记账**：已经落盘的片段 provider 已经按秒计过费了，
                 # 不记的话账本就少一笔（真实事故：取消时 3 个片段共 $1.95 没进账本，
                 # 而片段随后被删掉，连「补记账」的机会都没有了）。
                 # 仍按片段上的 `cost_recorded` 标记记，所以续跑不会重复计费。
-                cancelled = self.store.load_video_manifest(project_id)
-                recorded = self._record_video_cost(
+                recorded = cancelled is not None and self._record_video_cost(
                     project_id,
                     cancelled,
                     price_per_second=price_per_second,
@@ -1962,6 +1971,20 @@ class Pipeline:
                 if recorded:
                     self.store.save_video_manifest(project_id, cancelled)
                     logger.info("视频任务被取消，已为已生成片段补记账 $%.4f", recorded)
+                self._settle_video_status(
+                    self.get_project(project_id),
+                    self.store.load_video_manifest(project_id),
+                    self.store.load_audio_manifest(project_id),
+                )
+            raise
+        except Exception:
+            # 意外错误：同样把已经买到的片段记上账、状态退回可重试的位置，再把错误抛给任务
+            async with self._lock(project_id):
+                failed = self.store.load_video_manifest(project_id)
+                if failed is not None and self._record_video_cost(
+                    project_id, failed, price_per_second=price_per_second, settings=settings
+                ):
+                    self.store.save_video_manifest(project_id, failed)
                 self._settle_video_status(
                     self.get_project(project_id),
                     self.store.load_video_manifest(project_id),
@@ -2038,7 +2061,7 @@ class Pipeline:
             if manifest is None or rejection is None:
                 raise PipelineError(f"段 {unit_id} 没有待处理的拒收记录")
             if action == "regenerate_keyframe":
-                if rejection.kind != "first_frame":
+                if rejection.kind not in ("first_frame", video_service.KEYFRAME_FAILED):
                     raise PipelineError(
                         "被拒的是参考图（定妆照 / 场景图），不是首帧：请换图后选「重试」"
                     )

@@ -137,13 +137,15 @@ async def test_keyframer_generates_records_and_caches(store, setup):
 
 
 @pytest.mark.asyncio
-async def test_keyframe_failure_degrades_to_text_only(store, setup):
+async def test_keyframe_failure_interrupts_instead_of_text_only(store, setup):
+    """回归：关键帧画失败时以前悄悄改成纯文生视频（一致性没了，钱照花）。"""
     project, _project_dir, bible = setup
     image = FakeImageProvider(fail_subjects={"seg_1"})
     keyframer = keyframe_service.Keyframer(
         store, project.id, project, bible, image_provider=image
     )
-    assert await keyframer.first_frame(_segment(), FirstFrameVideo()) is None
+    with pytest.raises(video_service.KeyframeUnavailable):
+        await keyframer.first_frame(_segment(), FirstFrameVideo())
     assert cost_service.load_report(store, project.id).entries == []
 
 
@@ -430,3 +432,27 @@ def test_clip_clauses_drops_whole_parts_and_keeps_wardrobe():
     text = video_service.clip_clauses(parts, limit=45)
     assert text == "wears a red scarf, black hair in a bun"
     assert video_service.clip_clauses(["word " * 30], limit=20).endswith("word")
+
+
+@pytest.mark.asyncio
+async def test_keyframe_failure_stops_segment(store, setup, monkeypatch, settings):
+    """关键帧画不出来：这一段不买视频，记成待处理，等用户选重画 / 不带图。"""
+    project, project_dir, bible = setup
+    monkeypatch.setattr(settings, "video_segment_mode", True)
+    keyframer = keyframe_service.Keyframer(
+        store, project.id, project, bible, image_provider=FakeImageProvider(fail_subjects={"seg_1"})
+    )
+    video = FirstFrameVideo()
+    manifest = await video_service.generate_clips(
+        project,
+        store.load_storyboard(project.id),
+        video,
+        store.clips_dir(project.id),
+        project_dir,
+        bible=bible,
+        retry_backoff_sec=0,
+        keyframer=keyframer,
+    )
+    assert video.requests == [], "关键帧没画出来就不该买视频"
+    assert [r.kind for r in manifest.rejections] == [video_service.KEYFRAME_FAILED]
+    assert all(c.status.value == "failed" for c in manifest.clips)
