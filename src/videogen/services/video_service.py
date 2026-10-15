@@ -39,6 +39,12 @@ logger = logging.getLogger(__name__)
 
 #: 片段卡在「已提交、没取回」时附在错误后面的提示
 PENDING_HINT = "（下次生成会接着查这个任务、不重新计费；想放弃它重新生成，点这段的「重做这段」）"
+#: 异常文案里已经说了「会接着查」时只补后半句
+PENDING_HINT_SHORT = "（想放弃这个任务重新生成，点这段的「重做这段」）"
+
+
+def _with_pending_hint(message: str) -> str:
+    return message + (PENDING_HINT_SHORT if "接着查" in message else PENDING_HINT)
 
 #: 老版本的错误文案：轮询超时 / 已生成但下载失败（都带 `job=<id>`）
 _LEGACY_PENDING_RE = re.compile(r"(?:生成超时|已生成但下载失败)（job=([\w.-]+)")
@@ -333,7 +339,7 @@ async def _generate_one(
                 job_id if isinstance(exc, (VideoJobPending, VideoArtifactError)) else ""
             )
             if clip.pending_job_id:
-                clip.error = f"{message}{PENDING_HINT}"
+                clip.error = _with_pending_hint(message)
             request.resume_job_id = ""
             _cleanup_partial(output)
             if isinstance(exc, VideoReferenceRejected):
@@ -352,6 +358,13 @@ async def _generate_one(
                 pass  # _record_rejection 已经记过
             elif retryable:
                 logger.error("镜头 %s 生成失败（已重试 %d 次）：%s", shot.id, max_retries, message)
+            elif isinstance(exc, VideoJobPending):
+                logger.warning(
+                    "镜头 %s 的任务已提交但还没取回（job=%s），下次生成接着查：%s",
+                    shot.id,
+                    job_id or "?",
+                    message,
+                )
             else:
                 logger.error(
                     "镜头 %s 生成成功但落盘失败，已停止重试（避免重复计费）：job=%s %s",
@@ -486,7 +499,7 @@ async def _generate_segment(
                     job_id if isinstance(exc, (VideoJobPending, VideoArtifactError)) else ""
                 )
                 update(
-                    error=f"{message}{PENDING_HINT}" if pending else message,
+                    error=_with_pending_hint(message) if pending else message,
                     pending_job_id=pending,
                     **({"task_id": job_id} if job_id else {}),
                 )
