@@ -90,6 +90,9 @@ class Project(BaseModel):
     source_material: str = ""
     #: 科普：成片加「AI 生成」标识（片头显式 + 文件元数据隐式）。短剧不读
     ai_label: bool = True
+    #: 科普：画面来源。`still` = 每句一张 AI 示意图 + 推拉（新建科普项目的默认值）；
+    #: `video` = 视频模型。空 = 按 `video`（老项目行为不变）。短剧不读
+    visual_mode: str = ""
     #: 该项目的 LLM 模型（空 = 用 .env 里的默认）。多模型切换用。
     llm_model: str = ""
     #: **整片的国家/地区限定**（cn/jp/kr/west/india/mideast/africa/latam/sea/other；

@@ -99,6 +99,9 @@ class VideoRequest(BaseModel):
     #: 接着轮询上一次已经提交的任务（不重新提交、不重新计费）。
     #: 任务在服务端已失败时 provider 会重新提交
     resume_job_id: str = ""
+    #: 插图 provider（`draws_stills`）用的图片 prompt：视频 prompt 里的表演 / 运镜 / 「一镜到底」
+    #: 对一张图没有意义，还可能把图画成多格拼贴。其余 provider 不读
+    still_prompt: str = ""
     #: 任务一提交成功就回调（参数是 job id）：上层要立刻把 job id 落盘，
     #: 之后不管是取消、超时还是进程重启，都能接着轮询而不是再买一次
     on_submitted: Callable[[str], None] | None = Field(default=None, exclude=True)

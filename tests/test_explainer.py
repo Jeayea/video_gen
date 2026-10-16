@@ -14,17 +14,21 @@ from tests.factories import small_project
 from tests.fakes import FakeBgmLibrary, FakeLLM, FakeTTSProvider, FakeVideoProvider
 from videogen import main
 from videogen.models.audio import AudioClip, AudioManifest
-from videogen.models.bible import Character, Fact, StoryBible
+from videogen.models.bible import Character, Fact, Setting, StoryBible
 from videogen.models.compose import ComposeSegment, SubtitleMode
 from videogen.models.consistency import IssueSeverity
 from videogen.models.explainer import KnowledgeFact, KnowledgeItem, KnowledgeResponse, NewFact
 from videogen.models.project import ContentType, InputMode, Project
 from videogen.models.script import NARRATOR, DialogueLine, Scene, Script
 from videogen.models.storyboard import Shot
-from videogen.models.video import ClipStatus
+from videogen.models.video import ClipStatus, VideoClip, VideoManifest
 from videogen.orchestrator.batch import BatchManager, BatchStatus, ItemStatus
 from videogen.orchestrator.pipeline import Pipeline, PipelineError
+from videogen.providers.image.base import ImageProvider
+from videogen.providers.image.mock import MockImageProvider
 from videogen.providers.tts.mock import MockTTSProvider
+from videogen.providers.video import still as still_provider
+from videogen.providers.video.base import VideoProviderError, VideoRequest
 from videogen.providers.video.mock import MockVideoProvider
 from videogen.services import (
     audio_service,
@@ -35,7 +39,7 @@ from videogen.services import (
     video_service,
     voice_catalog,
 )
-from videogen.utils.ffmpeg import describe_media, ffmpeg_available
+from videogen.utils.ffmpeg import FFmpegError, describe_media, ffmpeg_available, probe_duration
 from videogen.utils.file_store import FileStore
 
 requires_ffmpeg = pytest.mark.skipif(not ffmpeg_available(), reason="需要 ffmpeg")
@@ -1116,8 +1120,10 @@ async def test_batch_runs_explainer_with_sourced_facts(store):
     project = store.load_project(item.project_id)
     assert project.status == "storyboard_confirmed"
     assert project.source_material == BATCH_MATERIAL
+    assert project.visual_mode == "still"  # 批量建的科普项目和界面上建的一样，默认插图
     storyboard = store.load_storyboard(item.project_id)
-    assert all(shot.narration and shot.segment_id for shot in storyboard.shots)
+    # 插图模式一句一张图，不编段
+    assert all(shot.narration and not shot.segment_id for shot in storyboard.shots)
 
 
 def test_batch_rejects_novel_explainer(store):
@@ -1153,3 +1159,156 @@ def test_knowledge_items_drop_copied_language_labels():
     )
     assert (item.description, item.visual_prompt) == ("蓝天白云", "clear sky")
     assert "English:" not in explainer_service.KNOWLEDGE_SYSTEM
+
+
+# ── 插图模式（visual_mode=still）─────────────────────
+
+
+def test_explainer_defaults_to_illustrations_and_api_accepts_mode(client):
+    body = {"title": "t", "input_text": "为什么天是蓝的", "content_type": "explainer"}
+    assert client.post("/api/projects", json=body).json()["visual_mode"] == "still"
+    body["visual_mode"] = "video"
+    created = client.post("/api/projects", json=body).json()
+    assert created["visual_mode"] == "video"
+    drama = client.post("/api/projects", json={"title": "d", "input_text": "x"}).json()
+    assert drama["visual_mode"] == ""
+    resp = client.put(f"/api/projects/{created['id']}", json={"visual_mode": "still"})
+    assert resp.json()["visual_mode"] == "still"
+    bad = client.put(f"/api/projects/{created['id']}", json={"visual_mode": "x"})
+    assert bad.status_code == 422
+    assert explainer_service.uses_stills(_explainer(visual_mode="still"))
+    assert not explainer_service.uses_stills(_explainer())
+    assert not explainer_service.uses_stills(Project(title="短剧", visual_mode="still"))
+
+
+@pytest.mark.parametrize("motion", still_provider.MOTIONS)
+def test_ken_burns_filter_moves_within_the_image(motion):
+    text = still_provider.ken_burns_filter(1080, 1920, 120, 24, motion)
+    assert text.startswith("scale=2160:3840:force_original_aspect_ratio=increase,crop=2160:3840")
+    assert "zoompan=" in text and "d=120:s=1080x1920:fps=24" in text
+    assert "(on/119)" in text
+    assert still_provider.motion_for("scene_1_shot_1") == still_provider.motion_for(
+        "scene_1_shot_1"
+    )
+
+
+def test_still_prompt_is_an_image_prompt_without_text(settings):
+    bible = StoryBible(settings=[Setting(id="loc_1", name="实验室",
+                                         visual_prompt="a dim lab bench with a glass prism")])
+    shot = Shot(id="s1", scene_id="scene_1", shot_no=1, camera="特写 · 缓推", location="loc_1",
+                video_prompt="macro shot of a prism splitting sunlight into colors，彩虹",
+                narration="阳光里藏着各种颜色。")
+    prompt = video_service.still_prompt(shot, _explainer(), bible)
+    assert prompt.startswith("An illustration for a science explainer video, aspect ratio 9:16")
+    assert "macro shot of a prism" in prompt and "setting: a dim lab bench" in prompt
+    assert f"style: {settings.explainer_illustration_style}" in prompt
+    assert "No text, no letters, no numbers" in prompt and "no film strip" in prompt
+    assert "阳光" not in prompt and "彩虹" not in prompt  # 中文一律不进图片 prompt
+    assert "single continuous take" not in prompt  # 视频的表演 / 一镜到底要求不进来
+
+
+class _CountingImage(ImageProvider):
+    """记录调用次数、报实际扣费的假图片 provider。"""
+
+    name = "fake-image"
+    model = "fake-image-1"
+
+    def __init__(self, cost: float | None = 0.05):
+        self.calls: list[str] = []
+        self.cost = cost
+
+    async def generate(self, request):
+        self.calls.append(request.prompt)
+        drawn = await MockImageProvider().generate(request)
+        return drawn.model_copy(update={"actual_cost_usd": self.cost})
+
+    async def aclose(self):
+        return None
+
+
+@requires_ffmpeg
+async def test_still_provider_draws_once_and_renders_a_moving_clip(tmp_path, monkeypatch):
+    image = _CountingImage(cost=0.05)
+    provider = still_provider.StillVideoProvider(image, price_usd=0.04, fps=12, slack_sec=1.0)
+    assert (await provider.planned_seconds(7), await provider.price_per_second()) == (1.0, 0.04)
+    real_run = still_provider.run_ffmpeg
+    failures = {"left": 1}
+
+    async def flaky_run(args, **kwargs):
+        if failures["left"]:
+            failures["left"] -= 1
+            raise FFmpegError("boom")
+        return await real_run(args, **kwargs)
+
+    monkeypatch.setattr(still_provider, "run_ffmpeg", flaky_run)
+    request = VideoRequest(shot_id="s1", prompt="video prompt", still_prompt="a prism",
+                           duration_sec=3, aspect_ratio="9:16", output_path=tmp_path / "s1.mp4")
+    with pytest.raises(VideoProviderError):
+        await provider.generate(request)
+    clip = await provider.generate(request)  # 渲染重试：不重新买图
+    assert image.calls == ["a prism"]
+    assert clip.actual_cost_usd == 0.05 and clip.duration_sec == 3
+    length = await probe_duration(clip.path)
+    assert length == pytest.approx(4.0, abs=0.15)  # 镜头 3 秒 + 1 秒余量
+
+
+async def test_mock_images_cost_nothing(tmp_path):
+    provider = still_provider.StillVideoProvider(MockImageProvider(), price_usd=0.04)
+    assert provider.paid is False
+    assert await provider.price_per_second() == 0.0
+
+
+@requires_ffmpeg
+async def test_explainer_illustration_chain_end_to_end(store, settings):
+    llm = FakeLLM()
+    project = _explainer(input_text="为什么天是蓝的")
+    explainer_service.apply_creation_defaults(project)
+    store.create_project(project)
+    pipeline = Pipeline(
+        store,
+        llm_factory=lambda: llm,
+        # 插图模式根本不该用到视频模型：给一个会炸的工厂
+        video_factory=lambda: (_ for _ in ()).throw(AssertionError("用到了视频模型")),
+        tts_factory=lambda: MockTTSProvider(),
+        bgm_factory=lambda: FakeBgmLibrary(),
+    )
+    await pipeline.generate_bible(project.id)
+    await pipeline.generate_script(project.id)
+    await pipeline.confirm_script(project.id, force=True)
+    storyboard = await pipeline.generate_storyboard(project.id)
+    assert not any(shot.segment_id for shot in storyboard.shots)  # 插图不编段
+    report = store.load_consistency(project.id)
+    assert any("AI 示意图" in i.message for i in report.issues)
+
+    await pipeline.confirm_storyboard(project.id, force=True)
+    plan = await pipeline.preflight(project.id, action="video")
+    assert plan["video"]["unit_kind"] == "image"
+    assert plan["video"]["billed_seconds"] == len(storyboard.shots)  # 一镜一张
+
+    job = await pipeline.start_video_generation(project.id)
+    finished = await wait_for_job(pipeline, job.id, timeout=120)
+    assert finished.status.value == "succeeded", finished.error
+    manifest = store.load_video_manifest(project.id)
+    assert manifest.provider == "still" and manifest.model == "still:mock"
+    assert len(manifest.ready_clips) == len(storyboard.shots)
+    assert all(c.prompt.startswith("An illustration") for c in manifest.ready_clips)
+
+    for start in (pipeline.start_audio_generation, pipeline.start_compose):
+        job = await start(project.id)
+        finished = await wait_for_job(pipeline, job.id, timeout=180)
+        assert finished.status.value == "succeeded", finished.error
+    compose = store.load_compose_report(project.id)
+    assert compose.ai_label and len(compose.segments) == len(storyboard.shots)
+
+
+async def test_switching_visual_mode_regenerates_everything(store, make_pipeline):
+    project, pipeline, _, _ = await _with_storyboard(store, make_pipeline)
+    manifest = VideoManifest(provider="mock", model="mock", clips=[
+        VideoClip(shot_id=s.id, status=ClipStatus.READY, path=f"clips/{s.id}.mp4")
+        for s in store.load_storyboard(project.id).shots
+    ])
+    store.save_video_manifest(project.id, manifest)
+    await pipeline.update_project(project.id, {"visual_mode": "still"})
+    plan = await pipeline.preflight(project.id, action="video")
+    assert plan["video"]["regenerate_all"] is True
+    assert plan["video"]["unit_kind"] == "image"

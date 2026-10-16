@@ -30,9 +30,11 @@ from videogen.providers import llm as llm_providers
 from videogen.providers import tts as tts_providers
 from videogen.providers import video as video_providers
 from videogen.providers.bgm.base import BgmLibrary
+from videogen.providers.image import get_image_provider
 from videogen.providers.llm.base import LLMProvider
 from videogen.providers.tts.base import TTSProvider
 from videogen.providers.video.base import VideoProvider
+from videogen.providers.video.still import StillVideoProvider
 from videogen.services import (
     audio_script_service,
     audio_service,
@@ -282,14 +284,14 @@ class Pipeline:
         cost_service.check_budget(report, upcoming_usd=upcoming_usd, action=action)
 
     async def _budget_shots(
-        self, storyboard: Storyboard, video: VideoManifest | None
+        self, storyboard: Storyboard, video: VideoManifest | None, project: Project | None = None
     ) -> list[Shot]:
         """预算口径：这次真正会去生成哪些镜头。
 
         与 `video_service.generate_clips` 的续跑逻辑保持一致 —— 换了 provider / 模型时
         已就绪的片段会被判为过期并全部重生成，所以预算也得按「全部」算。
         """
-        provider = self._video()
+        provider = self._video(project)
         try:
             switched = bool(video) and video_service.provider_switched(video, provider)
         except Exception:  # 判断不了就按「最坏情况全部重跑」保守估
@@ -300,7 +302,10 @@ class Pipeline:
         return list(storyboard.shots) if switched else _pending_shots(storyboard, video)
 
     async def _estimate_video_usd(
-        self, shots: list[Shot], storyboard: Storyboard | None = None
+        self,
+        shots: list[Shot],
+        storyboard: Storyboard | None = None,
+        project: Project | None = None,
     ) -> float:
         """按 provider 的计费档位与单价估算花费（问不到就退回配置单价）。
 
@@ -317,7 +322,7 @@ class Pipeline:
                 if any(sid in wanted for sid in segment.shot_ids)
             ]
         prices = cost_service.PriceTable.from_settings()
-        provider = self._video()
+        provider = self._video(project)
         try:
             price = await provider.price_per_second()
             seconds = 0.0
@@ -350,7 +355,7 @@ class Pipeline:
             for segment in storyboard_service.segments_of(storyboard)
             if any(sid in wanted for sid in segment.shot_ids)
         ]
-        provider = self._video()
+        provider = self._video(project)
         try:
             plan = await self._keyframe_estimator(project, provider)(segments)
         except Exception:  # 估不出就按 0，真正画之前还会逐张查预算
@@ -375,11 +380,12 @@ class Pipeline:
         `only_if_missing=True`（视频阶段/preflight 用）：已经编过段就不动；老项目已经有
         单镜生成好的片段时也不编段 —— 否则已就绪的镜头会被卷进新段落、整段重买。
 
-        科普项目永远按段落编（不看 `VIDEO_SEGMENT_MODE`）：关掉段落模式就要走档位合并，
-        一句一镜会被拼起来。
+        科普项目用视频模型时永远按段落编（不看 `VIDEO_SEGMENT_MODE`）：关掉段落模式就要走档位合并，
+        一句一镜会被拼起来。科普插图模式不编段：一句一张图，按张计费，没有档位可省。
         """
         settings = get_settings()
-        if not (settings.video_segment_mode or explainer_service.is_explainer(project)):
+        segmented = settings.video_segment_mode or explainer_service.is_explainer(project)
+        if not segmented or explainer_service.uses_stills(project):
             if any(shot.segment_id for shot in storyboard.shots):
                 storyboard = storyboard.model_copy(deep=True)
                 for shot in storyboard.shots:
@@ -430,7 +436,15 @@ class Pipeline:
             ),
         )
 
-    def _video(self) -> VideoProvider:
+    def _video(self, project: Project | None = None) -> VideoProvider:
+        """视频 provider；科普插图模式（`visual_mode=still`）换成插图 provider（画图 + 推拉）。"""
+        if explainer_service.uses_stills(project):
+            settings = get_settings()
+            return StillVideoProvider(
+                get_image_provider(),
+                price_usd=settings.image_price_usd,
+                fps=settings.video_fps,
+            )
         return self._video_factory()
 
     def _tts(self) -> TTSProvider:
@@ -1547,6 +1561,7 @@ class Pipeline:
                 project, script, bible, self.store.load_world_state(project_id)
             )
             issues = consistency_service.validate_storyboard(storyboard, script, bible)
+            issues += explainer_service.check_illustrations(project, storyboard)
             report = consistency_service.merge_storyboard_issues(script_report, issues)
             self.store.save_consistency(project_id, report)
 
@@ -1922,7 +1937,7 @@ class Pipeline:
         project = self.get_project(project_id)
         provider = None
         try:
-            provider = self._video()
+            provider = self._video(project)
         except Exception as exc:  # noqa: BLE001 - 估不出价不该让接口 500
             logger.warning("视频 provider 初始化失败，按配置单价估算：%s", exc)
         try:
@@ -2141,9 +2156,9 @@ class Pipeline:
                 storyboard, video=video, only_if_missing=True, project=project
             )
             self.store.save_storyboard(project_id, storyboard)
-            targets = await self._budget_shots(storyboard, video)
+            targets = await self._budget_shots(storyboard, video, project)
             try:
-                upcoming = await self._estimate_video_usd(targets, storyboard)
+                upcoming = await self._estimate_video_usd(targets, storyboard, project)
             except UnknownVideoPrice as exc:
                 # 设了预算才拦：不设预算等于主动放弃了上限，preflight 里照样会告警
                 if cost_service.load_report(self.store, project_id).budget_usd > 0:
@@ -2188,7 +2203,7 @@ class Pipeline:
         async with self._lock(project_id):
             project = self.get_project(project_id)
             storyboard = self.store.load_storyboard(project_id) or Storyboard()
-            provider = self._video()
+            provider = self._video(project)
             project_dir = self.store.ensure_project_dir(project_id)
             clips_dir = self.store.clips_dir(project_id)
             bible = self.store.load_bible(project_id)
@@ -3316,7 +3331,9 @@ class Pipeline:
             storyboard = self.store.load_storyboard(project.id)
             if storyboard and storyboard.shots:
                 report = consistency_service.merge_storyboard_issues(
-                    report, consistency_service.validate_storyboard(storyboard, script, bible)
+                    report,
+                    consistency_service.validate_storyboard(storyboard, script, bible)
+                    + explainer_service.check_illustrations(project, storyboard),
                 )
         self.store.save_consistency(project.id, report)
         return report

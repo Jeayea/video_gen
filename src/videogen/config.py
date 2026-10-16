@@ -149,6 +149,12 @@ class Settings(BaseSettings):
     explainer_line_pad_sec: float = 0.5
     #: 科普：相邻两句旁白之间的停顿（估算全片时长、合成裁镜头都用它）
     explainer_line_gap_sec: float = 0.2
+    #: 科普插图模式（visual_mode=still）的画风（英文，进图片 prompt）。默认画成插画而不是照片：
+    #: AI 画的「照片」会被观众当成真的，在科普里等于造假
+    explainer_illustration_style: str = (
+        "clean modern editorial illustration, soft natural colors, simple shapes, "
+        "gentle lighting, uncluttered background"
+    )
     tts_timeout_sec: float = 60.0
     #: 每句对白后面留的呼吸时间（秒），用于音画对齐
     audio_gap_sec: float = 0.25

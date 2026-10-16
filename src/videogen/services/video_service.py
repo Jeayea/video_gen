@@ -311,6 +311,9 @@ async def _generate_one(
         shot_id=shot.id,
         scene_id=shot.scene_id,
         prompt=with_opening_frame_note(build_prompt(shot, project, bible), first_frame),
+        still_prompt=(
+            still_prompt(shot, project, bible) if getattr(provider, "draws_stills", False) else ""
+        ),
         duration_sec=max(1, shot.duration_sec),
         aspect_ratio=project.aspect_ratio.value,
         output_path=output,
@@ -331,7 +334,8 @@ async def _generate_one(
     clip.status = ClipStatus.GENERATING
     clip.cost_usd = 0.0
     clip.cost_recorded = False
-    clip.prompt = request.prompt
+    # 插图模式记真正发给图片模型的那句（历史版本 / 排查用）
+    clip.prompt = request.still_prompt or request.prompt
     _emit(on_progress, manifest)
 
     attempts = max_retries + 1
@@ -1135,6 +1139,40 @@ def clip_clauses(parts: list[str], limit: int = _APPEARANCE_MAX_CHARS) -> str:
 
 def _split_clauses(text: str) -> list[str]:
     return [part.strip() for part in re.split(r"[,.;]", text) if part.strip()]
+
+
+_STILL_NO_TEXT = "No text, no letters, no numbers, no labels, no captions, no watermark"
+_STILL_RULES = (
+    "One single image with one clear subject. No split panels, no collage, no film strip, "
+    "no borders or frames, no storyboard layout"
+)
+
+
+def still_prompt(
+    shot: Shot, project: Project, bible: StoryBible | None, *, settings: Settings | None = None
+) -> str:
+    """插图模式（科普 `visual_mode=still`）的图片 prompt：画面描述 + 场景 / 道具锚点 + 画风。
+
+    不用 `build_prompt`：表演、运镜、「一镜到底」对一张图没有意义；关键帧试拍里
+    「opening frame of a film shot」还把图画成了带胶片齿孔的多格画面。画面里一律不许有字
+    （知识性的字留给叠加层），场景里自然出现的招牌照旧按原文保留。
+    """
+    from videogen.services.asset_service import english_only, text_rule
+
+    settings = settings or get_settings()
+    base = " ".join((shot.video_prompt or shot.visual_description or "").split())
+    parts = [
+        f"An illustration for a science explainer video, aspect ratio {project.aspect_ratio.value}",
+        base,
+        location_anchor(shot, bible, base),
+        prop_anchor(shot, bible, base),
+        f"style: {settings.explainer_illustration_style}" if settings.explainer_illustration_style
+        else "",
+        _STILL_RULES,
+    ]
+    joined = ". ".join(part.strip().rstrip(".").strip() for part in parts if part.strip())
+    body = english_only(joined, keep_signage=True)
+    return f"{body}. {text_rule(body, default=_STILL_NO_TEXT)}."
 
 
 def location_anchor(shot: Shot, bible: StoryBible | None, base: str = "") -> str:

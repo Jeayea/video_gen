@@ -268,6 +268,8 @@ class CreateProjectRequest(BaseModel):
     #: 科普：目标观众 / 参考资料原文
     audience: str = Field(default="", max_length=200)
     source_material: str = ""
+    #: 科普：画面来源（still = 每句一张 AI 示意图；video = 视频模型；空 = 科普默认 still）
+    visual_mode: str = Field(default="", pattern="^(|still|video)$")
 
 
 class UpdateProjectRequest(BaseModel):
@@ -301,6 +303,8 @@ class UpdateProjectRequest(BaseModel):
     audience: str | None = Field(default=None, max_length=200)
     source_material: str | None = None
     ai_label: bool | None = None
+    #: 科普：画面来源（still / video）。换了之后已生成的片段在下次生成时全部重做
+    visual_mode: str | None = Field(default=None, pattern="^(still|video)$")
 
 
 
@@ -609,6 +613,7 @@ async def create_project(req: CreateProjectRequest):
         content_type=req.content_type,
         audience=req.audience.strip(),
         source_material=req.source_material.strip(),
+        visual_mode=req.visual_mode,
     )
     explainer_service.apply_creation_defaults(project)
     store.create_project(project)

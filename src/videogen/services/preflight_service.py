@@ -167,7 +167,8 @@ async def video_plan(
         "model": provider_model,
         "price_per_second": round(price, 6),
         "price_source": price_source,
-        "unit_kind": "second",
+        # 插图 provider 按张计费：「秒数」就是张数、「每秒单价」就是每张单价
+        "unit_kind": getattr(provider, "unit_kind", "second"),
         "min_sec": round(min_sec, 3),
         "max_sec": round(max_sec, 3),
         "duration_options": [round(value, 3) for value in options],

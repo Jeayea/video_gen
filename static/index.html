@@ -1226,9 +1226,19 @@ async function renderProject(id) {
   // 4. 视频片段
   html += `
     <div class="panel" data-stage="video">
-      <h3><span class="num">4</span> 视频片段
+      <h3><span class="num">4</span> ${isExplainer(p) && p.visual_mode === 'still' ? '画面片段（AI 示意图）' : '视频片段'}
         <span id="video-tags"></span>
       </h3>
+      ${isExplainer(p) ? `<div class="bible-constraint">
+        <label>画面来源
+          <select id="visual-mode" onchange="setVisualMode(this.value)"
+            ${inStatus(p, ['video_generating', 'audio_generating', 'composing']) ? 'disabled' : ''}>
+            <option value="still" ${p.visual_mode === 'still' ? 'selected' : ''}>AI 示意图：每句一张图 + 推拉（按张计费，约 $0.04/张）</option>
+            <option value="video" ${p.visual_mode !== 'still' ? 'selected' : ''}>视频模型：每句一个视频镜头（按秒计费）</option>
+          </select>
+        </label>
+        <span class="hint">示意图是插画风格，不是真实照片；讲具体事物或数据的镜头之后会接图表与开放图库</span>
+      </div>` : ''}
       <div id="video-body">
         <span style="color:var(--text2);font-size:12px">尚未生成</span>
       </div>
@@ -2197,8 +2207,8 @@ function storyboardTierHint(sb) {
   if (plan && plan.shots_total) {
     const unit = plan.segment_mode ? `（编成 ${plan.segments_total} 段生成）` : '';
     rows.push(plan.to_generate
-      ? `本次要生成 ${plan.to_generate} 个镜头${unit} · 预计计费 ${plan.billed_seconds}s × $${plan.price_per_second}/s ≈ ${usd(plan.estimated_usd)}`
-      : `本片 ${plan.shots_total} 个镜头${unit}已全部生成 · 整片计费约 ${plan.billed_seconds_if_all}s × $${plan.price_per_second}/s ≈ ${usd(plan.estimated_usd_if_all)}`);
+      ? `本次要生成 ${plan.to_generate} 个镜头${unit} · 预计计费 ${billing(plan, plan.billed_seconds)} ≈ ${usd(plan.estimated_usd)}`
+      : `本片 ${plan.shots_total} 个镜头${unit}已全部生成 · 整片计费约 ${billing(plan, plan.billed_seconds_if_all)} ≈ ${usd(plan.estimated_usd_if_all)}`);
     if (plan.merge_plan && plan.merge_plan.worth_it) {
       rows.push(`还可以合并短镜头省 ≈ ${usd(plan.merge_plan.saving_usd)}`);
     }
@@ -2577,13 +2587,20 @@ async function loadPreflight(action) {
   return currentPreflight;
 }
 
+// 计费口径：视频模型按秒；科普插图按张（preflight 的 unit_kind = image 时「秒数」就是张数）
+function billing(plan, amount) {
+  return plan.unit_kind === 'image'
+    ? `${amount} 张 × $${plan.price_per_second}/张`
+    : `${amount}s × $${plan.price_per_second}/s`;
+}
+
 function videoPlanLine(status) {
   const plan = currentPreflight && currentPreflight.video;
   if (!plan || !plan.shots_total) return '';
   if (status === 'storyboard_review') return '';
   const parts = [
     `本次生成 ${plan.to_generate}/${plan.shots_total} 个片段`,
-    `计费 ${plan.billed_seconds}s × $${plan.price_per_second}/s ≈ <strong>${usd(plan.estimated_usd)}</strong>`,
+    `计费 ${billing(plan, plan.billed_seconds)} ≈ <strong>${usd(plan.estimated_usd)}</strong>`,
     plan.price_source === 'config' ? '（单价取配置）' : '',
   ].filter(Boolean).join(' · ');
   const extra = [];
@@ -2602,7 +2619,7 @@ function videoPlanLine(status) {
 function planConfirmText(plan) {
   const lines = [
     `将生成 ${plan.to_generate} 个片段（共 ${plan.shots_total} 个镜头）`,
-    `计费 ${plan.billed_seconds}s × $${plan.price_per_second}/s ≈ ${usd(plan.estimated_usd)}`,
+    `计费 ${billing(plan, plan.billed_seconds)} ≈ ${usd(plan.estimated_usd)}`,
   ];
   if (plan.regenerate_all) {
     lines.push(`⚠️ ${plan.regenerate_reason}：已就绪的 ${plan.existing_ready} 个片段会全部重新生成`);
@@ -2612,6 +2629,17 @@ function planConfirmText(plan) {
   }
   lines.push('', '确认开始生成吗？');
   return lines.join('\n');
+}
+
+async function setVisualMode(mode) {
+  const clips = ((currentVideo && currentVideo.manifest && currentVideo.manifest.clips) || [])
+    .filter(c => c.status === 'ready').length;
+  if (clips && !confirm(`换画面来源后，已生成的 ${clips} 个片段在下次生成时会全部重做（旧片段留进历史版本）。继续？`)) {
+    $('visual-mode').value = currentProject.visual_mode === 'still' ? 'still' : 'video';
+    return;
+  }
+  withBusy('切换画面来源...', () =>
+    api(`/api/projects/${currentProjectId}`, { method: 'PUT', body: JSON.stringify({ visual_mode: mode }) }));
 }
 
 async function doRedoSegment(shotId) {
@@ -2624,7 +2652,9 @@ async function doRedoSegment(shotId) {
   const what = shot.segment_id
     ? `整段 ${shot.segment_id}（${members.length} 个镜头：${members.map(s => s.id).join('、')}）`
     : `镜头 ${shotId}`;
-  const cost = price ? `，预计 ≈ ${usd(seconds * price)}（${seconds} 秒 × $${price}/秒）` : '';
+  const cost = !price ? ''
+    : plan.unit_kind === 'image' ? `，预计 ≈ ${usd(price)}（重画 1 张图）`
+    : `，预计 ≈ ${usd(seconds * price)}（${seconds} 秒 × $${price}/秒）`;
   if (!confirm(`重做${what}${cost}。\n已生成的这段会被删掉，成片需要重新合成。确定？`)) return;
   // 只确认这一次：确认之后直接提交（第二个确认框里点取消会留下一段已删掉、又没重做的空洞）
   stopVideoPolling();
@@ -3463,7 +3493,7 @@ function renderCost() {
   const upcoming = pre
     ? `<div class="hint" style="margin-top:8px">
          <strong>下一次操作预估</strong>（成本前置 preflight）：
-         视频 ${pre.video ? usd(pre.video.estimated_usd) : '—'}（${pre.video ? pre.video.billed_seconds + 's × $' + pre.video.price_per_second : '—'}）·
+         视频 ${pre.video ? usd(pre.video.estimated_usd) : '—'}（${pre.video ? billing(pre.video, pre.video.billed_seconds) : '—'}）·
          配音 ${pre.audio ? usd(pre.audio.estimated_usd) : '—'}${pre.audio && pre.audio.script_usd ? `（含 LLM 文案 ${usd(pre.audio.script_usd)}）` : ''} ·
          合成 ${pre.compose ? usd(pre.compose.estimated_usd) : '—'}
          ${pre.budget && pre.budget.limited

@@ -37,7 +37,7 @@ from videogen.models.script import (
     Script,
     ScriptOutline,
 )
-from videogen.models.storyboard import Shot
+from videogen.models.storyboard import Shot, Storyboard
 from videogen.providers.llm.base import LLMMessage, LLMProvider
 from videogen.services import bible_service, script_service, storyboard_service
 from videogen.utils.duration import SPEECH_CHARS_PER_SEC, apply_duration_budget, speech_seconds
@@ -57,6 +57,16 @@ def is_explainer(project: Project | None) -> bool:
     return getattr(project, "content_type", None) == ContentType.EXPLAINER
 
 
+#: 科普的两种画面来源
+VISUAL_STILL = "still"
+VISUAL_VIDEO = "video"
+
+
+def uses_stills(project: Project | None) -> bool:
+    """这个项目的画面是不是每句一张 AI 示意图（`visual_mode=still`，只对科普生效）。"""
+    return is_explainer(project) and getattr(project, "visual_mode", "") == VISUAL_STILL
+
+
 def apply_creation_defaults(project: Project, settings: Settings | None = None) -> Project:
     """建项目时给科普项目填默认值（用户没填的才填；短剧原样返回）。
 
@@ -65,6 +75,8 @@ def apply_creation_defaults(project: Project, settings: Settings | None = None) 
     if not is_explainer(project):
         return project
     settings = settings or get_settings()
+    if not project.visual_mode:
+        project.visual_mode = VISUAL_STILL
     if not project.subtitle_style:
         project.subtitle_style = SUBTITLE_STYLE
     if not project.music_mood:
@@ -1179,3 +1191,25 @@ def batch_hold_reasons(
     if errors:
         reasons.append(f"剧本检查有 {len(errors)} 条 ERROR（含 LLM 审稿）：{errors[0].message}")
     return reasons
+
+
+# ── 插图检查 ────────────────────────────────────────────
+
+
+def check_illustrations(project: Project, storyboard: Storyboard | None) -> list[ConsistencyIssue]:
+    """插图模式下讲事实的镜头画面只有 AI 示意图：提醒一次（不拦）。
+
+    AI 示意图适合比喻、氛围、过程；真实事物和数据要换成真实图片或图表（设计文档第四期）。
+    """
+    if not uses_stills(project) or storyboard is None:
+        return []
+    factual = [shot.id for shot in storyboard.shots if shot.fact_refs]
+    if not factual:
+        return []
+    return [_issue(
+        IssueSeverity.WARNING, "",
+        f"{len(factual)} 个讲事实的镜头画面是 AI 示意图（不是真实照片或数据图）",
+        "比喻、氛围、过程演示用示意图没问题；画面要当证据的（具体的物种、天体、仪器、数据），"
+        "暂时只能在分镜里改成不会被误认成真实照片的画面",
+        category="storyboard",
+    )]
