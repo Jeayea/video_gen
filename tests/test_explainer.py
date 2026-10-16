@@ -1162,6 +1162,12 @@ def test_knowledge_items_drop_copied_language_labels():
     assert "English:" not in explainer_service.KNOWLEDGE_SYSTEM
 
 
+def test_knowledge_prompt_keeps_markings_out_of_prop_looks():
+    # 试拍：道具写成「jug with measurement markings」，这段外观作为 key props 进了每张图，
+    # 分镜里写了「不要刻度」的那张照样画出「2 Liter」
+    assert "物品外观也不要写刻度、读数" in explainer_service.KNOWLEDGE_SYSTEM
+
+
 # ── 插图模式（visual_mode=still）─────────────────────
 
 
@@ -1315,3 +1321,21 @@ async def test_switching_visual_mode_regenerates_everything(store, make_pipeline
     plan = await pipeline.preflight(project.id, action="video")
     assert plan["video"]["regenerate_all"] is True
     assert plan["video"]["unit_kind"] == "image"
+
+
+async def test_review_flags_unreferenced_lines_for_overstatement(store, make_pipeline):
+    # 「大水理论」试拍：开场钩子「怎么反倒容易把人喝进急诊？」没标事实，
+    # 把资料里的「可能」说重了，审稿没报
+    project, pipeline, llm = await _with_bible(store, make_pipeline)
+    script = await pipeline.generate_script(project.id)
+    writer = next(c for c in llm.calls if "科普旁白撰稿" in str(c[0].content))
+    assert "不标事实的句子只能是提问、过渡或比喻" in str(writer[0].content)
+
+    script.scenes[0].dialogue[0].fact_refs = []
+    spy = FakeLLM()
+    await explainer_service.review_script(spy, project, script, store.load_bible(project.id))
+    system, user = str(spy.calls[0][0].content), str(spy.calls[0][-1].content)
+    assert "没有依据的句子说过头" in system and "「可能」说成「容易」" in system
+    first, second = script.scenes[0].dialogue[0].line, script.scenes[0].dialogue[1].line
+    assert f"{first}（无依据）" in user
+    assert f"{second}（依据 " in user
