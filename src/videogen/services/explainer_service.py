@@ -1110,3 +1110,28 @@ def voice_script_mode(project: Project | None, mode: str) -> tuple[str, str]:
         f"科普项目的配音文案只允许 off / perform（{mode} 会改写旁白，"
         "旁白和它引用的事实就对不上了），已按 perform 处理：只给念法、不改字"
     )
+
+
+# ── AI 生成标识 ─────────────────────────────────────────
+
+#: 片头显式标识停留多久（秒，变速前口径）。
+#: 《人工智能生成合成内容标识办法》要求视频起始画面加显著提示
+AI_LABEL_SEC = 3.0
+_AI_LABEL_TEXT = {"zh": "本视频由 AI 生成", "en": "This video is AI-generated"}
+
+
+def ai_label_text(project: Project | None, settings: Settings | None = None) -> str:
+    """片头烧进画面的标识文字；不是科普项目或关了 `ai_label` 时返回空串。"""
+    if not is_explainer(project) or not project.ai_label:
+        return ""
+    settings = settings or get_settings()
+    return _AI_LABEL_TEXT.get(settings.language_for(project), _AI_LABEL_TEXT["zh"])
+
+
+def ai_metadata(project: Project | None, settings: Settings | None = None) -> dict[str, str]:
+    """隐式标识：写进 mp4 文件元数据（ffmpeg `-metadata`）。"""
+    text = ai_label_text(project, settings)
+    if not text:
+        return {}
+    note = f"AIGC: {text}（画面与旁白由 AI 生成）"
+    return {"comment": note, "description": note}

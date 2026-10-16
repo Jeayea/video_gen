@@ -55,6 +55,8 @@ class ComposeReport(BaseModel):
     subtitle_mode_effective: SubtitleMode | None = None
     #: 烧字幕用的样式（soft/box/doc/classic）；没烧字幕时为空
     subtitle_style: str = ""
+    #: 片头烧进画面的 AI 生成标识（科普）；空 = 没加。隐式标识写在成片元数据的 comment 里
+    ai_label: str = ""
     segments: list[ComposeSegment] = Field(default_factory=list)
     bgm_id: str = ""
     bgm_path: str = ""

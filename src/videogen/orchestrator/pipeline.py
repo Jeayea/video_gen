@@ -2757,12 +2757,18 @@ class Pipeline:
                 )
             elif settings.bgm_engine_mode != "library":
                 manifest.bgm = None
-            audio_service.align_storyboard(
-                storyboard,
-                manifest,
-                gap_sec=settings.audio_gap_sec,
-                max_ratio=settings.audio_align_max_ratio,
-            )
+            if explainer_service.is_explainer(project):
+                # 科普不把取整后的时长写回分镜：合成时按配音实长 + 句间停顿裁镜头，
+                # 写回了的话「念一句、停半拍」的空隙就固定在分镜里了
+                manifest.adjustments = []
+                storyboard.audio_aligned = True
+            else:
+                audio_service.align_storyboard(
+                    storyboard,
+                    manifest,
+                    gap_sec=settings.audio_gap_sec,
+                    max_ratio=settings.audio_align_max_ratio,
+                )
             self.store.save_storyboard(project_id, storyboard)
             self.store.save_audio_manifest(project_id, manifest)
             # 镜头时长可能被拉长 -> 旧成片作废

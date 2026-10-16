@@ -268,8 +268,14 @@ def build_ass(
     font: str = "",
     font_scale: float = 0.0,
     margin_scale: float = 0.0,
+    label: str = "",
+    label_sec: float = 3.0,
+    cues: bool = True,
 ) -> str:
     """生成烧字幕用的 ASS。
+
+    `label`：片头在画面顶部居中挂 `label_sec` 秒的一行字（科普的「本视频由 AI 生成」），
+    和字幕走同一道烧录；`cues=False` 时只烧这行字、不烧字幕（字幕模式是 none）。
 
     `PlayResX/Y` 直接等于成片分辨率，所以字号 / 边距 / 描边都是**真实像素**，
     不用再往 libass 默认的 384x288 参考系里换算。`font` / `font_scale` /
@@ -322,8 +328,22 @@ def build_ass(
     events = [
         f"Dialogue: 0,{_ass_stamp(start)},{_ass_stamp(end)},Default,,0,0,0,,"
         f"{prefix}{_ass_text(text)}"
-        for start, end, text in _cue_times(segments, audio)
+        for start, end, text in (_cue_times(segments, audio) if cues else [])
     ]
+    styles = [f"Style: {style}"]
+    if label.strip():
+        # 同一套字体与底色，字号小一档，顶部居中（Alignment 8），躲开底部字幕
+        label_style = style.split(",")
+        label_style[0] = "Label"
+        label_style[2] = str(max(10, round(font_px * 0.8)))
+        label_style[18] = "8"
+        label_style[21] = str(round(height * 0.06))
+        styles.append("Style: " + ",".join(label_style))
+        events.insert(
+            0,
+            f"Dialogue: 1,{_ass_stamp(0)},{_ass_stamp(label_sec)},Label,,0,0,0,,"
+            f"{prefix}{_ass_text(label)}",
+        )
     header = [
         "[Script Info]",
         "ScriptType: v4.00+",
@@ -336,7 +356,7 @@ def build_ass(
         "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, "
         "BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, "
         "BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
-        f"Style: {style}",
+        *styles,
         "",
         "[Events]",
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",

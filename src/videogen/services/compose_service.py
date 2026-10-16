@@ -13,7 +13,7 @@ from videogen.models.compose import ComposeReport, ComposeSegment, SubtitleMode
 from videogen.models.project import Project
 from videogen.models.storyboard import Storyboard
 from videogen.models.video import VideoManifest
-from videogen.services import lipsync_service, subtitle_service, video_service
+from videogen.services import explainer_service, lipsync_service, subtitle_service, video_service
 from videogen.utils import loudness as loudness_utils
 from videogen.utils.audio_align import mouth_align_delay
 from videogen.utils.av_sync import check_av_sync, format_sync_warning
@@ -247,8 +247,11 @@ async def _finish(
     loudness_normalize: bool = False,
     target_lufs: float = -16.0,
     true_peak_db: float = -1.5,
+    metadata: dict[str, str] | None = None,
 ) -> SubtitleMode:
     """最后一道工序：混 BGM（可带人声闪避）+ 成片响度归一 + 挂字幕。
+
+    `metadata` 写进成片的全局元数据（科普的隐式 AI 生成标识）。
 
     响度归一放在**最后**：它调的是整条混音的增益，各层之间的比例不变
     （逐条配音的音量对齐在前面分段渲染时就做完了）。
@@ -267,6 +270,9 @@ async def _finish(
     if effective == SubtitleMode.SOFT and "mov_text" not in caps:
         effective = SubtitleMode.NONE
 
+    tags = [
+        arg for key, value in (metadata or {}).items() for arg in ("-metadata", f"{key}={value}")
+    ]
     burn = effective == SubtitleMode.BURN and subtitle_file is not None
     soft = effective == SubtitleMode.SOFT and subtitle_file is not None
     mix = (
@@ -327,6 +333,7 @@ async def _finish(
             "aac",
             "-b:a",
             "160k",
+            *tags,
             "-t",
             f"{duration:.3f}",
             "-movflags",
@@ -374,7 +381,7 @@ async def _finish(
             f"language={sub_language}",
         ]
 
-    args += ["-t", f"{duration:.3f}", "-movflags", "+faststart", output.name]
+    args += [*tags, "-t", f"{duration:.3f}", "-movflags", "+faststart", output.name]
     await run_ffmpeg(args, timeout_sec=FINISH_TIMEOUT_SEC, cwd=cwd)
     return effective
 
@@ -580,7 +587,13 @@ async def compose(
         storyboard, voice_audio, speaker_names=subtitle_service.speaker_name_map(bible)
     )
     segments = [s for s in segments if _bind_video(s, video_manifest, project_dir, warnings)]
-    if settings.compose_follow_clip_length:
+    explainer = explainer_service.is_explainer(project)
+    if explainer:
+        # 科普：镜头按配音实长 + 句间停顿裁（必须在字幕之前：字幕时间轴按段时长累加）
+        await _fit_to_voice(
+            segments, voice_audio, project_dir, settings.explainer_line_gap_sec, warnings
+        )
+    elif settings.compose_follow_clip_length:
         await _follow_clip_lengths(segments, video_manifest, voice_audio, project_dir)
     for segment in segments:
         segment.native_voice = segment.shot_id in native and not segment.audio_path
@@ -620,6 +633,15 @@ async def compose(
             f"成片 {speed:g} 倍速：内嵌软字幕无法随变速缩放，已自动改为烧字幕"
         )
         desired_mode = SubtitleMode.BURN
+    # AI 生成标识：片头烧一行字，字幕不烧的模式也要为它走一趟烧录
+    label = explainer_service.ai_label_text(project, settings)
+    label_only = False
+    if label and desired_mode == SubtitleMode.SOFT:
+        warnings.append("片头要烧录「AI 生成」标识：内嵌软字幕已改为烧字幕")
+        desired_mode = SubtitleMode.BURN
+    elif label and desired_mode == SubtitleMode.NONE:
+        label_only = True
+        desired_mode = SubtitleMode.BURN
     burn_exe: str | None = None
     if desired_mode == SubtitleMode.BURN:
         # 主 ffmpeg 常常没有 libass（brew 的 9.x 就没有），别急着降级：
@@ -630,6 +652,11 @@ async def compose(
             caps = candidate_caps  # 用「真正要执行的那个 exe」的能力判降级
             if candidate_exe and candidate_exe != resolve_ffmpeg():
                 warnings.append(f"主 ffmpeg 没有 libass，烧字幕改用：{candidate_exe}")
+        elif label:
+            raise ComposeError(
+                f"片头要烧录「{label}」标识，但找不到带 libass 的 ffmpeg"
+                "（pip install imageio-ffmpeg）；确定不要标识就把项目的 ai_label 关掉"
+            )
         else:
             warnings.append("当前 ffmpeg 没有 libass，无法烧字幕，已降级为内嵌软字幕")
     if desired_mode != SubtitleMode.NONE and "mov_text" not in caps:
@@ -708,7 +735,8 @@ async def compose(
         on_progress=on_progress,
         ambient=ambient_effective == "under",
         ambient_gain_db=settings.compose_ambient_gain_db,
-        align_mouth=settings.compose_align_dub_to_mouth,
+        # 科普全是旁白：原声里只有环境音，按「开口」推迟只会人为制造空隙
+        align_mouth=settings.compose_align_dub_to_mouth and not explainer,
         mouth_align_max_sec=settings.compose_mouth_align_max_sec,
         synced=synced,
         normalize_voice=settings.audio_normalize,
@@ -759,13 +787,22 @@ async def compose(
     subtitles_path: Path | None = None
     subtitles_vtt_path: Path | None = None
     srt = subtitle_service.build_srt(segments, voice_audio)
-    if srt.strip():
+    if srt.strip() and not label_only:
         subtitles_path = output_dir / "subtitles.srt"
         subtitles_path.write_text(srt, encoding="utf-8")
         subtitles_vtt_path = output_dir / "subtitles.vtt"
         subtitles_vtt_path.write_text(
             subtitle_service.build_vtt(segments, voice_audio), encoding="utf-8"
         )
+    elif label_only:
+        # 字幕模式 none：侧挂文件照旧导出，只是不烧
+        subtitles_path = None
+        if srt.strip():
+            (output_dir / "subtitles.srt").write_text(srt, encoding="utf-8")
+            subtitles_vtt_path = output_dir / "subtitles.vtt"
+            subtitles_vtt_path.write_text(
+                subtitle_service.build_vtt(segments, voice_audio), encoding="utf-8"
+            )
     else:
         subtitles_path = None
         warnings.append("没有台词内容，未生成字幕")
@@ -773,7 +810,7 @@ async def compose(
     # 烧字幕用 ASS：样式（字体 / 柔化 / 阴影 / 底条）写在文件里，像素单位 = 成片分辨率
     burn_path: Path | None = None
     look_name, look = subtitle_service.subtitle_look(settings.compose_subtitle_style)
-    if subtitles_path is not None and desired_mode == SubtitleMode.BURN:
+    if (subtitles_path is not None or label) and desired_mode == SubtitleMode.BURN:
         burn_path = output_dir / "subtitles.ass"
         burn_path.write_text(
             subtitle_service.build_ass(
@@ -784,6 +821,9 @@ async def compose(
                 font=settings.compose_subtitle_font,
                 font_scale=settings.compose_subtitle_font_scale,
                 margin_scale=settings.compose_subtitle_margin_scale,
+                label=label,
+                label_sec=explainer_service.AI_LABEL_SEC,
+                cues=not label_only,
             ),
             encoding="utf-8",
         )
@@ -817,7 +857,7 @@ async def compose(
         bgm_path=bgm_path,
         bgm_gain_db=bgm.gain_db if bgm and bgm.gain_db is not None else settings.bgm_gain_db,
         fade_sec=bgm_fade,
-        subtitle_file=subtitles_path,
+        subtitle_file=subtitles_path or burn_path,
         # 变速会把 soft 升级成 burn：传「真正要用的模式」，不是配置里的原值
         mode=SubtitleMode(desired_mode),
         caps=caps,
@@ -835,7 +875,12 @@ async def compose(
         loudness_normalize=settings.compose_loudness_normalize,
         target_lufs=settings.target_lufs,
         true_peak_db=settings.true_peak_db,
+        metadata=explainer_service.ai_metadata(project, settings),
     )
+    if label and effective_mode != SubtitleMode.BURN:
+        raise ComposeError(f"片头「{label}」标识没有烧进画面（字幕烧录失败），成片不交付")
+    if label_only:
+        effective_mode = SubtitleMode.NONE  # 只烧了标识，字幕仍是 none
     if bgm_path and bgm is not None:
         engine_label = {
             "generate": "本机现写",
@@ -927,6 +972,7 @@ async def compose(
         speed=speed,
         subtitle_mode=SubtitleMode(settings.subtitle_mode),
         subtitle_style=look_name if effective_mode == SubtitleMode.BURN else "",
+        ai_label=label,
         subtitle_mode_effective=effective_mode,
         segments=segments,
         bgm_id=bgm.id if bgm else "",
@@ -1309,6 +1355,35 @@ async def _follow_clip_lengths(
             # 已经按配音拉长过的镜头保留拉长后的时长（尾部冻结帧是有意的）
             need = max(need, segment.duration_sec)
         segment.duration_sec = round(max(length, need), 3)
+
+
+async def _fit_to_voice(
+    segments: list[ComposeSegment],
+    audio: AudioManifest | None,
+    project_dir: Path,
+    gap_sec: float,
+    warnings: list[str],
+) -> None:
+    """科普：有配音的镜头长度 = 配音实长 + 句间停顿（片段多出来的画面裁掉）。
+
+    镜头时长是向上取整的整数秒，照分镜放就是「念一句、停半拍」。配音比片段还长时
+    渲染会冻结末帧补足，这里只记一条 warning。没有配音的镜头照分镜时长。
+    """
+    frozen: list[str] = []
+    for segment in segments:
+        voice = audio.for_shot(segment.shot_id) if audio and segment.audio_path else None
+        if voice is None or voice.duration_sec <= 0:
+            continue
+        need = round(max(0.0, voice.offset_sec) + voice.duration_sec + max(0.0, gap_sec), 3)
+        length = await probe_duration(project_dir / segment.video_path)
+        if length and need > length + 0.05:
+            frozen.append(f"{segment.shot_id}（{need - length:.1f}s）")
+        segment.duration_sec = need
+    if frozen:
+        warnings.append(
+            f"{len(frozen)} 个镜头的旁白比画面长，末尾冻结画面补足：{'、'.join(frozen[:5])}"
+            f"{' …' if len(frozen) > 5 else ''}"
+        )
 
 
 def _passthrough_groups(

@@ -2,28 +2,42 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 
+from tests.conftest import wait_for_job
+from tests.factories import small_project
 from tests.fakes import FakeBgmLibrary, FakeLLM, FakeTTSProvider, FakeVideoProvider
 from videogen import main
+from videogen.models.audio import AudioClip, AudioManifest
 from videogen.models.bible import Character, Fact, StoryBible
+from videogen.models.compose import ComposeSegment, SubtitleMode
 from videogen.models.consistency import IssueSeverity
 from videogen.models.explainer import KnowledgeFact, KnowledgeResponse, NewFact
 from videogen.models.project import ContentType, Project
 from videogen.models.script import NARRATOR, DialogueLine, Scene, Script
 from videogen.models.storyboard import Shot
+from videogen.models.video import ClipStatus
 from videogen.orchestrator.pipeline import Pipeline, PipelineError
+from videogen.providers.tts.mock import MockTTSProvider
+from videogen.providers.video.mock import MockVideoProvider
 from videogen.services import (
     audio_service,
+    compose_service,
     consistency_service,
     explainer_service,
+    subtitle_service,
     video_service,
     voice_catalog,
 )
+from videogen.utils.ffmpeg import describe_media, ffmpeg_available
 from videogen.utils.file_store import FileStore
+
+requires_ffmpeg = pytest.mark.skipif(not ffmpeg_available(), reason="需要 ffmpeg")
 
 NARRATION = "天之所以是蓝的，是因为空气把蓝光散射得最多。"
 
@@ -776,3 +790,202 @@ def test_presenter_line_becomes_dialogue_in_frame():
     assert (shots[0].narration, shots[0].fact_refs) == ("天为什么是蓝的？", ["fact_1"])
     assert (shots[1].dialogue_text, shots[1].dialogue_speaker) == ("我们来做个实验。", "char_1")
     assert shots[1].narration is None and shots[1].character_in_frame == ["char_1"]
+
+
+# ── 配音与合成 ────────────────────────────────────────
+
+
+def test_ai_label_only_for_explainer_with_label_on(settings):
+    assert explainer_service.ai_label_text(Project(title="短剧")) == ""
+    assert explainer_service.ai_label_text(_explainer(ai_label=False)) == ""
+    assert explainer_service.ai_label_text(_explainer()) == "本视频由 AI 生成"
+    assert "AI-generated" in explainer_service.ai_label_text(_explainer(language="en"))
+    assert explainer_service.ai_metadata(Project(title="短剧")) == {}
+    assert "AIGC" in explainer_service.ai_metadata(_explainer())["comment"]
+
+
+def test_ass_label_sits_on_top_for_the_first_seconds():
+    segments = [
+        ComposeSegment(shot_id="a", index=0, duration_sec=2.0, text="第一句旁白"),
+        ComposeSegment(shot_id="b", index=1, duration_sec=2.0, text="第二句旁白"),
+    ]
+    look = subtitle_service.subtitle_look("box")[1]
+    ass = subtitle_service.build_ass(
+        segments, resolution=(1080, 1920), look=look, label="本视频由 AI 生成", label_sec=3.0
+    )
+    label_style = next(line for line in ass.splitlines() if line.startswith("Style: Label"))
+    assert label_style.split(",")[18] == "8"  # 顶部居中，躲开底部字幕
+    assert "Dialogue: 1,0:00:00.00,0:00:03.00,Label" in ass
+    assert "第一句旁白" in ass
+
+    only = subtitle_service.build_ass(
+        segments, resolution=(1080, 1920), look=look, label="本视频由 AI 生成", cues=False
+    )
+    assert [line for line in only.splitlines() if line.startswith("Dialogue")] == [
+        "Dialogue: 1,0:00:00.00,0:00:03.00,Label,,0,0,0,,本视频由 AI 生成"
+    ]
+    plain = subtitle_service.build_ass(segments, resolution=(1080, 1920), look=look)
+    assert "Label" not in plain
+
+
+def test_fit_to_voice_trims_to_speech_plus_gap(tmp_path, monkeypatch):
+    lengths = {"a.mp4": 4.0, "b.mp4": 2.0, "c.mp4": 3.0}
+
+    async def fake_probe(path, **_):
+        return lengths[Path(path).name]
+
+    monkeypatch.setattr(compose_service, "probe_duration", fake_probe)
+    segments = [
+        ComposeSegment(shot_id=sid, index=i, duration_sec=dur, video_path=f"{sid}.mp4",
+                       audio_path=audio)
+        for i, (sid, dur, audio) in enumerate(
+            [("a", 4.0, "audio/a.wav"), ("b", 3.0, "audio/b.wav"), ("c", 3.0, None)]
+        )
+    ]
+    audio = AudioManifest(
+        clips=[
+            AudioClip(id=sid, shot_id=sid, text="旁白", voice="v", status=ClipStatus.READY,
+                      path=f"audio/{sid}.wav", duration_sec=dur)
+            for sid, dur in (("a", 2.31), ("b", 2.6))
+        ]
+    )
+    warnings: list[str] = []
+    asyncio.run(compose_service._fit_to_voice(segments, audio, tmp_path, 0.2, warnings))
+    assert [s.duration_sec for s in segments] == [2.51, 2.8, 3.0]
+    assert len(warnings) == 1 and "b（0.8s）" in warnings[0]  # 画面 2 秒不够，冻结补足
+
+
+def test_finish_writes_metadata_on_both_paths(tmp_path, monkeypatch):
+    seen: list[list[str]] = []
+
+    async def fake_run(args, **_):
+        seen.append(args)
+
+    monkeypatch.setattr(compose_service, "run_ffmpeg", fake_run)
+    for mode in (SubtitleMode.BURN, SubtitleMode.SOFT):
+        asyncio.run(
+            compose_service._finish(
+                Path("base.mp4"), Path("final.mp4"), cwd=tmp_path, duration=5.0,
+                bgm_path=None, bgm_gain_db=-20.0, fade_sec=1.0,
+                subtitle_file=Path("subtitles.ass"), burn_file=Path("subtitles.ass"),
+                mode=mode, caps={"subtitles", "mov_text"}, crf=23, preset="veryfast",
+                metadata={"comment": "AIGC: 本视频由 AI 生成"},
+            )
+        )
+    for args in seen:
+        index = args.index("-metadata")
+        assert args[index + 1] == "comment=AIGC: 本视频由 AI 生成"
+
+
+@requires_ffmpeg  # 科普强制段落分镜：整段要用 ffmpeg 切回单镜
+async def test_explainer_audio_does_not_write_back_durations(store, make_pipeline):
+    llm = FakeLLM()
+    project, _, _, storyboard = await _with_storyboard(store, make_pipeline, llm)
+    pipeline = Pipeline(
+        store,
+        llm_factory=lambda: llm,
+        video_factory=lambda: MockVideoProvider(),
+        tts_factory=lambda: FakeTTSProvider(),
+        bgm_factory=lambda: FakeBgmLibrary(),
+    )
+    await pipeline.confirm_storyboard(project.id, force=True)
+    job = await pipeline.start_video_generation(project.id)
+    await wait_for_job(pipeline, job.id)
+    job = await pipeline.start_audio_generation(project.id, script_mode="polish")
+    finished = await wait_for_job(pipeline, job.id)
+    assert finished.status.value == "succeeded", finished.error
+
+    after = store.load_storyboard(project.id)
+    assert [s.duration_sec for s in after.shots] == [s.duration_sec for s in storyboard.shots]
+    assert [s.narration for s in after.shots] == [s.narration for s in storyboard.shots]
+    manifest = store.load_audio_manifest(project.id)
+    assert manifest.adjustments == []
+    assert manifest.script_mode == "perform"
+    assert any("只允许 off / perform" in w for w in manifest.warnings)
+    assert "perform" in llm.voice_modes and "polish" not in llm.voice_modes
+
+
+def _explainer_media_project(store, *, ai_label: bool = True) -> Project:
+    project = small_project(store, shots=2, shot_duration=3, dialogue="天之所以是蓝的。")
+    project = project.model_copy(
+        update={"content_type": ContentType.EXPLAINER, "ai_label": ai_label}
+    )
+    store.save_project(project)
+    storyboard = store.load_storyboard(project.id)
+    for shot in storyboard.shots:
+        shot.narration, shot.dialogue_text, shot.dialogue_speaker = shot.dialogue_text, None, None
+    store.save_storyboard(project.id, storyboard)
+    return project
+
+
+async def _compose_explainer(store, project, overrides=None):
+    pipeline = Pipeline(
+        store,
+        llm_factory=lambda: FakeLLM(),
+        video_factory=lambda: MockVideoProvider(),
+        tts_factory=lambda: MockTTSProvider(),
+        bgm_factory=lambda: FakeBgmLibrary(),
+    )
+    for start in (pipeline.start_video_generation, pipeline.start_audio_generation):
+        job = await start(project.id)
+        await wait_for_job(pipeline, job.id)
+    job = await pipeline.start_compose(project.id, overrides=overrides)
+    finished = await wait_for_job(pipeline, job.id, timeout=180)
+    return finished, store.load_compose_report(project.id)
+
+
+@requires_ffmpeg
+async def test_explainer_compose_trims_to_voice_and_labels(store, monkeypatch):
+    project = _explainer_media_project(store)
+    seen: dict = {}
+    original = compose_service._render_all
+
+    async def spy(*args, **kwargs):
+        seen["align_mouth"] = kwargs.get("align_mouth")
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(compose_service, "_render_all", spy)
+    finished, report = await _compose_explainer(
+        store, project, {"compose_subtitle_mode": "soft"}
+    )
+    assert finished.status.value == "succeeded", finished.error
+    if not any("AI 生成」标识" in w for w in report.warnings):
+        pytest.skip("本机没有带 libass 的 ffmpeg")
+
+    assert seen["align_mouth"] is False
+    audio = store.load_audio_manifest(project.id)
+    for segment in report.segments:
+        voice = audio.for_shot(segment.shot_id)
+        assert segment.duration_sec == pytest.approx(voice.duration_sec + 0.2, abs=0.001)
+    assert store.load_storyboard(project.id).shots[0].duration_sec == 3  # 分镜没被改
+
+    assert report.ai_label == "本视频由 AI 生成"
+    assert report.subtitle_mode_effective == SubtitleMode.BURN
+    ass = (store.output_dir(project.id) / "subtitles.ass").read_text(encoding="utf-8")
+    assert "本视频由 AI 生成" in ass and "天之所以是蓝的" in ass
+    info = await describe_media(store.output_dir(project.id) / "final.mp4")
+    assert "AIGC" in info
+
+
+@requires_ffmpeg
+async def test_explainer_label_is_burned_even_without_subtitles(store):
+    project = _explainer_media_project(store)
+    finished, report = await _compose_explainer(store, project, {"compose_subtitle_mode": "none"})
+    if finished.status.value != "succeeded" and "libass" in (finished.error or ""):
+        pytest.skip("本机没有带 libass 的 ffmpeg")
+    assert finished.status.value == "succeeded", finished.error
+    assert report.subtitle_mode_effective == SubtitleMode.NONE
+    assert report.ai_label
+    ass = (store.output_dir(project.id) / "subtitles.ass").read_text(encoding="utf-8")
+    assert "天之所以是蓝的" not in ass  # 字幕不烧，只烧标识
+    assert (store.output_dir(project.id) / "subtitles.srt").is_file()  # 侧挂照旧
+
+
+@requires_ffmpeg
+async def test_explainer_without_label_keeps_soft_subtitles(store):
+    project = _explainer_media_project(store, ai_label=False)
+    finished, report = await _compose_explainer(store, project, {"compose_subtitle_mode": "soft"})
+    assert finished.status.value == "succeeded", finished.error
+    assert report.ai_label == ""
+    assert report.subtitle_mode_effective == SubtitleMode.SOFT
+    assert "AIGC" not in await describe_media(store.output_dir(project.id) / "final.mp4")
