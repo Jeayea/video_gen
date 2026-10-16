@@ -270,6 +270,9 @@ KNOWLEDGE_SYSTEM = """你是科普知识底稿编辑。为一支 30-120 秒的�
 - visual_prompt 必须是英文，只写看得见的东西；不要出现公式、数据、标注这类知识性文字。
   物品外观也不要写刻度、读数、计时标记、标签和包装文字：这段描述会跟着这件物品进每一张图，
   图片模型照着画出来的数字几乎都是错的
+- 瓶、壶、桶、杯这类容器的 visual_prompt 写明开口：在哪、几个、什么样（"a single open screw-top
+  mouth at the top, no other openings"）。不写的话每张图的出水方式都不一样（拧盖、泵头、龙头），
+  人喝水时嘴也对不上瓶口
 - style.explainer_tone 按题目选一个：serious（严肃的医疗、安全、灾难、历史悲剧）/ light（一般科普）/
   meme（网络热词、流行现象、段子式的问题，即使和健康有关也可以选）
 - style.illustration_style 按题目选一个最合适的插图画风：{styles}
@@ -1179,6 +1182,9 @@ VISUALS_SYSTEM = """你是科普画面分镜师。一支科普讲解短片的旁
 - **物品上也不要有字和数字**：不要写带刻度、读数、计时标记、包装文字的东西
   （量杯刻度、仪表盘、水瓶上的毫升数），模型画出来的数字几乎都是错的；
   要表达「多少」就用对比（大杯 vs 小杯、满 vs 半满）
+- **人和物的接触要写清楚**：喝、倒、接、拧这类动作，写明接触点和方向（"lips sealed around the jug's
+  only opening at the top, jug tilted so the opening points down into the mouth"）。只写「豪饮」
+  「猛灌」时，图片模型会把嘴贴在瓶身随便一处、再补画一个瓶口
 - 画面里本来就不需要人时不要硬塞人；character_in_frame 只能填角色列表里已有的 id，没有就给空数组
 - video_prompt 必须全英文，禁止出现 char_1 / loc_1 这类内部 id，背景写到具体的可见物、光从哪来
 - 一个镜头只写一个连续的画面，不要在一句 video_prompt 里塞多个画面切换

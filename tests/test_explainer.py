@@ -1472,3 +1472,10 @@ async def test_outline_with_too_few_scenes_is_asked_again(store, make_pipeline):
     project, _, _ = await _with_bible(store, make_pipeline, stubborn)
     with pytest.raises(ValueError, match="2 次都只给了 4 场"):
         await explainer_service.generate_outline(stubborn, project, store.load_bible(project.id))
+
+
+def test_prompts_pin_down_container_openings_and_contact_points():
+    # 「大水理论」玩梗版：两张喝水的图嘴都没对着瓶口（瓶口在另一头 / 嘴贴在瓶身上），
+    # 桶在不同镜头里一会儿拧盖、一会儿泵头
+    assert "人和物的接触要写清楚" in explainer_service.VISUALS_SYSTEM
+    assert "容器的 visual_prompt 写明开口" in explainer_service.KNOWLEDGE_SYSTEM
