@@ -41,6 +41,7 @@ from videogen.services import (
     consistency_service,
     cost_service,
     dub_guide_service,
+    explainer_service,
     image_prompt_service,
     keyframe_service,
     music_service,
@@ -828,6 +829,7 @@ class Pipeline:
                 project.target_duration_sec,
                 strict=get_settings().script_strict,
                 partial=self._is_partial_arc(project_id),
+                explainer=explainer_service.is_explainer(project),
             )
             if review_issues:
                 report = report.model_copy(
@@ -1370,6 +1372,7 @@ class Pipeline:
                 project.target_duration_sec,
                 strict=get_settings().script_strict,
                 partial=self._is_partial_arc(project_id),
+                explainer=explainer_service.is_explainer(project),
             )
             issues = consistency_service.validate_storyboard(storyboard, script, bible)
             report = consistency_service.merge_storyboard_issues(script_report, issues)
@@ -3068,6 +3071,7 @@ class Pipeline:
                 project.target_duration_sec,
                 strict=get_settings().script_strict,
                 partial=self._is_partial_arc(project.id),
+                explainer=explainer_service.is_explainer(project),
             )
             storyboard = self.store.load_storyboard(project.id)
             if storyboard and storyboard.shots:

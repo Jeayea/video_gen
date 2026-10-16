@@ -5,7 +5,7 @@ import re
 
 from videogen.models.bible import StoryBible
 from videogen.models.consistency import ConsistencyIssue, ConsistencyReport, IssueSeverity
-from videogen.models.script import Scene, Script
+from videogen.models.script import NARRATOR, Scene, Script
 from videogen.models.storyboard import Shot, Storyboard
 from videogen.models.world_state import WorldState
 from videogen.utils.duration import deviation_ratio, speech_chars, speech_seconds
@@ -46,6 +46,7 @@ def validate_script(
     *,
     strict: bool = False,
     partial: bool = False,
+    explainer: bool = False,
 ) -> ConsistencyReport:
     """检查剧本与故事圣经之间的一致性。
 
@@ -53,13 +54,16 @@ def validate_script(
       ERROR 会让「确认剧本」被拒绝（可 force 跳过）
     - `partial=True` 表示「这只是长篇剧集里选中的几章」：此时**不能**因为结尾还悬着就报警，
       因为后面还要继续展开别的章（否则选前两章必然被拦）
+    - `explainer=True`：科普项目，旁白句的说话人是保留 id `narrator`，不算未知角色
     """
     issues: list[ConsistencyIssue] = []
     known_names = bible.all_names()
     known_ids = {c.id for c in bible.characters}
 
     for scene in script.scenes:
-        issues.extend(_check_dialogue_speakers(scene, known_ids))
+        issues.extend(
+            _check_dialogue_speakers(scene, known_ids | ({NARRATOR} if explainer else set()))
+        )
         issues.extend(_check_names_in_text(scene, known_names))
         issues.extend(_check_numbers(scene, bible))
         issues.extend(_check_scene_content(scene, strict=strict))

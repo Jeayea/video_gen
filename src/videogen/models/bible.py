@@ -86,10 +86,29 @@ class Prop(BaseModel):
     reference_image: str = ""
 
 
+FACT_STATUSES = ("unverified", "confirmed", "rejected")
+
+
 class Fact(BaseModel):
     id: str
     content: str
     type: str = "general"  # number / timeline / relationship / general
+    #: 科普：出处 —— 参考资料里的原句，或「模型自述」。短剧不用
+    source: str = ""
+    #: 科普：人工核对状态（unverified / confirmed / rejected）。短剧不用
+    status: str = "unverified"
+
+    @field_validator("source", mode="before")
+    @classmethod
+    def _stringify_source(cls, value: object) -> str:
+        return "" if value is None else str(value)
+
+    @field_validator("status", mode="before")
+    @classmethod
+    def _coerce_status(cls, value: object) -> str:
+        # 不认识的值一律当「未核对」：宁可多核一遍，也不能把笔误当成「已确认」
+        text = str(value or "").strip().lower()
+        return text if text in FACT_STATUSES else "unverified"
 
 
 class StyleGuide(BaseModel):

@@ -23,6 +23,13 @@ class InputMode(str, Enum):
     NOVEL = "novel"
 
 
+class ContentType(str, Enum):
+    #: 短剧（默认）：角色、冲突、台词
+    DRAMA = "drama"
+    #: 知识讲解：旁白为主线，每句旁白挂到知识底稿里的事实上（docs/EXPLAINER_DESIGN.md）
+    EXPLAINER = "explainer"
+
+
 class ProjectStatus(str, Enum):
     """阶段状态机。
 
@@ -75,6 +82,14 @@ class Project(BaseModel):
     target_duration_sec: int = 45
     input_mode: InputMode = InputMode.THEME
     input_text: str = ""
+    #: 内容类型（建项目时定，之后不改）
+    content_type: ContentType = ContentType.DRAMA
+    #: 科普：目标观众，进提示词（「初中生」「没有物理基础的成年人」）
+    audience: str = ""
+    #: 科普：参考资料原文（可空）。有资料时事实只能从资料里取
+    source_material: str = ""
+    #: 科普：成片加「AI 生成」标识（片头显式 + 文件元数据隐式）。短剧不读
+    ai_label: bool = True
     #: 该项目的 LLM 模型（空 = 用 .env 里的默认）。多模型切换用。
     llm_model: str = ""
     #: **整片的国家/地区限定**（cn/jp/kr/west/india/mideast/africa/latam/sea/other；

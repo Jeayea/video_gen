@@ -16,6 +16,7 @@ from videogen.models.audio import (
 )
 from videogen.models.bible import StoryBible
 from videogen.models.project import Project
+from videogen.models.script import NARRATOR
 from videogen.models.storyboard import Shot, Storyboard
 from videogen.models.video import ClipStatus, MediaKind
 from videogen.providers.bgm.base import BgmLibrary
@@ -29,7 +30,6 @@ logger = logging.getLogger(__name__)
 
 ProgressCallback = Callable[[AudioManifest], None] | None
 
-NARRATOR = "narrator"
 #: 原声引导的配音允许越过镜头末尾这么多（探测余量 + 字尾气声），不为它拉长镜头
 _GUIDED_SLACK_SEC = 0.15
 DEFAULT_RETRY_BACKOFF_SEC = 1.5

@@ -13,10 +13,15 @@ DEFAULT_CHAPTER_SCENES = 3
 DEFAULT_CHAPTER_DURATION_SEC = 36
 DEFAULT_CHAPTER_CHUNK = 4
 
+#: 旁白的保留说话人 id（不是角色）：配音走旁白音色；科普项目的剧本用它写旁白句
+NARRATOR = "narrator"
+
 
 class DialogueLine(BaseModel):
-    speaker: str = ""  # character id
+    speaker: str = ""  # character id，或 NARRATOR
     line: str = ""
+    #: 科普：这句话依据知识底稿里的哪几条事实（fact_1…）；纯过渡句为空。短剧不用
+    fact_refs: StrList = Field(default_factory=list)
 
     @field_validator("speaker", "line", mode="before")
     @classmethod

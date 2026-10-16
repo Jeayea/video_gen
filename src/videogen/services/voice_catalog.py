@@ -23,6 +23,7 @@ from dataclasses import dataclass
 
 from videogen.config import Settings, get_settings
 from videogen.models.bible import Character, StoryBible
+from videogen.models.script import NARRATOR
 from videogen.models.storyboard import VoiceDirection
 
 logger = logging.getLogger(__name__)
@@ -39,8 +40,6 @@ __all__ = [
     "is_cloud_voice",
     "voice_gender",
 ]
-
-NARRATOR = "narrator"
 
 #: 云端 TTS（OpenRouter 的 openai/gpt-audio-mini）可用音色。
 #: 云端只有名字、没有中文音色表那种元数据，所以选角仍然用 Edge 那份带元数据的表打分，

@@ -28,7 +28,7 @@ from videogen.providers.video.base import (
     VideoReferenceRejected,
     VideoRequest,
 )
-from videogen.services import voice_catalog
+from videogen.services import explainer_service, voice_catalog
 from videogen.services.storyboard_service import Segment, chain_predecessors, segments_of
 from videogen.utils import language, media_history, region
 from videogen.utils.ffmpeg import cut_clip, detect_cuts, ffmpeg_available, probe_duration
@@ -746,7 +746,7 @@ def build_segment_prompt(
             spoken = dialogue_directive(shot, bible)
             if spoken:
                 parts.append(spoken)
-        narrated = narration_directive(shot, settings=settings)
+        narrated = narration_directive(shot, settings=settings, project=project)
         if narrated:
             parts.append(narrated)
         body = ", ".join(p for p in parts if p)
@@ -1053,7 +1053,7 @@ def build_prompt(
         spoken = dialogue_directive(shot, bible)
         if spoken:
             parts.append(spoken)
-    narrated = narration_directive(shot, settings=settings)
+    narrated = narration_directive(shot, settings=settings, project=project)
     if narrated:
         parts.append(narrated)
     # 背景丰富度：分镜只写 "in an office" 时模型会画空墙，这段是统一的最低要求
@@ -1244,13 +1244,20 @@ def dialogue_directive(shot: Shot, bible: StoryBible | None = None) -> str:
     )
 
 
-def narration_directive(shot: Shot, *, settings: Settings | None = None) -> str:
+def narration_directive(
+    shot: Shot, *, settings: Settings | None = None, project: Project | None = None
+) -> str:
     """把这一镜的旁白交给开着原生音频的视频模型念（`VIDEO_PROMPT_NARRATION`）。
 
     旁白是画外音：必须写明「画面里没人说话、没人动嘴」，否则模型会让画面里的人对着旁白
     动嘴（和画外台词一个道理）。有台词的镜头不写旁白 —— 一个镜头只有一条声音（已知限制 3）。
+
+    科普项目一律不写：写了之后 `native_narration_shots` 会把这些镜头判成「原声念过了」、
+    跳过 TTS，每段换一个嗓子，「全片一个旁白声音」就做不到了。
     """
     settings = settings or get_settings()
+    if explainer_service.is_explainer(project):
+        return ""
     if not settings.video_prompt_narration or str(shot.dialogue_text or "").strip():
         return ""
     text = " ".join(str(shot.narration or "").split())
@@ -1569,10 +1576,17 @@ def _safe_relative(relative: str) -> bool:
 
 
 def dub_mode_for(project: Project | None, settings: Settings | None = None) -> str:
-    """这个项目的人声来源：项目字段优先，其次 `AUDIO_DUB_MODE`。"""
+    """这个项目的人声来源：项目字段优先，其次内容类型（科普默认 tts），最后 `AUDIO_DUB_MODE`。
+
+    科普要「全片一个旁白声音」，视频原声每段一个嗓子，所以项目没明确选时不跟全局的 native。
+    """
     settings = settings or get_settings()
     mode = (getattr(project, "dub_mode", "") or "").strip().lower()
-    return mode if mode in {"native", "tts"} else settings.dub_mode
+    if mode in {"native", "tts"}:
+        return mode
+    if explainer_service.is_explainer(project):
+        return "tts"
+    return settings.dub_mode
 
 
 def native_voice_shots(

@@ -109,6 +109,8 @@ class Shot(BaseModel):
     voice_script_original: str = ""
     #: LLM 给的念法建议（rate / volume / pitch），合成配音时优先于全局设置
     voice_direction: VoiceDirection | None = None
+    #: 科普：这一镜的旁白依据哪几条事实（从剧本旁白句继承）。短剧不用
+    fact_refs: StrList = Field(default_factory=list)
 
     @field_validator("duration_sec", mode="before")
     @classmethod

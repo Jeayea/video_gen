@@ -18,7 +18,7 @@ from videogen.models.audio import AudioManifest
 from videogen.models.bible import Character, StoryBible
 from videogen.models.music import MusicPlan
 from videogen.models.music import MusicRequest as MusicGenerateRequest
-from videogen.models.project import AspectRatio, InputMode, Project
+from videogen.models.project import AspectRatio, ContentType, InputMode, Project
 from videogen.orchestrator.batch import STOP_AFTER_STAGES, BatchManager
 from videogen.orchestrator.pipeline import Pipeline, PipelineError, PipelineNotFound
 from videogen.providers import bgm as bgm_providers
@@ -30,6 +30,7 @@ from videogen.providers.video.base import VideoProviderError
 from videogen.services import (
     asset_service,
     character_image_service,
+    explainer_service,
     lipsync_service,
     music_service,
     subtitle_service,
@@ -262,6 +263,11 @@ class CreateProjectRequest(BaseModel):
     target_duration_sec: int = Field(default=45, ge=5, le=600)
     #: 成片语言（zh / en；空 = 用 .env 的 PROJECT_LANGUAGE）
     language: str = Field(default="", pattern="^(zh|en|)$")
+    #: 内容类型（drama 短剧 / explainer 知识讲解）；建项目时定，之后不改
+    content_type: ContentType = ContentType.DRAMA
+    #: 科普：目标观众 / 参考资料原文
+    audience: str = Field(default="", max_length=200)
+    source_material: str = ""
 
 
 class UpdateProjectRequest(BaseModel):
@@ -291,6 +297,10 @@ class UpdateProjectRequest(BaseModel):
     dub_mode: str | None = Field(default=None, pattern="^(native|tts|)$")
     #: 成片语言（zh / en；空字符串 = 恢复默认）。只影响之后的生成，已有剧本不会被翻译
     language: str | None = Field(default=None, pattern="^(zh|en|)$")
+    #: 科普：目标观众 / 参考资料原文 / AI 生成标识（短剧项目改了也不读）
+    audience: str | None = Field(default=None, max_length=200)
+    source_material: str | None = None
+    ai_label: bool | None = None
 
 
 
@@ -582,6 +592,8 @@ async def health():
 
 @app.post("/api/projects")
 async def create_project(req: CreateProjectRequest):
+    if req.content_type == ContentType.EXPLAINER and req.input_mode == InputMode.NOVEL:
+        raise HTTPException(400, "科普讲解不支持小说模式：请用主题 / 大纲 / 完整旁白")
     project = Project(
         title=req.title.strip(),
         input_mode=req.input_mode,
@@ -589,7 +601,11 @@ async def create_project(req: CreateProjectRequest):
         aspect_ratio=req.aspect_ratio,
         target_duration_sec=req.target_duration_sec,
         language=req.language,
+        content_type=req.content_type,
+        audience=req.audience.strip(),
+        source_material=req.source_material.strip(),
     )
+    explainer_service.apply_creation_defaults(project)
     store.create_project(project)
     return project.model_dump()
 
