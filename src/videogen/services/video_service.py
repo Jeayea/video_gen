@@ -1141,7 +1141,10 @@ def _split_clauses(text: str) -> list[str]:
     return [part.strip() for part in re.split(r"[,.;]", text) if part.strip()]
 
 
-_STILL_NO_TEXT = "No text, no letters, no numbers, no labels, no captions, no watermark"
+_STILL_NO_TEXT = (
+    "No text, no letters, no numbers, no labels, no captions, no watermark; "
+    "objects carry no printed markings, no measurement scales, no brand names"
+)
 _STILL_RULES = (
     "One single image with one clear subject. No split panels, no collage, no film strip, "
     "no borders or frames, no storyboard layout"

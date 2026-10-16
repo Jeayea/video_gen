@@ -693,6 +693,7 @@ async def test_storyboard_visual_prompt_carries_the_rules(store, make_pipeline):
     )
     assert "不许合并、拆分、跳过句子" in system
     assert "no text, no labels" in system
+    assert "物品上也不要有字和数字" in system
     assert "1. " in llm.explainer_visual_prompts[0]
 
 
@@ -1203,6 +1204,8 @@ def test_still_prompt_is_an_image_prompt_without_text(settings):
     assert "macro shot of a prism" in prompt and "setting: a dim lab bench" in prompt
     assert f"style: {settings.explainer_illustration_style}" in prompt
     assert "No text, no letters, no numbers" in prompt and "no film strip" in prompt
+    # 试拍：水瓶上的刻度被画成「2.1 mL」「2Ller」，物品上的字和数字一律不要
+    assert "no measurement scales" in prompt
     assert "阳光" not in prompt and "彩虹" not in prompt  # 中文一律不进图片 prompt
     assert "single continuous take" not in prompt  # 视频的表演 / 一镜到底要求不进来
 
