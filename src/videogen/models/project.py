@@ -93,6 +93,12 @@ class Project(BaseModel):
     #: 科普：画面来源。`still` = 每句一张 AI 示意图 + 推拉（新建科普项目的默认值）；
     #: `video` = 视频模型。空 = 按 `video`（老项目行为不变）。短剧不读
     visual_mode: str = ""
+    #: 科普：语气（serious 严谨 / light 轻松 / meme 玩梗；空 = 生成知识底稿时按题目推荐）。
+    #: 进写稿、画面分镜、审稿和念法的提示词。短剧不读
+    tone: str = ""
+    #: 科普：插图画风（`explainer_service.ILLUSTRATION_STYLES` 的 key，或自填的英文画风；
+    #: 空 = 生成知识底稿时按题目推荐，推荐也没有时用 EXPLAINER_ILLUSTRATION_STYLE）。短剧不读
+    illustration_style: str = ""
     #: 该项目的 LLM 模型（空 = 用 .env 里的默认）。多模型切换用。
     llm_model: str = ""
     #: **整片的国家/地区限定**（cn/jp/kr/west/india/mideast/africa/latam/sea/other；

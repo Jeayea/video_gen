@@ -515,7 +515,8 @@ class FakeLLM(LLMProvider):
                  "visual_prompt": "a clear blue midday sky over a field"},
             ],
             "props": [{"name": "三棱镜", "visual_prompt": "a glass prism on a table"}],
-            "style": {"genre": "科普", "tone": "好奇、清楚", "pacing": "稳"},
+            "style": {"genre": "科普", "tone": "好奇、清楚", "pacing": "稳",
+                      "explainer_tone": "light", "illustration_style": "editorial"},
         }
 
     def _bible(self) -> dict:

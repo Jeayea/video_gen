@@ -640,6 +640,17 @@ body {
         <input id="inp-audience" maxlength="200" placeholder="例：初中生 / 普通成年人 / 有理科基础的大学生">
         <label>参考资料（可选，强烈建议）</label>
         <textarea id="inp-source" rows="5" placeholder="粘贴可靠来源的原文：事实只从资料里取，并逐条核对出处。不填的话事实都是模型自述，要人工逐条核对"></textarea>
+        <div class="row2">
+          <div>
+            <label>语气</label>
+            <select id="inp-tone"></select>
+          </div>
+          <div>
+            <label>插图画风</label>
+            <select id="inp-style" onchange="$('inp-style-custom').hidden = this.value !== '__custom'"></select>
+          </div>
+        </div>
+        <input id="inp-style-custom" maxlength="300" hidden placeholder="英文画风描述，例：paper cut-out collage, bold shadows">
       </div>
       <label>输入方式</label>
       <div class="mode-pick" id="mode-pick">
@@ -970,10 +981,31 @@ const MODE_TEXT = {
 };
 
 // 科普：多出「目标观众 / 参考资料」，不支持小说改编
+// 科普语气 / 插图画风的下拉选项（选项表来自 /api/health）
+function toneOptions(selected, autoLabel = '自动（按题目推荐）') {
+  const tones = (serverHealth && serverHealth.explainer_tones) || [];
+  return [`<option value="">${autoLabel}</option>`]
+    .concat(tones.map(t => `<option value="${t.key}" ${t.key === selected ? 'selected' : ''}>${esc(t.label)}</option>`))
+    .join('');
+}
+
+function styleOptions(selected, autoLabel = '自动（按题目推荐）') {
+  const styles = (serverHealth && serverHealth.illustration_styles) || [];
+  const custom = selected && !styles.some(s => s.key === selected);
+  return [`<option value="">${autoLabel}</option>`]
+    .concat(styles.map(s => `<option value="${s.key}" ${s.key === selected ? 'selected' : ''}>${esc(s.label)}</option>`))
+    .concat([`<option value="__custom" ${custom ? 'selected' : ''}>自定义（英文描述）…</option>`])
+    .join('');
+}
+
 function setContentType(value) {
   createContentType = value;
   const explainer = value === 'explainer';
   $('explainer-fields').hidden = !explainer;
+  if (explainer && !$('inp-tone').options.length) {
+    $('inp-tone').innerHTML = toneOptions('');
+    $('inp-style').innerHTML = styleOptions('');
+  }
   $('mode-novel').hidden = explainer;
   if (explainer && $('inp-mode').value === 'novel') {
     document.querySelector('input[name="inp-mode-radio"][value="theme"]').checked = true;
@@ -1004,6 +1036,9 @@ async function createProject() {
   if (createContentType === 'explainer') {
     body.audience = $('inp-audience').value.trim();
     body.source_material = $('inp-source').value;
+    body.tone = $('inp-tone').value;
+    const style = $('inp-style').value;
+    body.illustration_style = style === '__custom' ? $('inp-style-custom').value.trim() : style;
   }
   if (!body.input_text.trim()) { alert('请输入内容'); return; }
   try {
@@ -1108,7 +1143,13 @@ async function renderProject(id) {
       <h3><span class="num">1</span> ${isExplainer(p) ? '知识底稿' : '故事圣经'}</h3>
       ${isExplainer(p) ? `<div class="hint">${p.source_material
         ? `参考资料 ${p.source_material.length} 字：事实只从资料里取，出处逐条核对`
-        : '没有参考资料：事实都是模型自述，要逐条确认或驳回（批量生产会停在剧本阶段等你核对）'}${p.audience ? ` · 目标观众：${esc(p.audience)}` : ''}</div>` : ''}
+        : '没有参考资料：事实都是模型自述，要逐条确认或驳回（批量生产会停在剧本阶段等你核对）'}${p.audience ? ` · 目标观众：${esc(p.audience)}` : ''}</div>
+      <div class="bible-constraint">
+        <label>语气
+          <select id="explainer-tone" onchange="setExplainerTone(this.value)">${toneOptions(p.tone || '', '自动（生成底稿时按题目推荐）')}</select>
+        </label>
+        <span class="hint">影响之后写的旁白、画面和念法；已写好的剧本要「按意见重写」才会变</span>
+      </div>` : ''}
       <div class="bible-constraint" ${isExplainer(p) ? 'style="display:none"' : ''}>
         <label>国家/地区限定（名字与长相都会按它来）
           <select id="cast-region">
@@ -1238,6 +1279,18 @@ async function renderProject(id) {
           </select>
         </label>
         <span class="hint">示意图是插画风格，不是真实照片；讲具体事物或数据的镜头之后会接图表与开放图库</span>
+      </div>` : ''}
+      ${isExplainer(p) && p.visual_mode === 'still' ? `<div class="bible-constraint">
+        <label>插图画风
+          <select id="illustration-style" onchange="pickIllustrationStyle(this.value)"
+            ${inStatus(p, ['video_generating', 'audio_generating', 'composing']) ? 'disabled' : ''}>
+            ${styleOptions(p.illustration_style || '', '自动（生成底稿时按题目推荐）')}
+          </select>
+        </label>
+        <span id="illustration-custom" ${(serverHealth && (serverHealth.illustration_styles || []).some(s => s.key === p.illustration_style)) || !p.illustration_style ? 'hidden' : ''}>
+          <input id="illustration-custom-text" maxlength="300" placeholder="英文画风描述" value="${esc(p.illustration_style || '')}">
+          <button class="btn btn-sm" onclick="setIllustrationStyle($('illustration-custom-text').value.trim())">应用</button>
+        </span>
       </div>` : ''}
       <div id="video-body">
         <span style="color:var(--text2);font-size:12px">尚未生成</span>
@@ -2629,6 +2682,31 @@ function planConfirmText(plan) {
   }
   lines.push('', '确认开始生成吗？');
   return lines.join('\n');
+}
+
+async function setExplainerTone(tone) {
+  withBusy('切换语气...', () =>
+    api(`/api/projects/${currentProjectId}`, { method: 'PUT', body: JSON.stringify({ tone }) }));
+}
+
+function pickIllustrationStyle(value) {
+  if (value === '__custom') {
+    $('illustration-custom').hidden = false;
+    $('illustration-custom-text').focus();
+    return;
+  }
+  setIllustrationStyle(value);
+}
+
+async function setIllustrationStyle(style) {
+  const clips = ((currentVideo && currentVideo.manifest && currentVideo.manifest.clips) || [])
+    .filter(c => c.status === 'ready').length;
+  if (clips && !confirm(`换画风后，已画好的 ${clips} 张图在下次生成时会全部重画（按张计费，旧图留进历史版本）。继续？`)) {
+    $('illustration-style').innerHTML = styleOptions(currentProject.illustration_style || '', '自动（生成底稿时按题目推荐）');
+    return;
+  }
+  withBusy('切换画风...', () =>
+    api(`/api/projects/${currentProjectId}`, { method: 'PUT', body: JSON.stringify({ illustration_style: style }) }));
 }
 
 async function setVisualMode(mode) {

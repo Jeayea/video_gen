@@ -31,6 +31,7 @@ from videogen.providers.video import still as still_provider
 from videogen.providers.video.base import VideoProviderError, VideoRequest
 from videogen.providers.video.mock import MockVideoProvider
 from videogen.services import (
+    audio_script_service,
     audio_service,
     compose_service,
     consistency_service,
@@ -1339,3 +1340,101 @@ async def test_review_flags_unreferenced_lines_for_overstatement(store, make_pip
     first, second = script.scenes[0].dialogue[0].line, script.scenes[0].dialogue[1].line
     assert f"{first}（无依据）" in user
     assert f"{second}（依据 " in user
+
+
+# ── 语气与插图画风 ─────────────────────────────────────
+
+
+def test_api_accepts_tone_and_illustration_style(client):
+    body = {"title": "t", "input_text": "古罗马的水道", "content_type": "explainer",
+            "tone": "meme", "illustration_style": "roman_mosaic"}
+    created = client.post("/api/projects", json=body).json()
+    assert created["tone"] == "meme" and created["illustration_style"] == "roman_mosaic"
+    pid = created["id"]
+    custom = "paper cut-out collage, bold shadows"
+    resp = client.put(f"/api/projects/{pid}", json={"illustration_style": custom})
+    assert resp.json()["illustration_style"] == custom
+    # 不认识的 key、中文画风（会被画进画面）、不认识的语气都拒收
+    for bad in ({"illustration_style": "baroque"}, {"illustration_style": "剪纸风"},
+                {"tone": "angry"}):
+        assert client.put(f"/api/projects/{pid}", json=bad).status_code == 422
+    health = client.get("/api/health").json()
+    assert {t["key"] for t in health["explainer_tones"]} == set(explainer_service.TONES)
+    assert any(s["key"] == "greek_vase" for s in health["illustration_styles"])
+
+
+def test_still_prompt_uses_project_illustration_style():
+    shot = Shot(id="scene_1_shot_1", scene_id="scene_1", shot_no=1, duration_sec=4,
+                narration="罗马人用水道把山里的水引进城",
+                video_prompt="a Roman aqueduct over a valley")
+    default = video_service.still_prompt(shot, _explainer(visual_mode="still"), None)
+    assert "editorial illustration" in default
+    greek = video_service.still_prompt(
+        shot, _explainer(visual_mode="still", illustration_style="greek_vase"), None
+    )
+    assert "red-figure pottery" in greek and "no inscriptions" in greek
+    assert "editorial illustration" not in greek
+    custom = video_service.still_prompt(
+        shot, _explainer(visual_mode="still", illustration_style="paper cut-out collage"), None
+    )
+    assert "style: paper cut-out collage" in custom
+    # 画风标记：默认画风不加（老项目不重画），换画风 = 换模型
+    assert explainer_service.illustration_tag(_explainer()) == ""
+    assert explainer_service.illustration_tag(_explainer(illustration_style="editorial")) == ""
+    assert explainer_service.illustration_tag(_explainer(illustration_style="comic")) == "comic"
+    tag = explainer_service.illustration_tag(_explainer(illustration_style="paper cut-out"))
+    assert tag.startswith("custom-")
+
+
+async def test_changing_illustration_style_redraws_every_still(store, make_pipeline):
+    project, pipeline, _, _ = await _with_storyboard(store, make_pipeline, visual_mode="still")
+    manifest = VideoManifest(provider="still", model="still:mock", clips=[
+        VideoClip(shot_id=s.id, status=ClipStatus.READY, path=f"clips/{s.id}.mp4")
+        for s in store.load_storyboard(project.id).shots
+    ])
+    store.save_video_manifest(project.id, manifest)
+    for shot in store.load_storyboard(project.id).shots:
+        path = store.ensure_project_dir(project.id) / "clips" / f"{shot.id}.mp4"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"x")
+    plan = await pipeline.preflight(project.id, action="video")
+    assert plan["video"]["regenerate_all"] is False
+    await pipeline.update_project(project.id, {"illustration_style": "comic"})
+    plan = await pipeline.preflight(project.id, action="video")
+    assert plan["video"]["regenerate_all"] is True
+
+
+async def test_knowledge_base_recommends_tone_and_style_without_overriding(store, make_pipeline):
+    assert "illustration_style" in explainer_service.KNOWLEDGE_SYSTEM
+    assert "greek_vase（古希腊陶瓶画）" in explainer_service.KNOWLEDGE_SYSTEM
+    project, _, _ = await _with_bible(store, make_pipeline)
+    saved = store.load_project(project.id)
+    assert saved.tone == "light" and saved.illustration_style == "editorial"
+    chosen, _, _ = await _with_bible(store, make_pipeline, tone="meme", illustration_style="comic")
+    saved = store.load_project(chosen.id)
+    assert saved.tone == "meme" and saved.illustration_style == "comic"
+
+
+async def test_meme_tone_reaches_writer_visuals_review_and_voice(store, make_pipeline):
+    project, _, llm, storyboard = await _with_storyboard(
+        store, make_pipeline, tone="meme", visual_mode="still", illustration_style="comic"
+    )
+    writer = next(c for c in llm.calls if "科普旁白撰稿" in str(c[0].content))
+    assert "语气：玩梗" in str(writer[-1].content)
+    assert "数字和结论不夸张" in str(writer[-1].content)
+    visuals = next(c for c in llm.calls if "科普画面分镜师" in str(c[0].content))
+    assert "像表情包" in str(visuals[-1].content)
+    assert "插图画风：手绘漫画" in str(visuals[-1].content)
+
+    spy = FakeLLM()
+    script = store.load_script(project.id)
+    await explainer_service.review_script(spy, project, script, store.load_bible(project.id))
+    assert "一听就是玩笑的夸张比喻" in str(spy.calls[0][-1].content)
+
+    prompt = audio_script_service._build_user_prompt(
+        project=store.load_project(project.id), bible=None, scene=None,
+        shots=storyboard.shots[:1], mode="perform", max_chars=60, frames=0, scene_totals=(1, 1),
+    )
+    assert "念法俏皮" in prompt
+    # 短剧项目就算带了 tone 字段也不读
+    assert explainer_service.tone_block(Project(title="短剧", tone="meme")) == ""

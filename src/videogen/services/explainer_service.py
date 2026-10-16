@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import difflib
+import hashlib
 import logging
 import math
 import re
@@ -67,6 +68,153 @@ def uses_stills(project: Project | None) -> bool:
     return is_explainer(project) and getattr(project, "visual_mode", "") == VISUAL_STILL
 
 
+#: 科普语气（项目 `tone`）：key → (界面名, 写稿要求, 画面要求, 念法要求)。
+#: 空 = 生成知识底稿时由模型按题目推荐；推荐也没给时不加语气要求（老项目行为）
+TONES: dict[str, tuple[str, str, str, str]] = {
+    "serious": (
+        "严谨",
+        "语气严谨克制：不用网络流行语，不开玩笑；比喻要准确、朴素",
+        "画面朴素清楚，不搞笑",
+        "念法沉稳、清楚，不俏皮",
+    ),
+    "light": (
+        "轻松",
+        "语气轻松口语，像跟朋友聊天：多用生活化的比喻，偶尔一句俏皮话；不刻意玩网络梗",
+        "画面亲切生动，人物表情自然",
+        "念法轻松自然，像在跟朋友聊天",
+    ),
+    "meme": (
+        "玩梗",
+        "语气幽默、玩梗：开场钩子、过渡句和比喻可以用这个热词本身的梗、网络流行语、反差、自嘲、"
+        "一听就是玩笑的夸张比喻，让人想笑、想转发。讲事实的句子照底稿说：数字和结论不夸张，"
+        "不为了好笑改意思。不拿疾病、患者或某一类人开涮",
+        "画面要有喜剧感：夸张的表情和动作、反差、会做表情的拟人化物件（水瓶、器官、细胞），"
+        "像表情包；讲事实的镜头仍要让人一眼看懂这件事",
+        "念法俏皮、有节奏感，梗要念出笑点；讲到事实和建议时稳下来",
+    ),
+}
+
+#: 科普插图画风（项目 `illustration_style`）：key → (界面名, 英文画风词)。
+#: `editorial` 的画风词取配置 `EXPLAINER_ILLUSTRATION_STYLE`；不是 key 的值当作用户自填的英文画风。
+#: 古典画风容易被画上铭文 / 卷轴字，所以显式写「没有铭文」（统一的「禁止文字」规则照旧追加）
+ILLUSTRATION_STYLES: dict[str, tuple[str, str]] = {
+    "editorial": ("杂志插画（默认）", ""),
+    "flat_cartoon": (
+        "扁平卡通",
+        "flat vector cartoon illustration, bold clean outlines, bright cheerful colors, "
+        "simple rounded characters with expressive faces, plain background",
+    ),
+    "comic": (
+        "手绘漫画",
+        "hand-drawn comic illustration, expressive exaggerated characters and reactions, "
+        "ink outlines with flat colors, playful energetic composition",
+    ),
+    "watercolor": (
+        "水彩绘本",
+        "soft watercolor picture-book illustration, gentle washes of color, "
+        "visible paper texture, warm and calm",
+    ),
+    "vintage_science": (
+        "复古科学图鉴",
+        "vintage scientific illustration, engraved line art with hand-colored tints, "
+        "aged cream paper texture, precise and elegant",
+    ),
+    "greek_vase": (
+        "古希腊陶瓶画",
+        "ancient Greek red-figure pottery painting style, terracotta orange figures on a black "
+        "glaze ground, elegant fine black line work, decorative meander border, no inscriptions",
+    ),
+    "roman_mosaic": (
+        "罗马马赛克",
+        "ancient Roman floor mosaic style made of small stone tesserae, earthy ochre, terracotta, "
+        "cream and deep blue tones, no inscriptions",
+    ),
+    "ink_wash": (
+        "中国水墨",
+        "traditional Chinese ink wash painting, expressive brush strokes, muted colors with "
+        "light color accents, generous empty space, no calligraphy, no seals",
+    ),
+}
+#: 画风 key 的写法；自填画风不能和它撞
+_STYLE_KEY = re.compile(r"^[a-z_]+$")
+
+
+def tone_of(project: Project | None) -> str:
+    """科普项目的语气 key；短剧和没定语气的科普项目为空。"""
+    if not is_explainer(project):
+        return ""
+    tone = str(getattr(project, "tone", "") or "")
+    return tone if tone in TONES else ""
+
+
+def tone_block(project: Project | None, part: int = 1) -> str:
+    """进提示词的语气要求（`part`：1 写稿 / 2 画面 / 3 念法）。没定语气时为空。"""
+    tone = tone_of(project)
+    if not tone:
+        return ""
+    label, *rules = TONES[tone]
+    return f"语气：{label}。{rules[part - 1]}"
+
+
+def validate_illustration_style(value: str) -> str:
+    """校验项目的画风值，返回规整后的值；不合法抛 ValueError（API 转 400）。"""
+    value = " ".join(str(value or "").split())
+    if not value or value in ILLUSTRATION_STYLES:
+        return value
+    if _STYLE_KEY.match(value):
+        raise ValueError(f"没有这个画风：{value}")
+    if re.search(r"[　-鿿가-힯＀-￯]", value):
+        raise ValueError("自定义画风请用英文写：画风词会进图片 prompt，中文会被画进画面")
+    return value
+
+
+def illustration_prompt(project: Project | None, settings: Settings | None = None) -> str:
+    """插图的英文画风词：项目选的预设 / 自填画风，都没有时用配置的默认画风。"""
+    settings = settings or get_settings()
+    value = str(getattr(project, "illustration_style", "") or "").strip()
+    preset = ILLUSTRATION_STYLES.get(value)
+    if preset is not None:
+        return preset[1] or settings.explainer_illustration_style
+    if value and not _STYLE_KEY.match(value):
+        return value
+    return settings.explainer_illustration_style
+
+
+def illustration_tag(project: Project | None) -> str:
+    """画风的短标记，拼进插图 provider 的模型名：画风变了 = 换模型，已画好的图全部重画。
+
+    默认画风（空 / editorial）不加标记，老项目不会因此重画。
+    """
+    value = str(getattr(project, "illustration_style", "") or "").strip()
+    if not value or value == "editorial":
+        return ""
+    if value in ILLUSTRATION_STYLES:
+        return value
+    return "custom-" + hashlib.sha256(value.encode("utf-8")).hexdigest()[:8]
+
+
+def illustration_label(project: Project | None) -> str:
+    value = str(getattr(project, "illustration_style", "") or "").strip()
+    preset = ILLUSTRATION_STYLES.get(value)
+    if preset is not None:
+        return preset[0]
+    return f"自定义：{value}" if value else ILLUSTRATION_STYLES["editorial"][0]
+
+
+def apply_recommendation(project: Project, bible: StoryBible) -> bool:
+    """把知识底稿里模型推荐的语气 / 画风填进项目（用户已经选了的不动）。返回项目是否改了。"""
+    changed = False
+    tone = bible.style.explainer_tone
+    if not project.tone and tone in TONES:
+        project.tone = tone
+        changed = True
+    style = bible.style.illustration_style
+    if not project.illustration_style and style in ILLUSTRATION_STYLES:
+        project.illustration_style = style
+        changed = True
+    return changed
+
+
 def apply_creation_defaults(project: Project, settings: Settings | None = None) -> Project:
     """建项目时给科普项目填默认值（用户没填的才填；短剧原样返回）。
 
@@ -105,7 +253,8 @@ KNOWLEDGE_SYSTEM = """你是科普知识底稿编辑。为一支 30-120 秒的�
                 "visual_prompt": "a dim lab bench, a glass prism, a white screen, sunlight"}],
   "props": [{"name": "演示物", "description": "外观（中文）",
              "visual_prompt": "a clear triangular glass prism with polished edges"}],
-  "style": {"genre": "科普", "tone": "语气", "pacing": "节奏"}
+  "style": {"genre": "科普", "tone": "语气", "pacing": "节奏",
+            "explainer_tone": "light", "illustration_style": "editorial"}
 }
 
 要求：
@@ -118,8 +267,15 @@ KNOWLEDGE_SYSTEM = """你是科普知识底稿编辑。为一支 30-120 秒的�
 - visual_prompt 必须是英文，只写看得见的东西；不要出现公式、数据、标注这类知识性文字。
   物品外观也不要写刻度、读数、计时标记、标签和包装文字：这段描述会跟着这件物品进每一张图，
   图片模型照着画出来的数字几乎都是错的
+- style.explainer_tone 按题目选一个：serious（严肃的医疗、安全、灾难、历史悲剧）/ light（一般科普）/
+  meme（网络热词、流行现象、段子式的问题，即使和健康有关也可以选）
+- style.illustration_style 按题目选一个最合适的插图画风：{styles}
 - 不要输出任何 id（由系统分配）
-- 只输出 JSON"""
+- 只输出 JSON""".replace(
+    "{styles}",
+    " / ".join(f"{key}（{label}）" for key, (label, _) in ILLUSTRATION_STYLES.items())
+    + "。讲古希腊罗马、古代中国这类历史题目时选对应时代的画风",
+)
 
 
 def _source_rule(project: Project, has_material: bool, min_chars: int) -> str:
@@ -516,6 +672,7 @@ async def generate_outline(
         "## 用户写好的知识点（每个知识点一场，不增不删、不改顺序；你只补开场提问和小结）\n"
         f"{project.input_text}",
         f"\n目标观众：{_audience(project)}",
+        tone_block(project),
         f"目标时长：{project.target_duration_sec} 秒",
         f"\n## 知识底稿\n{_format_facts(bible)}",
     ]
@@ -609,6 +766,7 @@ async def generate_scene(
     parts = [
         f"## 知识底稿（只读）\n{_format_facts(bible)}",
         f"\n目标观众：{_audience(project)}",
+        tone_block(project),
         f"\n## 上下文\n{_prev_block(prev_scenes)}",
         "\n## 本场任务",
         f"场次 ID: {outline_scene.id}",
@@ -835,7 +993,13 @@ async def review_script(
     if not script.scenes:
         return []
     facts = {f.id: f.content for f in bible.facts}
-    lines = [f"目标观众：{_audience(project)}", f"\n## 知识底稿\n{_format_facts(bible)}"]
+    lines = [f"目标观众：{_audience(project)}"]
+    if tone_of(project) == "meme":
+        lines.append(
+            "语气：玩梗。一听就是玩笑的夸张比喻、网络流行语不算问题；"
+            "只看事实有没有被说错、说重（第 6 条照查）"
+        )
+    lines.append(f"\n## 知识底稿\n{_format_facts(bible)}")
     for scene in script.scenes:
         said = "\n".join(
             f"  - {d.line}"
@@ -1062,6 +1226,9 @@ async def generate_visuals(
     parts = [
         f"## 知识底稿里的演示场景与角色\n{storyboard_service.format_brief_bible(bible)}",
         f"\n目标观众：{_audience(project)}",
+        tone_block(project, 2),
+        (f"插图画风：{illustration_label(project)}（画面描述要能用这种画风画出来）"
+         if uses_stills(project) else ""),
         "\n## 本场",
         f"场次: {scene.id}",
         f"标题: {scene.heading}",

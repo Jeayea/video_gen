@@ -10,7 +10,7 @@ from urllib.parse import urlsplit
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from videogen import __version__
 from videogen.config import get_settings
@@ -270,6 +270,15 @@ class CreateProjectRequest(BaseModel):
     source_material: str = ""
     #: 科普：画面来源（still = 每句一张 AI 示意图；video = 视频模型；空 = 科普默认 still）
     visual_mode: str = Field(default="", pattern="^(|still|video)$")
+    #: 科普：语气（serious / light / meme；空 = 生成知识底稿时按题目推荐）
+    tone: str = Field(default="", pattern="^(|serious|light|meme)$")
+    #: 科普：插图画风（预设 key 或英文画风；空 = 按题目推荐）
+    illustration_style: str = Field(default="", max_length=300)
+
+    @field_validator("illustration_style")
+    @classmethod
+    def _check_style(cls, value: str) -> str:
+        return explainer_service.validate_illustration_style(value)
 
 
 class UpdateProjectRequest(BaseModel):
@@ -305,6 +314,15 @@ class UpdateProjectRequest(BaseModel):
     ai_label: bool | None = None
     #: 科普：画面来源（still / video）。换了之后已生成的片段在下次生成时全部重做
     visual_mode: str | None = Field(default=None, pattern="^(still|video)$")
+    #: 科普：语气 / 插图画风（空字符串 = 下次生成知识底稿时重新推荐）。
+    #: 换画风后插图在下次生成时全部重画
+    tone: str | None = Field(default=None, pattern="^(|serious|light|meme)$")
+    illustration_style: str | None = Field(default=None, max_length=300)
+
+    @field_validator("illustration_style")
+    @classmethod
+    def _check_style(cls, value: str | None) -> str | None:
+        return None if value is None else explainer_service.validate_illustration_style(value)
 
 
 
@@ -593,6 +611,14 @@ async def health():
         "active_batches": batches.active_count,
         "budget_usd": settings.budget_usd,
         "llm_model_candidates": settings.candidate_models,
+        # 科普的语气 / 插图画风选项（界面的下拉框用）
+        "explainer_tones": [
+            {"key": key, "label": label} for key, (label, *_) in explainer_service.TONES.items()
+        ],
+        "illustration_styles": [
+            {"key": key, "label": label}
+            for key, (label, _) in explainer_service.ILLUSTRATION_STYLES.items()
+        ],
     }
 
 
@@ -614,6 +640,8 @@ async def create_project(req: CreateProjectRequest):
         audience=req.audience.strip(),
         source_material=req.source_material.strip(),
         visual_mode=req.visual_mode,
+        tone=req.tone,
+        illustration_style=req.illustration_style,
     )
     explainer_service.apply_creation_defaults(project)
     store.create_project(project)

@@ -116,6 +116,10 @@ class StyleGuide(BaseModel):
     tone: str = ""
     pacing: str = ""
     taboo: StrList = Field(default_factory=list)
+    #: 科普：模型按题目推荐的语气 / 插图画风（`explainer_service.TONES` / `ILLUSTRATION_STYLES`
+    #: 的 key）。项目上这两项还空着时才采用，用户选过的不动
+    explainer_tone: str = ""
+    illustration_style: str = ""
 
 
 class StoryBible(BaseModel):

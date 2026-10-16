@@ -444,6 +444,7 @@ class Pipeline:
                 get_image_provider(),
                 price_usd=settings.image_price_usd,
                 fps=settings.video_fps,
+                style_tag=explainer_service.illustration_tag(project),
             )
         return self._video_factory()
 
@@ -554,6 +555,9 @@ class Pipeline:
             on_progress=lambda progress: self.store.save_explainer_source(project.id, progress),
         )
         self.store.remove_artifact(project.id, "explainer_source")
+        # 用户没选语气 / 画风时采用模型按题目推荐的（之后在面板上照样能改）
+        if explainer_service.apply_recommendation(project, bible):
+            self.store.save_project(project)
         return bible
 
     # ── 小说改编（切章 / 增量抽取 / 合并）────────────────────

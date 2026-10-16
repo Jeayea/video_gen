@@ -20,6 +20,7 @@ from videogen.providers.llm.base import (
     image_message,
     text_message,
 )
+from videogen.services import explainer_service
 from videogen.services.cost_service import PriceTable
 from videogen.utils import ffmpeg as ffmpeg_utils
 from videogen.utils import motion as motion_utils
@@ -521,6 +522,9 @@ def _build_user_prompt(
         f"画面比例：{project.aspect_ratio.value}",
         f"目标时长：{project.target_duration_sec} 秒",
     ]
+    tone = explainer_service.tone_block(project, 3)
+    if tone:
+        lines.append(tone)
     if bible:
         lines.append("## 角色")
         for character in bible.characters:

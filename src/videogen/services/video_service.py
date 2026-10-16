@@ -1169,7 +1169,7 @@ def still_prompt(
         base,
         location_anchor(shot, bible, base),
         prop_anchor(shot, bible, base),
-        f"style: {settings.explainer_illustration_style}" if settings.explainer_illustration_style
+        f"style: {style}" if (style := explainer_service.illustration_prompt(project, settings))
         else "",
         _STILL_RULES,
     ]

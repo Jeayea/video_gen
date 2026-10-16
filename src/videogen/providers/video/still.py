@@ -89,9 +89,12 @@ class StillVideoProvider(VideoProvider):
         crf: int = 20,
         slack_sec: float = 1.0,
         owns_image: bool = True,
+        style_tag: str = "",
     ) -> None:
         self.image = image
-        self.model = f"still:{image.model or image.name}"
+        # 画风拼进模型名：换画风 = 换模型，已就绪的片段在下次生成时全部重画
+        # （preflight 也按全部重画报价）
+        self.model = f"still:{image.model or image.name}" + (f"@{style_tag}" if style_tag else "")
         self.paid = image.name != "mock"
         self.price_usd = max(0.0, float(price_usd)) if self.paid else 0.0
         self.fps = max(1, int(fps))
