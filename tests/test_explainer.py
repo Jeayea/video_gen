@@ -18,10 +18,11 @@ from videogen.models.bible import Character, Fact, StoryBible
 from videogen.models.compose import ComposeSegment, SubtitleMode
 from videogen.models.consistency import IssueSeverity
 from videogen.models.explainer import KnowledgeFact, KnowledgeResponse, NewFact
-from videogen.models.project import ContentType, Project
+from videogen.models.project import ContentType, InputMode, Project
 from videogen.models.script import NARRATOR, DialogueLine, Scene, Script
 from videogen.models.storyboard import Shot
 from videogen.models.video import ClipStatus
+from videogen.orchestrator.batch import BatchManager, BatchStatus, ItemStatus
 from videogen.orchestrator.pipeline import Pipeline, PipelineError
 from videogen.providers.tts.mock import MockTTSProvider
 from videogen.providers.video.mock import MockVideoProvider
@@ -989,3 +990,137 @@ async def test_explainer_without_label_keeps_soft_subtitles(store):
     assert report.ai_label == ""
     assert report.subtitle_mode_effective == SubtitleMode.SOFT
     assert "AIGC" not in await describe_media(store.output_dir(project.id) / "final.mp4")
+
+
+# ── 批量放行 ──────────────────────────────────────────
+
+BATCH_MATERIAL = (
+    "空气分子对短波长的蓝光散射得更强烈，这就是天空呈现蓝色的原因之一。\n"
+    "日落时阳光穿过的大气层更厚，蓝光在路上被散射掉了，剩下的红光让天空发红。"
+)
+
+
+def _cited_script(*refs: str) -> Script:
+    return Script(
+        title="t",
+        scenes=[Scene(id="scene_1", heading="h", dialogue=[
+            DialogueLine(speaker=NARRATOR, line="一句旁白。", fact_refs=list(refs))
+        ])],
+    )
+
+
+def test_batch_hold_reasons():
+    sourced = Fact(id="fact_1", content="蓝光散射更强", source=BATCH_MATERIAL.splitlines()[0])
+    invented = Fact(id="fact_2", content="编的", source=explainer_service.SOURCE_SELF)
+    bible = StoryBible(facts=[sourced, invented])
+    with_material = _explainer(source_material=BATCH_MATERIAL)
+
+    no_material = explainer_service.batch_hold_reasons(
+        _explainer(), bible, _cited_script("fact_1"), []
+    )
+    assert len(no_material) == 1 and "没有参考资料" in no_material[0]
+    assert explainer_service.batch_hold_reasons(
+        with_material, bible, _cited_script("fact_1"), []
+    ) == []
+    held = explainer_service.batch_hold_reasons(
+        with_material, bible, _cited_script("fact_1", "fact_2", "fact_9"), []
+    )
+    assert held == ["2 条被旁白引用的事实没通过出处校验：fact_2、fact_9"]
+    error = consistency_service.ConsistencyIssue(
+        severity=IssueSeverity.ERROR, category="review", message="把散射说成了反射"
+    )
+    warning = error.model_copy(update={"severity": IssueSeverity.WARNING})
+    assert explainer_service.batch_hold_reasons(
+        with_material, bible, _cited_script("fact_1"), [warning]
+    ) == []
+    held = explainer_service.batch_hold_reasons(
+        with_material, bible, _cited_script("fact_1"), [error]
+    )
+    assert held == ["剧本检查有 1 条 ERROR（含 LLM 审稿）：把散射说成了反射"]
+
+
+def _batch_pipeline(store, llm) -> Pipeline:
+    return Pipeline(
+        store,
+        llm_factory=lambda: llm,
+        video_factory=lambda: FakeVideoProvider(),
+        tts_factory=lambda: FakeTTSProvider(),
+        bgm_factory=lambda: FakeBgmLibrary(),
+    )
+
+
+async def _run_batch(manager, batch_id: str):
+    for _ in range(3000):
+        batch = manager.get(batch_id)
+        if not batch.is_active:
+            return batch
+        await asyncio.sleep(0.01)
+    raise AssertionError("批量没跑完")
+
+
+async def test_batch_holds_explainer_without_material(store):
+    manager = BatchManager()
+    batch = manager.submit(
+        _batch_pipeline(store, FakeLLM()),
+        [{"input_text": "为什么天是蓝的"}],
+        content_type=ContentType.EXPLAINER,
+        audience="初中生",
+        stop_after="storyboard",
+    )
+    batch = await _run_batch(manager, batch.id)
+    item = batch.items[0]
+    assert item.status == ItemStatus.HELD
+    assert item.stage == "script" and "没有参考资料" in item.error
+    assert batch.status == BatchStatus.PARTIAL and "待核对 1" in batch.message
+    project = store.load_project(item.project_id)
+    assert project.status == "script_review"  # 剧本留着，人工核对后接着做
+    assert (project.audience, project.subtitle_style) == ("初中生", "box")
+    assert store.load_storyboard(item.project_id) is None
+
+
+async def test_batch_runs_explainer_with_sourced_facts(store):
+    llm = FakeLLM()
+    llm.explainer_new_facts = False
+    manager = BatchManager()
+    batch = manager.submit(
+        _batch_pipeline(store, llm),
+        [{"input_text": "为什么天是蓝的", "source_material": BATCH_MATERIAL}],
+        content_type=ContentType.EXPLAINER,
+        stop_after="storyboard",
+    )
+    public = batch.to_public()
+    assert "source_material" not in public["items"][0]  # 资料原文不进对外的批量状态
+    batch = await _run_batch(manager, batch.id)
+    item = batch.items[0]
+    assert item.status == ItemStatus.SUCCEEDED, item.error
+    project = store.load_project(item.project_id)
+    assert project.status == "storyboard_confirmed"
+    assert project.source_material == BATCH_MATERIAL
+    storyboard = store.load_storyboard(item.project_id)
+    assert all(shot.narration and shot.segment_id for shot in storyboard.shots)
+
+
+def test_batch_rejects_novel_explainer(store):
+    with pytest.raises(ValueError, match="小说"):
+        BatchManager().submit(
+            _batch_pipeline(store, FakeLLM()),
+            [{"input_text": "x"}],
+            content_type=ContentType.EXPLAINER,
+            input_mode=InputMode.NOVEL,
+        )
+
+
+def test_batch_api_accepts_explainer(client):
+    resp = client.post(
+        "/api/batches",
+        json={
+            "items": [{"input_text": "为什么天是蓝的", "source_material": BATCH_MATERIAL}],
+            "content_type": "explainer",
+            "audience": "小学生",
+            "stop_after": "storyboard",
+        },
+    )
+    assert resp.status_code == 202, resp.text
+    body = resp.json()
+    assert (body["content_type"], body["audience"]) == ("explainer", "小学生")
+    assert "source_material" not in body["items"][0]

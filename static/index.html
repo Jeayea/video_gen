@@ -134,6 +134,16 @@ body {
 }
 .tag-mini.warn { border-color: var(--yellow); color: var(--yellow); }
 .tag-mini.ok { border-color: var(--green); color: var(--green); }
+.tag-mini.bad { border-color: var(--red); color: var(--red); }
+#explainer-fields { margin-bottom: 0; }
+#explainer-fields[hidden], #mode-novel[hidden] { display: none; }
+/* 科普：知识底稿的事实 / 旁白句后面的事实引用 */
+.fact-list { display: flex; flex-direction: column; gap: 8px; margin-top: 8px; }
+.fact-row { border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; font-size: 13px; }
+.fact-row .fact-head { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+.fact-row .fact-source { font-size: 12px; color: var(--text2); margin-top: 4px; }
+.fact-row .fact-actions { margin-top: 6px; display: flex; gap: 6px; }
+.fact-ref { cursor: pointer; margin-left: 4px; }
 
 /* 长篇剧集大纲：章卡片（选章展开成剧本） */
 .story-outline { margin-bottom: 12px; }
@@ -616,16 +626,27 @@ body {
 <div class="modal-backdrop" id="create-modal" hidden onclick="if (event.target === this) closeCreate()">
   <div class="modal">
     <h2>新建项目</h2>
-    <div class="sub">选一种输入方式。小说会自动切章，之后按章挑着拍。</div>
+    <div class="sub" id="create-sub">选一种输入方式。小说会自动切章，之后按章挑着拍。</div>
     <div class="create-form">
       <label>标题</label>
       <input id="inp-title" placeholder="都市逆袭短剧" value="">
+      <label>内容类型</label>
+      <div class="mode-pick" id="type-pick">
+        <label><input type="radio" name="inp-type-radio" value="drama" checked onchange="setContentType(this.value)">短剧<small>人物、冲突、对白</small></label>
+        <label><input type="radio" name="inp-type-radio" value="explainer" onchange="setContentType(this.value)">科普讲解<small>一句旁白一个镜头，事实带出处</small></label>
+      </div>
+      <div id="explainer-fields" class="create-form" hidden>
+        <label>目标观众</label>
+        <input id="inp-audience" maxlength="200" placeholder="例：初中生 / 普通成年人 / 有理科基础的大学生">
+        <label>参考资料（可选，强烈建议）</label>
+        <textarea id="inp-source" rows="5" placeholder="粘贴可靠来源的原文：事实只从资料里取，并逐条核对出处。不填的话事实都是模型自述，要人工逐条核对"></textarea>
+      </div>
       <label>输入方式</label>
       <div class="mode-pick" id="mode-pick">
-        <label><input type="radio" name="inp-mode-radio" value="theme" checked onchange="setInputMode(this.value)">主题 / 关键词<small>一句话创意，AI 写故事</small></label>
-        <label><input type="radio" name="inp-mode-radio" value="outline" onchange="setInputMode(this.value)">故事大纲<small>已有梗概，AI 扩写</small></label>
-        <label><input type="radio" name="inp-mode-radio" value="full_script" onchange="setInputMode(this.value)">完整剧本<small>按现成剧本拆分</small></label>
-        <label><input type="radio" name="inp-mode-radio" value="novel" onchange="setInputMode(this.value)">小说原文<small>自动切章，按章改编</small></label>
+        <label><input type="radio" name="inp-mode-radio" value="theme" checked onchange="setInputMode(this.value)"><span data-mode-label="theme">主题 / 关键词</span><small data-mode-hint="theme">一句话创意，AI 写故事</small></label>
+        <label><input type="radio" name="inp-mode-radio" value="outline" onchange="setInputMode(this.value)"><span data-mode-label="outline">故事大纲</span><small data-mode-hint="outline">已有梗概，AI 扩写</small></label>
+        <label><input type="radio" name="inp-mode-radio" value="full_script" onchange="setInputMode(this.value)"><span data-mode-label="full_script">完整剧本</span><small data-mode-hint="full_script">按现成剧本拆分</small></label>
+        <label id="mode-novel"><input type="radio" name="inp-mode-radio" value="novel" onchange="setInputMode(this.value)">小说原文<small>自动切章，按章改编</small></label>
       </div>
       <select id="inp-mode" hidden>
         <option value="theme">主题/关键词</option>
@@ -854,7 +875,7 @@ function renderProjectGrid() {
   list.innerHTML = shown.map(p => `
     <div class="project-card" onclick="selectProject(${jsArg(p.id)})">
       <div class="project-cover">
-        <span class="cover-icon">${p.input_mode === 'novel' ? '📖' : '🎬'}</span>
+        <span class="cover-icon">${isExplainer(p) ? '🔬' : p.input_mode === 'novel' ? '📖' : '🎬'}</span>
         <img class="cover-img" alt="" loading="lazy" onerror="this.remove()"
              src="${withToken(`/api/projects/${p.id}/assets/characters/char_1/reference`)}">
         <span class="corner">${statusTag(p.status)}</span>
@@ -865,6 +886,7 @@ function renderProjectGrid() {
       <div class="body">
         <div class="title">${esc(p.title) || '未命名'}</div>
         <div class="meta">
+          ${isExplainer(p) ? '<span class="mode-badge">科普</span>' : ''}
           <span class="mode-badge">${esc(MODE_LABEL[p.input_mode] || p.input_mode)}</span>
           <span>目标 ${p.target_duration_sec}s</span>
           <span>· ${esc(String(p.created_at || '').slice(0, 10))}</span>
@@ -938,6 +960,37 @@ function setInputMode(value) {
   onInputModeChange();
 }
 
+let createContentType = 'drama';
+
+// 输入方式的说明随内容类型换：[短剧, 科普]
+const MODE_TEXT = {
+  theme: [['主题 / 关键词', '一句话创意，AI 写故事'], ['题目', '一个问题或现象，AI 排结构、写旁白']],
+  outline: [['故事大纲', '已有梗概，AI 扩写'], ['要点大纲', '你定知识点，AI 写旁白']],
+  full_script: [['完整剧本', '按现成剧本拆分'], ['完整旁白', '一字不改，只切镜头、标事实']],
+};
+
+// 科普：多出「目标观众 / 参考资料」，不支持小说改编
+function setContentType(value) {
+  createContentType = value;
+  const explainer = value === 'explainer';
+  $('explainer-fields').hidden = !explainer;
+  $('mode-novel').hidden = explainer;
+  if (explainer && $('inp-mode').value === 'novel') {
+    document.querySelector('input[name="inp-mode-radio"][value="theme"]').checked = true;
+    $('inp-mode').value = 'theme';
+  }
+  for (const [mode, texts] of Object.entries(MODE_TEXT)) {
+    const [label, hint] = texts[explainer ? 1 : 0];
+    document.querySelector(`[data-mode-label="${mode}"]`).textContent = label;
+    document.querySelector(`[data-mode-hint="${mode}"]`).textContent = hint;
+  }
+  $('inp-title').placeholder = explainer ? '为什么天是蓝的' : '都市逆袭短剧';
+  $('create-sub').textContent = explainer
+    ? '科普讲解：先整理带出处的知识底稿，再写旁白；一句旁白一个镜头。'
+    : '选一种输入方式。小说会自动切章，之后按章挑着拍。';
+  onInputModeChange();
+}
+
 async function createProject() {
   const body = {
     title: $('inp-title').value || '未命名项目',
@@ -946,7 +999,12 @@ async function createProject() {
     aspect_ratio: $('inp-aspect').value,
     target_duration_sec: parseInt($('inp-duration').value) || 45,
     language: $('inp-language').value,
+    content_type: createContentType,
   };
+  if (createContentType === 'explainer') {
+    body.audience = $('inp-audience').value.trim();
+    body.source_material = $('inp-source').value;
+  }
   if (!body.input_text.trim()) { alert('请输入内容'); return; }
   try {
     $('global-status').textContent = '创建中...';
@@ -954,6 +1012,7 @@ async function createProject() {
     closeCreate();
     $('inp-text').value = '';
     $('inp-title').value = '';
+    $('inp-source').value = '';
     await selectProject(p.id);
   } catch (e) {
     alert('创建失败: ' + e.message);
@@ -1022,6 +1081,7 @@ async function renderProject(id) {
       <div style="min-width:0">
         <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
           <span class="ptitle">${esc(p.title)}</span> ${statusTag(p.status)}
+          ${isExplainer(p) ? '<span class="mode-badge">科普</span>' : ''}
           <span class="mode-badge">${esc(MODE_LABEL[p.input_mode] || p.input_mode)}</span>
         </div>
         <div class="pmeta">${p.aspect_ratio} · 目标 ${p.target_duration_sec}s ·
@@ -1045,8 +1105,11 @@ async function renderProject(id) {
   // 1. 故事圣经
   html += `
     <div class="panel" data-stage="bible">
-      <h3><span class="num">1</span> 故事圣经</h3>
-      <div class="bible-constraint">
+      <h3><span class="num">1</span> ${isExplainer(p) ? '知识底稿' : '故事圣经'}</h3>
+      ${isExplainer(p) ? `<div class="hint">${p.source_material
+        ? `参考资料 ${p.source_material.length} 字：事实只从资料里取，出处逐条核对`
+        : '没有参考资料：事实都是模型自述，要逐条确认或驳回（批量生产会停在剧本阶段等你核对）'}${p.audience ? ` · 目标观众：${esc(p.audience)}` : ''}</div>` : ''}
+      <div class="bible-constraint" ${isExplainer(p) ? 'style="display:none"' : ''}>
         <label>国家/地区限定（名字与长相都会按它来）
           <select id="cast-region">
             <option value="">自动（按角色名字判断）</option>
@@ -1084,7 +1147,7 @@ async function renderProject(id) {
       </div>
       <div class="panel-actions">
         ${inStatus(p, ['draft','failed'])
-          ? '<button class="btn btn-sm" onclick="doGenerateBible()" id="btn-bible">生成圣经</button>' : ''}
+          ? `<button class="btn btn-sm" onclick="doGenerateBible()" id="btn-bible">${isExplainer(p) ? '生成知识底稿' : '生成圣经'}</button>` : ''}
         <button class="btn btn-sm btn-outline" onclick="startEdit('bible')" id="btn-bible-edit" style="display:none">编辑 JSON</button>
         ${inStatus(p, ['script_confirmed','storyboard_review','storyboard_confirmed'])
           ? '<span class="hint">剧本已确认，圣经已锁定（如需修改请先退回剧本阶段）</span>' : ''}
@@ -1118,7 +1181,7 @@ async function renderProject(id) {
           ? '<button class="btn btn-sm" onclick="doGenerateScript()" id="btn-script">生成剧本</button>' : ''}
         ${p.input_mode === 'novel' && !currentStoryOutline
           ? '<span class="hint">小说模式：先生成故事圣经（会切章并抽取前几章），再在章节列表里勾选要拍的章</span>' : ''}
-        ${inStatus(p, ['draft','failed','script_review']) && !currentStoryOutline
+        ${inStatus(p, ['draft','failed','script_review']) && !currentStoryOutline && !isExplainer(p)
           ? `<button class="btn btn-sm btn-outline" onclick="doGenerateStoryOutline()" id="btn-story">生成长篇大纲（${modelInfo && modelInfo.story_chapters ? modelInfo.story_chapters : 20} 章）</button>` : ''}
         <button class="btn btn-sm btn-outline" onclick="startEdit('script')" id="btn-script-edit" style="display:none">编辑 JSON</button>
         ${inStatus(p, ['script_review'])
@@ -1296,6 +1359,10 @@ function stageSub(key) {
     case 'bible': {
       const b = currentBible;
       if (!b) return '未生成';
+      if (isExplainer(currentProject)) {
+        const confirmed = (b.facts || []).filter(f => f.status === 'confirmed').length;
+        return `${(b.facts || []).length} 条事实 · 已确认 ${confirmed}`;
+      }
       return `${b.characters.length} 角色 · ${b.settings.length} 场景 · ${(b.props || []).length} 道具`;
     }
     case 'script': {
@@ -1338,6 +1405,7 @@ function renderStageNav() {
   const doneAll = p.status === 'done';
   const currentIndex = FLOW.indexOf(auto);
   nav.innerHTML = STAGES.map(([key, label], i) => {
+    if (key === 'bible' && isExplainer(p)) label = '知识底稿';
     const flowIndex = FLOW.indexOf(key);
     const done = flowIndex >= 0 && (doneAll || flowIndex < currentIndex);
     const current = !doneAll && key === auto;
@@ -1376,6 +1444,21 @@ function batchPanelHtml() {
         一次提交多个主题，自动跑完整条链路（<strong>跳过人工确认门控</strong>）。
       </div>
       <div class="edit-form active">
+        <div class="row">
+          <label>内容类型
+            <select id="batch-type" onchange="onBatchTypeChange()">
+              <option value="drama" selected>短剧</option>
+              <option value="explainer">科普讲解</option>
+            </select>
+          </label>
+          <label id="batch-audience-wrap" style="display:none">目标观众
+            <input id="batch-audience" maxlength="200" placeholder="例：初中生" />
+          </label>
+        </div>
+        <label id="batch-source-wrap" style="display:none">参考资料（所有主题共用；不填的条目会停在剧本阶段等你在知识底稿里核对）
+          <textarea id="batch-source" rows="4"></textarea>
+          <span class="hint">科普条目只有「有资料 + 引用的事实全部通过出处校验 + 剧本检查没有 ERROR」才自动往下跑</span>
+        </label>
         <label>主题列表（每行一个，最多 ${(modelInfo && modelInfo.batch_max_items) || 20} 条）
           <textarea id="batch-items" placeholder="被裁员的程序员靠 AI 逆袭&#10;替嫁新娘反杀豪门"></textarea>
         </label>
@@ -1458,6 +1541,7 @@ function renderBible() {
     if (!bible || !$('bible-view')) return;
     $('btn-bible-edit').style.display = '';
     const style = [bible.style.genre, bible.style.tone, bible.style.pacing].filter(Boolean).map(esc).join(' · ');
+    if (isExplainer(currentProject)) { renderKnowledge(bible); return; }
     $('bible-view').innerHTML = `
       <div class="hint">${style || '未设定风格'} · ${bible.facts.length} 条关键事实</div>
       <div id="asset-view"><span class="hint">加载剧集资产…</span></div>
@@ -1473,6 +1557,90 @@ function renderBible() {
     refreshReferencePlan();
     renderAssets();
   } catch (e) { /* 面板渲染失败不应影响其它面板 */ }
+}
+
+// ── 科普：知识底稿（事实逐条显示出处，确认 / 驳回写回 Fact.status）──────────────
+
+const FACT_STATUS = {
+  unverified: ['未核对', 'warn'], confirmed: ['已确认', 'ok'], rejected: ['已驳回', 'bad'],
+};
+const SOURCE_SELF = '模型自述';
+
+function factById(id) {
+  return ((currentBible && currentBible.facts) || []).find(f => f.id === id);
+}
+
+// 这条事实被几句旁白引用
+function factCitations(id) {
+  const scenes = (currentScript && currentScript.scenes) || [];
+  return scenes.reduce((n, s) => n + s.dialogue.filter(d => (d.fact_refs || []).includes(id)).length, 0);
+}
+
+function factTag(id) {
+  const fact = factById(id);
+  const [label, cls] = fact ? FACT_STATUS[fact.status] || FACT_STATUS.unverified : ['不存在', 'bad'];
+  const tip = fact ? `${fact.content}\n出处：${fact.source || '（无）'}\n${label}` : '底稿里没有这条事实';
+  return `<span class="tag-mini fact-ref ${cls}" title="${esc(tip)}" onclick="showFact(${jsArg(id)})">${esc(id)}</span>`;
+}
+
+function showFact(id) {
+  const fact = factById(id);
+  if (!fact) { alert(`${id}：知识底稿里没有这条事实`); return; }
+  const [label] = FACT_STATUS[fact.status] || FACT_STATUS.unverified;
+  alert(`${fact.id}（${label}）\n\n${fact.content}\n\n出处：${fact.source || '（无）'}`);
+}
+
+function renderKnowledge(bible) {
+  const p = currentProject || {};
+  const editable = inStatus(p, ['draft', 'failed', 'script_review']);
+  const facts = bible.facts || [];
+  const counts = Object.keys(FACT_STATUS).map(k => [k, facts.filter(f => f.status === k).length]);
+  $('bible-view').innerHTML = `
+    <div class="hint">${facts.length} 条事实：${counts.map(([k, n]) => `${FACT_STATUS[k][0]} ${n}`).join(' · ')}
+      ${editable ? '' : '（剧本已确认，底稿已锁定；要改先退回剧本阶段）'}</div>
+    <div class="hint">出处校验只证明引文在资料里真实存在，不证明结论对 —— 请对照原句确认。</div>
+    <div class="fact-list">
+      ${facts.map(f => {
+        const [label, cls] = FACT_STATUS[f.status] || FACT_STATUS.unverified;
+        const selfStated = !f.source || f.source.startsWith(SOURCE_SELF);
+        const cited = factCitations(f.id);
+        return `
+        <div class="fact-row" id="fact-${esc(f.id)}">
+          <div class="fact-head">
+            <span class="tag-mini">${esc(f.id)}</span>
+            <span class="tag-mini ${cls}">${label}</span>
+            ${f.type && f.type !== 'general' ? `<span class="tag-mini">${esc(f.type)}</span>` : ''}
+            ${cited ? `<span class="tag-mini">被 ${cited} 句旁白引用</span>` : ''}
+            <span>${esc(f.content)}</span>
+          </div>
+          <div class="fact-source">出处：${selfStated
+            ? `<span class="tag-mini warn">${esc(f.source || SOURCE_SELF)}</span>`
+            : `「${esc(f.source)}」`}</div>
+          ${editable ? `<div class="fact-actions">
+            ${f.status !== 'confirmed' ? `<button class="btn btn-sm btn-outline" onclick="setFactStatus(${jsArg(f.id)}, 'confirmed')">确认</button>` : ''}
+            ${f.status !== 'rejected' ? `<button class="btn btn-sm btn-outline" onclick="setFactStatus(${jsArg(f.id)}, 'rejected')">驳回</button>` : ''}
+            ${f.status !== 'unverified' ? `<button class="btn btn-sm btn-outline" onclick="setFactStatus(${jsArg(f.id)}, 'unverified')">撤销</button>` : ''}
+          </div>` : ''}
+        </div>`;
+      }).join('') || '<span class="hint">底稿里还没有事实</span>'}
+    </div>
+    <div id="asset-view" style="margin-top:12px"><span class="hint">加载演示场景与道具…</span></div>
+    <details style="margin-top:8px">
+      <summary style="font-size:11px;color:var(--text2);cursor:pointer">查看完整 JSON</summary>
+      <pre style="background:var(--bg2);border-radius:8px;padding:10px;font-size:11px;overflow-x:auto;max-height:250px;overflow-y:auto;margin-top:6px;color:var(--text2)">${esc(JSON.stringify(bible, null, 2))}</pre>
+    </details>
+  `;
+  renderAssets();
+}
+
+// 只改状态、不动内容：走现有的 PUT bible（内容或出处改了，服务端会把状态退回未核对）
+function setFactStatus(id, status) {
+  const bible = JSON.parse(JSON.stringify(currentBible));
+  const fact = (bible.facts || []).find(f => f.id === id);
+  if (!fact) return;
+  fact.status = status;
+  withBusy('更新事实状态...', () =>
+    api(`/api/projects/${currentProjectId}/bible`, { method: 'PUT', body: JSON.stringify(bible) }));
 }
 
 // ── 剧集资产（角色 / 场景 / 关键道具）──────────────────────────────────────
@@ -1783,7 +1951,7 @@ function renderScript() {
             <div class="heading">${esc(s.heading || s.id)} <span class="tag-mini">${esc(s.id)}</span></div>
             <div class="summary">${esc(s.summary)}</div>
             <div class="dialogue">
-              ${s.dialogue.map(d => `<div><span class="speaker" title="${esc(d.speaker)}">${esc(speakerName(d.speaker))}：</span>${esc(d.line)}</div>`).join('')}
+              ${s.dialogue.map(d => `<div><span class="speaker" title="${esc(d.speaker)}">${esc(speakerName(d.speaker))}：</span>${esc(d.line)}${(d.fact_refs || []).map(factTag).join('')}</div>`).join('')}
             </div>
             <div class="duration">${s.duration_sec}s · ${esc(s.emotion)}</div>
             <div class="scene-actions">
@@ -1966,6 +2134,7 @@ function shotBlockHtml(s, si) {
           ${(s.props_in_frame || []).length ? `<span class="tag-mini" title="关键道具">🔑 ${esc(namesOf('props', s.props_in_frame))}</span>` : ''}
           ${s.dialogue_text ? `<span style="color:var(--accent2)" title="${esc(s.dialogue_speaker)}">💬 ${esc(speakerName(s.dialogue_speaker))}${s.voice_offscreen ? '（画外音）' : ''}</span>` : ''}
         </div>
+        ${isExplainer(currentProject) && (s.narration || s.dialogue_text) ? `<div style="color:var(--accent2)">🎙 ${esc(s.narration || s.dialogue_text)}${(s.fact_refs || []).map(factTag).join('')}</div>` : ''}
         <div>${esc(s.visual_description)}</div>
         ${s.video_prompt ? `<div class="prompt">${esc(s.video_prompt)}</div>` : ''}
         <div class="shot-actions">
@@ -2612,6 +2781,10 @@ const SCRIPT_MODES = [
   ['polish', '改写已有台词/旁白'],
   ['full', '补旁白 + 改写 + 念法建议'],
 ];
+const EXPLAINER_SCRIPT_MODES = [
+  ['off', '只用分镜原文案'],
+  ['perform', '只给念法（看画面写语气，不改一个字）'],
+];
 let audioScriptMode = 'off';
 let audioScriptVision = true;
 let audioScriptForce = false;
@@ -2632,10 +2805,15 @@ function onScriptFlagChange() {
 function renderAudioScript() {
   const box = $('audio-script');
   if (!box) return;
-  const options = SCRIPT_MODES
+  // 科普：补写 / 改写旁白会让句子和它引用的事实对不上，只给 off / perform（服务端同样会拦）
+  const explainer = isExplainer(currentProject);
+  const modes = explainer ? EXPLAINER_SCRIPT_MODES : SCRIPT_MODES;
+  if (!modes.some(([value]) => value === audioScriptMode)) audioScriptMode = 'off';
+  const options = modes
     .map(([value, label]) => `<option value="${value}"${value === audioScriptMode ? ' selected' : ''}>${esc(label)}</option>`)
     .join('');
   box.innerHTML = `
+    ${explainer ? '<div class="hint">科普项目只给念法、不改旁白（旁白和事实标注一一对应）</div>' : ''}
     <label>配音文案
       <select id="audio-script-mode" onchange="onScriptModeChange()">${options}</select>
     </label>
@@ -3408,6 +3586,7 @@ async function generateAllReferences() {
 
 const ITEM_STATUS_LABEL = {
   pending: '等待', running: '进行中', succeeded: '完成', failed: '失败', cancelled: '已取消',
+  held: '待核对',
 };
 
 function stopBatchPolling() {
@@ -3425,6 +3604,7 @@ function renderBatch() {
     tags.innerHTML = batch
       ? `<span class="tag-mini">${batch.summary.succeeded}/${batch.summary.total} 完成</span>` +
         (batch.summary.failed ? `<span class="tag-mini warn">${batch.summary.failed} 失败</span>` : '') +
+        (batch.summary.held ? `<span class="tag-mini warn">${batch.summary.held} 待核对</span>` : '') +
         `<span class="tag-mini ${active ? '' : 'ok'}">${esc(batch.status)}</span>`
       : '';
   }
@@ -3447,7 +3627,7 @@ function renderBatch() {
         <tr>
           <td>${item.index + 1}</td>
           <td>${esc(item.title)}</td>
-          <td><span class="tag-mini ${item.status === 'failed' ? 'warn' : item.status === 'succeeded' ? 'ok' : ''}">${esc(ITEM_STATUS_LABEL[item.status] || item.status)}</span></td>
+          <td><span class="tag-mini ${['failed', 'held'].includes(item.status) ? 'warn' : item.status === 'succeeded' ? 'ok' : ''}">${esc(ITEM_STATUS_LABEL[item.status] || item.status)}</span></td>
           <td>${esc(item.stage || '-')}</td>
           <td>${item.project_id
             ? `<a href="#" onclick="selectProject('${item.project_id}');return false;">${esc(item.project_id)}</a>`
@@ -3474,12 +3654,25 @@ async function refreshBatch() {
   renderBatch();
 }
 
+function onBatchTypeChange() {
+  const explainer = $('batch-type').value === 'explainer';
+  $('batch-audience-wrap').style.display = explainer ? '' : 'none';
+  $('batch-source-wrap').style.display = explainer ? '' : 'none';
+  $('batch-items').placeholder = explainer
+    ? '为什么天是蓝的\n疫苗为什么要打两针'
+    : '被裁员的程序员靠 AI 逆袭\n替嫁新娘反杀豪门';
+}
+
 function doStartBatch() {
   const lines = ($('batch-items').value || '')
     .split('\n').map(x => x.trim()).filter(Boolean);
   if (!lines.length) { alert('请至少填一个主题（每行一个）'); return; }
+  const contentType = $('batch-type').value;
+  const source = contentType === 'explainer' ? $('batch-source').value : '';
   const payload = {
-    items: lines.map(text => ({ input_text: text })),
+    items: lines.map(text => ({ input_text: text, source_material: source })),
+    content_type: contentType,
+    audience: contentType === 'explainer' ? $('batch-audience').value.trim() : '',
     target_duration_sec: Number($('batch-duration').value || 45),
     stop_after: $('batch-stop').value,
     audio_script_mode: ($('batch-script-mode') && $('batch-script-mode').value) || '',
@@ -3506,7 +3699,16 @@ function doGenerateBible() {
   const notes = valueOf('bible-notes').trim();
   const body = { model: currentModel(), cast_region: region, notes };
   let label = '生成故事圣经中（约 10 秒）...';
-  if (currentProject && currentProject.input_mode === 'novel') {
+  if (isExplainer(currentProject)) {
+    label = '整理知识底稿中（资料长时按块抽取，约 10-60 秒）...';
+    const facts = (currentBible && currentBible.facts) || [];
+    if (facts.length) {
+      const confirmed = facts.filter(f => f.status === 'confirmed').length;
+      const cited = facts.filter(f => factCitations(f.id) > 0).length;
+      if (!confirm(`底稿里已有 ${facts.length} 条事实：已确认 ${confirmed} 条，被旁白引用 ${cited} 条。\n`
+        + '重新生成时内容没变的事实沿用原 id 和核对状态；内容或出处变了的退回「未核对」。继续？')) return;
+    }
+  } else if (currentProject && currentProject.input_mode === 'novel') {
     const n = parseInt(valueOf('novel-chapters'), 10) || 3;
     body.novel_chapters = n;
     if (!confirm(`小说模式：切章（$0）→ 逐章抽取前 ${n} 章的人物/场景/道具 → 合并成圣经。\n只花 LLM 的钱，不花视频费。继续？`)) return;
@@ -3518,12 +3720,24 @@ function doGenerateBible() {
     }));
 }
 
+const EXPLAINER_PLACEHOLDER = {
+  theme: '一个题目，例如：为什么天是蓝的',
+  outline: '要讲的几个知识点，每行一个（会保留你的顺序与要点）',
+  full_script: '粘贴写好的完整旁白：一个字都不改，只按句子切镜头、标注依据的事实',
+};
+
 function onInputModeChange() {
-  const novel = $('inp-mode').value === 'novel';
-  $('inp-text').placeholder = novel
+  const mode = $('inp-mode').value;
+  if (createContentType === 'explainer') {
+    $('inp-text').placeholder = EXPLAINER_PLACEHOLDER[mode] || EXPLAINER_PLACEHOLDER.theme;
+    return;
+  }
+  $('inp-text').placeholder = mode === 'novel'
     ? '粘贴小说原文（自动按「第X章 / Chapter N」切章；没有章标题就按字数切段）'
     : '例如：一个被裁员的程序员靠 AI 逆袭创业';
 }
+
+function isExplainer(p) { return !!p && p.content_type === 'explainer'; }
 
 function valueOf(id) {
   const el = document.getElementById(id);

@@ -117,6 +117,8 @@ class FakeLLM(LLMProvider):
         self.explainer_annotate_valid = True
         #: 科普分镜：故意漏掉最后一个镜头的画面 / 收到过的画面分镜请求（user prompt）
         self.explainer_visuals_skip_last = False
+        #: 科普旁白：False = 每场只写一句引用底稿的旁白、不提新事实（新事实没有出处，批量过不了）
+        self.explainer_new_facts = True
         self.explainer_visual_prompts: list[str] = []
 
     # ── LLMProvider 接口 ──────────────────────────────
@@ -414,6 +416,13 @@ class FakeLLM(LLMProvider):
     def _explainer_scene(self, scene_id: str, user: str) -> dict:
         """每场两句旁白：第一句引用 fact_1，第二句引用模型新提出的 new_1。"""
         revised = "（重写）" if "## 重写本场" in user else ""
+        if not self.explainer_new_facts:
+            return {
+                "heading": f"{scene_id} 标题",
+                "summary": f"{scene_id} 讲了一个知识点",
+                "lines": [{"line": f"{scene_id}：阳光里其实藏着各种颜色的光。",
+                           "fact_refs": list(self.explainer_line_refs)}],
+            }
         return {
             "heading": f"{scene_id} 标题",
             "summary": f"{scene_id} 讲了一个知识点",

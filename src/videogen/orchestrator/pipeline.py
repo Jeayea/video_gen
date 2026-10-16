@@ -91,6 +91,14 @@ class PipelineError(Exception):
     """流水线业务错误（状态不允许、前置产物缺失、生成失败等）。"""
 
 
+class ExplainerHeld(PipelineError):
+    """批量链路里的科普项目没过放行条件：停在剧本阶段，等人在知识底稿里核对。"""
+
+    def __init__(self, reasons: list[str]):
+        self.reasons = reasons
+        super().__init__("停在剧本阶段等人工核对：" + "；".join(reasons))
+
+
 class PipelineNotFound(PipelineError):
     """项目或产物不存在。"""
 
@@ -3220,6 +3228,17 @@ class Pipeline:
             story = self.store.load_story_outline(project_id)
             chapters = [story.chapters[0].id] if story and story.chapters else None
         await self.generate_script(project_id, model=model, chapters=chapters)
+        project = self.get_project(project_id)
+        if explainer_service.is_explainer(project):
+            report = self.store.load_consistency(project_id)
+            reasons = explainer_service.batch_hold_reasons(
+                project,
+                self.store.load_bible(project_id),
+                self.store.load_script(project_id),
+                report.issues if report else [],
+            )
+            if reasons:
+                raise ExplainerHeld(reasons)
         await self.confirm_script(project_id)
         stage("storyboard")
         await self.generate_storyboard(project_id, model=model)

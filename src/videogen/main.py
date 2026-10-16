@@ -365,6 +365,8 @@ class GenerateReferencesRequest(BaseModel):
 class BatchItemRequest(BaseModel):
     title: str = ""
     input_text: str = Field(min_length=1)
+    #: 科普：这一条的参考资料原文（没有资料的科普条目会停在剧本阶段等人工核对）
+    source_material: str = ""
 
 
 class BatchRequest(BaseModel):
@@ -372,6 +374,9 @@ class BatchRequest(BaseModel):
     target_duration_sec: int = Field(default=45, ge=5, le=600)
     aspect_ratio: AspectRatio = AspectRatio.VERTICAL
     input_mode: InputMode = InputMode.THEME
+    #: 内容类型：科普条目只有在「有资料 + 出处全过 + 审稿无 ERROR」时才自动往下跑
+    content_type: ContentType = ContentType.DRAMA
+    audience: str = Field(default="", max_length=200)
     #: 批量跑到哪一步就停：storyboard（只要剧本+分镜）/ video / audio / compose（默认全流程）
     stop_after: str = "compose"
     model: str = ""
@@ -1649,6 +1654,8 @@ async def create_batch(req: BatchRequest):
             target_duration_sec=req.target_duration_sec,
             aspect_ratio=req.aspect_ratio,
             input_mode=req.input_mode,
+            content_type=req.content_type,
+            audience=req.audience,
             stop_after=req.stop_after,
             model=req.model,
             audio_script_mode=req.audio_script_mode,

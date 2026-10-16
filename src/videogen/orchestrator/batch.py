@@ -9,7 +9,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel, Field
 
-from videogen.models.project import AspectRatio, InputMode
+from videogen.models.project import AspectRatio, ContentType, InputMode
 from videogen.utils.redact import scrub_secrets
 
 if TYPE_CHECKING:  # pragma: no cover - 只为类型标注，避免循环 import
@@ -38,12 +38,16 @@ class ItemStatus(str, Enum):
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     CANCELLED = "cancelled"
+    #: 科普没过放行条件：停在剧本阶段等人工核对（不算失败，项目留着接着做）
+    HELD = "held"
 
 
 class BatchItem(BaseModel):
     index: int
     title: str = ""
     input_text: str = ""
+    #: 科普：这一条的参考资料原文（只用来建项目，不进对外的批量状态）
+    source_material: str = ""
     project_id: str = ""
     status: ItemStatus = ItemStatus.PENDING
     stage: str = ""
@@ -63,6 +67,9 @@ class Batch(BaseModel):
     target_duration_sec: int = 45
     aspect_ratio: AspectRatio = AspectRatio.VERTICAL
     input_mode: InputMode = InputMode.THEME
+    content_type: ContentType = ContentType.DRAMA
+    #: 科普：目标观众
+    audience: str = ""
     stop_after: str = "compose"
     model: str = ""
     #: 配音文案模式（"" = 用 .env 配置；off/narration/polish/full）
@@ -85,12 +92,13 @@ class Batch(BaseModel):
             ItemStatus.SUCCEEDED,
             ItemStatus.FAILED,
             ItemStatus.CANCELLED,
+            ItemStatus.HELD,
         })
         return min(100, round(done / len(self.items) * 100))
 
     def to_public(self) -> dict:
         return {
-            **self.model_dump(),
+            **self.model_dump(exclude={"items": {"__all__": {"source_material"}}}),
             "percent": self.percent,
             "is_active": self.is_active,
             "summary": self.summary(),
@@ -104,6 +112,7 @@ class Batch(BaseModel):
             "pending": sum(1 for i in self.items if i.status == ItemStatus.PENDING),
             "running": sum(1 for i in self.items if i.status == ItemStatus.RUNNING),
             "cancelled": sum(1 for i in self.items if i.status == ItemStatus.CANCELLED),
+            "held": sum(1 for i in self.items if i.status == ItemStatus.HELD),
         }
 
 
@@ -138,6 +147,8 @@ class BatchManager:
         target_duration_sec: int = 45,
         aspect_ratio: AspectRatio = AspectRatio.VERTICAL,
         input_mode: InputMode = InputMode.THEME,
+        content_type: ContentType = ContentType.DRAMA,
+        audience: str = "",
         stop_after: str = "compose",
         model: str = "",
         audio_script_mode: str = "",
@@ -152,6 +163,8 @@ class BatchManager:
             raise ValueError(f"一次最多 {max_items} 条（当前 {len(cleaned)} 条）")
         if stop_after not in STOP_AFTER_STAGES:
             raise ValueError(f"stop_after 只能是 {', '.join(STOP_AFTER_STAGES)}")
+        if content_type == ContentType.EXPLAINER and input_mode == InputMode.NOVEL:
+            raise ValueError("科普讲解不支持小说改编模式")
 
         batch = Batch(
             items=[
@@ -159,12 +172,15 @@ class BatchManager:
                     index=index,
                     title=str(item.get("title") or "").strip() or f"批量项目 {index + 1}",
                     input_text=str(item["input_text"]).strip(),
+                    source_material=str(item.get("source_material") or "").strip(),
                 )
                 for index, item in enumerate(cleaned)
             ],
             target_duration_sec=target_duration_sec,
             aspect_ratio=aspect_ratio,
             input_mode=input_mode,
+            content_type=content_type,
+            audience=audience,
             stop_after=stop_after,
             model=model,
             audio_script_mode=audio_script_mode,
@@ -210,6 +226,8 @@ class BatchManager:
 
     async def _run(self, pipeline: Pipeline, batch: Batch) -> None:
         from videogen.models.project import Project
+        from videogen.orchestrator.pipeline import ExplainerHeld
+        from videogen.services import explainer_service
 
         batch.status = BatchStatus.RUNNING
         batch.started_at = datetime.now(UTC).isoformat()
@@ -231,7 +249,11 @@ class BatchManager:
                     input_mode=batch.input_mode,
                     aspect_ratio=batch.aspect_ratio,
                     target_duration_sec=batch.target_duration_sec,
+                    content_type=batch.content_type,
+                    audience=batch.audience,
+                    source_material=item.source_material,
                 )
+                explainer_service.apply_creation_defaults(project)
                 pipeline.store.create_project(project)
                 item.project_id = project.id
                 try:
@@ -246,6 +268,16 @@ class BatchManager:
                     item.status = ItemStatus.CANCELLED
                     item.updated_at = datetime.now(UTC).isoformat()
                     raise
+                except ExplainerHeld as held:
+                    item.status = ItemStatus.HELD
+                    item.stage = "script"
+                    item.error = "；".join(held.reasons)[:400]
+                    item.updated_at = datetime.now(UTC).isoformat()
+                    logger.info(
+                        "批量条目停在剧本阶段等人工核对 batch=%s project=%s：%s",
+                        batch.id, project.id, item.error,
+                    )
+                    return
                 except Exception as exc:  # noqa: BLE001 - 单条失败不阻塞其它条目
                     item.status = ItemStatus.FAILED
                     item.error = scrub_secrets(f"{type(exc).__name__}: {exc}")[:400]
@@ -269,14 +301,17 @@ class BatchManager:
             batch.message = scrub_secrets(str(exc))[:300]
         else:
             summary = batch.summary()
-            if summary["failed"] and summary["succeeded"]:
+            if summary["failed"] and (summary["succeeded"] or summary["held"]):
                 batch.status = BatchStatus.PARTIAL
             elif summary["failed"]:
                 batch.status = BatchStatus.FAILED
+            elif summary["held"]:
+                batch.status = BatchStatus.PARTIAL
             elif batch.status != BatchStatus.CANCELLED:
                 batch.status = BatchStatus.SUCCEEDED
             batch.message = (
                 f"完成：成功 {summary['succeeded']}，失败 {summary['failed']}"
+                + (f"，待核对 {summary['held']}" if summary["held"] else "")
                 + (f"，取消 {summary['cancelled']}" if summary["cancelled"] else "")
             )
         finally:

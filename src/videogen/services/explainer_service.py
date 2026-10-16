@@ -1135,3 +1135,47 @@ def ai_metadata(project: Project | None, settings: Settings | None = None) -> di
         return {}
     note = f"AIGC: {text}（画面与旁白由 AI 生成）"
     return {"comment": note, "description": note}
+
+
+# ── 批量放行 ────────────────────────────────────────────
+
+
+def batch_hold_reasons(
+    project: Project,
+    bible: StoryBible | None,
+    script: Script | None,
+    issues: list[ConsistencyIssue],
+    settings: Settings | None = None,
+) -> list[str]:
+    """批量链路里科普项目能不能跳过人工确认往下跑；返回停下来的理由（空 = 放行）。
+
+    三条都要满足（docs/EXPLAINER_DESIGN.md 第 5 节）：有参考资料、旁白引用的事实全部通过出处校验、
+    剧本检查（含 LLM 审稿）没有 ERROR。批量不该自动交付没人核对过的知识。
+    """
+    settings = settings or get_settings()
+    reasons: list[str] = []
+    material = project.source_material.strip()
+    if not material:
+        reasons.append("没有参考资料：事实全是模型自述，要人工在知识底稿里核对")
+    else:
+        facts = {f.id: f for f in (bible.facts if bible else [])}
+        cited: list[str] = []
+        for scene in script.scenes if script else []:
+            for line in scene.dialogue:
+                cited.extend(ref for ref in line.fact_refs if ref not in cited)
+        failed = [
+            ref
+            for ref in cited
+            if ref not in facts
+            or source_state(facts[ref], material, min_chars=settings.explainer_min_quote_chars)
+            != "ok"
+        ]
+        if failed:
+            reasons.append(
+                f"{len(failed)} 条被旁白引用的事实没通过出处校验：{'、'.join(failed[:5])}"
+                f"{' …' if len(failed) > 5 else ''}"
+            )
+    errors = [i for i in issues if i.severity == IssueSeverity.ERROR]
+    if errors:
+        reasons.append(f"剧本检查有 {len(errors)} 条 ERROR（含 LLM 审稿）：{errors[0].message}")
+    return reasons
