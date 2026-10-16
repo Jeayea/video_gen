@@ -7,10 +7,14 @@ HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-8001}"
 RELOAD="${RELOAD:-1}"
 
-args=(--host "$HOST" --port "$PORT")
+# 第一次运行：还没装就先装（建 venv、装锁定版本的依赖、生成 .env）
+if [ ! -x .venv/bin/python ]; then
+  ./install.sh
+fi
+
+args=(serve --host "$HOST" --port "$PORT")
 if [ "$RELOAD" != "0" ]; then
   args+=(--reload)
 fi
 
-echo "videogen → http://${HOST}:${PORT}"
-exec .venv/bin/python -m uvicorn videogen.main:app "${args[@]}"
+exec .venv/bin/python -m videogen.cli "${args[@]}"

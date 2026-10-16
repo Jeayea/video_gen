@@ -20,15 +20,20 @@ AI 短剧自动化流水线：从一句创意、一份大纲、一部剧本或�
 
 ## 安装
 
-需要 Python 3.11+。ffmpeg 可选：没装时 `media` 依赖会带一个便携版。
+需要 Python 3.11+（macOS / Linux）。ffmpeg 可选：没装时会带一个便携版。
 
 ```bash
-python -m venv .venv && .venv/bin/pip install -e ".[dev,media]"
-cp .env.example .env          # 填入 OPENROUTER_API_KEY
-./run.sh                      # 打开 http://127.0.0.1:8001
+git clone https://github.com/Jeayea/video_gen.git && cd video_gen
+./run.sh                      # 第一次会自动安装，然后打开 http://127.0.0.1:8001
 ```
 
-- 只填 `OPENROUTER_API_KEY` 就能跑通文本链路。视频默认 `VIDEO_PROVIDER=mock`，不花钱
+第一次运行 `run.sh` 会调用 `./install.sh`：建 `.venv`、按 `requirements.lock` 装锁定版本的依赖（带哈希校验）、
+生成 `.env` 并提示粘贴 `OPENROUTER_API_KEY`（不回显），最后跑一遍环境自检。脚本可以重复跑，已有的 `.env` 不会被覆盖。
+
+- 只填 `OPENROUTER_API_KEY` 就能跑通全流程。视频默认 `VIDEO_PROVIDER=mock`，不花钱
+- `.env.example` 只有最常改的几项；全部配置项在 [.env.full.example](.env.full.example)，要改哪项就把那一行抄进 `.env`
+- 随时自检（key 有没有配、ffmpeg 能不能烧字幕、口型环境装没装；不联网、不花钱）：`.venv/bin/videogen doctor`
+- 启动也可以用 `.venv/bin/videogen serve [--host ... --port ... --reload]`
 - 可选：`python -m videogen.tools.demo_bgm` 生成 4 首演示 BGM 到 `./assets/bgm`
 - 服务默认只监听 `127.0.0.1`。改监听地址用 `HOST=0.0.0.0 PORT=8001 ./run.sh`，**暴露到局域网前先设置 `API_TOKEN`**
 
@@ -73,7 +78,7 @@ curl -s localhost:8001/api/projects/$PID/cost        # 实际花费账本
 
 ### 常用配置
 
-完整列表见 [.env.example](.env.example)。
+完整列表见 [.env.full.example](.env.full.example)。
 
 | 想做什么 | 配置 |
 |----------|------|
@@ -94,6 +99,7 @@ curl -s localhost:8001/api/projects/$PID/cost        # 实际花费账本
 ## 开发
 
 ```bash
+./install.sh --dev                                  # 加装 pytest / ruff
 .venv/bin/python -m pytest -q                       # 离线测试，不调用付费服务
 .venv/bin/ruff check src tests tools
 .venv/bin/python tools/e2e/mock_pipeline_e2e.py --source <源项目 id>   # 免费的端到端冒烟

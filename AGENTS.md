@@ -19,6 +19,10 @@ README 只讲「这是什么、怎么装、怎么用」。这里记录**项目�
   .venv/bin/python -m pytest -q          # 全量约 3 分钟；需要 ffmpeg 的用例没有 ffmpeg 时自动跳过
   ```
 
+- **依赖锁定**：`requirements.lock` / `requirements-dev.lock` 是 `uv pip compile --universal --generate-hashes`
+  生成的（命令写在文件头）。改了 `pyproject.toml` 的依赖要重新生成两份，`install.sh` 用 `--require-hashes` 装
+- **配置模板**：`.env.example` 是最小模板，`.env.full.example` 是全部配置项；两份的值都必须等于 `config.py` 的默认值
+  （`tests/test_cli.py` 会查），新增配置项记得加进 full 版
 - `tests/test_secrets.py` 会扫描所有被 git 跟踪的文件，出现真实形态的 key 就失败；
   `.env`、`projects/`（媒体产物）不进仓库
 - **花真钱的脚本默认只看账**：`tools/e2e/real_shot_e2e.py` 不带 `--yes` 只播种 + 打印 preflight 报价

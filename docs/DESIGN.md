@@ -96,12 +96,15 @@ video_gen/
 ├── README.md
 ├── docs/DESIGN.md
 ├── pyproject.toml
-├── .env.example
+├── requirements.lock          # 锁定版本 + 哈希（install.sh 用；-dev 版多了测试工具）
+├── install.sh / run.sh        # 一键安装 / 启动
+├── .env.example               # 最小配置；.env.full.example 是全部配置项
 ├── src/
 │   └── videogen/
 │       ├── __init__.py
 │       ├── config.py              # 配置管理
 │       ├── main.py                # FastAPI 入口
+│       ├── cli.py                 # 命令行：videogen serve / doctor
 │       ├── orchestrator/
 │       │   ├── __init__.py
 │       │   ├── state_machine.py   # 阶段状态机
