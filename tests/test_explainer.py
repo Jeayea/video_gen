@@ -1378,6 +1378,10 @@ def test_still_prompt_uses_project_illustration_style():
         shot, _explainer(visual_mode="still", illustration_style="paper cut-out collage"), None
     )
     assert "style: paper cut-out collage" in custom
+    comic = video_service.still_prompt(
+        shot, _explainer(visual_mode="still", illustration_style="comic"), None
+    )
+    assert "no panel grid" in comic
     # 画风标记：默认画风不加（老项目不重画），换画风 = 换模型
     assert explainer_service.illustration_tag(_explainer()) == ""
     assert explainer_service.illustration_tag(_explainer(illustration_style="editorial")) == ""
@@ -1438,3 +1442,33 @@ async def test_meme_tone_reaches_writer_visuals_review_and_voice(store, make_pip
     assert "念法俏皮" in prompt
     # 短剧项目就算带了 tone 字段也不读
     assert explainer_service.tone_block(Project(title="短剧", tone="meme")) == ""
+
+
+class _ShortOutlineLLM(FakeLLM):
+    """第一次给的科普大纲只有 4 场（gemini-3.8-flash 实测会这样）。"""
+
+    def __init__(self, short_times: int = 1):
+        super().__init__()
+        self.short_times = short_times
+
+    def _respond(self, messages):
+        payload = super()._respond(messages)
+        if "科普讲解的结构编辑" in str(messages[0].content) and self.short_times > 0:
+            self.short_times -= 1
+            payload = {"scenes": payload["scenes"][:4]}
+        return payload
+
+
+async def test_outline_with_too_few_scenes_is_asked_again(store, make_pipeline):
+    llm = _ShortOutlineLLM()
+    project, pipeline, _ = await _with_bible(store, make_pipeline, llm)
+    script = await pipeline.generate_script(project.id)
+    assert len(script.scenes) >= explainer_service.MIN_POINTS + 2
+    outline_calls = [c for c in llm.calls if "科普讲解的结构编辑" in str(c[0].content)]
+    assert len(outline_calls) == 2
+    assert "只有 4 场，不够" in str(outline_calls[1][-1].content)
+
+    stubborn = _ShortOutlineLLM(short_times=9)
+    project, _, _ = await _with_bible(store, make_pipeline, stubborn)
+    with pytest.raises(ValueError, match="2 次都只给了 4 场"):
+        await explainer_service.generate_outline(stubborn, project, store.load_bible(project.id))

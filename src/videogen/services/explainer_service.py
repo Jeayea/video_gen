@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import difflib
 import hashlib
+import json
 import logging
 import math
 import re
@@ -106,8 +107,10 @@ ILLUSTRATION_STYLES: dict[str, tuple[str, str]] = {
     ),
     "comic": (
         "手绘漫画",
-        "hand-drawn comic illustration, expressive exaggerated characters and reactions, "
-        "ink outlines with flat colors, playful energetic composition",
+        # 只写 comic 会被画成分格的漫画页（「大水理论」试拍 10 张里 1 张三格）
+        "a single full-bleed comic panel (not a comic page, no panel grid), hand-drawn comic "
+        "illustration, expressive exaggerated characters and reactions, ink outlines with flat "
+        "colors, playful energetic composition",
     ),
     "watercolor": (
         "水彩绘本",
@@ -652,6 +655,10 @@ OUTLINE_SYSTEM = """你是科普讲解的结构编辑。把一个题目排成固
 只输出 JSON。"""
 
 
+#: 大纲场数不够时最多要几次
+OUTLINE_ATTEMPTS = 2
+
+
 def _format_facts(bible: StoryBible) -> str:
     rows = []
     for fact in bible.facts:
@@ -680,11 +687,29 @@ async def generate_outline(
         LLMMessage(role="system", content=OUTLINE_SYSTEM),
         LLMMessage(role="user", content="\n".join(lines)),
     ]
-    response = await llm.chat_json(messages, schema=OutlineResponse, temperature=0.5)
-    raw = [s for s in response.scenes if isinstance(s, dict)]
-    if len(raw) < MIN_POINTS + 2:
+    need = MIN_POINTS + 2
+    raw: list[dict] = []
+    # 场数不够时把要求告诉模型再要一次：同一份输入 gemini-3.8-flash 有时给 5 场、有时给 4 场
+    for attempt in range(OUTLINE_ATTEMPTS):
+        response = await llm.chat_json(messages, schema=OutlineResponse, temperature=0.5)
+        raw = [s for s in response.scenes if isinstance(s, dict)]
+        if len(raw) >= need:
+            break
+        logger.warning("科普大纲只有 %d 场（第 %d 次），要求重写", len(raw), attempt + 1)
+        messages = [
+            *messages,
+            LLMMessage(role="assistant", content=json.dumps({"scenes": raw}, ensure_ascii=False)),
+            LLMMessage(
+                role="user",
+                content=f"只有 {len(raw)} 场，不够：至少要 {need} 场"
+                f"（1 场开场提问 + 至少 {MIN_POINTS} 场知识点 + 1 场小结）。"
+                "请把知识点拆开，重写完整大纲。",
+            ),
+        ]
+    else:
         raise ValueError(
-            f"科普大纲至少要 {MIN_POINTS + 2} 场（提问 + {MIN_POINTS} 个知识点 + 小结）"
+            f"科普大纲至少要 {need} 场（提问 + {MIN_POINTS} 个知识点 + 小结），"
+            f"模型 {OUTLINE_ATTEMPTS} 次都只给了 {len(raw)} 场"
         )
     if len(raw) > MAX_POINTS + 2:
         raw = [raw[0], *raw[1 : MAX_POINTS + 1], raw[-1]]
