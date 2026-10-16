@@ -622,3 +622,157 @@ def test_new_fact_with_existing_content_points_to_the_existing_one():
     assert mapping == {"new_1": "fact_1", "new_2": "fact_4"}
     assert [f.id for f in bible.facts] == ["fact_1", "fact_3", "fact_4"]
     assert bible.facts[-1].source == explainer_service.SOURCE_SELF
+
+
+# ── 分镜：一句一镜 ────────────────────────────────────
+
+
+async def _with_storyboard(store, make_pipeline, llm=None, **kwargs):
+    project, pipeline, llm = await _with_bible(store, make_pipeline, llm, **kwargs)
+    await pipeline.generate_script(project.id)
+    await pipeline.confirm_script(project.id, force=True)
+    storyboard = await pipeline.generate_storyboard(project.id)
+    return project, pipeline, llm, storyboard
+
+
+async def test_storyboard_is_one_shot_per_sentence(store, make_pipeline, settings):
+    assert settings.video_segment_mode is False  # 测试基线关着段落分镜
+    project, _, llm, storyboard = await _with_storyboard(store, make_pipeline)
+    script = store.load_script(project.id)
+
+    lines = [(s.id, d) for s in script.scenes for d in s.dialogue]
+    assert len(storyboard.shots) == len(lines)
+    for shot, (scene_id, line) in zip(storyboard.shots, lines, strict=True):
+        assert shot.scene_id == scene_id
+        # 旁白、事实引用、时长由代码按句子定，模型改的旁白和时长不认
+        assert shot.narration == line.line
+        assert (shot.dialogue_text, shot.dialogue_speaker) == (None, None)
+        assert shot.fact_refs == line.fact_refs
+        assert shot.duration_sec == explainer_service.line_seconds(line.line)
+        assert shot.video_prompt.startswith("macro shot")
+        assert shot.character_in_frame == []  # 不存在的角色 id 被丢掉
+        assert shot.location == "loc_1"
+    # 场次时长 = 各句镜头之和，没被归一化改动
+    for scene in script.scenes:
+        assert sum(s.duration_sec for s in storyboard.shots_for_scene(scene.id)) == (
+            scene.duration_sec
+        )
+    # VIDEO_SEGMENT_MODE=false 对科普不生效：照样编段
+    assert all(shot.segment_id for shot in storyboard.shots)
+    assert not any("专业分镜师" in str(c[0].content) for c in llm.calls)
+    assert len(llm.explainer_visual_prompts) == len(script.scenes)
+    report = store.load_consistency(project.id)
+    assert not any(
+        i.severity == IssueSeverity.ERROR and i.shot_id for i in report.issues
+    )
+
+
+async def test_storyboard_visual_prompt_carries_the_rules(store, make_pipeline):
+    _, _, llm, _ = await _with_storyboard(store, make_pipeline)
+    system = next(
+        str(c[0].content) for c in llm.calls if "科普画面分镜师" in str(c[0].content)
+    )
+    assert "不许合并、拆分、跳过句子" in system
+    assert "no text, no labels" in system
+    assert "1. " in llm.explainer_visual_prompts[0]
+
+
+async def test_missing_visuals_are_flagged_not_invented(store, make_pipeline):
+    llm = FakeLLM()
+    llm.explainer_visuals_skip_last = True
+    project, _, _, storyboard = await _with_storyboard(store, make_pipeline, llm)
+    script = store.load_script(project.id)
+    assert len(storyboard.shots) == sum(len(s.dialogue) for s in script.scenes)
+    blank = [s.id for s in storyboard.shots if not s.video_prompt]
+    assert blank == [storyboard.shots_for_scene(s.id)[-1].id for s in script.scenes]
+    report = store.load_consistency(project.id)
+    flagged = {i.shot_id for i in report.issues if "缺少 video_prompt" in i.message}
+    assert flagged == set(blank)
+
+
+async def test_explainer_storyboard_resumes_after_failure(store, make_pipeline):
+    llm = FakeLLM()
+    project, pipeline, _ = await _with_bible(store, make_pipeline, llm)
+    await pipeline.generate_script(project.id)
+    await pipeline.confirm_script(project.id, force=True)
+    llm.fail_at = "explainer_visuals:scene_3"
+    with pytest.raises(PipelineError):
+        await pipeline.generate_storyboard(project.id)
+    assert store.load_storyboard(project.id).scene_ids() == {"scene_1", "scene_2"}
+
+    llm.fail_at = None
+    before = len(llm.explainer_visual_prompts)
+    storyboard = await pipeline.generate_storyboard(project.id)
+    assert len(llm.explainer_visual_prompts) - before == 3
+    assert len(storyboard.scene_ids()) == 5
+
+
+async def test_revise_only_rewrites_visual_fields(store, make_pipeline):
+    project, pipeline, _, storyboard = await _with_storyboard(store, make_pipeline)
+    target = storyboard.shots_for_scene("scene_2")[1]
+
+    result = await pipeline.propose_storyboard_revision(
+        project.id, shot_id=target.id, feedback="换成日落的画面"
+    )
+    assert result["changed_shots"] == [target.id]
+    shots = {s["id"]: s for s in result["storyboard"]["shots"]}
+    fresh = shots[target.id]
+    assert fresh["video_prompt"].endswith("no text, no labels")
+    assert "revised" in fresh["video_prompt"]
+    for field in ("narration", "fact_refs", "duration_sec", "segment_id"):
+        assert fresh[field] == getattr(target, field)
+    others = [s for s in storyboard.shots if s.id != target.id]
+    assert all(shots[s.id]["video_prompt"] == s.video_prompt for s in others)
+
+    result = await pipeline.propose_storyboard_revision(project.id, scene_id="scene_3")
+    scene_shots = storyboard.shots_for_scene("scene_3")
+    assert result["changed_shots"] == [s.id for s in scene_shots]
+    revised = [s for s in result["storyboard"]["shots"] if s["scene_id"] == "scene_3"]
+    assert [s["narration"] for s in revised] == [s.narration for s in scene_shots]
+    assert len(result["storyboard"]["shots"]) == len(storyboard.shots)
+    # 只是提案：分镜没被保存
+    saved = store.load_storyboard(project.id)
+    assert [s.video_prompt for s in saved.shots] == [s.video_prompt for s in storyboard.shots]
+
+
+async def test_merge_shots_is_refused(store, make_pipeline):
+    project, pipeline, _, _ = await _with_storyboard(store, make_pipeline)
+    await pipeline.confirm_storyboard(project.id, force=True)
+    with pytest.raises(PipelineError, match="一句旁白一个镜头"):
+        await pipeline.merge_short_shots(project.id)
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected"),
+    [("off", "off"), ("perform", "perform"), ("narration", "perform"),
+     ("polish", "perform"), ("full", "perform")],
+)
+def test_voice_script_mode_is_limited_for_explainer(mode, expected):
+    actual, warning = explainer_service.voice_script_mode(_explainer(), mode)
+    assert actual == expected
+    assert bool(warning) == (mode != expected)
+    assert explainer_service.voice_script_mode(Project(title="短剧"), mode) == (mode, "")
+
+
+async def test_preflight_uses_the_limited_voice_script_mode(store, make_pipeline):
+    project, pipeline, _, _ = await _with_storyboard(store, make_pipeline)
+    plan = await pipeline.preflight(project.id, action="audio", script_mode="polish")
+    assert plan["audio"]["script_mode"] == "perform"
+
+
+def test_presenter_line_becomes_dialogue_in_frame():
+    bible = StoryBible(characters=[Character(id="char_1", name="讲解员")])
+    scene = Scene(
+        id="scene_1",
+        heading="开场",
+        dialogue=[
+            DialogueLine(speaker=NARRATOR, line="天为什么是蓝的？", fact_refs=["fact_1"]),
+            DialogueLine(speaker="char_1", line="我们来做个实验。"),
+            DialogueLine(speaker=NARRATOR, line="  "),
+        ],
+    )
+    shots = explainer_service.shots_from_scene(scene, bible)
+    assert [s.id for s in shots] == ["scene_1_shot_1", "scene_1_shot_2"]
+    assert (shots[0].narration, shots[0].fact_refs) == ("天为什么是蓝的？", ["fact_1"])
+    assert (shots[1].dialogue_text, shots[1].dialogue_speaker) == ("我们来做个实验。", "char_1")
+    assert shots[1].narration is None and shots[1].character_in_frame == ["char_1"]

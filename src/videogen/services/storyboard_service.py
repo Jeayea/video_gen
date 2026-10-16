@@ -22,8 +22,10 @@ __all__ = [
     "Segment",
     "absorb_bucket",
     "apply_duration_tier",
+    "aspect_hint",
     "assign_segments",
     "chain_predecessors",
+    "format_brief_bible",
     "generate_shots_for_scene",
     "merge_shots",
     "merge_to_count",
@@ -85,7 +87,11 @@ _CHAR_ID_RE = re.compile(r"\bchar_[0-9]+\b")
 _LOC_ID_RE = re.compile(r"\bloc_[0-9]+\b")
 
 
-def _format_brief_bible(bible: StoryBible) -> str:
+def aspect_hint(project: Project) -> str:
+    return _ASPECT_HINTS.get(project.aspect_ratio.value, _ASPECT_HINTS["9:16"])
+
+
+def format_brief_bible(bible: StoryBible) -> str:
     lines = ["角色（id 仅用于 character_in_frame / dialogue_speaker，不要写进 video_prompt）:"]
     for c in bible.characters:
         lines.append(f"  - id={c.id} 姓名={c.name} 外貌={c.visual_prompt or c.description}")
@@ -185,7 +191,7 @@ async def generate_shots_for_scene(
     `environment` 是长篇大纲展开时留下的环境线索（背景不够丰富的补丁之一）；
     `story_context` 是这一场在整篇里的位置（章标题/情节点），避免分镜脱离全篇。
     """
-    aspect_hint = _ASPECT_HINTS.get(project.aspect_ratio.value, _ASPECT_HINTS["9:16"])
+    hint = aspect_hint(project)
     dialogue_text = "\n".join(f"  {d.speaker}: {d.line}" for d in scene.dialogue) or "（无对白）"
     constraints = duration_constraints(scene.duration_sec, tier)
     shot_count_rule = (
@@ -204,7 +210,7 @@ async def generate_shots_for_scene(
     if segment_mode and not constraints:
         tier_block = f"\n## 段落节奏（视频按段生成）\n{SEGMENT_SHOT_RULES}\n"
     user_prompt = f"""## 角色与场景参考
-{_format_brief_bible(bible)}
+{format_brief_bible(bible)}
 
 ## 本场剧本
 场次: {scene.id}
@@ -216,7 +222,7 @@ async def generate_shots_for_scene(
 {dialogue_text}
 {context_block}{env_block}{tier_block}{_revision_block(revision, feedback, target_shot)}
 ## 要求
-- 画面比例: {project.aspect_ratio.value} → {aspect_hint}
+- 画面比例: {project.aspect_ratio.value} → {hint}
 - {shot_count_rule}
 - video_prompt 必须是英文，且不得包含 char_N / loc_N 这类 id；
   画面里要出现的文字（黑板 / 招牌 / 横幅 / 屏幕）保留原文、用引号括起来，不要翻译

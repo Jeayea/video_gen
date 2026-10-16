@@ -24,6 +24,7 @@ from videogen.models.explainer import (
     KnowledgeResponse,
     NewFact,
     SourceChunk,
+    VisualsResponse,
 )
 from videogen.models.llm_io import OutlineResponse
 from videogen.models.project import ContentType, InputMode, Project
@@ -36,8 +37,9 @@ from videogen.models.script import (
     Script,
     ScriptOutline,
 )
+from videogen.models.storyboard import Shot
 from videogen.providers.llm.base import LLMMessage, LLMProvider
-from videogen.services import bible_service, script_service
+from videogen.services import bible_service, script_service, storyboard_service
 from videogen.utils.duration import SPEECH_CHARS_PER_SEC, apply_duration_budget, speech_seconds
 from videogen.utils.novel import source_fingerprint, split_chapters
 from videogen.utils.text import quote_source
@@ -929,4 +931,182 @@ def _issue(
     return ConsistencyIssue(
         severity=severity, scene_id=scene_id, category=category, message=message,
         suggestion=suggestion,
+    )
+
+
+# ── 分镜：一句旁白一个镜头 ─────────────────────────────
+
+#: 科普镜头里模型能改的字段（画面）。旁白、fact_refs、时长、id 由代码按句子定，重写分镜也不动它们
+VISUAL_FIELDS = (
+    "camera",
+    "visual_description",
+    "character_in_frame",
+    "mood",
+    "video_prompt",
+    "location",
+    "props_in_frame",
+)
+
+VISUALS_SYSTEM = """你是科普画面分镜师。一支科普讲解短片的旁白已经定稿，一句旁白就是一个镜头，
+镜头的数量、顺序、时长都已经定了。你只负责给每个镜头设计画面：怎么把这句话拍成观众看得懂的画面。
+
+每个镜头输出：
+{
+  "index": 1,
+  "camera": "景别 · 运镜（如：特写 · 缓推 / 全景 · 固定）",
+  "visual_description": "中文画面描述",
+  "character_in_frame": [],
+  "mood": "画面情绪（英文情绪词：curious / calm / amazed …）",
+  "video_prompt": "subject + action + environment + lighting（全英文）",
+  "location": "loc_id（知识底稿里的演示场景 id，没有合适的留空）",
+  "props_in_frame": ["prop_1"]
+}
+
+要求：
+- index 对应旁白句的编号，**每一句都要有、只能有一个镜头**：不许合并、拆分、跳过句子，也不要改写旁白
+- 画面服务于这句话：优先用实物、日常现象、比喻、过程演示（慢动作、微距、剖面、示意性的动态）
+- **不要让画面里出现知识性的文字**：公式、数据、图表标注、术语、字幕 —— 视频模型写错一个字就是讲错。
+  video_prompt 里写明 no text, no labels, no captions；场景里自然出现的招牌、标语不受限制
+- 画面里本来就不需要人时不要硬塞人；character_in_frame 只能填角色列表里已有的 id，没有就给空数组
+- video_prompt 必须全英文，禁止出现 char_1 / loc_1 这类内部 id，背景写到具体的可见物、光从哪来
+- 一个镜头只写一个连续的画面，不要在一句 video_prompt 里塞多个画面切换
+- 相邻镜头的画面要连得上（同一个演示过程的前后两步、同一个地点换景别）
+- 只输出 JSON: {"shots": [...]}"""
+
+
+def shots_from_scene(
+    scene: Scene, bible: StoryBible, settings: Settings | None = None
+) -> list[Shot]:
+    """一句旁白一个镜头：id、顺序、时长、旁白、fact_refs 都由代码定（确定性，模型碰不到）。
+
+    旁白落 `narration`；有讲解人物（说话人是圣经里的角色）时那句落成对白。
+    """
+    known = {c.id for c in bible.characters}
+    shots: list[Shot] = []
+    for line in scene.dialogue:
+        text = line.line.strip()
+        if not text:
+            continue
+        index = len(shots) + 1
+        speaker = line.speaker if line.speaker in known else None
+        shots.append(
+            Shot(
+                id=f"{scene.id}_shot_{index}",
+                scene_id=scene.id,
+                shot_no=index,
+                duration_sec=line_seconds(text, settings),
+                narration=None if speaker else text,
+                dialogue_text=text if speaker else None,
+                dialogue_speaker=speaker,
+                character_in_frame=[speaker] if speaker else [],
+                fact_refs=list(line.fact_refs),
+            )
+        )
+    return shots
+
+
+def _shot_line(index: int, shot: Shot, *, with_visuals: bool) -> str:
+    text = shot.narration or shot.dialogue_text or ""
+    who = f"（{shot.dialogue_speaker} 说）" if shot.dialogue_speaker else ""
+    row = f"{index}. {who}{text}（{shot.duration_sec} 秒）"
+    if with_visuals and (shot.video_prompt or shot.visual_description):
+        row += f"\n   当前画面：{shot.camera}；{shot.visual_description}；{shot.video_prompt}"
+    return row
+
+
+async def generate_visuals(
+    llm: LLMProvider,
+    project: Project,
+    bible: StoryBible,
+    scene: Scene,
+    shots: list[Shot],
+    *,
+    feedback: str = "",
+    target_shot: str = "",
+    revision: bool = False,
+) -> list[str]:
+    """给这一场已经按句子排好的镜头填画面字段（原地改 `shots`），返回模型漏掉的镜头 id。
+
+    `revision=True`：按 `feedback` 重写已有画面；再给 `target_shot` 时只改那一个镜头。
+    漏掉的镜头 `video_prompt` 留空，分镜校验会报 ERROR，可以单镜重写补上。
+    """
+    if not shots:
+        return []
+    numbered = "\n".join(
+        _shot_line(i, shot, with_visuals=revision) for i, shot in enumerate(shots, start=1)
+    )
+    target_index = next((i for i, s in enumerate(shots, start=1) if s.id == target_shot), 0)
+    parts = [
+        f"## 知识底稿里的演示场景与角色\n{storyboard_service.format_brief_bible(bible)}",
+        f"\n目标观众：{_audience(project)}",
+        "\n## 本场",
+        f"场次: {scene.id}",
+        f"标题: {scene.heading}",
+        f"摘要: {scene.summary}",
+        f"\n## 旁白（每句一个镜头，共 {len(shots)} 个）\n{numbered}",
+        f"\n画面比例: {project.aspect_ratio.value} → {storyboard_service.aspect_hint(project)}",
+    ]
+    if revision:
+        note = " ".join(str(feedback or "").split()) or "整体重画一版，画面更直观"
+        parts.append(f"\n## 按修改意见重画\n修改意见（优先级最高）：{note}")
+        if target_index:
+            parts.append(f"只输出编号 {target_index} 这一个镜头，其余镜头只是给你看上下文。")
+        parts.append("旁白不改；意见没提到的部分尽量保持。")
+    parts.append('\n输出 JSON: {"shots": [...]}')
+    messages = [
+        LLMMessage(role="system", content=VISUALS_SYSTEM),
+        LLMMessage(role="user", content="\n".join(parts)),
+    ]
+    response = await llm.chat_json(
+        messages, schema=VisualsResponse, temperature=0.5, max_tokens=4096
+    )
+
+    drafts = list(response.shots)
+    by_index = {d.index: d for d in drafts if d.index}
+    if not by_index and len(drafts) == (1 if target_index else len(shots)):
+        # 模型没写编号、但条数对得上：按顺序对应
+        start = target_index or 1
+        by_index = {start + i: d for i, d in enumerate(drafts)}
+    wanted = [target_index] if target_index else range(1, len(shots) + 1)
+    known_chars = {c.id for c in bible.characters}
+    known_locs = {s.id for s in bible.settings}
+    known_props = {p.id for p in bible.props}
+    missing: list[str] = []
+    for index in wanted:
+        shot = shots[index - 1]
+        draft = by_index.get(index)
+        if draft is None:
+            missing.append(shot.id)
+            continue
+        location = draft.location.strip()
+        shot.camera = draft.camera
+        shot.visual_description = draft.visual_description
+        # 讲解人物说话的镜头：人一定在画面里（同短剧的「说话人补进画面」）
+        chars = [c for c in draft.character_in_frame if c in known_chars]
+        if shot.dialogue_speaker and shot.dialogue_speaker not in chars:
+            chars.append(shot.dialogue_speaker)
+        shot.character_in_frame = chars
+        shot.mood = draft.mood
+        shot.video_prompt = storyboard_service.sanitize_video_prompt(draft.video_prompt, bible)
+        shot.location = location if location in known_locs else ""
+        shot.props_in_frame = [p for p in draft.props_in_frame if p in known_props]
+    if missing:
+        logger.warning("科普分镜 %s：模型漏了 %d 个镜头的画面：%s", scene.id, len(missing),
+                       "、".join(missing))
+    return missing
+
+
+# ── 配音文案模式 ────────────────────────────────────────
+
+#: 科普只允许的配音文案模式：narration / polish / full 会补写或改写旁白，句子和 fact_refs 就对不上了
+VOICE_SCRIPT_MODES = ("off", "perform")
+
+
+def voice_script_mode(project: Project | None, mode: str) -> tuple[str, str]:
+    """返回 `(实际模式, 告警)`。科普项目只认 off / perform，别的模式退回 perform；短剧原样返回。"""
+    if not is_explainer(project) or mode in VOICE_SCRIPT_MODES:
+        return mode, ""
+    return "perform", (
+        f"科普项目的配音文案只允许 off / perform（{mode} 会改写旁白，"
+        "旁白和它引用的事实就对不上了），已按 perform 处理：只给念法、不改字"
     )

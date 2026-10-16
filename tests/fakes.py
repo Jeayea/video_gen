@@ -115,6 +115,9 @@ class FakeLLM(LLMProvider):
         self.explainer_review_issues: list[dict] = []
         self.explainer_reviews = 0
         self.explainer_annotate_valid = True
+        #: 科普分镜：故意漏掉最后一个镜头的画面 / 收到过的画面分镜请求（user prompt）
+        self.explainer_visuals_skip_last = False
+        self.explainer_visual_prompts: list[str] = []
 
     # ── LLMProvider 接口 ──────────────────────────────
 
@@ -191,6 +194,12 @@ class FakeLLM(LLMProvider):
         if "科普文稿标注" in system:
             self._maybe_fail("explainer_annotate")
             return self._explainer_annotate(user)
+        if "科普画面分镜师" in system:
+            scene_id = SCENE_ID_RE.search(user)
+            sid = scene_id.group(1) if scene_id else "scene_1"
+            self._maybe_fail(f"explainer_visuals:{sid}")
+            self.explainer_visual_prompts.append(user)
+            return self._explainer_visuals(user)
         if "严格的科普审校" in system:
             self.explainer_reviews += 1
             return {"issues": list(self.explainer_review_issues)}
@@ -418,6 +427,32 @@ class FakeLLM(LLMProvider):
                 {"key": "new_1", "content": f"{scene_id}{revised} 补充的事实：蓝光波长较短",
                  "source": ""}
             ],
+        }
+
+    def _explainer_visuals(self, user: str) -> dict:
+        """按旁白编号逐镜给画面；顺手塞一句旁白和合并提示，验证代码不认模型改的旁白。"""
+        only = re.search(r"只输出编号 (\d+) 这一个镜头", user)
+        count = len(re.findall(r"^\d+\. ", user, flags=re.M))
+        indices = [int(only.group(1))] if only else list(range(1, count + 1))
+        if self.explainer_visuals_skip_last and not only:
+            indices = indices[:-1]
+        revised = " revised" if "## 按修改意见重画" in user else ""
+        return {
+            "shots": [
+                {
+                    "index": i,
+                    "camera": "特写 · 缓推",
+                    "visual_description": f"第 {i} 句的演示画面",
+                    "character_in_frame": ["char_404"],
+                    "mood": "curious",
+                    "video_prompt": f"macro shot of sunlight through a glass prism {i}{revised}, "
+                    "no text, no labels",
+                    "location": "loc_1",
+                    "narration": "模型改写过的旁白（不该被采用）",
+                    "duration_sec": 99,
+                }
+                for i in indices
+            ]
         }
 
     def _explainer_annotate(self, user: str) -> dict:

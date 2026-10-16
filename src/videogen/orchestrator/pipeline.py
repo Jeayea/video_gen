@@ -360,14 +360,18 @@ class Pipeline:
         query_tier: bool = True,
         video: VideoManifest | None = None,
         only_if_missing: bool = False,
+        project: Project | None = None,
     ) -> Storyboard:
         """按配置给分镜编段（段落分镜）；关掉段落模式时返回一份去掉段落标记的副本。
 
         `only_if_missing=True`（视频阶段/preflight 用）：已经编过段就不动；老项目已经有
         单镜生成好的片段时也不编段 —— 否则已就绪的镜头会被卷进新段落、整段重买。
+
+        科普项目永远按段落编（不看 `VIDEO_SEGMENT_MODE`）：关掉段落模式就要走档位合并，
+        一句一镜会被拼起来。
         """
         settings = get_settings()
-        if not settings.video_segment_mode:
+        if not (settings.video_segment_mode or explainer_service.is_explainer(project)):
             if any(shot.segment_id for shot in storyboard.shots):
                 storyboard = storyboard.model_copy(deep=True)
                 for shot in storyboard.shots:
@@ -1392,51 +1396,56 @@ class Pipeline:
 
             self._guard_budget(project_id, action="重写分镜")
             llm = self._llm(model, project)
-            segment_mode = get_settings().video_segment_mode
-            try:
-                tier = None if segment_mode else await self._duration_tier()
-                drafts = await storyboard_service.generate_shots_for_scene(
-                    llm,
-                    project,
-                    bible,
-                    scene,
-                    tier=tier,
-                    environment=entry.environment if entry else "",
-                    story_context=_chapter_context(story, entry),
-                    segment_mode=segment_mode,
-                    revision=current,
-                    feedback=feedback,
-                    target_shot=shot_id,
+            if explainer_service.is_explainer(project):
+                proposal, changed = await self._revise_explainer_visuals(
+                    project, storyboard, bible, scene, llm, shot_id=shot_id, feedback=feedback
                 )
-            except Exception as exc:
-                raise PipelineError(f"重写分镜失败：{exc}") from exc
-            finally:
-                self._record_llm_cost(project_id, CostStage.STORYBOARD, llm)
-                await llm.aclose()
-            if not drafts:
-                raise PipelineError("模型没有返回镜头，换个说法再试一次")
-
-            proposal = storyboard.model_copy(deep=True)
-            if target is not None:
-                # 只换内容：id / 时长 / 段落都沿用原镜头，别的镜头一个字都不动
-                draft = drafts[0]
-                fresh = target.model_copy(
-                    update={field: getattr(draft, field) for field in _REVISABLE_SHOT_FIELDS}
-                )
-                proposal.shots = [fresh if s.id == target.id else s for s in proposal.shots]
-                changed = [target.id]
             else:
-                first = next(i for i, s in enumerate(proposal.shots) if s.scene_id == scene_id)
-                rest = [s for s in proposal.shots if s.scene_id != scene_id]
-                proposal.shots = rest[:first] + drafts + rest[first:]
-                scoped = Script(title=script.title, logline="", scenes=[scene])
-                if tier is not None:
-                    storyboard_service.apply_duration_tier(proposal, scoped, tier)
+                segment_mode = get_settings().video_segment_mode
+                try:
+                    tier = None if segment_mode else await self._duration_tier()
+                    drafts = await storyboard_service.generate_shots_for_scene(
+                        llm,
+                        project,
+                        bible,
+                        scene,
+                        tier=tier,
+                        environment=entry.environment if entry else "",
+                        story_context=_chapter_context(story, entry),
+                        segment_mode=segment_mode,
+                        revision=current,
+                        feedback=feedback,
+                        target_shot=shot_id,
+                    )
+                except Exception as exc:
+                    raise PipelineError(f"重写分镜失败：{exc}") from exc
+                finally:
+                    self._record_llm_cost(project_id, CostStage.STORYBOARD, llm)
+                    await llm.aclose()
+                if not drafts:
+                    raise PipelineError("模型没有返回镜头，换个说法再试一次")
+
+                proposal = storyboard.model_copy(deep=True)
+                if target is not None:
+                    # 只换内容：id / 时长 / 段落都沿用原镜头，别的镜头一个字都不动
+                    draft = drafts[0]
+                    fresh = target.model_copy(
+                        update={field: getattr(draft, field) for field in _REVISABLE_SHOT_FIELDS}
+                    )
+                    proposal.shots = [fresh if s.id == target.id else s for s in proposal.shots]
+                    changed = [target.id]
                 else:
-                    storyboard_service.normalize_storyboard_durations(proposal, scoped)
-                changed = [s.id for s in drafts]
+                    first = next(i for i, s in enumerate(proposal.shots) if s.scene_id == scene_id)
+                    rest = [s for s in proposal.shots if s.scene_id != scene_id]
+                    proposal.shots = rest[:first] + drafts + rest[first:]
+                    scoped = Script(title=script.title, logline="", scenes=[scene])
+                    if tier is not None:
+                        storyboard_service.apply_duration_tier(proposal, scoped, tier)
+                    else:
+                        storyboard_service.normalize_storyboard_durations(proposal, scoped)
+                    changed = [s.id for s in drafts]
             proposal, _fixes = consistency_service.repair_storyboard(proposal, script, bible)
-            proposal = await self._apply_segment_mode(proposal)
+            proposal = await self._apply_segment_mode(proposal, project=project)
             impact = video_service.storyboard_impact(
                 storyboard, proposal, self.store.load_video_manifest(project_id)
             )
@@ -1449,6 +1458,43 @@ class Pipeline:
             "changed_shots": changed,
             "impact": impact,
         }
+
+    async def _revise_explainer_visuals(
+        self,
+        project: Project,
+        storyboard: Storyboard,
+        bible: StoryBible,
+        scene: Scene,
+        llm: LLMProvider,
+        *,
+        shot_id: str,
+        feedback: str,
+    ) -> tuple[Storyboard, list[str]]:
+        """科普的分镜重写只改画面字段：镜头数、旁白、fact_refs、时长原样保留（要改旁白回剧本阶段）。"""
+        proposal = storyboard.model_copy(deep=True)
+        shots = proposal.shots_for_scene(scene.id)
+        before = {s.id: s.model_dump() for s in shots}
+        try:
+            missing = await explainer_service.generate_visuals(
+                llm,
+                project,
+                bible,
+                scene,
+                shots,
+                feedback=feedback,
+                target_shot=shot_id,
+                revision=True,
+            )
+        except Exception as exc:
+            raise PipelineError(f"重写分镜失败：{exc}") from exc
+        finally:
+            self._record_llm_cost(project.id, CostStage.STORYBOARD, llm)
+            await llm.aclose()
+        wanted = [shot_id] if shot_id else [s.id for s in shots]
+        if all(sid in missing for sid in wanted):
+            raise PipelineError("模型没有返回镜头，换个说法再试一次")
+        changed = [s.id for s in shots if s.model_dump() != before[s.id]]
+        return proposal, changed
 
     # ── 分镜 ──────────────────────────────────────────────
 
@@ -1530,6 +1576,10 @@ class Pipeline:
         # 视频模型的最短计费档位（H3 = 5 秒）：分镜阶段就按它拆镜头，
         # 否则 3 秒的镜头也要买 5 秒（事后合并只能补救，不如一开始就不浪费）
         tier = await self._duration_tier()
+        if explainer_service.is_explainer(project):
+            return await self._run_explainer_storyboard(
+                project, script, bible, llm, storyboard, resuming=resuming, tier=tier
+            )
         # 段落分镜：计费按段算，镜头本身不必被抬到最短档位（短镜头才有剪辑节奏）
         segment_mode = get_settings().video_segment_mode
         if tier is not None and not segment_mode:
@@ -1569,8 +1619,38 @@ class Pipeline:
             storyboard_service.normalize_storyboard_durations(storyboard, script)
             storyboard.duration_tier = tier
         if segment_mode:
-            await self._apply_segment_mode(storyboard, tier=tier, query_tier=False)
+            await self._apply_segment_mode(
+                storyboard, tier=tier, query_tier=False, project=project
+            )
         self.store.save_storyboard(project_id, storyboard)
+        return storyboard
+
+    async def _run_explainer_storyboard(
+        self,
+        project: Project,
+        script: Script,
+        bible: StoryBible,
+        llm: LLMProvider,
+        storyboard: Storyboard,
+        *,
+        resuming: bool,
+        tier: DurationTier | None,
+    ) -> Storyboard:
+        """科普分镜：镜头由代码按旁白句子生成（一句一镜），LLM 只填画面字段。
+
+        不按场归一时长、不走档位合并：镜头时长就是这句旁白念完要多久。逐场落盘，失败可续跑。
+        """
+        covered = storyboard.scene_ids() if resuming else set()
+        for scene in script.scenes:
+            if scene.id in covered:
+                continue
+            shots = explainer_service.shots_from_scene(scene, bible)
+            await explainer_service.generate_visuals(llm, project, bible, scene, shots)
+            storyboard.shots.extend(shots)
+            self.store.save_storyboard(project.id, storyboard)
+        storyboard.duration_tier = tier
+        await self._apply_segment_mode(storyboard, tier=tier, query_tier=False, project=project)
+        self.store.save_storyboard(project.id, storyboard)
         return storyboard
 
     async def confirm_storyboard(self, project_id: str, *, force: bool = False) -> Project:
@@ -1655,8 +1735,8 @@ class Pipeline:
     async def storyboard_impact(self, project_id: str, data: dict) -> dict:
         """只算不写：按这份分镜保存的话，哪些已生成的段要重做、大概多少钱。"""
         async with self._lock(project_id):
-            self.get_project(project_id)
-            storyboard = await self._parse_storyboard(data)
+            project = self.get_project(project_id)
+            storyboard = await self._parse_storyboard(data, project)
             impact = video_service.storyboard_impact(
                 self.store.load_storyboard(project_id),
                 storyboard,
@@ -1668,13 +1748,13 @@ class Pipeline:
         impact["estimated_usd"] = round(impact["stale_seconds"] * price, 4)
         return impact
 
-    async def _parse_storyboard(self, data: dict) -> Storyboard:
+    async def _parse_storyboard(self, data: dict, project: Project) -> Storyboard:
         try:
             storyboard = Storyboard.model_validate(data)
         except Exception as exc:
             raise PipelineError(f"分镜更新失败：{exc}") from exc
         # 镜头改了时长/顺序，段落要按新分镜重编（编段按场确定性计算，别的场不受影响）
-        return await self._apply_segment_mode(storyboard)
+        return await self._apply_segment_mode(storyboard, project=project)
 
     async def update_storyboard(self, project_id: str, data: dict) -> Storyboard:
         """更新分镜。已生成的媒体**只作废受影响的段**（`video_service.storyboard_impact`）。"""
@@ -1685,7 +1765,7 @@ class Pipeline:
                 EDIT_STORYBOARD_STATUSES | EDIT_CONFIRMED_STORYBOARD_STATUSES,
                 "修改分镜",
             )
-            storyboard = await self._parse_storyboard(data)
+            storyboard = await self._parse_storyboard(data, project)
             old = self.store.load_storyboard(project_id)
             video = self.store.load_video_manifest(project_id)
             audio = self.store.load_audio_manifest(project_id)
@@ -1843,7 +1923,10 @@ class Pipeline:
             if storyboard is not None and storyboard.shots:
                 # 只算不写：没编过段的老分镜按「会怎么编」来估价（与真正生成同一口径）
                 storyboard = await self._apply_segment_mode(
-                    storyboard.model_copy(deep=True), video=video, only_if_missing=True
+                    storyboard.model_copy(deep=True),
+                    video=video,
+                    only_if_missing=True,
+                    project=project,
                 )
             return await preflight_service.preflight(
                 project=project,
@@ -1854,7 +1937,12 @@ class Pipeline:
                 report=self.cost_report(project_id),
                 settings=get_settings(),
                 action=action,
-                script_mode=script_mode,
+                script_mode=explainer_service.voice_script_mode(
+                    project,
+                    audio_script_service.normalize_mode(
+                        script_mode or get_settings().audio_script_mode
+                    ),
+                )[0],
                 keyframe_estimator=(
                     self._keyframe_estimator(project, provider) if provider else None
                 ),
@@ -1908,6 +1996,11 @@ class Pipeline:
         self._reject_if_running(project_id, VIDEO_JOB_KIND, "视频生成")
         async with self._lock(project_id):
             project = self.get_project(project_id)
+            if explainer_service.is_explainer(project):
+                raise PipelineError(
+                    "科普项目一句旁白一个镜头，合并镜头会把句子和它引用的事实拼在一起；"
+                    "科普按段落生成视频，短镜头不会被单独按最短档位计费"
+                )
             self._require(project, GENERATE_VIDEO_STATUSES, "合并镜头")
             storyboard = self.store.load_storyboard(project_id)
             if not storyboard or not storyboard.shots:
@@ -2037,7 +2130,7 @@ class Pipeline:
             # 否则「生成缺失片段」会把预算门控绕过去（真实场景：mock → H3 一次 $9.75）。
             video = self.store.load_video_manifest(project_id)
             storyboard = await self._apply_segment_mode(
-                storyboard, video=video, only_if_missing=True
+                storyboard, video=video, only_if_missing=True, project=project
             )
             self.store.save_storyboard(project_id, storyboard)
             targets = await self._budget_shots(storyboard, video)
@@ -2097,7 +2190,7 @@ class Pipeline:
             self._reject_if_rejections_pending(existing)
             # 批量链路不经过 start_video_generation，这里再兜一次编段（已编过就不动）
             storyboard = await self._apply_segment_mode(
-                storyboard, video=existing, only_if_missing=True
+                storyboard, video=existing, only_if_missing=True, project=project
             )
             if storyboard.shots:
                 self.store.save_storyboard(project_id, storyboard)
@@ -2435,8 +2528,11 @@ class Pipeline:
                 raise PipelineError("没有可用的视频片段，请先生成视频")
 
             settings = get_settings()
-            mode = audio_script_service.normalize_mode(
-                script_mode if script_mode is not None else settings.audio_script_mode
+            mode, _ = explainer_service.voice_script_mode(
+                project,
+                audio_script_service.normalize_mode(
+                    script_mode if script_mode is not None else settings.audio_script_mode
+                ),
             )
             upcoming = cost_service.estimate_audio_usd(storyboard)
             if mode != "off":
@@ -2521,11 +2617,18 @@ class Pipeline:
             project_dir = self.store.ensure_project_dir(project_id)
             audio_dir = self.store.audio_dir(project_id)
             settings = get_settings()
-            mode = audio_script_service.normalize_mode(
-                script_mode if script_mode is not None else settings.audio_script_mode
+            mode, mode_warning = explainer_service.voice_script_mode(
+                project,
+                audio_script_service.normalize_mode(
+                    script_mode if script_mode is not None else settings.audio_script_mode
+                ),
             )
             existing_audio = self.store.load_audio_manifest(project_id) or AudioManifest()
             existing_audio.script_mode = mode
+            if mode_warning:
+                logger.warning("%s project=%s", mode_warning, project_id)
+                if mode_warning not in existing_audio.warnings:
+                    existing_audio.warnings.append(mode_warning)
             dub_mode = video_service.dub_mode_for(project, settings)
 
         def on_progress(manifest: AudioManifest) -> None:

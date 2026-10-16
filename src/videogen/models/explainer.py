@@ -124,3 +124,40 @@ class AnnotateResponse(BaseModel):
     @classmethod
     def _none_to_empty(cls, value: object) -> object:
         return [] if value is None else value
+
+
+class VisualDraft(BaseModel):
+    """科普分镜：模型只给画面字段（id / 时长 / 旁白 / fact_refs 由代码按句子定）。"""
+
+    index: int = 0
+    camera: str = ""
+    visual_description: str = ""
+    character_in_frame: StrList = Field(default_factory=list)
+    mood: str = ""
+    video_prompt: str = ""
+    location: str = ""
+    props_in_frame: StrList = Field(default_factory=list)
+
+    @field_validator("index", mode="before")
+    @classmethod
+    def _coerce_index(cls, value: object) -> int:
+        return coerce_int(value, 0)
+
+    @field_validator("camera", "visual_description", "mood", "video_prompt", "location",
+                     mode="before")
+    @classmethod
+    def _stringify(cls, value: object) -> str:
+        return "" if value is None else str(value)
+
+
+class VisualsResponse(BaseModel):
+    shots: list[VisualDraft] = Field(default_factory=list)
+
+    @field_validator("shots", mode="before")
+    @classmethod
+    def _none_to_empty(cls, value: object) -> object:
+        if value is None:
+            return []
+        if isinstance(value, dict):
+            return [value]
+        return value
