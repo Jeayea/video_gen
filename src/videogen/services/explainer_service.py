@@ -89,10 +89,10 @@ KNOWLEDGE_SYSTEM = """你是科普知识底稿编辑。为一支 30-120 秒的�
 输出 JSON：
 {
   "facts": [{"content": "一条可核对的事实（一句中文）", "source": "出处原句", "type": "concept"}],
-  "settings": [{"name": "演示场景名", "description": "中文：这里能拍到什么",
-                "visual_prompt": "English: visible objects, materials, lighting"}],
-  "props": [{"name": "演示物", "description": "中文：外观",
-             "visual_prompt": "English: the object itself (material, color, shape)"}],
+  "settings": [{"name": "演示场景名", "description": "这里能拍到什么（中文）",
+                "visual_prompt": "a dim lab bench, a glass prism, a white screen, sunlight"}],
+  "props": [{"name": "演示物", "description": "外观（中文）",
+             "visual_prompt": "a clear triangular glass prism with polished edges"}],
   "style": {"genre": "科普", "tone": "语气", "pacing": "节奏"}
 }
 

@@ -15,7 +15,7 @@ from videogen.models.storyboard import Storyboard
 from videogen.models.video import VideoManifest
 from videogen.services import explainer_service, lipsync_service, subtitle_service, video_service
 from videogen.utils import loudness as loudness_utils
-from videogen.utils.audio_align import mouth_align_delay
+from videogen.utils.audio_align import mouth_align_delay, speech_span
 from videogen.utils.av_sync import check_av_sync, format_sync_warning
 from videogen.utils.ffmpeg import atempo_chain as ffmpeg_atempo_chain
 from videogen.utils.ffmpeg import (
@@ -1364,17 +1364,24 @@ async def _fit_to_voice(
     gap_sec: float,
     warnings: list[str],
 ) -> None:
-    """科普：有配音的镜头长度 = 配音实长 + 句间停顿（片段多出来的画面裁掉）。
+    """科普：有配音的镜头长度 = 说完的那一刻 + 句间停顿（片段多出来的画面裁掉）。
 
-    镜头时长是向上取整的整数秒，照分镜放就是「念一句、停半拍」。配音比片段还长时
-    渲染会冻结末帧补足，这里只记一条 warning。没有配音的镜头照分镜时长。
+    镜头时长是向上取整的整数秒，照分镜放就是「念一句、停半拍」。「说完」按配音文件里的人声
+    算，不按文件长度：云端 TTS 的文件尾巴常带静音（实测一条 3.25 秒的配音 2.0 秒就说完了，
+    按文件长度裁，两句之间空了 1.47 秒）。探测不了时退回文件长度。
+    配音比片段还长时渲染会冻结末帧补足，这里只记一条 warning。没有配音的镜头照分镜时长。
     """
     frozen: list[str] = []
     for segment in segments:
         voice = audio.for_shot(segment.shot_id) if audio and segment.audio_path else None
         if voice is None or voice.duration_sec <= 0:
             continue
-        need = round(max(0.0, voice.offset_sec) + voice.duration_sec + max(0.0, gap_sec), 3)
+        spoken = voice.duration_sec
+        audio_file = project_dir / segment.audio_path
+        span = await speech_span(audio_file, audio_file.parent)
+        if span is not None and 0 < span[1] < spoken:
+            spoken = span[1]
+        need = round(max(0.0, voice.offset_sec) + spoken + max(0.0, gap_sec), 3)
         length = await probe_duration(project_dir / segment.video_path)
         if length and need > length + 0.05:
             frozen.append(f"{segment.shot_id}（{need - length:.1f}s）")

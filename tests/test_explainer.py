@@ -17,7 +17,7 @@ from videogen.models.audio import AudioClip, AudioManifest
 from videogen.models.bible import Character, Fact, StoryBible
 from videogen.models.compose import ComposeSegment, SubtitleMode
 from videogen.models.consistency import IssueSeverity
-from videogen.models.explainer import KnowledgeFact, KnowledgeResponse, NewFact
+from videogen.models.explainer import KnowledgeFact, KnowledgeItem, KnowledgeResponse, NewFact
 from videogen.models.project import ContentType, InputMode, Project
 from videogen.models.script import NARRATOR, DialogueLine, Scene, Script
 from videogen.models.storyboard import Shot
@@ -852,8 +852,27 @@ def test_fit_to_voice_trims_to_speech_plus_gap(tmp_path, monkeypatch):
     )
     warnings: list[str] = []
     asyncio.run(compose_service._fit_to_voice(segments, audio, tmp_path, 0.2, warnings))
-    assert [s.duration_sec for s in segments] == [2.51, 2.8, 3.0]
+    assert [s.duration_sec for s in segments] == [2.51, 2.8, 3.0]  # 探测不了人声：按文件长度
     assert len(warnings) == 1 and "b（0.8s）" in warnings[0]  # 画面 2 秒不够，冻结补足
+
+
+def test_fit_to_voice_ignores_trailing_silence_in_the_tts_file(tmp_path, monkeypatch):
+    # 实测：云端 TTS 3.25 秒的文件 2.0 秒就说完了，按文件长度裁两句之间空 1.47 秒
+    async def fake_probe(path, **_):
+        return 5.0
+
+    async def fake_span(path, work_dir, **_):
+        return (0.05, 2.0)
+
+    monkeypatch.setattr(compose_service, "probe_duration", fake_probe)
+    monkeypatch.setattr(compose_service, "speech_span", fake_span)
+    segment = ComposeSegment(shot_id="a", duration_sec=4.0, video_path="a.mp4",
+                             audio_path="audio/a.wav")
+    audio = AudioManifest(clips=[AudioClip(id="a", shot_id="a", text="旁白", voice="v",
+                                           status=ClipStatus.READY, path="audio/a.wav",
+                                           duration_sec=3.25)])
+    asyncio.run(compose_service._fit_to_voice([segment], audio, tmp_path, 0.2, []))
+    assert segment.duration_sec == 2.2
 
 
 def test_finish_writes_metadata_on_both_paths(tmp_path, monkeypatch):
@@ -957,7 +976,8 @@ async def test_explainer_compose_trims_to_voice_and_labels(store, monkeypatch):
     audio = store.load_audio_manifest(project.id)
     for segment in report.segments:
         voice = audio.for_shot(segment.shot_id)
-        assert segment.duration_sec == pytest.approx(voice.duration_sec + 0.2, abs=0.001)
+        # 说完 + 0.2 秒停顿：不超过文件长度 + 0.2（mock 配音尾巴可能带静音）
+        assert 0.2 < segment.duration_sec <= voice.duration_sec + 0.2 + 0.001
     assert store.load_storyboard(project.id).shots[0].duration_sec == 3  # 分镜没被改
 
     assert report.ai_label == "本视频由 AI 生成"
@@ -1124,3 +1144,12 @@ def test_batch_api_accepts_explainer(client):
     body = resp.json()
     assert (body["content_type"], body["audience"]) == ("explainer", "小学生")
     assert "source_material" not in body["items"][0]
+
+
+def test_knowledge_items_drop_copied_language_labels():
+    # 实测：模型照抄格式说明里的「English: …」，这个标签会一路进到关键帧和视频 prompt
+    item = KnowledgeItem.model_validate(
+        {"name": "晴天", "description": "中文：蓝天白云", "visual_prompt": "English: clear sky"}
+    )
+    assert (item.description, item.visual_prompt) == ("蓝天白云", "clear sky")
+    assert "English:" not in explainer_service.KNOWLEDGE_SYSTEM

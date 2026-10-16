@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 from pydantic import BaseModel, Field, field_validator
 
 from videogen.models.bible import StyleGuide
@@ -21,6 +23,9 @@ class KnowledgeFact(BaseModel):
         return "" if value is None else str(value)
 
 
+_LABEL_PREFIX = re.compile(r"^\s*(english|中文|英文)\s*[:：]\s*", re.IGNORECASE)
+
+
 class KnowledgeItem(BaseModel):
     """演示场景 / 演示道具（id 由代码分配，模型给的不认）。"""
 
@@ -31,7 +36,8 @@ class KnowledgeItem(BaseModel):
     @field_validator("name", "description", "visual_prompt", mode="before")
     @classmethod
     def _stringify(cls, value: object) -> str:
-        return "" if value is None else str(value)
+        # 模型会照抄格式说明里的「English: …」标签（实测），它会一路进到图片 / 视频 prompt
+        return _LABEL_PREFIX.sub("", "" if value is None else str(value))
 
 
 class KnowledgeResponse(BaseModel):
