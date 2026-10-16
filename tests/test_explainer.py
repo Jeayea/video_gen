@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -9,11 +11,18 @@ from tests.fakes import FakeBgmLibrary, FakeLLM, FakeTTSProvider, FakeVideoProvi
 from videogen import main
 from videogen.models.bible import Character, Fact, StoryBible
 from videogen.models.consistency import IssueSeverity
+from videogen.models.explainer import KnowledgeFact, KnowledgeResponse
 from videogen.models.project import ContentType, Project
 from videogen.models.script import NARRATOR, DialogueLine, Scene, Script
 from videogen.models.storyboard import Shot
-from videogen.orchestrator.pipeline import Pipeline
-from videogen.services import audio_service, consistency_service, video_service, voice_catalog
+from videogen.orchestrator.pipeline import Pipeline, PipelineError
+from videogen.services import (
+    audio_service,
+    consistency_service,
+    explainer_service,
+    video_service,
+    voice_catalog,
+)
 from videogen.utils.file_store import FileStore
 
 NARRATION = "天之所以是蓝的，是因为空气把蓝光散射得最多。"
@@ -177,3 +186,184 @@ def test_explainer_still_flags_unknown_speakers():
     script.scenes[0].dialogue.append(DialogueLine(speaker="char_9", line="我来补一句。"))
     report = consistency_service.validate_script(script, StoryBible(), explainer=True)
     assert len(_speaker_errors(report)) == 1
+
+
+# ── 出处校验 ──────────────────────────────────────────
+
+MATERIAL = (
+    "太阳光由各种颜色的光组成。阳光穿过大气层时，空气分子对短波长的蓝光散射得更强烈，"
+    "所以我们从各个方向都能看到蓝光，天空因此呈现蓝色。日落时阳光穿过的大气更厚，"
+    "蓝光在途中被散射掉了，剩下的红光和橙光让天边变红。"
+)
+
+
+def test_quote_found_despite_punctuation_and_spacing():
+    state, real = explainer_service.match_quote(
+        "空气分子 对短波长的蓝光, 散射得更强烈", MATERIAL, min_chars=8
+    )
+    assert state == "ok"
+    assert real == "空气分子对短波长的蓝光散射得更强烈"
+
+
+def test_slightly_altered_quote_is_replaced_with_the_real_sentence():
+    # 模型抄错一个字（「强烈」写成「剧烈」）：算通过，并换回资料里的原句
+    state, real = explainer_service.match_quote(
+        "所以我们从各个方向都能看到蓝光，天空因此呈现蓝色", MATERIAL, min_chars=8
+    )
+    assert state == "ok"
+    state, real = explainer_service.match_quote(
+        "蓝光在途中被散射掉了，剩下的红光和黄光让天边变红", MATERIAL, min_chars=8
+    )
+    assert state == "ok"
+    assert real == "蓝光在途中被散射掉了，剩下的红光和橙光让天边变红"
+
+
+def test_short_and_fabricated_quotes():
+    assert explainer_service.match_quote("蓝光", MATERIAL, min_chars=8)[0] == "short"
+    state, _ = explainer_service.match_quote(
+        "海水的颜色反射到天空上形成蓝色", MATERIAL, min_chars=8
+    )
+    assert state == "missing"
+
+
+def test_fuzzy_match_stays_fast_on_long_material():
+    material = "无关的段落内容，用来把资料撑长。" * 4000 + MATERIAL
+    started = time.perf_counter()
+    state, _ = explainer_service.match_quote(
+        "蓝光在途中被散射掉了，剩下的红光和黄光让天边变红", material, min_chars=8
+    )
+    assert state == "ok"
+    assert time.perf_counter() - started < 2.0
+
+
+def test_verify_sources_marks_self_stated_and_missing():
+    facts = [
+        Fact(id="fact_1", content="a", source=""),
+        Fact(id="fact_2", content="b", source="空气分子对短波长的蓝光散射得更强烈"),
+        Fact(id="fact_3", content="c", source="海水的颜色反射到天空上形成蓝色"),
+    ]
+    no_material = [Fact(id="fact_9", content="d", source="")]
+    explainer_service.verify_sources(no_material, "", min_chars=8)
+    assert no_material[0].source == explainer_service.SOURCE_SELF
+    explainer_service.verify_sources(facts, MATERIAL, min_chars=8)
+    assert facts[0].source == explainer_service.SOURCE_NOT_FOUND
+    assert facts[1].source == "空气分子对短波长的蓝光散射得更强烈"
+    assert facts[2].source == explainer_service.SOURCE_NOT_FOUND
+    assert [explainer_service.source_state(f, MATERIAL, min_chars=8) for f in facts] == [
+        "missing",
+        "ok",
+        "missing",
+    ]
+
+
+# ── 底稿合并：id 与核对状态 ──────────────────────────
+
+
+def _response(*items: tuple[str, str]) -> KnowledgeResponse:
+    return KnowledgeResponse(facts=[KnowledgeFact(content=c, source=s) for c, s in items])
+
+
+def test_regenerated_knowledge_keeps_ids_and_status_of_unchanged_facts():
+    old = StoryBible(
+        characters=[Character(id="char_1", name="讲解员")],
+        facts=[
+            Fact(id="fact_1", content="甲", source="出处甲", status="confirmed"),
+            Fact(id="fact_2", content="乙", source="出处乙", status="confirmed"),
+            Fact(id="fact_3", content="丙", source="出处丙", status="rejected"),
+        ],
+    )
+    bible = explainer_service.merge_knowledge(
+        [_response(("甲", "出处甲"), ("乙", "换了出处"), ("丁", "出处丁"), ("甲", "重复"))],
+        old,
+        max_facts=60,
+    )
+    by_content = {f.content: f for f in bible.facts}
+    assert (by_content["甲"].id, by_content["甲"].status) == ("fact_1", "confirmed")
+    # 出处变了：id 不变，但要重新核对
+    assert (by_content["乙"].id, by_content["乙"].status) == ("fact_2", "unverified")
+    # 新事实不复用被丢掉的 fact_3：旁白里残留的 fact_3 引用必须还能被查出来
+    assert by_content["丁"].id == "fact_4"
+    assert "丙" not in by_content
+    assert [c.name for c in bible.characters] == ["讲解员"]
+
+
+def test_manual_edit_resets_fact_status():
+    old = StoryBible(
+        facts=[
+            Fact(id="fact_1", content="甲", source="s", status="confirmed"),
+            Fact(id="fact_2", content="乙", source="s", status="confirmed"),
+        ]
+    )
+    new = old.model_copy(deep=True)
+    new.facts[0].content = "甲（改过）"
+    new.facts[1].status = "rejected"  # 只改状态 = 人工核对，保留
+    assert explainer_service.reset_changed_facts(old, new) == ["fact_1"]
+    assert [f.status for f in new.facts] == ["unverified", "rejected"]
+
+
+# ── 生成知识底稿（流水线）────────────────────────────
+
+
+def _explainer_project(store, **kwargs) -> Project:
+    project = _explainer(input_text="为什么天是蓝的", **kwargs)
+    store.create_project(project)
+    return project
+
+
+async def test_theme_knowledge_base_without_characters(store, make_pipeline):
+    llm = FakeLLM()
+    project = _explainer_project(store)
+    bible = await make_pipeline(llm).generate_bible(project.id)
+    assert bible.characters == []
+    assert [f.id for f in bible.facts] == ["fact_1", "fact_2", "fact_3"]
+    assert {f.source for f in bible.facts} == {explainer_service.SOURCE_SELF}
+    assert {f.status for f in bible.facts} == {"unverified"}
+    assert [s.id for s in bible.settings] == ["loc_1"]
+    assert [p.id for p in bible.props] == ["prop_1"]
+
+
+async def test_source_material_is_chunked_and_resumes_after_failure(
+    store, make_pipeline, settings, monkeypatch
+):
+    monkeypatch.setattr(settings, "explainer_source_max_chars", 500)
+    paragraph = "空气分子对短波长的蓝光散射得更强烈，这就是天空呈现蓝色的原因之一。"
+    material = "\n".join(f"第{i}段：{paragraph}" * 8 for i in range(1, 4))
+    project = _explainer_project(store, source_material=material)
+    assert len(explainer_service.split_source(material, 500)) == 3
+
+    llm = FakeLLM(fail_at="knowledge:2")
+    pipeline = make_pipeline(llm)
+    with pytest.raises(PipelineError):
+        await pipeline.generate_bible(project.id)
+    progress = store.load_explainer_source(project.id)
+    assert [c.result is not None for c in progress.chunks] == [True, False, False]
+
+    store.save_project(store.load_project(project.id).model_copy(update={"status": "draft"}))
+    llm.fail_at = None
+    bible = await pipeline.generate_bible(project.id)
+    assert llm.knowledge_calls == 3  # 第 1 块没有重抽
+    assert store.load_explainer_source(project.id) is None
+    sources = [f.source for f in bible.facts]
+    assert explainer_service.SOURCE_NOT_FOUND in sources
+    assert any(s.startswith("第1段") for s in sources)
+
+
+async def test_update_bible_resets_confirmed_fact_when_content_changes(store, make_pipeline):
+    project = _explainer_project(store)
+    pipeline = make_pipeline(FakeLLM())
+    bible = await pipeline.generate_bible(project.id)
+    data = bible.model_dump()
+    data["facts"][0]["status"] = "confirmed"
+    data["facts"][1]["status"] = "confirmed"
+    await pipeline.update_bible(project.id, data)
+    data["facts"][0]["content"] = "改过的内容"
+    saved = await pipeline.update_bible(project.id, data)
+    assert [f.status for f in saved.facts[:2]] == ["unverified", "confirmed"]
+
+
+async def test_explainer_has_no_long_form_outline(store, make_pipeline):
+    project = _explainer_project(store)
+    pipeline = make_pipeline(FakeLLM())
+    await pipeline.generate_bible(project.id)
+    with pytest.raises(PipelineError, match="固定结构"):
+        await pipeline.generate_story_outline(project.id)

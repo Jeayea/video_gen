@@ -139,6 +139,12 @@ class Settings(BaseSettings):
     #: 小说模式：圣经最多收几个角色 / 每章最多抽几个关键道具
     novel_max_characters: int = 12
     novel_max_props_per_chapter: int = 3
+    #: 科普：参考资料超过这么多字就按段切块、逐块抽取知识底稿（一次喂给 LLM 的原文要有上限）
+    explainer_source_max_chars: int = 6000
+    #: 科普：出处引文至少这么多字（去掉空白和标点后）才算数，太短的引文几乎总能在资料里匹配上
+    explainer_min_quote_chars: int = 8
+    #: 科普：知识底稿最多收几条事实
+    explainer_max_facts: int = 60
     tts_timeout_sec: float = 60.0
     #: 每句对白后面留的呼吸时间（秒），用于音画对齐
     audio_gap_sec: float = 0.25

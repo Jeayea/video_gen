@@ -497,7 +497,9 @@ class Pipeline:
             llm = self._llm(model, project)
 
             try:
-                if project.input_mode == InputMode.NOVEL:
+                if explainer_service.is_explainer(project):
+                    bible = await self._explainer_bible(project, llm)
+                elif project.input_mode == InputMode.NOVEL:
                     bible = await self._novel_bible(project, llm, novel_chapters)
                 else:
                     bible = await bible_service.generate_bible(project, llm)
@@ -515,6 +517,18 @@ class Pipeline:
             self.store.remove_artifact(project_id, "consistency_report")
             self._invalidate_media(project_id)
             return bible
+
+    async def _explainer_bible(self, project: Project, llm: LLMProvider) -> StoryBible:
+        """科普：生成知识底稿。资料分块抽取的进度逐块落盘，成功后删掉（失败重试接着抽）。"""
+        bible = await explainer_service.generate_knowledge_base(
+            project,
+            llm,
+            previous=self.store.load_bible(project.id),
+            progress=self.store.load_explainer_source(project.id),
+            on_progress=lambda progress: self.store.save_explainer_source(project.id, progress),
+        )
+        self.store.remove_artifact(project.id, "explainer_source")
+        return bible
 
     # ── 小说改编（切章 / 增量抽取 / 合并）────────────────────
 
@@ -623,6 +637,8 @@ class Pipeline:
                 bible = StoryBible.model_validate(data)
             except Exception as exc:
                 raise PipelineError(f"圣经更新失败：{exc}") from exc
+            # 改了内容或出处的事实，之前的「已确认」就不算数了
+            explainer_service.reset_changed_facts(self.store.load_bible(project_id), bible)
             self.store.save_bible(project_id, bible)
             self._invalidate_media(project_id)
             self._revalidate(project, bible, self.store.load_script(project_id))
@@ -704,6 +720,8 @@ class Pipeline:
         async with self._lock(project_id):
             project = self.get_project(project_id)
             self._require(project, GENERATE_STORY_STATUSES, "生成长篇大纲（需先退回剧本阶段）")
+            if explainer_service.is_explainer(project):
+                raise PipelineError("科普讲解是固定结构（提问 → 知识点 → 小结），没有长篇大纲")
             bible = self.store.load_bible(project_id)
             if not bible:
                 raise PipelineError("故事圣经不存在，请先生成圣经")

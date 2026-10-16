@@ -16,6 +16,7 @@ from videogen.models.bible import StoryBible
 from videogen.models.compose import ComposeReport
 from videogen.models.consistency import ConsistencyReport
 from videogen.models.cost import CostReport
+from videogen.models.explainer import ExplainerSource
 from videogen.models.novel import NovelSource
 from videogen.models.project import (
     LEGACY_STATUS_MAP,
@@ -221,6 +222,13 @@ class FileStore:
 
     def load_novel(self, project_id: str) -> NovelSource | None:
         return self._load(project_id, "novel", NovelSource)
+
+    # --- 科普：参考资料分块抽取进度 ---
+    def save_explainer_source(self, project_id: str, source: ExplainerSource) -> None:
+        self._save(project_id, "explainer_source", source)
+
+    def load_explainer_source(self, project_id: str) -> ExplainerSource | None:
+        return self._load(project_id, "explainer_source", ExplainerSource)
 
     # --- Script ---
     def save_script(self, project_id: str, script: Script) -> None:

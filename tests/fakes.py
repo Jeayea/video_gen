@@ -107,6 +107,8 @@ class FakeLLM(LLMProvider):
         #: 小说模式：抽取过哪些章 / 合并调用了几次
         self.novel_extracted: list[str] = []
         self.novel_merges = 0
+        #: 科普：知识底稿调用次数
+        self.knowledge_calls = 0
 
     # ── LLMProvider 接口 ──────────────────────────────
 
@@ -163,6 +165,8 @@ class FakeLLM(LLMProvider):
         user = message_text(messages[-1])
 
         # 用各阶段 system prompt 里独一无二的锚点判断，避免误匹配
+        if "科普知识底稿编辑" in system:
+            return self._knowledge(user)
         if "图片 prompt 翻译" in system:
             self._maybe_fail("image_prompt")
             # 故意留一个中文字符：调用方必须把残留的中文剔掉
@@ -370,6 +374,39 @@ class FakeLLM(LLMProvider):
                 }
             )
         return {"lines": lines}
+
+    def _knowledge(self, user: str) -> dict:
+        """科普知识底稿：有资料块时从块里逐字摘句当出处，另附一条资料里没有的「编造」引文。"""
+        chunk = re.search(r"\n<原文>\n(.*?)\n</原文>", user, re.S)
+        index = re.search(r"第 (\d+)/\d+ 块", user)
+        self._maybe_fail(f"knowledge:{index.group(1) if index else 1}")
+        self.knowledge_calls += 1
+        if chunk:
+            sentences = [x for x in re.split(r"[。！？\n]", chunk.group(1)) if len(x) >= 8]
+            facts = [
+                {"content": f"资料要点：{x}", "source": x, "type": "general"}
+                for x in sentences[:3]
+            ]
+            facts.append(
+                {"content": "一条资料里没有依据的说法", "source": "这句话在资料里根本没有出现过",
+                 "type": "general"}
+            )
+        else:
+            facts = [
+                {"content": "天空呈蓝色，是因为大气把短波长的蓝光散射得更多", "type": "concept"},
+                {"content": "常见误解：天是蓝的因为反射了海水；实际上是空气散射阳光",
+                 "type": "misconception"},
+                {"content": "散射强度和波长的四次方成反比", "type": "number"},
+            ]
+        return {
+            "facts": facts,
+            "settings": [
+                {"name": "晴朗的天空", "description": "正午的蓝天",
+                 "visual_prompt": "a clear blue midday sky over a field"},
+            ],
+            "props": [{"name": "三棱镜", "visual_prompt": "a glass prism on a table"}],
+            "style": {"genre": "科普", "tone": "好奇、清楚", "pacing": "稳"},
+        }
 
     def _bible(self) -> dict:
         return {
