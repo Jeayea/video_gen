@@ -745,9 +745,26 @@ async def review_structure(
             f"## {scene.id}｜{scene.heading}（{scene.duration_sec}s）\n"
             f"概述：{scene.summary}\n情绪：{scene.emotion}\n台词：{dialogue}"
         )
+    return await ask_review(
+        llm, REVIEW_SYSTEM, "\n".join(lines), script, adaptation=adaptation
+    )
+
+
+async def ask_review(
+    llm: LLMProvider,
+    system: str,
+    user: str,
+    script: Script,
+    *,
+    adaptation: bool = False,
+) -> list[ConsistencyIssue]:
+    """让 LLM 审一遍剧本，解析成 ERROR/WARNING（短剧的剧本医生和科普审稿共用）。
+
+    失败一律降级成空列表：评审挂了不能把生成链路打死。
+    """
     messages = [
-        LLMMessage(role="system", content=REVIEW_SYSTEM),
-        LLMMessage(role="user", content="\n".join(lines)),
+        LLMMessage(role="system", content=system),
+        LLMMessage(role="user", content=user),
     ]
     try:
         result = await llm.chat_json(

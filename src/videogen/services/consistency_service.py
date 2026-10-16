@@ -8,6 +8,7 @@ from videogen.models.consistency import ConsistencyIssue, ConsistencyReport, Iss
 from videogen.models.script import NARRATOR, Scene, Script
 from videogen.models.storyboard import Shot, Storyboard
 from videogen.models.world_state import WorldState
+from videogen.services import explainer_service
 from videogen.utils.duration import deviation_ratio, speech_chars, speech_seconds
 
 #: 时长偏离目标超过这个比例算问题
@@ -46,7 +47,6 @@ def validate_script(
     *,
     strict: bool = False,
     partial: bool = False,
-    explainer: bool = False,
 ) -> ConsistencyReport:
     """检查剧本与故事圣经之间的一致性。
 
@@ -54,16 +54,13 @@ def validate_script(
       ERROR 会让「确认剧本」被拒绝（可 force 跳过）
     - `partial=True` 表示「这只是长篇剧集里选中的几章」：此时**不能**因为结尾还悬着就报警，
       因为后面还要继续展开别的章（否则选前两章必然被拦）
-    - `explainer=True`：科普项目，旁白句的说话人是保留 id `narrator`，不算未知角色
     """
     issues: list[ConsistencyIssue] = []
     known_names = bible.all_names()
     known_ids = {c.id for c in bible.characters}
 
     for scene in script.scenes:
-        issues.extend(
-            _check_dialogue_speakers(scene, known_ids | ({NARRATOR} if explainer else set()))
-        )
+        issues.extend(_check_dialogue_speakers(scene, known_ids))
         issues.extend(_check_names_in_text(scene, known_names))
         issues.extend(_check_numbers(scene, bible))
         issues.extend(_check_scene_content(scene, strict=strict))
@@ -109,21 +106,7 @@ def _check_structure(
     # 只有「精确证据」才够格拦确认（相邻场一模一样 = 一定没推进）；
     # 「结尾带问号」「找不到冲突词」是提示级线索 —— 正常台词里问句很常见，
     # 拿它当 ERROR 会把好剧本也拦住，所以永远是 WARNING
-    hard = IssueSeverity.ERROR if strict else IssueSeverity.WARNING
-
-    for previous, current in itertools.pairwise(scenes):
-        before = _scene_text(previous)
-        after = _scene_text(current)
-        if before and before == after:
-            issues.append(
-                ConsistencyIssue(
-                    severity=hard,
-                    scene_id=current.id,
-                    category="structure",
-                    message=f"场次 {current.id} 与上一场内容完全相同，剧情没有推进",
-                    suggestion="删掉重复场次，或写出新的信息/冲突/转折",
-                )
-            )
+    issues.extend(_check_adjacent_duplicates(script, strict=strict))
 
     last = scenes[-1]
     tail = _scene_text(last)
@@ -148,6 +131,26 @@ def _check_structure(
                     category="structure",
                     message="全剧找不到任何对抗/冲突语汇，故事可能平铺直叙",
                     suggestion="至少给主角一个明确的目标与阻力（对手、期限、代价）",
+                )
+            )
+    return issues
+
+
+def _check_adjacent_duplicates(script: Script, *, strict: bool = False) -> list[ConsistencyIssue]:
+    """相邻两场内容一字不差 = 一定没推进（精确证据，严格模式下拦确认）。"""
+    hard = IssueSeverity.ERROR if strict else IssueSeverity.WARNING
+    issues: list[ConsistencyIssue] = []
+    for previous, current in itertools.pairwise(script.scenes):
+        before = _scene_text(previous)
+        after = _scene_text(current)
+        if before and before == after:
+            issues.append(
+                ConsistencyIssue(
+                    severity=hard,
+                    scene_id=current.id,
+                    category="structure",
+                    message=f"场次 {current.id} 与上一场内容完全相同，剧情没有推进",
+                    suggestion="删掉重复场次，或写出新的信息/冲突/转折",
                 )
             )
     return issues
@@ -406,6 +409,39 @@ def merge_storyboard_issues(
     report: ConsistencyReport, extra: list[ConsistencyIssue]
 ) -> ConsistencyReport:
     return ConsistencyReport(stage="script+storyboard", issues=[*report.issues, *extra])
+
+
+
+def validate_explainer_script(
+    script: Script,
+    bible: StoryBible,
+    target_duration_sec: int = 0,
+    *,
+    strict: bool = False,
+    source_material: str = "",
+    min_quote_chars: int = 8,
+) -> ConsistencyReport:
+    """科普项目的剧本检查（docs/EXPLAINER_DESIGN.md 第 4 节）。
+
+    沿用：说话人（`narrator` 是保留 id，放行）、空场 / 重复场、时长。
+    跳过：「X说」人名（旁白里常有牛顿、爱因斯坦）、数字比对（由事实引用管）、时间线、对抗语汇。
+    换成：事实引用检查、旁白总量超时长、旁白以外的说话人提示。
+    """
+    issues: list[ConsistencyIssue] = []
+    known_ids = {c.id for c in bible.characters} | {NARRATOR}
+    for scene in script.scenes:
+        issues.extend(_check_dialogue_speakers(scene, known_ids))
+        issues.extend(_check_scene_content(scene, strict=strict))
+    issues.extend(_check_adjacent_duplicates(script, strict=strict))
+    issues.extend(_check_duration(script, target_duration_sec))
+    issues.extend(explainer_service.check_speakers(script, bible))
+    issues.extend(
+        explainer_service.check_facts(
+            script, bible, source_material, min_chars=min_quote_chars
+        )
+    )
+    issues.extend(explainer_service.check_length(script, target_duration_sec))
+    return ConsistencyReport(stage="script", issues=issues)
 
 
 # ── 剧本层检查 ────────────────────────────────────────

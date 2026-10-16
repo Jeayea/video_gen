@@ -145,6 +145,10 @@ class Settings(BaseSettings):
     explainer_min_quote_chars: int = 8
     #: 科普：知识底稿最多收几条事实
     explainer_max_facts: int = 60
+    #: 科普：一句旁白一个镜头，镜头时长 = ceil(念白秒数 + 这个余量)
+    explainer_line_pad_sec: float = 0.5
+    #: 科普：相邻两句旁白之间的停顿（估算全片时长、合成裁镜头都用它）
+    explainer_line_gap_sec: float = 0.2
     tts_timeout_sec: float = 60.0
     #: 每句对白后面留的呼吸时间（秒），用于音画对齐
     audio_gap_sec: float = 0.25

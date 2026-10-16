@@ -11,7 +11,7 @@ from tests.fakes import FakeBgmLibrary, FakeLLM, FakeTTSProvider, FakeVideoProvi
 from videogen import main
 from videogen.models.bible import Character, Fact, StoryBible
 from videogen.models.consistency import IssueSeverity
-from videogen.models.explainer import KnowledgeFact, KnowledgeResponse
+from videogen.models.explainer import KnowledgeFact, KnowledgeResponse, NewFact
 from videogen.models.project import ContentType, Project
 from videogen.models.script import NARRATOR, DialogueLine, Scene, Script
 from videogen.models.storyboard import Shot
@@ -177,14 +177,15 @@ def _speaker_errors(report) -> list[str]:
 def test_narrator_speaker_passes_only_in_explainer():
     bible = StoryBible(characters=[Character(id="char_1", name="林悦")])
     script = _narrated_script()
-    assert _speaker_errors(consistency_service.validate_script(script, bible, explainer=True)) == []
+    explainer = consistency_service.validate_explainer_script(script, bible)
+    assert _speaker_errors(explainer) == []
     assert _speaker_errors(consistency_service.validate_script(script, bible))
 
 
 def test_explainer_still_flags_unknown_speakers():
     script = _narrated_script()
     script.scenes[0].dialogue.append(DialogueLine(speaker="char_9", line="我来补一句。"))
-    report = consistency_service.validate_script(script, StoryBible(), explainer=True)
+    report = consistency_service.validate_explainer_script(script, StoryBible())
     assert len(_speaker_errors(report)) == 1
 
 
@@ -305,7 +306,8 @@ def test_manual_edit_resets_fact_status():
 
 
 def _explainer_project(store, **kwargs) -> Project:
-    project = _explainer(input_text="为什么天是蓝的", **kwargs)
+    kwargs.setdefault("input_text", "为什么天是蓝的")
+    project = _explainer(**kwargs)
     store.create_project(project)
     return project
 
@@ -367,3 +369,256 @@ async def test_explainer_has_no_long_form_outline(store, make_pipeline):
     await pipeline.generate_bible(project.id)
     with pytest.raises(PipelineError, match="固定结构"):
         await pipeline.generate_story_outline(project.id)
+
+
+# ── 剧本（流水线）────────────────────────────────────
+
+
+async def _with_bible(store, make_pipeline, llm=None, **kwargs):
+    llm = llm or FakeLLM()
+    project = _explainer_project(store, **kwargs)
+    pipeline = make_pipeline(llm)
+    await pipeline.generate_bible(project.id)
+    return project, pipeline, llm
+
+
+async def test_theme_script_is_pure_narration_with_resolved_fact_refs(store, make_pipeline):
+    project, pipeline, llm = await _with_bible(store, make_pipeline)
+    script = await pipeline.generate_script(project.id)
+
+    assert [s.id for s in script.scenes] == [f"scene_{i}" for i in range(1, 6)]
+    lines = [d for s in script.scenes for d in s.dialogue]
+    assert {d.speaker for d in lines} == {NARRATOR}
+    assert not any("（停顿）" in d.line for d in lines)  # 舞台提示照样清掉
+    bible = store.load_bible(project.id)
+    facts = {f.id: f for f in bible.facts}
+    # 每场的 new_1 都换成了正式 id，且新事实已在底稿里（未核对、模型自述）
+    new_ids = [s.dialogue[1].fact_refs[0] for s in script.scenes]
+    assert new_ids == [f"fact_{i}" for i in range(4, 9)]
+    assert all(facts[i].status == "unverified" for i in new_ids)
+    assert all(facts[i].source == explainer_service.SOURCE_SELF for i in new_ids)
+    # 场次时长按旁白算，不按大纲预算
+    for scene in script.scenes:
+        assert scene.duration_sec == explainer_service.scene_seconds(scene)
+    assert llm.explainer_reviews == 1
+    assert not any("剧本医生" in str(c[0].content) for c in llm.calls)
+
+    report = store.load_consistency(project.id)
+    errors = [i for i in report.issues if i.severity == IssueSeverity.ERROR]
+    assert errors == []
+    assert any("还没核对" in i.message for i in report.issues)
+
+
+async def test_outline_mode_keeps_user_points(store, make_pipeline):
+    project, pipeline, llm = await _with_bible(
+        store, make_pipeline, input_mode="outline"
+    )
+    await pipeline.generate_script(project.id)
+    outline_call = next(c for c in llm.calls if "科普讲解的结构编辑" in str(c[0].content))
+    assert "不增不删" in str(outline_call[-1].content)
+
+
+async def test_explainer_script_resumes_after_failure(store, make_pipeline):
+    llm = FakeLLM()
+    project, pipeline, _ = await _with_bible(store, make_pipeline, llm)
+    llm.fail_at = "explainer_scene:scene_3"
+    with pytest.raises(PipelineError):
+        await pipeline.generate_script(project.id)
+    assert [s.id for s in store.load_script(project.id).scenes] == ["scene_1", "scene_2"]
+
+    llm.fail_at = None
+    before = sum(1 for c in llm.calls if "科普旁白撰稿" in str(c[0].content))
+    script = await pipeline.generate_script(project.id)
+    after = sum(1 for c in llm.calls if "科普旁白撰稿" in str(c[0].content))
+    assert len(script.scenes) == 5
+    assert after - before == 3  # 前两场没有重写
+
+
+async def test_explainer_rejects_chapters(store, make_pipeline):
+    project, pipeline, _ = await _with_bible(store, make_pipeline)
+    with pytest.raises(PipelineError, match="没有章节"):
+        await pipeline.generate_script(project.id, chapters=["ch_1"])
+
+
+FULL_SCRIPT = (
+    "天为什么是蓝的？（先想一想）\n"
+    "阳光里有各种颜色的光。蓝光波长短，更容易被空气散射。\n\n"
+    "所以抬头看，四面八方都是蓝光！日落时光走的路更长，蓝光散射没了，天就红了。"
+)
+
+
+async def test_full_script_keeps_every_user_sentence_verbatim(store, make_pipeline):
+    project, pipeline, _ = await _with_bible(
+        store, make_pipeline, input_mode="full_script", input_text=FULL_SCRIPT
+    )
+    script = await pipeline.generate_script(project.id)
+
+    said = [d.line for s in script.scenes for d in s.dialogue]
+    assert said == [text for _, text in explainer_service.split_sentences(FULL_SCRIPT)]
+    assert said[0] == "天为什么是蓝的？（先想一想）"  # 用户写的括号也不动
+    assert len(said) == 5
+    assert [len(s.dialogue) for s in script.scenes] == [2, 2, 1]
+    bible = store.load_bible(project.id)
+    first_ref = script.scenes[0].dialogue[0].fact_refs[0]
+    assert bible.facts[-1].id == first_ref
+    assert store.load_outline(project.id).scenes[-1].id == "scene_3"
+
+
+async def test_full_script_falls_back_to_paragraphs_when_grouping_is_broken(
+    store, make_pipeline
+):
+    llm = FakeLLM()
+    llm.explainer_annotate_valid = False
+    project, pipeline, _ = await _with_bible(
+        store, make_pipeline, llm, input_mode="full_script", input_text=FULL_SCRIPT
+    )
+    script = await pipeline.generate_script(project.id)
+    # 模型漏了一句：按用户的 3 个段落分场，5 句一句不少
+    assert [len(s.dialogue) for s in script.scenes] == [1, 2, 2]
+    assert sum(len(s.dialogue) for s in script.scenes) == 5
+
+
+async def test_rewriting_a_scene_adds_its_new_facts(store, make_pipeline):
+    project, pipeline, _ = await _with_bible(store, make_pipeline)
+    await pipeline.generate_script(project.id)
+    count = len(store.load_bible(project.id).facts)
+    scene = await pipeline.regenerate_scene(project.id, "scene_2", feedback="讲慢一点")
+    assert "（重写）" in scene.dialogue[0].line
+    bible = store.load_bible(project.id)
+    assert scene.dialogue[1].fact_refs == [bible.facts[-1].id]
+    assert len(bible.facts) == count + 1
+    assert scene.duration_sec == explainer_service.scene_seconds(scene)
+
+
+async def test_rejected_fact_blocks_confirm_until_forced(store, make_pipeline):
+    project, pipeline, _ = await _with_bible(store, make_pipeline)
+    await pipeline.generate_script(project.id)
+    bible = store.load_bible(project.id).model_dump()
+    bible["facts"][0]["status"] = "rejected"
+    await pipeline.update_bible(project.id, bible)
+    with pytest.raises(PipelineError, match="已驳回"):
+        await pipeline.confirm_script(project.id)
+    confirmed = await pipeline.confirm_script(project.id, force=True)
+    assert confirmed.status == "script_confirmed"
+
+
+async def test_review_errors_are_reported(store, make_pipeline):
+    llm = FakeLLM()
+    llm.explainer_review_issues = [
+        {"severity": "error", "scene_id": "scene_2", "message": "把散射说成了反射"}
+    ]
+    project, pipeline, _ = await _with_bible(store, make_pipeline, llm)
+    await pipeline.generate_script(project.id)
+    report = store.load_consistency(project.id)
+    assert any(
+        i.severity == IssueSeverity.ERROR and "反射" in i.message for i in report.issues
+    )
+
+
+# ── 剧本检查规则 ──────────────────────────────────────
+
+
+def _checked(script: Script, bible: StoryBible, **kwargs):
+    return consistency_service.validate_explainer_script(script, bible, **kwargs)
+
+
+def test_fact_reference_rules():
+    bible = StoryBible(
+        facts=[
+            Fact(id="fact_1", content="甲", status="confirmed"),
+            Fact(id="fact_2", content="乙", status="rejected"),
+            Fact(id="fact_3", content="丙"),
+        ]
+    )
+    script = Script(
+        scenes=[
+            Scene(
+                id="scene_1",
+                summary="s",
+                dialogue=[
+                    DialogueLine(speaker=NARRATOR, line="一", fact_refs=["fact_1", "fact_9"]),
+                    DialogueLine(speaker=NARRATOR, line="二", fact_refs=["fact_2", "fact_3"]),
+                ],
+            )
+        ]
+    )
+    report = _checked(script, bible)
+    errors = [i.message for i in report.issues if i.severity == IssueSeverity.ERROR]
+    assert len(errors) == 2
+    assert any("不存在的事实 fact_9" in m for m in errors)
+    assert any("已驳回的事实 fact_2" in m for m in errors)
+    unverified = [i.message for i in report.issues if "还没核对" in i.message]
+    assert unverified == ["1 条被旁白引用的事实还没核对：fact_3"]
+
+
+def test_source_warnings_only_with_material():
+    bible = StoryBible(
+        facts=[
+            Fact(id="fact_1", content="甲", source=explainer_service.SOURCE_NOT_FOUND),
+            Fact(id="fact_2", content="乙", source="蓝光"),
+            Fact(id="fact_3", content="丙", source="空气分子对短波长的蓝光散射得更强烈"),
+        ]
+    )
+    script = Script(
+        scenes=[
+            Scene(
+                id="scene_1",
+                summary="s",
+                dialogue=[
+                    DialogueLine(
+                        speaker=NARRATOR, line="一", fact_refs=["fact_1", "fact_2", "fact_3"]
+                    )
+                ],
+            )
+        ]
+    )
+    with_material = [i.message for i in _checked(script, bible, source_material=MATERIAL).issues]
+    assert any("fact_1 的出处在参考资料里找不到" in m for m in with_material)
+    assert any("fact_2 的引文太短" in m for m in with_material)
+    assert not any("fact_3" in m and "出处" in m for m in with_material)
+    without = [i.message for i in _checked(script, bible).issues]
+    assert not any("出处" in m or "引文" in m for m in without)
+
+
+def test_drama_only_checks_are_skipped_and_length_is_checked():
+    long_line = "牛顿说光是由不同颜色组成的，这个实验后来被很多人重复过很多次。"
+    script = Script(
+        scenes=[
+            Scene(
+                id=f"scene_{i}",
+                summary=f"第 {i} 场",
+                dialogue=[DialogueLine(speaker=NARRATOR, line=long_line)] * 4,
+                duration_sec=10,
+            )
+            for i in range(1, 4)
+        ]
+    )
+    report = _checked(script, StoryBible(), target_duration_sec=30)
+    messages = [i.message for i in report.issues]
+    assert not any("人名" in m for m in messages)  # 「牛顿说」不报未定义人名
+    assert not any("冲突" in m or "悬念" in m for m in messages)
+    assert any("旁白念完约" in m for m in messages)
+    assert not any("旁白念完约" in m for m in [
+        i.message for i in _checked(script, StoryBible(), target_duration_sec=120).issues
+    ])
+
+
+def test_known_character_line_is_only_a_warning():
+    bible = StoryBible(characters=[Character(id="char_1", name="讲解员")])
+    script = _narrated_script()
+    script.scenes[0].dialogue.append(DialogueLine(speaker="char_1", line="我来补一句。"))
+    report = _checked(script, bible)
+    assert _speaker_errors(report) == []
+    assert any("旁白以外的说话人" in i.message for i in report.issues)
+
+
+def test_new_fact_with_existing_content_points_to_the_existing_one():
+    bible = StoryBible(facts=[Fact(id="fact_1", content="甲"), Fact(id="fact_3", content="丙")])
+    mapping = explainer_service.add_new_facts(
+        bible,
+        [NewFact(key="new_1", content=" 甲 "), NewFact(key="new_2", content="丁")],
+        "",
+    )
+    assert mapping == {"new_1": "fact_1", "new_2": "fact_4"}
+    assert [f.id for f in bible.facts] == ["fact_1", "fact_3", "fact_4"]
+    assert bible.facts[-1].source == explainer_service.SOURCE_SELF

@@ -109,6 +109,12 @@ class FakeLLM(LLMProvider):
         self.novel_merges = 0
         #: 科普：知识底稿调用次数
         self.knowledge_calls = 0
+        #: 科普：大纲里几个知识点 / 旁白第一句引用哪些事实 / 审稿返回什么 / 反向标注分场是否合规
+        self.explainer_points = 3
+        self.explainer_line_refs = ["fact_1"]
+        self.explainer_review_issues: list[dict] = []
+        self.explainer_reviews = 0
+        self.explainer_annotate_valid = True
 
     # ── LLMProvider 接口 ──────────────────────────────
 
@@ -167,6 +173,27 @@ class FakeLLM(LLMProvider):
         # 用各阶段 system prompt 里独一无二的锚点判断，避免误匹配
         if "科普知识底稿编辑" in system:
             return self._knowledge(user)
+        if "科普讲解的结构编辑" in system:
+            self._maybe_fail("explainer_outline")
+            return {
+                "scenes": [{"title": "开场提问", "brief": "天为什么是蓝的？"}]
+                + [
+                    {"title": f"知识点 {i}", "brief": f"第 {i} 个知识点"}
+                    for i in range(1, self.explainer_points + 1)
+                ]
+                + [{"title": "小结", "brief": "回答开场问题"}]
+            }
+        if "科普旁白撰稿" in system:
+            scene_id = SCENE_ID_RE.search(user)
+            sid = scene_id.group(1) if scene_id else "scene_1"
+            self._maybe_fail(f"explainer_scene:{sid}")
+            return self._explainer_scene(sid, user)
+        if "科普文稿标注" in system:
+            self._maybe_fail("explainer_annotate")
+            return self._explainer_annotate(user)
+        if "严格的科普审校" in system:
+            self.explainer_reviews += 1
+            return {"issues": list(self.explainer_review_issues)}
         if "图片 prompt 翻译" in system:
             self._maybe_fail("image_prompt")
             # 故意留一个中文字符：调用方必须把残留的中文剔掉
@@ -374,6 +401,45 @@ class FakeLLM(LLMProvider):
                 }
             )
         return {"lines": lines}
+
+    def _explainer_scene(self, scene_id: str, user: str) -> dict:
+        """每场两句旁白：第一句引用 fact_1，第二句引用模型新提出的 new_1。"""
+        revised = "（重写）" if "## 重写本场" in user else ""
+        return {
+            "heading": f"{scene_id} 标题",
+            "summary": f"{scene_id} 讲了一个知识点",
+            "emotion": "好奇",
+            "lines": [
+                {"line": f"（停顿）{scene_id}{revised}：阳光里其实藏着各种颜色的光。",
+                 "fact_refs": list(self.explainer_line_refs)},
+                {"line": f"{scene_id}：蓝光比红光更容易被空气散射开。", "fact_refs": ["new_1"]},
+            ],
+            "new_facts": [
+                {"key": "new_1", "content": f"{scene_id}{revised} 补充的事实：蓝光波长较短",
+                 "source": ""}
+            ],
+        }
+
+    def _explainer_annotate(self, user: str) -> dict:
+        """按句号编号两两分场；`explainer_annotate_valid=False` 时故意漏掉最后一句。"""
+        count = len(re.findall(r"^\d+\. ", user, flags=re.M))
+        indices = list(range(1, count + 1))
+        if not self.explainer_annotate_valid:
+            indices = indices[:-1]
+        scenes = [
+            {
+                "title": f"第 {n} 场",
+                "summary": f"第 {n} 场概括",
+                "lines": [{"index": i, "fact_refs": ["fact_1"]} for i in indices[k : k + 2]],
+            }
+            for n, k in enumerate(range(0, len(indices), 2), start=1)
+        ]
+        if scenes:
+            scenes[0]["lines"][0]["fact_refs"] = ["new_1"]
+        return {
+            "scenes": scenes,
+            "new_facts": [{"key": "new_1", "content": "用户文稿里陈述的事实", "source": ""}],
+        }
 
     def _knowledge(self, user: str) -> dict:
         """科普知识底稿：有资料块时从块里逐字摘句当出处，另附一条资料里没有的「编造」引文。"""

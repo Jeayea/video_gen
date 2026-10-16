@@ -5,6 +5,7 @@ from __future__ import annotations
 from pydantic import BaseModel, Field, field_validator
 
 from videogen.models.bible import StyleGuide
+from videogen.utils.coerce import StrList, coerce_int
 
 
 class KnowledgeFact(BaseModel):
@@ -61,3 +62,65 @@ class ExplainerSource(BaseModel):
 
     fingerprint: str = ""
     chunks: list[SourceChunk] = Field(default_factory=list)
+
+
+class NarrationLine(BaseModel):
+    line: str = ""
+    fact_refs: StrList = Field(default_factory=list)
+
+    @field_validator("line", mode="before")
+    @classmethod
+    def _stringify(cls, value: object) -> str:
+        return "" if value is None else str(value)
+
+
+class NewFact(KnowledgeFact):
+    """旁白阶段模型提出的新事实：`key`（new_1…）只在这一次输出里用来引用，正式 id 由代码分配。"""
+
+    key: str = ""
+
+    @field_validator("key", mode="before")
+    @classmethod
+    def _stringify_key(cls, value: object) -> str:
+        return "" if value is None else str(value)
+
+
+class ExplainerSceneResponse(BaseModel):
+    heading: str = ""
+    summary: str = ""
+    emotion: str = ""
+    lines: list[NarrationLine] = Field(default_factory=list)
+    new_facts: list[NewFact] = Field(default_factory=list)
+
+    @field_validator("lines", "new_facts", mode="before")
+    @classmethod
+    def _none_to_empty(cls, value: object) -> object:
+        return [] if value is None else value
+
+
+class AnnotatedLine(BaseModel):
+    index: int = 0
+    fact_refs: StrList = Field(default_factory=list)
+
+    @field_validator("index", mode="before")
+    @classmethod
+    def _coerce_index(cls, value: object) -> int:
+        return coerce_int(value, 0)
+
+
+class AnnotatedScene(BaseModel):
+    title: str = ""
+    summary: str = ""
+    lines: list[AnnotatedLine] = Field(default_factory=list)
+
+
+class AnnotateResponse(BaseModel):
+    """完整旁白模式的反向标注：只分场、只标 fact_refs，不改字。"""
+
+    scenes: list[AnnotatedScene] = Field(default_factory=list)
+    new_facts: list[NewFact] = Field(default_factory=list)
+
+    @field_validator("scenes", "new_facts", mode="before")
+    @classmethod
+    def _none_to_empty(cls, value: object) -> object:
+        return [] if value is None else value

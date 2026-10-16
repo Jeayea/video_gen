@@ -807,25 +807,36 @@ class Pipeline:
             if redo_chapters and not chapters:
                 # 只重做：别把「不选 = 全部章」带出来，一口气展开整本书
                 chapters = list(redo_chapters)
+            explainer = explainer_service.is_explainer(project)
+            if explainer and (chapters or redo_chapters):
+                raise PipelineError("科普讲解没有章节：不要传 chapters / redo_chapters")
             novel_mode = project.input_mode == InputMode.NOVEL
             if novel_mode:
                 bible = await self._prepare_novel_chapters(project, chapters, model)
             llm = self._llm(model, project)
             review_issues: list = []
             try:
-                script, world_state = await self._run_script_generation(
-                    project,
-                    bible,
-                    llm,
-                    chapters=chapters,
-                    force=force,
-                    redo_chapters=redo_chapters,
-                    feedback=feedback,
-                )
+                if explainer:
+                    script, bible = await self._run_explainer_script(project, bible, llm)
+                    world_state = WorldState()
+                else:
+                    script, world_state = await self._run_script_generation(
+                        project,
+                        bible,
+                        llm,
+                        chapters=chapters,
+                        force=force,
+                        redo_chapters=redo_chapters,
+                        feedback=feedback,
+                    )
                 # 结构评审：机器判不了的那部分（钩子/转折/高潮/因果）交给 LLM 当剧本医生。
                 # 放在 try 内是为了让 finally 里的记账把两次调用的 token 一起记进 script 阶段；
                 # review_structure 自己吞异常，评审失败不会连累剧本生成
-                if get_settings().script_llm_review:
+                if get_settings().script_llm_review and explainer:
+                    review_issues = await explainer_service.review_script(
+                        llm, project, script, bible
+                    )
+                elif get_settings().script_llm_review:
                     review_issues = await script_service.review_structure(
                         llm,
                         script,
@@ -840,15 +851,7 @@ class Pipeline:
                 self._record_llm_cost(project_id, CostStage.SCRIPT, llm)
                 await llm.aclose()
 
-            report = consistency_service.validate_script(
-                script,
-                bible,
-                world_state,
-                project.target_duration_sec,
-                strict=get_settings().script_strict,
-                partial=self._is_partial_arc(project_id),
-                explainer=explainer_service.is_explainer(project),
-            )
+            report = self._validate_script(project, script, bible, world_state)
             if review_issues:
                 report = report.model_copy(
                     update={"issues": [*report.issues, *review_issues]}
@@ -871,6 +874,63 @@ class Pipeline:
                 len(report.issues),
             )
             return script
+
+    async def _run_explainer_script(
+        self, project: Project, bible: StoryBible, llm: LLMProvider
+    ) -> tuple[Script, StoryBible]:
+        """科普：逐场写旁白（每场落盘、失败可续跑），模型提出的新事实并进底稿。
+
+        完整旁白模式不写，只做反向标注（分场 + fact_refs，一个字都不改）。
+        """
+        project_id = project.id
+        if project.input_mode == InputMode.FULL_SCRIPT:
+            outline, script = await explainer_service.annotate_full_script(llm, project, bible)
+            self._reset_script_artifacts(project_id, outline, script)
+            self.store.save_bible(project_id, bible)
+            script.logline = script.scenes[0].summary
+            self.store.save_script(project_id, script)
+            return script, bible
+
+        resuming = project.status == ProjectStatus.FAILED
+        outline = self.store.load_outline(project_id) if resuming else None
+        if outline is None:
+            outline = await explainer_service.generate_outline(llm, project, bible)
+            script = Script(title=project.title, logline="")
+            self._reset_script_artifacts(project_id, outline, script)
+        else:
+            script = self.store.load_script(project_id) or Script(title=project.title, logline="")
+            logger.info(
+                "续跑科普旁白 %s：已完成 %d/%d 场",
+                project_id,
+                len(script.scenes),
+                len(outline.scenes),
+            )
+        done = script.scene_ids()
+        for outline_scene in outline.scenes:
+            if outline_scene.id in done:
+                continue
+            scene, new_facts = await explainer_service.generate_scene(
+                llm, project, bible, outline_scene, script.scenes, len(outline.scenes)
+            )
+            mapping = explainer_service.add_new_facts(bible, new_facts, project.source_material)
+            explainer_service.resolve_refs(scene, mapping)
+            # 底稿先落盘：旁白里引用的新事实 id 必须已经在底稿里
+            self.store.save_bible(project_id, bible)
+            script.scenes.append(scene)
+            self.store.save_script(project_id, script)
+        script.logline = script.scenes[0].summary if script.scenes else ""
+        self.store.save_script(project_id, script)
+        return script, bible
+
+    def _reset_script_artifacts(
+        self, project_id: str, outline: ScriptOutline, script: Script
+    ) -> None:
+        """重新生成剧本：新大纲 + 空剧本落盘，旧分镜和下游媒体全部作废。"""
+        self.store.save_outline(project_id, outline)
+        self.store.remove_artifact(project_id, "storyboard")
+        self._invalidate_media(project_id)
+        self.store.save_script(project_id, script)
+        self.store.save_world_state(project_id, WorldState())
 
     async def _prepare_novel_chapters(
         self, project: Project, chapters: list[str] | None, model: str
@@ -1127,6 +1187,33 @@ class Pipeline:
             "重做章 %s：%d 场 -> %d 场（场次编号已重排）", chapter_id, len(old), len(extra.scenes)
         )
 
+    def _validate_script(
+        self,
+        project: Project,
+        script: Script,
+        bible: StoryBible,
+        world_state: WorldState | None,
+    ) -> ConsistencyReport:
+        """剧本检查：按内容类型分派（科普换一套规则，见 docs/EXPLAINER_DESIGN.md 第 4 节）。"""
+        settings = get_settings()
+        if explainer_service.is_explainer(project):
+            return consistency_service.validate_explainer_script(
+                script,
+                bible,
+                project.target_duration_sec,
+                strict=settings.script_strict,
+                source_material=project.source_material,
+                min_quote_chars=settings.explainer_min_quote_chars,
+            )
+        return consistency_service.validate_script(
+            script,
+            bible,
+            world_state,
+            project.target_duration_sec,
+            strict=settings.script_strict,
+            partial=self._is_partial_arc(project.id),
+        )
+
     def _is_partial_arc(self, project_id: str) -> bool:
         """当前剧本是否只是长篇剧集里的一段（还有章没展开）。
 
@@ -1222,24 +1309,43 @@ class Pipeline:
 
             self._guard_budget(project_id, action="重写场次")
             llm = self._llm(model, project)
+            explainer = explainer_service.is_explainer(project)
             try:
-                scene, _response = await script_service.generate_scene(
-                    llm,
-                    project,
-                    bible,
-                    entry,
-                    script.scenes[:index],
-                    world_state,
-                    len(script.scenes),
-                    revision=current,
-                    feedback=feedback,
-                )
+                if explainer:
+                    scene, new_facts = await explainer_service.generate_scene(
+                        llm,
+                        project,
+                        bible,
+                        entry,
+                        script.scenes[:index],
+                        len(script.scenes),
+                        revision=current,
+                        feedback=feedback,
+                    )
+                else:
+                    scene, _response = await script_service.generate_scene(
+                        llm,
+                        project,
+                        bible,
+                        entry,
+                        script.scenes[:index],
+                        world_state,
+                        len(script.scenes),
+                        revision=current,
+                        feedback=feedback,
+                    )
             except Exception as exc:
                 raise PipelineError(f"重写场次失败：{exc}") from exc
             finally:
                 self._record_llm_cost(project_id, CostStage.SCRIPT, llm)
                 await llm.aclose()
-            scene.duration_sec = current.duration_sec
+            if explainer:
+                # 科普的场次时长由旁白决定（generate_scene 已按新旁白算好）；新事实并进底稿
+                mapping = explainer_service.add_new_facts(bible, new_facts, project.source_material)
+                explainer_service.resolve_refs(scene, mapping)
+                self.store.save_bible(project_id, bible)
+            else:
+                scene.duration_sec = current.duration_sec
             script.scenes[index] = scene
             self.store.save_script(project_id, script)
             self._invalidate_media(project_id)
@@ -1383,14 +1489,8 @@ class Pipeline:
             if repairs:
                 self.store.save_storyboard(project_id, storyboard)
                 logger.info("分镜自动修复 %d 处：%s", len(repairs), "；".join(repairs))
-            script_report = consistency_service.validate_script(
-                script,
-                bible,
-                self.store.load_world_state(project_id),
-                project.target_duration_sec,
-                strict=get_settings().script_strict,
-                partial=self._is_partial_arc(project_id),
-                explainer=explainer_service.is_explainer(project),
+            script_report = self._validate_script(
+                project, script, bible, self.store.load_world_state(project_id)
             )
             issues = consistency_service.validate_storyboard(storyboard, script, bible)
             report = consistency_service.merge_storyboard_issues(script_report, issues)
@@ -3082,14 +3182,8 @@ class Pipeline:
         if not script or not script.scenes:
             report = ConsistencyReport(stage="script")
         else:
-            report = consistency_service.validate_script(
-                script,
-                bible,
-                self.store.load_world_state(project.id),
-                project.target_duration_sec,
-                strict=get_settings().script_strict,
-                partial=self._is_partial_arc(project.id),
-                explainer=explainer_service.is_explainer(project),
+            report = self._validate_script(
+                project, script, bible, self.store.load_world_state(project.id)
             )
             storyboard = self.store.load_storyboard(project.id)
             if storyboard and storyboard.shots:

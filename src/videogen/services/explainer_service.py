@@ -8,21 +8,37 @@ from __future__ import annotations
 
 import difflib
 import logging
+import math
 import re
 from collections import Counter
 from collections.abc import Callable
 
 from videogen.config import Settings, get_settings
 from videogen.models.bible import Fact, Prop, Setting, StoryBible, StyleGuide
+from videogen.models.consistency import ConsistencyIssue, IssueSeverity
 from videogen.models.explainer import (
+    AnnotateResponse,
+    ExplainerSceneResponse,
     ExplainerSource,
     KnowledgeItem,
     KnowledgeResponse,
+    NewFact,
     SourceChunk,
 )
+from videogen.models.llm_io import OutlineResponse
 from videogen.models.project import ContentType, InputMode, Project
+from videogen.models.script import (
+    MIN_SCENE_DURATION_SEC,
+    NARRATOR,
+    DialogueLine,
+    OutlineScene,
+    Scene,
+    Script,
+    ScriptOutline,
+)
 from videogen.providers.llm.base import LLMMessage, LLMProvider
-from videogen.services import bible_service
+from videogen.services import bible_service, script_service
+from videogen.utils.duration import SPEECH_CHARS_PER_SEC, apply_duration_budget, speech_seconds
 from videogen.utils.novel import source_fingerprint, split_chapters
 from videogen.utils.text import quote_source
 
@@ -421,3 +437,496 @@ def source_state(fact: Fact, material: str, *, min_chars: int) -> str:
     if not source or source.startswith(SOURCE_SELF) or source.startswith(SOURCE_USER_PREFIX):
         return "missing"
     return match_quote(source, material, min_chars=min_chars)[0]
+
+
+# ── 时长 ──────────────────────────────────────────────
+
+
+def line_seconds(line: str, settings: Settings | None = None) -> int:
+    """一句旁白（= 一个镜头）的时长：ceil(念白秒数 + 余量)。"""
+    settings = settings or get_settings()
+    return max(1, math.ceil(speech_seconds(line) + settings.explainer_line_pad_sec))
+
+
+def scene_seconds(scene: Scene, settings: Settings | None = None) -> int:
+    """一场的时长 = 各句旁白镜头时长之和（科普的场次时长由旁白决定，不由大纲预算决定）。"""
+    total = sum(line_seconds(d.line, settings) for d in scene.dialogue if d.line.strip())
+    return max(MIN_SCENE_DURATION_SEC, total)
+
+
+def narration_seconds(script: Script, settings: Settings | None = None) -> float:
+    """全片旁白念完要多久：念白秒数 + 句间停顿（不含取整余量，合成时按配音实长裁镜头）。"""
+    settings = settings or get_settings()
+    lines = [d.line for s in script.scenes for d in s.dialogue if d.line.strip()]
+    return sum(speech_seconds(line) for line in lines) + settings.explainer_line_gap_sec * len(
+        lines
+    )
+
+
+# ── 大纲 ──────────────────────────────────────────────
+
+#: 知识点场数的上下限（开场提问和小结另算）
+MIN_POINTS = 3
+MAX_POINTS = 5
+
+OUTLINE_SYSTEM = """你是科普讲解的结构编辑。把一个题目排成固定结构的分场大纲（不写旁白）：
+1. 第一场：开场提问 —— 一个反常识的问题或现象，让观众想知道答案
+2. 中间 3-5 场：每场一个知识点，先给直觉（日常看得到的现象、比喻），再讲原理；
+   后一个知识点建立在前一个之上，用到的概念必须前面已经讲过
+3. 最后一场：小结 —— 回答开场提出的问题
+
+输出 JSON：
+{"scenes": [{"title": "这一场的标题", "brief": "这一场讲什么，用到哪几条事实（写 fact id）"}]}
+只输出 JSON。"""
+
+
+def _format_facts(bible: StoryBible) -> str:
+    rows = []
+    for fact in bible.facts:
+        flag = "（已驳回，不能用）" if fact.status == "rejected" else ""
+        rows.append(f"- [{fact.id}] {fact.content}{flag}")
+    return "\n".join(rows) or "（底稿里还没有事实）"
+
+
+def _audience(project: Project) -> str:
+    return " ".join(project.audience.split()) or "没有专业背景的成年人"
+
+
+async def generate_outline(
+    llm: LLMProvider, project: Project, bible: StoryBible
+) -> ScriptOutline:
+    lines = [
+        f"## 题目\n{project.input_text}" if project.input_mode == InputMode.THEME else
+        "## 用户写好的知识点（每个知识点一场，不增不删、不改顺序；你只补开场提问和小结）\n"
+        f"{project.input_text}",
+        f"\n目标观众：{_audience(project)}",
+        f"目标时长：{project.target_duration_sec} 秒",
+        f"\n## 知识底稿\n{_format_facts(bible)}",
+    ]
+    messages = [
+        LLMMessage(role="system", content=OUTLINE_SYSTEM),
+        LLMMessage(role="user", content="\n".join(lines)),
+    ]
+    response = await llm.chat_json(messages, schema=OutlineResponse, temperature=0.5)
+    raw = [s for s in response.scenes if isinstance(s, dict)]
+    if len(raw) < MIN_POINTS + 2:
+        raise ValueError(
+            f"科普大纲至少要 {MIN_POINTS + 2} 场（提问 + {MIN_POINTS} 个知识点 + 小结）"
+        )
+    if len(raw) > MAX_POINTS + 2:
+        raw = [raw[0], *raw[1 : MAX_POINTS + 1], raw[-1]]
+    budget = apply_duration_budget(project.target_duration_sec, len(raw), MIN_SCENE_DURATION_SEC)
+    return ScriptOutline(
+        target_duration_sec=project.target_duration_sec,
+        scenes=[
+            OutlineScene(
+                id=f"scene_{i}",
+                title=str(item.get("title") or f"第 {i} 场"),
+                brief=str(item.get("brief") or item.get("summary") or ""),
+                duration_budget_sec=budget,
+            )
+            for i, item in enumerate(raw, start=1)
+        ],
+    )
+
+
+# ── 逐场旁白 ──────────────────────────────────────────
+
+SCENE_SYSTEM = """你是科普旁白撰稿。你在逐场写一支科普讲解短片的旁白：
+全片只有一个旁白声音，没有角色对白。
+
+规则：
+1. 每句旁白只讲一个意思，15-30 字，口语、念得顺。一句话就是一个镜头，每句都要能配一个画面
+2. 每句标 fact_refs：这句话依据知识底稿里的哪几条事实（写 id）；纯过渡句（「我们来看看」）给空数组
+3. 只讲底稿里有的事实，「已驳回」的事实不能用。这句话需要、但底稿里没有的事实写进 new_facts
+   （key 写 new_1、new_2……，在 fact_refs 里引用这个 key）；拿不准的不要写，不要编数字
+4. 术语第一次出现时当场解释；难度按目标观众来
+5. line 里只写要念出来的话：不写舞台提示、画面描述、「旁白：」这类前缀
+
+输出 JSON：
+{
+  "heading": "这一场的标题",
+  "summary": "一句话概括这一场",
+  "emotion": "好奇 / 惊讶 / 恍然大悟……",
+  "lines": [{"line": "旁白句", "fact_refs": ["fact_1"]}],
+  "new_facts": [{"key": "new_1", "content": "事实", "source": "出处", "type": "general"}]
+}
+只输出 JSON。"""
+
+
+def _new_fact_rule(project: Project, min_chars: int) -> str:
+    if project.source_material.strip():
+        return (
+            "new_facts 的 source 必须逐字摘抄<原文>里的一句（至少 "
+            f"{min_chars} 个字）；资料里没有依据的事实不要提"
+        )
+    return "new_facts 的 source 留空（系统会标成「模型自述」，由人工核对）"
+
+
+def _prev_block(prev_scenes: list[Scene]) -> str:
+    if not prev_scenes:
+        return "（这是第一场）"
+    prev = prev_scenes[-1]
+    said = "\n".join(f"  {d.line}" for d in prev.dialogue[-3:])
+    return f"上一场 [{prev.id}] {prev.heading}：{prev.summary}\n最后几句：\n{said}"
+
+
+async def generate_scene(
+    llm: LLMProvider,
+    project: Project,
+    bible: StoryBible,
+    outline_scene: OutlineScene,
+    prev_scenes: list[Scene],
+    total_scenes: int,
+    *,
+    revision: Scene | None = None,
+    feedback: str = "",
+    settings: Settings | None = None,
+) -> tuple[Scene, list[NewFact]]:
+    """写一场旁白，返回 `(场次, 模型提出的新事实)`。新事实由调用方 `add_new_facts` 并进底稿。"""
+    settings = settings or get_settings()
+    budget = outline_scene.duration_budget_sec
+    chars = int(budget * SPEECH_CHARS_PER_SEC * 0.9)
+    material = project.source_material.strip()
+    parts = [
+        f"## 知识底稿（只读）\n{_format_facts(bible)}",
+        f"\n目标观众：{_audience(project)}",
+        f"\n## 上下文\n{_prev_block(prev_scenes)}",
+        "\n## 本场任务",
+        f"场次 ID: {outline_scene.id}",
+        f"标题: {outline_scene.title}",
+        f"概述: {outline_scene.brief}",
+        f"本场旁白合计不超过 {chars} 字（约 {budget} 秒，按每秒 {SPEECH_CHARS_PER_SEC} 字念）",
+        f"这是第 {len(prev_scenes) + 1} 场，共 {total_scenes} 场",
+        _new_fact_rule(project, settings.explainer_min_quote_chars),
+    ]
+    if material:
+        excerpt = material[: settings.explainer_source_max_chars]
+        parts.append(f"\n## 参考资料\n{quote_source(excerpt)}")
+    if revision is not None:
+        said = "\n".join(f"  {d.line}" for d in revision.dialogue) or "  （无）"
+        note = " ".join(str(feedback or "").split()) or "整体重写一版，讲得更清楚"
+        parts.append(
+            f"\n## 重写本场（按修改意见）\n当前版本：\n{said}\n\n修改意见（优先级最高）：{note}\n"
+            "意见没提到的部分尽量保持。"
+        )
+    parts.append("\n请写本场旁白（JSON）。")
+    messages = [
+        LLMMessage(role="system", content=SCENE_SYSTEM),
+        LLMMessage(role="user", content="\n".join(parts)),
+    ]
+    response = await llm.chat_json(
+        messages, schema=ExplainerSceneResponse, temperature=0.5, max_tokens=4096
+    )
+    dialogue = []
+    for item in response.lines:
+        text = script_service.clean_dialogue_line(item.line)
+        if text:
+            dialogue.append(DialogueLine(speaker=NARRATOR, line=text, fact_refs=item.fact_refs))
+    if not dialogue:
+        raise ValueError(f"{outline_scene.id} 没有写出旁白")
+    scene = Scene(
+        id=outline_scene.id,
+        heading=response.heading or outline_scene.title,
+        summary=response.summary or outline_scene.brief,
+        dialogue=dialogue,
+        emotion=response.emotion,
+    )
+    scene.duration_sec = scene_seconds(scene, settings)
+    return scene, response.new_facts
+
+
+def add_new_facts(
+    bible: StoryBible,
+    new_facts: list[NewFact],
+    material: str,
+    settings: Settings | None = None,
+) -> dict[str, str]:
+    """把旁白阶段提出的新事实并进底稿（unverified），返回 `key → 正式 id`。
+
+    内容和已有事实一字不差的不重复加，key 直接指向已有的那条。
+    """
+    settings = settings or get_settings()
+    existing = {_compact(f.content): f.id for f in bible.facts}
+    mapping: dict[str, str] = {}
+    added: list[Fact] = []
+    for item in new_facts:
+        content = _compact(item.content)
+        if not content:
+            continue
+        fact_id = existing.get(content)
+        if fact_id is None:
+            fact_id = f"fact_{next_fact_number(bible.facts + added)}"
+            fact = Fact(id=fact_id, content=content, type=item.type or "general",
+                        source=_compact(item.source))
+            added.append(fact)
+            existing[content] = fact_id
+        if item.key:
+            mapping[item.key.strip()] = fact_id
+    verify_sources(added, material, min_chars=settings.explainer_min_quote_chars)
+    bible.facts.extend(added)
+    return mapping
+
+
+def resolve_refs(scene: Scene, mapping: dict[str, str]) -> None:
+    """把旁白里引用的临时 key（new_1）换成正式事实 id，去重保序。"""
+    for line in scene.dialogue:
+        refs: list[str] = []
+        for ref in line.fact_refs:
+            real = mapping.get(ref.strip(), ref.strip())
+            if real and real not in refs:
+                refs.append(real)
+        line.fact_refs = refs
+
+
+# ── 完整旁白：反向标注（不改字）──────────────────────
+
+ANNOTATE_SYSTEM = """你是科普文稿标注员。用户已经写好了一支科普短片的完整旁白，按编号逐句给出。
+你**不改任何一个字**，只做两件事：
+1. 分场：按讲解结构（开场提问 / 每个知识点一场 / 小结）把句子分成几场，
+   每场是编号连续的若干句，全部句子按顺序各用一次
+2. 标注：给每句标 fact_refs（依据知识底稿里的哪几条事实）；句子陈述了、但底稿里没有的事实写进
+   new_facts（key 写 new_1、new_2……，在 fact_refs 里引用这个 key）；纯过渡句给空数组
+
+输出 JSON：
+{
+  "scenes": [{"title": "标题", "summary": "一句话概括",
+              "lines": [{"index": 1, "fact_refs": ["fact_1"]}]}],
+  "new_facts": [{"key": "new_1", "content": "事实", "source": "出处", "type": "general"}]
+}
+只输出 JSON。"""
+
+_SENTENCE_RE = re.compile(r"[^。！？!?…]+[。！？!?…”」』]*")
+#: 句末标点后面整段都在括号里的片段（「天为什么是蓝的？（先想一想）」）：属于前一句，不单独成句
+_BRACKET_TAIL_RE = re.compile(r"^\s*[（(][^）)]*[）)]\s*$")
+
+
+def split_sentences(text: str) -> list[tuple[int, str]]:
+    """完整旁白按句切开：`(段落序号, 句子)`。句子原样保留（只去掉首尾空白）。"""
+    out: list[tuple[int, str]] = []
+    paragraphs = [p for p in re.split(r"\n\s*\n|\n", text or "") if p.strip()]
+    for index, paragraph in enumerate(paragraphs):
+        sentences: list[str] = []
+        for piece in _SENTENCE_RE.findall(paragraph):
+            if sentences and _BRACKET_TAIL_RE.match(piece):
+                sentences[-1] += piece
+            elif piece.strip():
+                sentences.append(piece)
+        out.extend((index, sentence.strip()) for sentence in sentences)
+    return out
+
+
+def _grouping_from(response: AnnotateResponse, count: int) -> list[list[int]] | None:
+    """模型给的分场能不能用：每句恰好一次、按顺序、每场连续。不能用返回 None。"""
+    groups = [[line.index for line in scene.lines] for scene in response.scenes]
+    flat = [i for group in groups for i in group]
+    if not groups or any(not g for g in groups) or flat != list(range(1, count + 1)):
+        return None
+    return groups
+
+
+async def annotate_full_script(
+    llm: LLMProvider,
+    project: Project,
+    bible: StoryBible,
+    settings: Settings | None = None,
+) -> tuple[ScriptOutline, Script]:
+    """完整旁白模式：用户的旁白原样进剧本，模型只负责分场和标 fact_refs。
+
+    新事实直接并进 `bible`。模型的分场不合规（漏句、重句、乱序）时按用户的段落分场 ——
+    宁可分得粗，也不能改动或丢掉用户的句子。
+    """
+    settings = settings or get_settings()
+    sentences = split_sentences(project.input_text)
+    if not sentences:
+        raise ValueError("完整旁白是空的")
+    numbered = "\n".join(f"{i}. {text}" for i, (_, text) in enumerate(sentences, start=1))
+    user = (
+        f"## 知识底稿\n{_format_facts(bible)}\n\n"
+        f"{_new_fact_rule(project, settings.explainer_min_quote_chars)}\n\n"
+        f"## 用户的旁白（共 {len(sentences)} 句）\n{numbered}"
+    )
+    messages = [
+        LLMMessage(role="system", content=ANNOTATE_SYSTEM),
+        LLMMessage(role="user", content=user),
+    ]
+    response = await llm.chat_json(
+        messages, schema=AnnotateResponse, temperature=0.2, max_tokens=4096
+    )
+    mapping = add_new_facts(bible, response.new_facts, project.source_material, settings)
+    refs = {line.index: line.fact_refs for scene in response.scenes for line in scene.lines}
+
+    groups = _grouping_from(response, len(sentences))
+    titles = [(s.title, s.summary) for s in response.scenes] if groups else []
+    if groups is None:
+        logger.warning("反向标注的分场不合规，按用户的段落分场")
+        by_paragraph: dict[int, list[int]] = {}
+        for i, (paragraph, _) in enumerate(sentences, start=1):
+            by_paragraph.setdefault(paragraph, []).append(i)
+        groups = list(by_paragraph.values())
+
+    outline = ScriptOutline(target_duration_sec=project.target_duration_sec)
+    script = Script(title=project.title, logline="")
+    for n, group in enumerate(groups, start=1):
+        title, summary = titles[n - 1] if titles else ("", "")
+        scene = Scene(
+            id=f"scene_{n}",
+            heading=title or f"第 {n} 场",
+            summary=summary or sentences[group[0] - 1][1],
+            dialogue=[
+                DialogueLine(speaker=NARRATOR, line=sentences[i - 1][1], fact_refs=refs.get(i, []))
+                for i in group
+            ],
+        )
+        resolve_refs(scene, mapping)
+        scene.duration_sec = scene_seconds(scene, settings)
+        script.scenes.append(scene)
+        outline.scenes.append(
+            OutlineScene(id=scene.id, title=scene.heading, brief=scene.summary,
+                         duration_budget_sec=scene.duration_sec)
+        )
+    return outline, script
+
+
+# ── 审稿 ──────────────────────────────────────────────
+
+REVIEW_SYSTEM = """你是严格的科普审校。只找会让这支科普短片「讲错」或「讲不清」的问题：
+1. 讲错了：旁白和它引用的事实不符，或者事实本身有明显的科学错误
+2. 概念顺序倒置：用到了后面才解释的概念
+3. 术语没解释：术语第一次出现时没有当场解释
+4. 难度和目标观众不匹配
+5. 结尾没有回答开场提出的问题
+
+要求：
+- 只报确定的问题，不报文风偏好，不凑数；每条写明 scene_id
+- severity: "error" = 讲错了 / 结尾没回答开场问题；"warning" = 讲不清、顺序或难度问题
+- 最多 6 条，按严重程度排序
+
+只输出 JSON：
+{"issues": [{"severity": "error", "scene_id": "scene_2", "category": "accuracy",
+             "message": "问题是什么", "suggestion": "怎么改"}]}"""
+
+
+async def review_script(
+    llm: LLMProvider, project: Project, script: Script, bible: StoryBible
+) -> list[ConsistencyIssue]:
+    """科普审稿：LLM 当第二双眼睛。它和写稿通常是同一类模型，不能代替人工核对事实。"""
+    if not script.scenes:
+        return []
+    facts = {f.id: f.content for f in bible.facts}
+    lines = [f"目标观众：{_audience(project)}", f"\n## 知识底稿\n{_format_facts(bible)}"]
+    for scene in script.scenes:
+        said = "\n".join(
+            f"  - {d.line}" + (f"（依据 {', '.join(d.fact_refs)}）" if d.fact_refs else "")
+            for d in scene.dialogue
+        )
+        lines.append(f"\n## {scene.id}｜{scene.heading}\n{said}")
+    cited = {r for s in script.scenes for d in s.dialogue for r in d.fact_refs}
+    unknown = sorted(cited - set(facts))
+    if unknown:
+        lines.append(f"\n（注：{', '.join(unknown)} 不在底稿里，已由系统另行报错，不用再报）")
+    return await script_service.ask_review(llm, REVIEW_SYSTEM, "\n".join(lines), script)
+
+
+# ── 确定性检查 ────────────────────────────────────────
+
+#: 全片旁白念完的时长超过目标多少倍就提示
+LENGTH_WARN_RATIO = 1.2
+
+
+def check_facts(
+    script: Script, bible: StoryBible, material: str, *, min_chars: int
+) -> list[ConsistencyIssue]:
+    """旁白引用的事实：不存在 / 已驳回 → ERROR；未核对、出处找不到、引文过短 → WARNING。"""
+    facts = {f.id: f for f in bible.facts}
+    issues: list[ConsistencyIssue] = []
+    cited: list[str] = []
+    for scene in script.scenes:
+        for line in scene.dialogue:
+            for ref in line.fact_refs:
+                fact = facts.get(ref)
+                if fact is None:
+                    issues.append(_issue(
+                        IssueSeverity.ERROR, scene.id,
+                        f"旁白引用了底稿里不存在的事实 {ref}：「{line.line[:20]}」",
+                        "在知识底稿里补上这条事实，或改掉这句旁白的引用",
+                    ))
+                elif fact.status == "rejected":
+                    issues.append(_issue(
+                        IssueSeverity.ERROR, scene.id,
+                        f"旁白引用了已驳回的事实 {ref}（{fact.content[:20]}）："
+                        f"「{line.line[:20]}」",
+                        "改写这句旁白，或重新核对这条事实",
+                    ))
+                if fact is not None and ref not in cited:
+                    cited.append(ref)
+
+    unverified = [ref for ref in cited if facts[ref].status == "unverified"]
+    if unverified:
+        issues.append(_issue(
+            IssueSeverity.WARNING, "",
+            f"{len(unverified)} 条被旁白引用的事实还没核对：{'、'.join(unverified)}",
+            "在知识底稿面板里逐条确认或驳回",
+        ))
+    if material.strip():
+        for ref in cited:
+            state = source_state(facts[ref], material, min_chars=min_chars)
+            if state == "missing":
+                issues.append(_issue(
+                    IssueSeverity.WARNING, "",
+                    f"事实 {ref} 的出处在参考资料里找不到（{facts[ref].content[:20]}）",
+                    "核对这条事实；资料里确实没有就驳回，或补上资料里的原句",
+                ))
+            elif state == "short":
+                issues.append(_issue(
+                    IssueSeverity.WARNING, "",
+                    f"事实 {ref} 的引文太短（不到 {min_chars} 个字），几乎总能匹配上，不算核对过",
+                    "把出处改成资料里完整的那一句",
+                ))
+    return issues
+
+
+def check_length(
+    script: Script, target_duration_sec: int, settings: Settings | None = None
+) -> list[ConsistencyIssue]:
+    """旁白总量 vs 目标时长。按镜头量语速没有意义（镜头时长本来就按字数算），要卡的是总量。"""
+    if target_duration_sec <= 0:
+        return []
+    seconds = narration_seconds(script, settings)
+    if seconds <= target_duration_sec * LENGTH_WARN_RATIO:
+        return []
+    return [_issue(
+        IssueSeverity.WARNING, "",
+        f"旁白念完约 {seconds:.0f} 秒，超过目标 {target_duration_sec} 秒的 "
+        f"{LENGTH_WARN_RATIO:.0%}，成片会被拉长",
+        "删句或合并知识点；确实要讲这么多就把目标时长调长",
+        category="duration",
+    )]
+
+
+def check_speakers(script: Script, bible: StoryBible) -> list[ConsistencyIssue]:
+    """科普默认纯旁白：出现已知角色的台词只提示（有讲解人物时是正常的）。
+
+    未知说话人另由通用的说话人检查报 ERROR。
+    """
+    known = {c.id for c in bible.characters}
+    issues: list[ConsistencyIssue] = []
+    for scene in script.scenes:
+        speakers = sorted({d.speaker for d in scene.dialogue if d.speaker in known})
+        if speakers:
+            issues.append(_issue(
+                IssueSeverity.WARNING, scene.id,
+                f"这一场有旁白以外的说话人：{'、'.join(speakers)}",
+                "科普默认纯旁白；有讲解人物时可以忽略",
+                category="name",
+            ))
+    return issues
+
+
+def _issue(
+    severity: IssueSeverity, scene_id: str, message: str, suggestion: str, *, category: str = "fact"
+) -> ConsistencyIssue:
+    return ConsistencyIssue(
+        severity=severity, scene_id=scene_id, category=category, message=message,
+        suggestion=suggestion,
+    )
