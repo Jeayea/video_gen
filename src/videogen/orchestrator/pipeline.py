@@ -21,10 +21,36 @@ from videogen.models.script import (
     ScriptOutline,
     StoryOutline,
 )
-from videogen.models.storyboard import DurationTier, Shot, Storyboard, VoiceDirection
+from videogen.models.storyboard import DurationTier, Storyboard, VoiceDirection
 from videogen.models.video import ClipStatus, VideoManifest
 from videogen.models.world_state import WorldState
+from videogen.orchestrator import status as project_status
+from videogen.orchestrator.errors import (
+    ExplainerHeld,
+    PipelineError,
+    PipelineNotFound,
+    UnknownVideoPrice,
+)
 from videogen.orchestrator.jobs import Job, JobContext, JobManager
+from videogen.orchestrator.status import (
+    COMPOSE_STATUSES,
+    CONFIRM_SCRIPT_STATUSES,
+    CONFIRM_STORYBOARD_STATUSES,
+    EDIT_BIBLE_STATUSES,
+    EDIT_CONFIRMED_STORYBOARD_STATUSES,
+    EDIT_SCRIPT_STATUSES,
+    EDIT_STORYBOARD_STATUSES,
+    GENERATE_AUDIO_STATUSES,
+    GENERATE_BIBLE_STATUSES,
+    GENERATE_SCRIPT_STATUSES,
+    GENERATE_STORY_STATUSES,
+    GENERATE_STORYBOARD_STATUSES,
+    GENERATE_VIDEO_STATUSES,
+    REOPEN_AUDIO_STATUSES,
+    REOPEN_SCRIPT_STATUSES,
+    REOPEN_STORYBOARD_STATUSES,
+    TRANSIENT_STATUSES,
+)
 from videogen.providers import bgm as bgm_providers
 from videogen.providers import llm as llm_providers
 from videogen.providers import tts as tts_providers
@@ -53,9 +79,11 @@ from videogen.services import (
     storyboard_service,
     video_service,
 )
+from videogen.services.storyboard_service import Segment
 from videogen.utils import language, media_history
 from videogen.utils.ffmpeg import ffmpeg_available
 from videogen.utils.file_store import FileStore
+from videogen.utils.ids import unsafe_ids
 from videogen.utils.redact import scrub_secrets
 from videogen.utils.text import count_speech_chars
 
@@ -81,76 +109,53 @@ def _chapter_context(story: StoryOutline | None, entry: OutlineScene | None) -> 
     return "\n".join(lines)
 
 
-def _pending_shots(storyboard: Storyboard, manifest: VideoManifest | None) -> list[Shot]:
-    """还需要生成的镜头（续跑时跳过已经就绪的）。"""
-    if not manifest:
-        return list(storyboard.shots)
-    ready = {c.shot_id for c in manifest.ready_clips}
-    return [s for s in storyboard.shots if s.id not in ready]
+def _reject_unsafe_ids(label: str, ids: list[str]) -> None:
+    """手写的 id 会被拼进文件名（`clips/<镜头>.mp4`、`refs/<角色>.png`）。
+
+    带 `../`、`*` 的一律拒收（见 `utils/ids.py`）。
+    """
+    bad = unsafe_ids(ids)
+    if bad:
+        raise PipelineError(
+            f"{label}里的 id 只能用字母、数字、下划线和连字符（最长 64 个字符）："
+            + "、".join(repr(b) for b in bad[:5])
+        )
 
 
-class PipelineError(Exception):
-    """流水线业务错误（状态不允许、前置产物缺失、生成失败等）。"""
+#: 科普分镜里由旁白决定、不许在分镜阶段改的字段（一句旁白 = 一个镜头 = 一组 fact_refs）
+_EXPLAINER_LOCKED_FIELDS = (
+    "scene_id",
+    "duration_sec",
+    "narration",
+    "dialogue_text",
+    "dialogue_speaker",
+    "fact_refs",
+)
 
 
-class ExplainerHeld(PipelineError):
-    """批量链路里的科普项目没过放行条件：停在剧本阶段，等人在知识底稿里核对。"""
+def _reject_explainer_narration_edits(new: Storyboard, old: Storyboard | None) -> None:
+    """科普分镜只许改画面：镜头集合、顺序和旁白相关字段都要和现在一样。
 
-    def __init__(self, reasons: list[str]):
-        self.reasons = reasons
-        super().__init__("停在剧本阶段等人工核对：" + "；".join(reasons))
+    镜头是代码按旁白句子切的，事实标注挂在「这一句」上。分镜阶段改了旁白（或把旁白填进台词），
+    `fact_refs`、剧本、审稿就对不上了；台词还会被当成对白写进视频 prompt、走口型对齐。
+    """
+    if old is None:
+        return
+    if [s.id for s in new.shots] != [s.id for s in old.shots]:
+        raise PipelineError("科普分镜的镜头由旁白句子决定，不能增删或调换；要改旁白请回剧本阶段")
+    for after, before in zip(new.shots, old.shots, strict=True):
+        changed = [
+            name
+            for name in _EXPLAINER_LOCKED_FIELDS
+            if getattr(after, name) != getattr(before, name)
+        ]
+        if changed:
+            raise PipelineError(
+                f"科普分镜只能改画面：镜头 {after.id} 改了 {'、'.join(changed)}；"
+                "旁白、事实标注和时长由剧本决定，要改请回剧本阶段"
+            )
 
 
-class PipelineNotFound(PipelineError):
-    """项目或产物不存在。"""
-
-
-class UnknownVideoPrice(RuntimeError):
-    """真实视频模型读不到单价、配置也没填：预估会是 $0。"""
-
-
-# ── 各操作的入口状态白名单（唯一事实来源）──────────────────
-
-GENERATE_BIBLE_STATUSES = {ProjectStatus.DRAFT, ProjectStatus.FAILED}
-GENERATE_SCRIPT_STATUSES = {
-    ProjectStatus.DRAFT,
-    ProjectStatus.FAILED,
-    ProjectStatus.SCRIPT_REVIEW,
-}
-#: 长篇大纲入口：与剧本同权限（退回剧本阶段后可重出/续写大纲）
-GENERATE_STORY_STATUSES = set(GENERATE_SCRIPT_STATUSES)
-CONFIRM_SCRIPT_STATUSES = {ProjectStatus.SCRIPT_REVIEW}
-REOPEN_SCRIPT_STATUSES = {
-    ProjectStatus.SCRIPT_CONFIRMED,
-    ProjectStatus.STORYBOARD_REVIEW,
-    ProjectStatus.STORYBOARD_CONFIRMED,
-    # 已经出片的项目也要能退回改剧本（改文本时才作废媒体）
-    ProjectStatus.VIDEO_READY,
-    ProjectStatus.AUDIO_READY,
-    ProjectStatus.DONE,
-}
-GENERATE_STORYBOARD_STATUSES = {
-    ProjectStatus.SCRIPT_CONFIRMED,
-    ProjectStatus.STORYBOARD_REVIEW,
-    ProjectStatus.FAILED,
-}
-CONFIRM_STORYBOARD_STATUSES = {ProjectStatus.STORYBOARD_REVIEW}
-#: 退回配音阶段：换音色 / 换念法 / 改台词后重做配音（成片会一起作废）
-REOPEN_AUDIO_STATUSES = {
-    ProjectStatus.AUDIO_READY,
-    ProjectStatus.DONE,
-}
-
-REOPEN_STORYBOARD_STATUSES = {
-    ProjectStatus.STORYBOARD_CONFIRMED,
-    ProjectStatus.VIDEO_READY,
-    ProjectStatus.AUDIO_READY,
-    ProjectStatus.DONE,
-}
-
-EDIT_BIBLE_STATUSES = {ProjectStatus.DRAFT, ProjectStatus.FAILED, ProjectStatus.SCRIPT_REVIEW}
-EDIT_SCRIPT_STATUSES = {ProjectStatus.DRAFT, ProjectStatus.FAILED, ProjectStatus.SCRIPT_REVIEW}
-EDIT_STORYBOARD_STATUSES = {ProjectStatus.SCRIPT_CONFIRMED, ProjectStatus.STORYBOARD_REVIEW}
 #: 单镜重写时从模型结果里拿哪些字段（id / 时长 / 段落沿用原镜头）
 _REVISABLE_SHOT_FIELDS = (
     "camera",
@@ -165,47 +170,6 @@ _REVISABLE_SHOT_FIELDS = (
     "dialogue_speaker",
     "voice_offscreen",
 )
-#: 确认之后（甚至成片之后）也能改分镜：只作废受影响的段，其余已生成的片段保留
-EDIT_CONFIRMED_STORYBOARD_STATUSES = {
-    ProjectStatus.STORYBOARD_CONFIRMED,
-    ProjectStatus.VIDEO_READY,
-    ProjectStatus.AUDIO_READY,
-    ProjectStatus.DONE,
-}
-
-#: 视频生成入口：确认分镜后开跑，或在 VIDEO_READY 下补跑失败/未生成的镜头。
-#: 允许 VIDEO_GENERATING 是为了让「任务已死但状态没收拾干净」的项目也能手动重试。
-GENERATE_VIDEO_STATUSES = {
-    ProjectStatus.STORYBOARD_CONFIRMED,
-    ProjectStatus.VIDEO_READY,
-    ProjectStatus.VIDEO_GENERATING,
-    # 配音/合成之后也允许补跑镜头（配音与文本无关，不会被作废）
-    ProjectStatus.AUDIO_READY,
-    ProjectStatus.COMPOSING,
-    ProjectStatus.DONE,
-}
-
-#: 进程重启后需要收尾的「进行中」状态
-TRANSIENT_STATUSES = {
-    ProjectStatus.VIDEO_GENERATING,
-    ProjectStatus.AUDIO_GENERATING,
-    ProjectStatus.COMPOSING,
-}
-
-#: 配音入口：视频就绪后开跑；AUDIO_READY 下允许补跑失败条目
-GENERATE_AUDIO_STATUSES = {
-    ProjectStatus.VIDEO_READY,
-    ProjectStatus.AUDIO_READY,
-    ProjectStatus.AUDIO_GENERATING,
-}
-
-#: 合成入口：配音就绪后合成；DONE 下允许重新合成（换 BGM / 换字幕模式）
-COMPOSE_STATUSES = {
-    ProjectStatus.AUDIO_READY,
-    ProjectStatus.COMPOSING,
-    ProjectStatus.DONE,
-}
-
 VIDEO_JOB_KIND = "video"
 AUDIO_JOB_KIND = "audio"
 COMPOSE_JOB_KIND = "compose"
@@ -283,81 +247,52 @@ class Pipeline:
         report = cost_service.load_report(self.store, project_id)
         cost_service.check_budget(report, upcoming_usd=upcoming_usd, action=action)
 
-    async def _budget_shots(
-        self, storyboard: Storyboard, video: VideoManifest | None, project: Project | None = None
-    ) -> list[Shot]:
-        """预算口径：这次真正会去生成哪些镜头。
+    async def _budget_units(
+        self, storyboard: Storyboard, video: VideoManifest | None, project: Project
+    ) -> list[Segment]:
+        """预算口径：这次真正会去生成哪些单元（段 / 单镜）。
 
-        与 `video_service.generate_clips` 的续跑逻辑保持一致 —— 换了 provider / 模型时
-        已就绪的片段会被判为过期并全部重生成，所以预算也得按「全部」算。
+        和 `video_service.generate_clips` 是同一个判断（`pending_units`）：换了 provider / 模型时
+        已就绪的片段全部重跑，预算按全部算；片段文件丢了也算。
         """
         provider = self._video(project)
         try:
-            switched = bool(video) and video_service.provider_switched(video, provider)
-        except Exception:  # 判断不了就按「最坏情况全部重跑」保守估
-            logger.warning("provider 变更判断失败，按全部镜头预估预算", exc_info=True)
-            switched = bool(video and video.clips)
-        finally:
-            await provider.aclose()
-        return list(storyboard.shots) if switched else _pending_shots(storyboard, video)
-
-    async def _estimate_video_usd(
-        self,
-        shots: list[Shot],
-        storyboard: Storyboard | None = None,
-        project: Project | None = None,
-    ) -> float:
-        """按 provider 的计费档位与单价估算花费（问不到就退回配置单价）。
-
-        给了 `storyboard` 就按**段落**算：一段只买一次档位（与真正生成同一口径）。
-        """
-        if not shots:
-            return 0.0
-        wanted = {shot.id for shot in shots}
-        units = [float(shot.duration_sec) for shot in shots]
-        if storyboard is not None:
-            units = [
-                float(segment.duration_sec)
-                for segment in storyboard_service.segments_of(storyboard)
-                if any(sid in wanted for sid in segment.shot_ids)
-            ]
-        prices = cost_service.PriceTable.from_settings()
-        provider = self._video(project)
-        try:
-            price = await provider.price_per_second()
-            seconds = 0.0
-            for unit in units:
-                seconds += await provider.planned_seconds(unit)
-        except Exception:
-            logger.warning("视频成本预估失败，按配置单价估算", exc_info=True)
-            return cost_service.estimate_video_usd(
-                Storyboard(shots=list(shots)), prices
+            return video_service.pending_units(
+                storyboard, video, provider, self.store.project_dir(project.id)
             )
+        except Exception:  # 判断不了就按「最坏情况全部重跑」保守估
+            logger.warning("待生成单元判断失败，按全部单元预估预算", exc_info=True)
+            return storyboard_service.segments_of(storyboard)
         finally:
             await provider.aclose()
-        unit = prices.video_per_second if price is None else max(0.0, price)
-        if unit <= 0 and seconds > 0 and provider.paid:
+
+    async def _estimate_video_usd(self, units: list[Segment], project: Project) -> float:
+        """按 provider 的计费档位与单价估算花费（与 preflight 同一个 `quote_units`）。
+
+        单价问不到、配置单价也是 0 的付费模型抛 `UnknownVideoPrice`
+        （以前问价失败时直接按 $0 返回，设了预算也拦不住）。
+        """
+        if not units:
+            return 0.0
+        provider = self._video(project)
+        try:
+            quote = await preflight_service.quote_units(units, provider)
+        finally:
+            await provider.aclose()
+        if quote.price_unknown:
             raise UnknownVideoPrice(
                 f"读不到视频模型 {getattr(provider, 'model', provider.name)} 的单价，"
                 "预估会是 $0、预算拦不住。请在 .env 设置 VIDEO_PRICE_PER_SECOND（USD/秒）"
             )
-        return round(seconds * unit, 6)
+        return quote.usd
 
-    async def _estimate_keyframe_usd(
-        self, project: Project, shots: list[Shot], storyboard: Storyboard
-    ) -> float:
+    async def _estimate_keyframe_usd(self, project: Project, units: list[Segment]) -> float:
         """只认首帧的模型：这次要新画的开场关键帧（与 preflight 同一口径）。"""
-        if not shots:
+        if not units:
             return 0.0
-        wanted = {shot.id for shot in shots}
-        segments = [
-            segment
-            for segment in storyboard_service.segments_of(storyboard)
-            if any(sid in wanted for sid in segment.shot_ids)
-        ]
         provider = self._video(project)
         try:
-            plan = await self._keyframe_estimator(project, provider)(segments)
+            plan = await self._keyframe_estimator(project, provider)(units)
         except Exception:  # 估不出就按 0，真正画之前还会逐张查预算
             logger.warning("关键帧预估失败", exc_info=True)
             return 0.0
@@ -466,13 +401,7 @@ class Pipeline:
             raise PipelineNotFound(f"项目不存在: {project_id}")
         return project
 
-    @staticmethod
-    def _require(project: Project, allowed: set[ProjectStatus], action: str) -> None:
-        if project.status not in allowed:
-            expected = "/".join(sorted(s.value for s in allowed))
-            raise PipelineError(
-                f"当前状态 '{project.status.value}' 不允许{action}（需要 {expected}）"
-            )
+    _require = staticmethod(project_status.require)
 
     def _fail(self, project: Project, action: str) -> None:
         project.status = ProjectStatus.FAILED
@@ -627,7 +556,7 @@ class Pipeline:
             for chapter in novel.chapters:
                 if chapter.id in to_merge:
                     chapter.merged = True
-            self.store.save_bible(project.id, bible)
+            self.store.save_bible(project.id, bible, keep_references=True)
             self.store.save_novel(project.id, novel)
         assert bible is not None
         story = novel_service.build_story_outline(
@@ -667,6 +596,10 @@ class Pipeline:
                 bible = StoryBible.model_validate(data)
             except Exception as exc:
                 raise PipelineError(f"圣经更新失败：{exc}") from exc
+            _reject_unsafe_ids(
+                "圣经",
+                [item.id for item in (*bible.characters, *bible.settings, *bible.props)],
+            )
             # 改了内容或出处的事实，之前的「已确认」就不算数了
             explainer_service.reset_changed_facts(self.store.load_bible(project_id), bible)
             self.store.save_bible(project_id, bible)
@@ -724,7 +657,7 @@ class Pipeline:
                 await llm.aclose()
             items = getattr(bible, kind)
             setattr(bible, kind, [item if x.id == item_id else x for x in items])
-            self.store.save_bible(project_id, bible)
+            self.store.save_bible(project_id, bible, keep_references=True)
             self._invalidate_media(project_id)
             self._revalidate(project, bible, self.store.load_script(project_id))
             return {
@@ -916,7 +849,7 @@ class Pipeline:
         if project.input_mode == InputMode.FULL_SCRIPT:
             outline, script = await explainer_service.annotate_full_script(llm, project, bible)
             self._reset_script_artifacts(project_id, outline, script)
-            self.store.save_bible(project_id, bible)
+            self.store.save_bible(project_id, bible, keep_references=True)
             script.logline = script.scenes[0].summary
             self.store.save_script(project_id, script)
             return script, bible
@@ -945,7 +878,7 @@ class Pipeline:
             mapping = explainer_service.add_new_facts(bible, new_facts, project.source_material)
             explainer_service.resolve_refs(scene, mapping)
             # 底稿先落盘：旁白里引用的新事实 id 必须已经在底稿里
-            self.store.save_bible(project_id, bible)
+            self.store.save_bible(project_id, bible, keep_references=True)
             script.scenes.append(scene)
             self.store.save_script(project_id, script)
         script.logline = script.scenes[0].summary if script.scenes else ""
@@ -1300,6 +1233,7 @@ class Pipeline:
                 script = Script.model_validate(data)
             except Exception as exc:
                 raise PipelineError(f"剧本更新失败：{exc}") from exc
+            _reject_unsafe_ids("剧本", [scene.id for scene in script.scenes])
             self.store.save_script(project_id, script)
             self._invalidate_media(project_id)
             self._revalidate(project, self.store.load_bible(project_id), script)
@@ -1373,7 +1307,7 @@ class Pipeline:
                 # 科普的场次时长由旁白决定（generate_scene 已按新旁白算好）；新事实并进底稿
                 mapping = explainer_service.add_new_facts(bible, new_facts, project.source_material)
                 explainer_service.resolve_refs(scene, mapping)
-                self.store.save_bible(project_id, bible)
+                self.store.save_bible(project_id, bible, keep_references=True)
             else:
                 scene.duration_sec = current.duration_sec
             script.scenes[index] = scene
@@ -1714,8 +1648,11 @@ class Pipeline:
         """只重配这几句（TTS 模式）：可顺手改念法，其余配音原样复用，再提交配音任务。
 
         成片已经做完（DONE）时会退回配音阶段 —— 旧成片里还是旧的那句。
+        配音任务在跑时先拒绝：这里会改分镜和配音清单，跑着的任务结束时会把它们整份覆盖掉。
         """
+        self._reject_if_running(project_id, AUDIO_JOB_KIND, "配音")
         async with self._lock(project_id):
+            self._reject_if_running(project_id, AUDIO_JOB_KIND, "配音")
             project = self.get_project(project_id)
             if video_service.dub_mode_for(project) != "tts":
                 raise PipelineError(
@@ -1769,10 +1706,17 @@ class Pipeline:
                 storyboard,
                 self.store.load_video_manifest(project_id),
             )
-        preflight = await self.preflight(project_id, action="video")
-        price = ((preflight.get("video") or {}).get("price_per_second")) or 0.0
-        impact["price_per_second"] = price
-        impact["estimated_usd"] = round(impact["stale_seconds"] * price, 4)
+        # 重买的钱按模型档位算（和预算门同一个 quote_units），不是分镜秒数 × 单价
+        stale = {seg["segment_id"] for seg in impact["stale_segments"]}
+        units = [u for u in storyboard_service.segments_of(storyboard) if u.id in stale]
+        provider = self._video(project)
+        try:
+            quote = await preflight_service.quote_units(units, provider)
+        finally:
+            await provider.aclose()
+        impact["price_per_second"] = quote.price
+        impact["billed_seconds"] = round(quote.billed_seconds, 3)
+        impact["estimated_usd"] = round(quote.usd, 4)
         return impact
 
     async def _parse_storyboard(self, data: dict, project: Project) -> Storyboard:
@@ -1780,8 +1724,19 @@ class Pipeline:
             storyboard = Storyboard.model_validate(data)
         except Exception as exc:
             raise PipelineError(f"分镜更新失败：{exc}") from exc
-        # 镜头改了时长/顺序，段落要按新分镜重编（编段按场确定性计算，别的场不受影响）
-        return await self._apply_segment_mode(storyboard, project=project)
+        _reject_unsafe_ids(
+            "分镜",
+            [v for shot in storyboard.shots for v in (shot.id, shot.scene_id, shot.segment_id)],
+        )
+        if explainer_service.is_explainer(project):
+            _reject_explainer_narration_edits(storyboard, self.store.load_storyboard(project.id))
+        # 镜头改了时长/顺序，段落要按新分镜重编；完全没改过的场沿用旧的编段
+        storyboard = await self._apply_segment_mode(storyboard, project=project)
+        if any(shot.segment_id for shot in storyboard.shots):
+            storyboard_service.keep_unchanged_scene_segments(
+                storyboard, self.store.load_storyboard(project.id)
+            )
+        return storyboard
 
     async def update_storyboard(self, project_id: str, data: dict) -> Storyboard:
         """更新分镜。已生成的媒体**只作废受影响的段**（`video_service.storyboard_impact`）。"""
@@ -1815,13 +1770,7 @@ class Pipeline:
                 self.store.save_audio_manifest(project_id, audio)
             self.store.purge_media(project_id, compose=True, reason="分镜修改")
             if project.status in EDIT_CONFIRMED_STORYBOARD_STATUSES:
-                ready = video is not None and all(
-                    (clip := video.get(s.id)) is not None and clip.status == ClipStatus.READY
-                    for s in storyboard.shots
-                )
-                project.status = (
-                    ProjectStatus.VIDEO_READY if ready else ProjectStatus.STORYBOARD_CONFIRMED
-                )
+                project.status = project_status.after_clips_changed(storyboard, video)
                 self.store.save_project(project)
             if impact["stale_segments"] or impact["removed_shots"]:
                 logger.info(
@@ -1917,13 +1866,7 @@ class Pipeline:
             self.store.save_video_manifest(project_id, video)
             label = f"恢复历史片段 {entry_id}"
             self.store.purge_media(project_id, compose=True, reason=label)
-            ready = all(
-                (clip := video.get(s.id)) is not None and clip.status == ClipStatus.READY
-                for s in storyboard.shots
-            )
-            project.status = (
-                ProjectStatus.VIDEO_READY if ready else ProjectStatus.STORYBOARD_CONFIRMED
-            )
+            project.status = project_status.after_clips_changed(storyboard, video)
             self.store.save_project(project)
             return result
 
@@ -1973,6 +1916,7 @@ class Pipeline:
                 keyframe_estimator=(
                     self._keyframe_estimator(project, provider) if provider else None
                 ),
+                project_dir=self.store.project_dir(project_id),
             )
         finally:
             if provider is not None:
@@ -2160,16 +2104,16 @@ class Pipeline:
                 storyboard, video=video, only_if_missing=True, project=project
             )
             self.store.save_storyboard(project_id, storyboard)
-            targets = await self._budget_shots(storyboard, video, project)
+            targets = await self._budget_units(storyboard, video, project)
             try:
-                upcoming = await self._estimate_video_usd(targets, storyboard, project)
+                upcoming = await self._estimate_video_usd(targets, project)
             except UnknownVideoPrice as exc:
                 # 设了预算才拦：不设预算等于主动放弃了上限，preflight 里照样会告警
                 if cost_service.load_report(self.store, project_id).budget_usd > 0:
                     raise cost_service.BudgetExceeded(str(exc)) from exc
                 logger.warning("%s", exc)
                 upcoming = 0.0
-            upcoming += await self._estimate_keyframe_usd(project, targets, storyboard)
+            upcoming += await self._estimate_keyframe_usd(project, targets)
             self._guard_budget(
                 project_id, upcoming_usd=upcoming, action="生成视频片段"
             )
@@ -2427,6 +2371,26 @@ class Pipeline:
             return 0.0
         actual = round(sum(c.cost_usd for c in unrecorded), 6)
         seconds = sum(c.duration_sec for c in unrecorded)
+        if actual > 0:
+            # 段落的扣费只记在段内第一个镜头上，所以按「单元」（段 / 单镜）看有没有实报：
+            # 有实报的单元按实报；没实报的单元按单价 × 秒数估。以前只要有一条实报，
+            # 整批都按实报合计入账，没实报的那几段记成 $0
+            units: dict[str, list] = {}
+            for clip in unrecorded:
+                units.setdefault(clip.segment_id or clip.shot_id, []).append(clip)
+            unreported = sum(
+                c.duration_sec
+                for group in units.values()
+                if not any(c.cost_usd > 0 for c in group)
+                for c in group
+            )
+            if unreported:
+                unit_price = (
+                    price_per_second
+                    if price_per_second is not None
+                    else cost_service.PriceTable.from_settings().video_per_second
+                )
+                actual = round(actual + unreported * max(0.0, unit_price), 6)
         if actual > 0 and price_per_second:
             expected = seconds * price_per_second
             if expected > 0 and actual > expected * 1.2:
@@ -2458,17 +2422,23 @@ class Pipeline:
 
         给老版本留下的项目用：只读片段上的 `cost_usd`（provider 报的实际扣费），
         **不调 API、不动媒体、不动项目状态**，可以反复调用（幂等）。
+
+        视频任务在跑时拒绝：任务结束时会按内存里的清单记账，这里再记一次就重复了；
+        进度回调还会把磁盘上的「已记账」标记刷回去，等于可以反复补记。
         """
-        self.get_project(project_id)
-        manifest = self.store.load_video_manifest(project_id)
-        if manifest is None:
-            raise PipelineError("视频片段清单不存在，没有可补记的花费")
-        before = self.cost_report(project_id)
-        recorded = self._record_video_cost(
-            project_id, manifest, price_per_second=None, settings=get_settings()
-        )
-        self.store.save_video_manifest(project_id, manifest)
-        report = self.cost_report(project_id)
+        self._reject_if_video_running(project_id)
+        async with self._lock(project_id):
+            self.get_project(project_id)
+            self._reject_if_video_running(project_id)
+            manifest = self.store.load_video_manifest(project_id)
+            if manifest is None:
+                raise PipelineError("视频片段清单不存在，没有可补记的花费")
+            before = self.cost_report(project_id)
+            recorded = self._record_video_cost(
+                project_id, manifest, price_per_second=None, settings=get_settings()
+            )
+            self.store.save_video_manifest(project_id, manifest)
+            report = self.cost_report(project_id)
         return {
             "recorded_usd": round(recorded, 6),
             "clips": len(manifest.ready_clips),
@@ -2485,13 +2455,7 @@ class Pipeline:
         manifest: VideoManifest | None,
         audio: AudioManifest | None = None,
     ) -> None:
-        """有可用片段就进 VIDEO_READY（配音仍在则保持 AUDIO_READY），否则退回分镜确认态。"""
-        if not manifest or not manifest.ready_clips:
-            project.status = ProjectStatus.STORYBOARD_CONFIRMED
-        elif audio is not None and audio.is_usable and audio.ready_clips:
-            project.status = ProjectStatus.AUDIO_READY
-        else:
-            project.status = ProjectStatus.VIDEO_READY
+        project.status = project_status.after_video(manifest, audio)
         self.store.save_project(project)
 
     def get_video_manifest(self, project_id: str) -> VideoManifest | None:
@@ -2674,89 +2638,49 @@ class Pipeline:
                 else "配音文案准备中…",
             )
 
-        if dub_mode == "native":
-            # 原声模式：对白 / 旁白都用视频模型原片里的声音，不调 TTS、不写念法、不花钱
-            await provider.aclose()
-            manifest = AudioManifest(
-                provider="native",
-                voice_map=existing_audio.voice_map,
-                warnings=[
-                    "原声模式（AUDIO_DUB_MODE=native）：不做 TTS 配音，所有镜头用视频原声；"
-                    "要按镜头配音改成 tts"
-                ],
-            )
-            ctx.note("原声模式：跳过 TTS 配音")
-        else:
-            # ── 可选：让 LLM 看着真实画面写/改配音文案 ──
-            await self._apply_voice_script(
+        try:
+            manifest = await self._produce_audio(
                 ctx,
                 project,
                 storyboard,
                 script,
                 bible,
                 video,
+                provider,
+                existing_audio,
                 project_dir=project_dir,
+                audio_dir=audio_dir,
                 settings=settings,
                 mode=mode,
+                dub_mode=dub_mode,
+                voice_overrides=voice_overrides,
                 use_vision=use_vision,
-                force=force_script,
-                manifest=existing_audio,
+                force_script=force_script,
                 on_progress=on_progress,
             )
-
-            # ── 可选：原声引导（视频模型念过一遍台词，照着它的位置和节奏重配） ──
-            guides: dict = {}
-            if settings.dub_guide_mode == "native":
-                guides = await dub_guide_service.prepare_guides(
-                    storyboard, video, project_dir, audio_dir / dub_guide_service.GUIDE_DIR
+        except BaseException:
+            # 取消和意外错误同一套收尾：已经合成的配音 TTS 已经计过费，要记账；
+            # 状态退回可重试的位置（以前只处理取消，普通异常会让项目卡在 AUDIO_GENERATING，
+            # 退回分镜、合成都被拒，只能重启进程）
+            async with self._lock(project_id):
+                partial = self.store.load_audio_manifest(project_id)
+                if partial is not None:
+                    recorded = self._record_audio_cost(project_id, partial)
+                    if recorded:
+                        self.store.save_audio_manifest(project_id, partial)
+                        logger.info("配音任务中断，已为已生成条目补记账 $%.4f", recorded)
+                self._settle_audio_status(
+                    self.get_project(project_id),
+                    self.store.load_audio_manifest(project_id),
+                    self.store.load_video_manifest(project_id),
                 )
-                ctx.note(f"原声引导：{len(guides)} 句台词找到了原声")
-                if not guides:
-                    logger.warning(
-                        "原声引导已打开，但没有一个片段带可用的原声（视频要用 "
-                        "VIDEO_GENERATE_AUDIO=true 生成）；按普通配音处理 project=%s",
-                        project_id,
-                    )
-
-            try:
-                manifest = await audio_service.synthesize_all(
-                    project,
-                    storyboard,
-                    bible,
-                    provider,
-                    audio_dir,
-                    project_dir,
-                    settings=settings,
-                    concurrency=settings.tts_concurrency,
-                    max_retries=settings.tts_max_retries,
-                    retry_backoff_sec=settings.tts_retry_backoff_sec,
-                    existing=existing_audio,
-                    voice_overrides=voice_overrides,
-                    guides=guides,
-                    native_narration=video_service.native_narration_shots(storyboard, video),
-                    on_progress=on_progress,
-                )
-            except asyncio.CancelledError:
-                async with self._lock(project_id):
-                    # 取消也要记账（理由同 `_run_video_job`）：已经合成的配音 TTS 已经计过费
-                    cancelled = self.store.load_audio_manifest(project_id)
-                    if cancelled is not None:
-                        recorded = self._record_audio_cost(project_id, cancelled)
-                        if recorded:
-                            self.store.save_audio_manifest(project_id, cancelled)
-                            logger.info("配音任务被取消，已为已生成条目补记账 $%.4f", recorded)
-                    self._settle_audio_status(
-                        self.get_project(project_id),
-                        self.store.load_audio_manifest(project_id),
-                        self.store.load_video_manifest(project_id),
-                    )
-                raise
-            finally:
-                await provider.aclose()
+            raise
 
         async with self._lock(project_id):
             # 状态可能在生成期间被别处改过，重新读一份再落
             project = self.get_project(project_id)
+            # 圣经也重新读：生成期间可能刚登记了定妆照，用开工时那份写回会把它覆盖掉
+            bible = self.store.load_bible(project_id)
             # 选角结果写回圣经：角色卡片上能看到/改到自己的音色，重跑也不会换人
             if bible is not None and manifest.voice_map:
                 touched = False
@@ -2812,6 +2736,89 @@ class Pipeline:
         )
         if failed and not ready:
             raise PipelineError(f"全部 {failed} 条配音生成失败，请检查 TTS 配置 / 网络")
+
+    async def _produce_audio(
+        self,
+        ctx: JobContext,
+        project: Project,
+        storyboard: Storyboard,
+        script: Script | None,
+        bible: StoryBible | None,
+        video: VideoManifest | None,
+        provider: TTSProvider,
+        existing_audio: AudioManifest,
+        *,
+        project_dir: Path,
+        audio_dir: Path,
+        settings,
+        mode: str,
+        dub_mode: str,
+        voice_overrides: dict[str, str] | None,
+        use_vision: bool | None,
+        force_script: bool | None,
+        on_progress: Callable[[AudioManifest], None],
+    ) -> AudioManifest:
+        """配音任务的生成部分（锁外跑）：原声模式直接出清单，TTS 模式先写文案、再逐条合成。"""
+        try:
+            if dub_mode == "native":
+                # 原声模式：对白 / 旁白都用视频模型原片里的声音，不调 TTS、不写念法、不花钱
+                ctx.note("原声模式：跳过 TTS 配音")
+                return AudioManifest(
+                    provider="native",
+                    voice_map=existing_audio.voice_map,
+                    warnings=[
+                        "原声模式（AUDIO_DUB_MODE=native）：不做 TTS 配音，所有镜头用视频原声；"
+                        "要按镜头配音改成 tts"
+                    ],
+                )
+            # ── 可选：让 LLM 看着真实画面写/改配音文案 ──
+            await self._apply_voice_script(
+                ctx,
+                project,
+                storyboard,
+                script,
+                bible,
+                video,
+                project_dir=project_dir,
+                settings=settings,
+                mode=mode,
+                use_vision=use_vision,
+                force=force_script,
+                manifest=existing_audio,
+                on_progress=on_progress,
+            )
+            # ── 可选：原声引导（视频模型念过一遍台词，照着它的位置和节奏重配） ──
+            guides: dict = {}
+            if settings.dub_guide_mode == "native":
+                guides = await dub_guide_service.prepare_guides(
+                    storyboard, video, project_dir, audio_dir / dub_guide_service.GUIDE_DIR
+                )
+                ctx.note(f"原声引导：{len(guides)} 句台词找到了原声")
+                if not guides:
+                    logger.warning(
+                        "原声引导已打开，但没有一个片段带可用的原声（视频要用 "
+                        "VIDEO_GENERATE_AUDIO=true 生成）；按普通配音处理 project=%s",
+                        project.id,
+                    )
+            return await audio_service.synthesize_all(
+                project,
+                storyboard,
+                bible,
+                provider,
+                audio_dir,
+                project_dir,
+                settings=settings,
+                concurrency=settings.tts_concurrency,
+                max_retries=settings.tts_max_retries,
+                retry_backoff_sec=settings.tts_retry_backoff_sec,
+                existing=existing_audio,
+                voice_overrides=voice_overrides,
+                guides=guides,
+                native_narration=video_service.native_narration_shots(storyboard, video),
+                on_progress=on_progress,
+            )
+        finally:
+            await provider.aclose()
 
     async def _apply_voice_script(
         self,
@@ -2891,15 +2898,7 @@ class Pipeline:
         audio: AudioManifest | None,
         video: VideoManifest | None,
     ) -> None:
-        """配音齐全（含「本来就没台词」）就进 AUDIO_READY，否则退回 VIDEO_READY。"""
-        if audio is not None and audio.is_usable and video and video.ready_clips:
-            project.status = ProjectStatus.AUDIO_READY
-        else:
-            project.status = (
-                ProjectStatus.VIDEO_READY
-                if video and video.ready_clips
-                else ProjectStatus.STORYBOARD_CONFIRMED
-            )
+        project.status = project_status.after_audio(audio, video)
         self.store.save_project(project)
 
     def get_audio_manifest(self, project_id: str) -> AudioManifest | None:
@@ -3035,12 +3034,13 @@ class Pipeline:
                     on_progress=on_progress,
                 )
             except asyncio.CancelledError:
-                self.store.purge_media(project_id, compose=True, keep_history=False)
+                self.store.discard_compose_output(project_id)
                 self._settle_compose_status(project, audio, video)
                 raise
             except Exception:
-                # 失败的半截成片一律删掉，避免被当成可用产物（旧成片在上面已经留进历史版本）
-                self.store.purge_media(project_id, compose=True, keep_history=False)
+                # 失败的半截成片一律删掉，避免被当成可用产物（旧成片在上面已经留进历史版本）；
+                # 分段 / 口型 / 配乐缓存留着，重试时不用全部重渲
+                self.store.discard_compose_output(project_id)
                 self._settle_compose_status(project, audio, video)
                 raise
 
@@ -3085,6 +3085,22 @@ class Pipeline:
             duck=overrides.get("bgm_duck"),
             force=bool(overrides.get("bgm_force")),
         )
+        durations = None
+        if video is not None and video.is_usable:
+            # 配乐按成片里的真实时长写（和合成同一份时间轴），不按分镜整数秒
+            try:
+                timeline = await compose_service.plan_timeline(
+                    project,
+                    storyboard,
+                    video,
+                    compose_service.voice_audio_for(project, audio, settings),
+                    project_dir=self.store.ensure_project_dir(project_id),
+                    settings=settings,
+                    bible=self.store.load_bible(project_id),
+                )
+                durations = {segment.shot_id: segment.duration_sec for segment in timeline}
+            except Exception:  # 配乐是可选的：算不出时间轴就按分镜秒数
+                logger.warning("配乐时间轴计算失败，按分镜时长写谱", exc_info=True)
         outcome = await music_service.resolve_music(
             project=project,
             storyboard=storyboard,
@@ -3095,6 +3111,7 @@ class Pipeline:
             settings=settings,
             library=self._bgm(),
             request=request,
+            durations=durations,
         )
         if not outcome.ok:
             note = outcome.note or "配乐不可用"
@@ -3121,12 +3138,8 @@ class Pipeline:
     def _settle_compose_status(
         self, project: Project, audio: AudioManifest | None, video: VideoManifest | None
     ) -> None:
-        if audio is not None and audio.is_usable and video and video.ready_clips:
-            project.status = ProjectStatus.AUDIO_READY
-        elif video and video.ready_clips:
-            project.status = ProjectStatus.VIDEO_READY
-        else:
-            project.status = ProjectStatus.STORYBOARD_CONFIRMED
+        """合成失败 / 取消：和配音结束同一条规则（成片作废，退回 AUDIO_READY 或更早）。"""
+        project.status = project_status.after_audio(audio, video)
         self.store.save_project(project)
 
     def get_compose_report(self, project_id: str) -> ComposeReport | None:
@@ -3174,14 +3187,9 @@ class Pipeline:
                 self._settle_video_status(project, manifest, audio)
             elif project.status == ProjectStatus.AUDIO_GENERATING:
                 self._settle_audio_status(project, audio, manifest)
-            else:  # COMPOSING：半截成片（旧成片在开始合成前已留进历史版本）
-                self.store.purge_media(project.id, compose=True, keep_history=False)
-                project.status = (
-                    ProjectStatus.AUDIO_READY
-                    if audio and audio.is_usable and manifest and manifest.ready_clips
-                    else ProjectStatus.VIDEO_READY
-                )
-                self.store.save_project(project)
+            else:  # COMPOSING：半截成片（旧成片在开始合成前已留进历史版本），缓存留着
+                self.store.discard_compose_output(project.id)
+                self._settle_compose_status(project, audio, manifest)
             recovered.append(project.id)
             logger.warning(
                 "重启恢复：项目 %s 原处于中断状态，已回退为 %s", project.id, project.status.value
@@ -3198,13 +3206,18 @@ class Pipeline:
         ready = video.ready_clips if video else []
         # 片段上的 cost_usd 是 provider 报的**实测扣费**；账本可能漏记（老版本 bug）
         actual_video = round(sum(c.cost_usd for c in ready), 6)
-        unrecorded_video = round(sum(c.cost_usd for c in ready if not c.cost_recorded), 6)
+        # 视频任务在跑时，已就绪的片段要等任务结束才记账，不算漏记（否则 UI 会催人点「补齐」）
+        video_running = self.jobs.busy_for(project_id, VIDEO_JOB_KIND) is not None
+        unrecorded_video = 0.0 if video_running else round(
+            sum(c.cost_usd for c in ready if not c.cost_recorded), 6
+        )
         ledger_video = round(sum(e.usd for e in report.entries if e.stage == CostStage.VIDEO), 6)
         return {
             "project_status": project.status.value,
             "video_actual_usd": actual_video,
             "video_ledger_usd": ledger_video,
             "video_unrecorded_usd": unrecorded_video,
+            "video_job_running": video_running,
             "summary": report.summary(),
             "stages": report.stage_totals(),
             "budget_usd": report.budget_usd,
@@ -3228,8 +3241,8 @@ class Pipeline:
     ) -> Project:
         """从文本一路跑到成片，**跳过人工确认门控**（批量生产用）。
 
-        复用各自的任务执行体（`_run_*_job`），但用一个临时 JobContext，
-        这样进度/错误处理与单步执行完全一致，不会出现两套逻辑。
+        媒体阶段提交和单步一样的后台任务再等它跑完（`JobManager.wait`），
+        预算门、进度、错误处理、互斥都与单步执行完全一致，不会出现两套逻辑。
         """
         def stage(name: str) -> None:
             if on_stage is not None:
@@ -3265,31 +3278,23 @@ class Pipeline:
         if stop_after == "storyboard":
             return self.get_project(project_id)
 
+        # 媒体阶段走和单步一样的入口：预算门、状态检查、任务表互斥都生效。
+        # 以前这里直接调 `_run_*_job`（不进任务表）：预算门被绕过，
+        # 批量跑视频期间手动再点「生成视频」也不会被拦，每个镜头买两遍
         stage("video")
-        await self._run_video_job(self._scratch(project_id, VIDEO_JOB_KIND), project_id)
+        await self.jobs.wait((await self.start_video_generation(project_id)).id)
         if stop_after == "video":
             return self.get_project(project_id)
 
         stage("audio")
-        await self._run_audio_job(
-            self._scratch(project_id, AUDIO_JOB_KIND),
-            project_id,
-            voices,
-            script_mode=script_mode,
-        )
+        job = await self.start_audio_generation(project_id, voices, script_mode=script_mode)
+        await self.jobs.wait(job.id)
         if stop_after == "audio":
             return self.get_project(project_id)
 
         stage("compose")
-        await self._run_compose_job(
-            self._scratch(project_id, COMPOSE_JOB_KIND), project_id, overrides
-        )
+        await self.jobs.wait((await self.start_compose(project_id, overrides)).id)
         return self.get_project(project_id)
-
-    @staticmethod
-    def _scratch(project_id: str, kind: str) -> JobContext:
-        """给同步调用链用的临时上下文（不进任务表、不影响互斥）。"""
-        return JobContext(Job(project_id=project_id, kind=kind))
 
     # ── 读取 / 校验 / 删除 ────────────────────────────────
 
@@ -3343,6 +3348,15 @@ class Pipeline:
         return report
 
     async def delete_project(self, project_id: str) -> bool:
+        """删项目前先取消它的任务并等收尾跑完。
+
+        不取消的话，视频任务会继续提交付费请求，落盘时还会把项目目录重建出来
+        （孤儿目录里的花费永远进不了账本）。收尾要拿项目锁，所以必须在锁外等。
+        """
+        await self.jobs.cancel_project(project_id)
+        await self.jobs.drain(project_id)
         async with self._lock(project_id):
+            if self.jobs.busy_for(project_id) is not None:
+                raise PipelineError("这个项目刚提交了新任务，请先取消再删除")
             self._locks.pop(project_id, None)
             return self.store.delete_project(project_id)

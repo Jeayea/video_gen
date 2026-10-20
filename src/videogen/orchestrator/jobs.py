@@ -13,7 +13,7 @@ from videogen.utils.redact import scrub_secrets
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["Job", "JobContext", "JobManager", "JobStatus"]
+__all__ = ["Job", "JobCancelled", "JobContext", "JobManager", "JobStatus"]
 
 
 class JobStatus(str, Enum):
@@ -22,6 +22,10 @@ class JobStatus(str, Enum):
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     CANCELLED = "cancelled"
+
+
+class JobCancelled(RuntimeError):
+    """`JobManager.wait()` 等的任务被取消了（不是等待方自己被取消）。"""
 
 
 class Job(BaseModel):
@@ -57,6 +61,8 @@ class JobContext:
     def __init__(self, job: Job) -> None:
         self.job = job
         self._cancelled = False
+        #: runner 抛出的原始异常（`wait()` 原样抛给等待方）
+        self.error: BaseException | None = None
 
     def set_progress(self, done: int, total: int, message: str = "") -> None:
         self.job.progress = max(0, done)
@@ -168,6 +174,41 @@ class JobManager:
         logger.info("任务取消请求 job=%s", job_id)
         return True
 
+    async def wait(self, job_id: str) -> Job:
+        """等任务跑完；失败时抛出 runner 的原始异常，被取消时抛 `JobCancelled`。
+
+        给同步调用链（批量）用：任务照常进任务表，单步入口的互斥对它同样生效。
+        等待方被取消时 asyncio 会连带取消这个任务；任务自己的取消路径会吞掉
+        CancelledError，等待方因此醒来时拿到的是「正常结束」，所以要再看一次 `cancelling()`。
+        """
+        job = self._jobs.get(job_id)
+        if job is None:
+            raise KeyError(job_id)
+        task = self._tasks.get(job_id)
+        context = self._contexts.get(job_id)
+        if task is not None:
+            await task
+        current = asyncio.current_task()
+        if current is not None and current.cancelling():
+            raise asyncio.CancelledError
+        if job.status == JobStatus.FAILED:
+            if context is not None and context.error is not None:
+                raise context.error
+            raise RuntimeError(job.error or "任务失败")
+        if job.status == JobStatus.CANCELLED:
+            raise JobCancelled(f"{job.kind} 任务已取消（job={job.id}）")
+        return job
+
+    async def drain(self, project_id: str) -> None:
+        """等这个项目所有还没跑完的任务协程结束（含已取消、还在收尾的）。"""
+        tasks = [
+            task
+            for job_id, task in list(self._tasks.items())
+            if not task.done() and (job := self._jobs.get(job_id)) and job.project_id == project_id
+        ]
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
     async def cancel_project(self, project_id: str, kind: str | None = None) -> int:
         count = 0
         for job in list(self._jobs.values()):
@@ -215,6 +256,7 @@ class JobManager:
             job.message = job.message or "已取消"
             logger.info("任务已取消 job=%s", job.id)
         except Exception as exc:
+            context.error = exc
             job.status = JobStatus.FAILED
             job.error = scrub_secrets(f"{type(exc).__name__}: {exc}")[:500]
             logger.exception("任务失败 job=%s", job.id)
