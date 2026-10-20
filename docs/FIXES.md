@@ -1671,3 +1671,95 @@ reads / written / sign / displays / characters 这类词后面**的引号中文�
 **修法**：`_poll` 拿到失败原因时，带了图且原因含 `image sensitive` → 抛 `VideoReferenceRejected(kind, code="1026")`，
 和 400 拒收同一条路（记进 rejections、后续段不开工、面板逐段选）。文本被拒（`input text sensitive`）仍是普通失败。
 **验证**：新增用例；真实复现是同一镜头去掉那张定妆照后一次通过（$0.65）。
+
+## v0.30 · 代码审查（2026-10-20）：花钱入口、本机安全、缓存与时间轴
+
+起点是一次只读的全仓审查（编排 / 视频计费 / 音频合成 / 文本链路 / 安全五块并行）。下面每条都有离线回归用例，
+并且确认过用例在修复前的代码上会失败。全部是离线复现，没有真实扣费。
+
+**花钱入口**
+
+| 问题 | 修法 | 用例 |
+|---|---|---|
+| 问价接口挂了时预算门按 $0 放行（配置单价默认 0） | 问价失败也走「配置单价 × 秒数」，单价为 0 的付费模型抛 `UnknownVideoPrice`，设了预算就拒 | `test_billing_guards.py::test_price_lookup_failure_*` |
+| 批量链路直接调 `_run_*_job`：视频 / 配音预算门全被绕过，也不进任务表 | `run_chain` 改走 `start_*` + `JobManager.wait()`（失败抛原始异常、被取消抛 `JobCancelled`、等待方被取消时向上传） | `test_batch_chain_goes_through_the_video_budget_gate` |
+| 批量跑视频时手动再点「生成视频」不被拦，每个镜头买两遍（复现 10 镜调用 20 次） | 同上：批量的任务进任务表，互斥对它生效 | `test_batch_video_stage_blocks_a_manual_second_run` |
+| 视频任务在跑时点「补齐漏记」重复记账；生成期间面板还一直显示「漏记 $X」 | `reconcile_video_cost` 拿锁并拒绝在跑的任务；`cost_status` 生成期间不报漏记（新增 `video_job_running`） | `test_reconcile_is_refused_while_video_is_generating` |
+| 删项目不取消任务：付费请求照发，落盘把目录重建成孤儿 | `delete_project` 先 `cancel_project` + `drain` 再删 | `test_delete_project_cancels_its_jobs_first` |
+| 改分镜后重新编段，旧段的 job 散到两个新单元上：两边都去续查，同一笔 $1.30 记两次、新镜头拿旧画面 | `storyboard_impact` 把挂着 job / 已买整段的失败片段也算「已生成」；片段新增 `job_unit`（提交时的单元指纹），只有指纹一样、挂的镜头集合也一样的单元才能续查 / 复用整段 | `test_segments.py::test_regrouped_segments_do_not_resume_the_old_job` |
+| 音画对齐写回时长后，改任意一场都会整片重编段，没动过的场整段重买（复现一场 4 镜 $2.1） | `keep_unchanged_scene_segments`：除 `segment_id` 外完全没改的场沿用旧编段 | `test_editing_one_scene_keeps_segments_of_untouched_scenes` |
+| 本机没 ffmpeg 时，真买到的整段被标成「就绪 + 占位」：之后生成跳过、合成拒收，只能重买 | 按「切分失败」处理（保留整段、下次直接重切）；老项目里这种片段装好 ffmpeg 后自动重切 | `test_bought_segment_without_ffmpeg_is_resplit_later_not_rebought` |
+| 一批里有的片段报了扣费、有的没报：没报的记 $0 | 按单元（段 / 单镜）区分，没实报的按单价 × 秒数估 | `test_unreported_units_are_estimated_not_booked_at_zero` |
+| 提交返回 504 时重发 POST（网关超时，任务可能已建好）；刚提交的任务第一次查询 404 就重新提交 | 504 按「提交后没收到响应」处理（pending，不重发）；只有续查的老任务 404 才算不存在 | `test_gateway_timeout_*` / `test_fresh_job_not_found_yet_*` |
+| 续查已提交的任务 / 复用已买整段时仍去画开场关键帧（$0.04，预算刚好用完时还挡住免费的续查） | 先判断续查 / 复用，是的话不画；续查时 `clip.prompt` 沿用提交时那份 | `test_resuming_a_submitted_job_does_not_draw_a_new_keyframe` |
+| 整段买到后只改了内存：切分期间被取消 / 崩溃，磁盘上没有这笔扣费 | 买到即落盘 | — |
+
+**本机安全**
+
+| 问题 | 修法 | 用例 |
+|---|---|---|
+| DNS rebinding：攻击者域名解析到 127.0.0.1 后 Origin 与 Host 一致，跨站写检查放行；默认无 token、预算不限，恶意网页能读写项目、触发付费生成 | 没设 `API_TOKEN` 时 Host 只认本机名 + `API_ALLOWED_ORIGINS` 的主机 + 新配置 `API_ALLOWED_HOSTS`（`*` 关闭）；设了 token 不查 | `test_api.py::test_dns_rebinding_*` |
+| 手写的 id（`PUT 圣经 / 剧本 / 分镜`）直接拼进文件名：`../` 能写出项目目录，`*` 删 refs/ 下所有图 | 写入边界按 `utils/ids.SAFE_ID_RE` 校验（不放进模型校验器：读盘失败会把老项目隔离成 `.bad`）；按 id 的 glob 一律 `glob.escape` | `test_put_rejects_ids_*` / `test_reference_cleanup_treats_ids_literally` |
+| 轮询地址 / 下载地址来自接口响应，不看主机就带 key | 只对 OpenRouter 自己的主机（含子域名、同协议）带鉴权头；下载只认 2xx | `test_key_is_never_sent_to_a_foreign_host` |
+| `<原文>` 标记只删一遍：`<</原文>/原文>` 删完正好拼出新的闭合标记 | 删到删不出为止 | `test_novel_source_is_fenced_off_from_instructions` |
+
+**缓存、时间轴、状态**
+
+| 问题 | 修法 | 用例 |
+|---|---|---|
+| 本机配乐从来没拿到画面运动数据：片段路径是相对的，按工作目录解析永远找不到（真实项目 28 镜命中 0），「动作爆发给重音」一直没生效 | 拼上项目目录 | `test_motions_resolve_clip_paths_against_the_project_dir` |
+| 合成失败整个删 `output/`：分段、口型、配乐缓存全没了；一段失败其余段继续在后台写 | 只删半截成片和报告（`discard_compose_output`）；一段失败取消其余段；渲染前先删 `.params` 标记，半截文件不会被当成可复用；标记补上环境音增益 | `test_compose_failure_keeps_render_caches` |
+| 配乐按分镜整数秒写谱，合成却按配音实长 / 片段实长走（科普 60 秒对 54.2 秒）；分段时长不对齐整帧，拼接后漂移 | 新增 `compose_service.plan_timeline()`：定下每镜最终时长并向上对齐到整帧，配乐和合成用同一份 | `test_music_is_planned_on_the_compose_timeline` / `test_plan_timeline_snaps_*` |
+| 变速时片头「AI 生成」标识跟着被压短（2 倍速只剩 1.5 秒） | 烧录时长按倍速放大 | `test_ai_label_keeps_its_length_after_speed_change` |
+| 配音任务里的普通异常让项目卡在 `AUDIO_GENERATING`（只处理了取消），TTS provider 也可能没关 | 取消和异常同一套收尾（记账 + 退状态）；生成部分抽成 `_produce_audio`，provider 统一在 finally 里关 | `test_audio_job_error_does_not_leave_project_stuck` |
+| 配音任务 / 圣经条目重写 / 小说合并 / 科普新事实：读圣经 → 等 LLM → 整份写回，抹掉这期间刚登记的定妆照 | 配音任务写回前重读；其余走 `save_bible(keep_references=True)`（参考图以磁盘为准，读写之间没有 await） | `test_bible_item_rewrite_keeps_references_registered_meanwhile` |
+| 「重配这几句」在配音任务运行中也能改分镜和配音清单，随后被任务覆盖 | 先拒绝在跑的配音任务 | `test_redub_is_refused_while_audio_job_runs` |
+| 科普「一句一镜」能被手工改分镜绕过（改旁白、把旁白挪进台词、改时长、增删镜头） | 科普项目的分镜 PUT 只许改画面字段 | `test_storyboard_edits_cannot_touch_the_narration` |
+| 没有资料的科普项目重新生成底稿，所有「已确认」被打回（拿收尾前的引文和收尾后的比） | 先 `verify_sources` 再比出处 | `test_regenerating_without_material_keeps_confirmed_facts` |
+
+**测试基础设施**：`FakeLLM` 认不出阶段时以前静默返回 `{}`，短剧剧本医生和配乐建议就是这样「通过」的 ——
+剧本医生的拦截在流水线测试里从没被测到。现在认不出就抛错，两个阶段加了显式路由
+（`test_script_doctor_error_blocks_confirmation_end_to_end`）。
+
+**行为变化**：没设 `API_TOKEN` 又要从局域网 IP / 别的域名访问时，要设 `API_ALLOWED_HOSTS`；
+分段渲染参数标记格式变了，第一次合成会重渲所有分段（本机 CPU，$0）；镜头时长对齐到整帧，最多多出一帧。
+
+## v0.31 · 重构：花钱口径收成一处、状态机拆出去；低优先级问题（2026-10-20）
+
+**重构**（行为不变的部分由原有 1009 个用例兜底，变了的部分见下）
+
+- `orchestrator/status.py`：各操作的入口状态白名单、`require()`，以及「按产物推状态」的三个纯函数
+  `after_video` / `after_audio` / `after_clips_changed`。原来同一条规则在 `pipeline.py` 里写了 6 遍
+  （`_settle_audio_status` 和 `_settle_compose_status` 逐字相同，重启恢复里又手写一遍）。
+  `orchestrator/errors.py`：四个异常类。`pipeline` 里照旧能 import 到
+- **「这次要买哪些单元」只剩一个判断**：`video_service.unit_needs_generation` / `pending_units`。
+  以前有三份：生成看「就绪 + 文件在」，预算门只看「就绪」，preflight 另把占位算待生成 ——
+  片段文件丢了时生成会重买、预算门和 preflight 都按 $0 估（`test_budget_basis_is_pending_only_when_provider_unchanged`）
+- **「要花多少」只剩一个函数**：`preflight_service.quote_units`（单价 → 档位 → 计费秒数 → 单价读不到的判定），
+  预算门、preflight、改分镜的影响预估共用。影响预估以前按分镜秒数 × 单价，3 秒的段在 H3 上报 $0.39、实际 $0.65
+  （`test_storyboard_impact_prices_rebuys_by_billing_tier`）
+
+**低优先级问题**
+
+| 问题 | 修法 | 用例 |
+|---|---|---|
+| 科普 outline 模式：用户只写了 2 个知识点时要求「至少 3 个」并让模型拆；写了 6 个以上悄悄截掉 | outline 模式只要求「提问 + 至少 1 个知识点 + 小结」，不截 | `test_outline_mode_follows_the_users_point_count` |
+| 完整旁白切句：英文不按句点切、「“…！”他说。」切成两镜、开头的「……」被丢掉 | 换成逐字扫描（引号里不断句、英文句点不切小数），句子拼回去就是原文 | `test_split_sentences_keeps_*` |
+| 出处校验：全角数字对不上半角引文；`İ` 这类字母展开后切回原文错位；每条事实都重新归一化整份资料 | 逐字 NFKC + casefold、展开的字记同一个位置；归一化结果缓存 | `test_quote_matching_normalizes_full_width_and_case` |
+| 小说合并复用空号：删掉 char_2 后新角色分到 char_2，旧定妆照被当孤儿图补登记给它；`finalize_bible` 按下标补 id 会撞号 | `utils/ids.allocate_id`：最大号 + 1、不复用空号 | `test_new_ids_never_reuse_a_deleted_number` |
+| 切章认不出「第 1 章」「CHAPTER ONE」「卷一 第一章」 | 数字两边允许空格、英文数词、可选卷号前缀 | `test_split_recognizes_common_heading_variants` |
+| 科普资料复用小说切章：标题前不到 200 字的引言被丢；提示语把资料叫「小说原文」 | 资料按段落装箱（`pack_paragraphs`），提示语分开（`MATERIAL_GUARD`） | `test_source_material_chunks_keep_every_word_*` |
+| `?token=` 按子串放行（`.../references/plan` 也算） | 按路由精确匹配 | `test_url_token_allowlist` |
+| 上传只看扩展名；响应没有 `nosniff` | 按文件头认 PNG / JPEG / WebP 且和扩展名一致；全局加 `X-Content-Type-Options: nosniff`；两份上传代码合成 `_decode_image_upload` | `test_reference_upload_checks_file_signature` |
+| 设了 token 时，免鉴权的 `/api/health` 仍返回本机绝对路径 | 没带 token 的请求里这三项置空 | `test_health_hides_local_paths_without_token` |
+| 读产物时的瞬时 OSError 也把文件隔离成 `.bad`（项目从列表里消失）；原子写没有 fsync | 只有内容坏了才隔离；写临时文件后 fsync 再改名 | `test_transient_read_error_does_not_quarantine` |
+| 图片接口读超时后重发 POST（图可能已画完扣费） | 连接都没建立才重发；其余报不可重试 | `test_read_timeout_after_sending_is_not_resent` |
+| 分段复用标记不含配音文件身份 | 标记里加配音文件的大小 + 修改时间 | `test_segment_marker_changes_when_the_voice_file_is_redone` |
+| 密钥扫描只认 3 种前缀，没有提交前检查 | `test_secrets.py` 加 Anthropic / AWS / Google / Slack / 私钥块；新增 `tools/hooks/pre-commit`（ruff + gitleaks，没装 gitleaks 时跑自带扫描）。全部提交历史按这些形态扫过一遍：0 命中 | — |
+
+**行为变化**：科普资料切块的边界变了，已经抽到一半的底稿续跑时会按新切法重抽（几分钱 LLM）；
+preflight 不再把「就绪的占位片段」算待生成（和真正生成一致：mock 缺 ffmpeg 时本来就不会重生成）。
+
+**没做**：重做中间章时的世界状态（已知限制 49，要按场留世界状态快照，是设计层面的改动）、口型产物按文件时间复用、
+口型对齐按配音文件长度算延后上限、请求体大小上限（整本小说可能就有几 MB，上限多少要按用途定）、
+`_generate_one` / `_generate_segment` 合并、`video_service.py` 按职责拆文件。
