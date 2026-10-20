@@ -389,6 +389,11 @@ class Settings(BaseSettings):
     #: 写接口额外放行的页面来源（逗号分隔，如 `https://studio.example.com`）。
     #: 同源页面和反向代理（看 X-Forwarded-Host）不用配；前端单独部署在别的域名时才需要
     api_allowed_origins: str = ""
+    #: 没设 API_TOKEN 时，请求的 Host 必须是本机名（127.0.0.1 / localhost / ::1）、
+    #: API_ALLOWED_ORIGINS 里的主机或这里列的主机（逗号分隔，`*` = 不检查）。
+    #: 挡的是 DNS rebinding：攻击者的域名解析到 127.0.0.1 后，Origin 和 Host 都是它自己，
+    #: 跨站检查拦不住
+    api_allowed_hosts: str = ""
 
     @property
     def projects_path(self) -> Path:

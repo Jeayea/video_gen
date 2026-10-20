@@ -92,7 +92,7 @@ class Recorder:
         self.models = models if models is not None else [HAILUO3]
         self.submit_status = submit_status
         self.polls = list(
-            polls or [{"status": "completed", "unsigned_urls": ["https://cdn/v.mp4"]}]
+            polls or [{"status": "completed", "unsigned_urls": ["https://cdn.openrouter.ai/v.mp4"]}]
         )
         self.download_bytes = download_bytes
         self.content_ok = content_ok
@@ -143,7 +143,7 @@ class Recorder:
         if path.endswith("/videos/job-1") and request.method == "GET":
             poll = self.polls.pop(0) if len(self.polls) > 1 else self.polls[0]
             return httpx.Response(200, json=self._poll_payload(poll))
-        if request.url.host == "cdn":
+        if request.url.host == "cdn.openrouter.ai":
             # 真实环境里 unsigned_urls 也需要 Authorization，裸下载会 401
             if self.unsigned_requires_auth and "authorization" not in request.headers:
                 return httpx.Response(401, json={"error": {"message": "unauthorized"}})
@@ -374,7 +374,7 @@ async def test_generate_success_flow(tmp_path):
         polls=[
             {"status": "pending"},
             {"status": "processing"},
-            {"status": "completed", "unsigned_urls": ["https://cdn/v.mp4"]},
+            {"status": "completed", "unsigned_urls": ["https://cdn.openrouter.ai/v.mp4"]},
         ]
     )
     provider = make_provider(recorder)
@@ -445,7 +445,7 @@ async def test_timeout_raises_and_mentions_job(tmp_path):
 @pytest.mark.asyncio
 async def test_empty_download_is_rejected(tmp_path):
     recorder = Recorder(
-        polls=[{"status": "completed", "unsigned_urls": ["https://cdn/empty.mp4"]}],
+        polls=[{"status": "completed", "unsigned_urls": ["https://cdn.openrouter.ai/empty.mp4"]}],
         download_bytes=b"",
     )
     provider = make_provider(recorder)
@@ -813,9 +813,39 @@ async def test_download_falls_back_to_unsigned_url_with_auth(tmp_path):
     clip = await provider.generate(request_for(tmp_path))
 
     assert clip.path.is_file()
-    cdn_requests = [r for r in recorder.requests if r.url.host == "cdn"]
+    cdn_requests = [r for r in recorder.requests if r.url.host == "cdn.openrouter.ai"]
     assert cdn_requests, "content 端点失败后应该回退到 unsigned_urls"
     assert cdn_requests[0].headers.get("authorization", "").startswith("Bearer ")
+
+
+@pytest.mark.asyncio
+async def test_key_is_never_sent_to_a_foreign_host(tmp_path):
+    """响应里的地址指向别的域名：只匿名下载 / 轮询，key 不出 OpenRouter。"""
+    recorder = Recorder(
+        content_ok=False,
+        polls=[{"status": "completed", "unsigned_urls": ["https://files.example.com/v.mp4"]}],
+    )
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "files.example.com":
+            seen.append(request)
+            return httpx.Response(200, content=VIDEO_BYTES)
+        return recorder.handler(request)
+
+    provider = OpenRouterVideoProvider(
+        api_key="test-key-not-a-real-secret",
+        model="minimax/hailuo-3",
+        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+    provider.poll_interval_sec = 0.01
+    clip = await provider.generate(request_for(tmp_path))
+
+    assert clip.path.is_file()
+    assert seen and all("authorization" not in r.headers for r in seen)
+    assert provider._own_host("https://openrouter.ai/api/v1/videos/x")
+    assert not provider._own_host("https://openrouter.ai.evil.example/x")
+    assert not provider._own_host("http://openrouter.ai/x")  # 降级到明文也不带
 
 
 @pytest.mark.asyncio
@@ -824,7 +854,7 @@ async def test_download_failure_is_not_retryable_and_carries_job_id(tmp_path):
     recorder = Recorder(content_ok=False)
 
     def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.host == "cdn":
+        if request.url.host == "cdn.openrouter.ai":
             return httpx.Response(403, json={"error": {"message": "forbidden"}})
         return recorder.handler(request)
 
@@ -850,7 +880,7 @@ async def test_video_service_does_not_regenerate_after_artifact_failure(store):
     recorder = Recorder(content_ok=False)
 
     def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.host == "cdn":
+        if request.url.host == "cdn.openrouter.ai":
             return httpx.Response(401, json={"error": {"message": "unauthorized"}})
         return recorder.handler(request)
 
@@ -981,7 +1011,7 @@ async def test_timeout_is_not_retryable_and_resumes_same_job(store):
     assert clip.pending_job_id == "job-1"
 
     # 服务端其实跑完了：再点一次生成，只是接着查同一个任务
-    recorder.polls = [{"status": "completed", "unsigned_urls": ["https://cdn/v.mp4"]}]
+    recorder.polls = [{"status": "completed", "unsigned_urls": ["https://cdn.openrouter.ai/v.mp4"]}]
     job = await pipeline.start_video_generation(project.id)
     await wait_for_job(pipeline, job.id, timeout=30)
     assert recorder.submits == 1, "接着查原任务，不再买一次"
@@ -996,7 +1026,7 @@ async def test_download_failure_is_recovered_on_next_run_without_resubmitting(st
     state = {"cdn_ok": False}
 
     def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.host == "cdn" and not state["cdn_ok"]:
+        if request.url.host == "cdn.openrouter.ai" and not state["cdn_ok"]:
             return httpx.Response(401, json={"error": {"message": "unauthorized"}})
         return recorder.handler(request)
 
@@ -1074,7 +1104,7 @@ async def test_resumed_job_failed_on_server_is_resubmitted(tmp_path):
     recorder = Recorder(
         polls=[
             {"status": "failed", "error": "internal"},
-            {"status": "completed", "unsigned_urls": ["https://cdn/v.mp4"]},
+            {"status": "completed", "unsigned_urls": ["https://cdn.openrouter.ai/v.mp4"]},
         ]
     )
     provider = make_provider(recorder)
@@ -1125,7 +1155,7 @@ async def test_prompt_limit_is_learned_from_failure_and_applied_on_retry(tmp_pat
     recorder = Recorder(
         polls=[
             {"status": "failed", "error": "ret:1201, prompt: size must be between 0 and 400"},
-            {"status": "completed", "unsigned_urls": ["https://cdn/v.mp4"]},
+            {"status": "completed", "unsigned_urls": ["https://cdn.openrouter.ai/v.mp4"]},
         ]
     )
     provider = make_provider(recorder, model="minimax/hailuo-3")
@@ -1188,3 +1218,40 @@ async def test_legacy_timeout_clip_resumes_old_job(store):
     await wait_for_job(pipeline, job.id, timeout=30)
     assert recorder.submits == 0, "原任务其实跑完了：接着查，不重新提交"
     assert store.load_video_manifest(project.id).clips[0].status.value == "ready"
+
+
+@pytest.mark.asyncio
+async def test_gateway_timeout_on_submit_is_not_resubmitted(tmp_path):
+    """504：网关等上游超时，任务可能已经建好 —— 不重发（以前会再 POST 两次、上层再重试）。"""
+    from videogen.providers.video.base import VideoJobPending
+
+    recorder = Recorder(submit_status=504)
+    provider = make_provider(recorder)
+    with pytest.raises(VideoJobPending, match="504"):
+        await provider.generate(request_for(tmp_path))
+    assert recorder.submits == 1
+
+
+@pytest.mark.asyncio
+async def test_fresh_job_not_found_yet_is_pending_not_resubmitted(tmp_path):
+    """刚提交的任务第一次查询就 404：更可能是还没同步，留着 job id 下次接着查，不当场重交。"""
+    from videogen.providers.video.base import VideoJobPending
+
+    recorder = Recorder()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/videos/job-1") and request.method == "GET":
+            recorder.requests.append(request)
+            return httpx.Response(404, json={"error": {"message": "not found"}})
+        return recorder.handler(request)
+
+    provider = OpenRouterVideoProvider(
+        api_key="test-key",
+        model="minimax/hailuo-3",
+        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+    provider.poll_interval_sec = 0.01
+    with pytest.raises(VideoJobPending) as exc:
+        await provider.generate(request_for(tmp_path))
+    assert exc.value.job_id == "job-1"
+    assert recorder.submits == 1

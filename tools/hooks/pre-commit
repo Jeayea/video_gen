@@ -1,0 +1,17 @@
+#!/bin/sh
+# 提交前检查：ruff + 密钥扫描。装法（不改 core.hooksPath，免得 .git/hooks 里已有的钩子失效）：
+#   ln -s ../../tools/hooks/pre-commit .git/hooks/pre-commit
+# 装了 gitleaks（brew install gitleaks）就用它扫暂存区；没装就跑仓库自带的密钥扫描用例。
+set -e
+cd "$(git rev-parse --show-toplevel)"
+
+.venv/bin/ruff check src tests tools
+
+if command -v gitleaks >/dev/null 2>&1; then
+  # gitleaks 8.19 起是 `git --staged`，更早的版本是 `protect --staged`
+  gitleaks git --staged --redact --no-banner 2>/dev/null \
+    || gitleaks protect --staged --redact --no-banner
+else
+  echo "没装 gitleaks（brew install gitleaks），这次只跑仓库自带的密钥扫描" >&2
+  .venv/bin/python -m pytest -q tests/test_secrets.py
+fi

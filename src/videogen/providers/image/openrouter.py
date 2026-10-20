@@ -131,6 +131,17 @@ class OpenRouterImageProvider(ImageProvider):
                 response = await client.post(url, headers=self._headers(), json=payload)
             except httpx.HTTPError as exc:
                 last_error = scrub_secrets(f"{type(exc).__name__}: {exc}")
+                # 连接都没建立才能放心重发；读超时 / 断流时图可能已经画完扣了费，重发 = 再买一张
+                # （和视频提交同一条规矩）
+                sent = not isinstance(
+                    exc, (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
+                )
+                if sent:
+                    error = ImageProviderError(
+                        f"图片请求发出后没收到响应（{last_error}），可能已经扣费；不自动重发"
+                    )
+                    error.retryable = False  # 上层也别重试
+                    raise error from exc
                 if attempt < self.max_http_retries:
                     await asyncio.sleep(min(15.0, self.retry_backoff_sec * attempt))
                     continue

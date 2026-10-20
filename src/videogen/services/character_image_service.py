@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import glob
 import logging
 import re
 from collections.abc import Callable
@@ -253,7 +254,7 @@ def _orphan_reference(store: FileStore, project_id: str, character: Character) -
     """
     if _existing_reference(store, project_id, character) is not None:
         return None
-    for path in sorted(store.refs_dir(project_id).glob(f"{character.id}.*")):
+    for path in sorted(store.refs_dir(project_id).glob(f"{glob.escape(character.id)}.*")):
         if path.is_file() and path.suffix.lower() in _ALLOWED_SUFFIXES:
             return path
     return None
@@ -406,7 +407,7 @@ async def generate_character_image(
         raise CharacterImageError("图片模型没有产出有效文件")
 
     # 清掉同名角色的旧后缀文件，避免 refs/ 里堆一堆 char_1.png / char_1.jpg
-    for stale in refs_dir.glob(f"{char_id}.*"):
+    for stale in refs_dir.glob(f"{glob.escape(char_id)}.*"):
         if stale != saved:
             try:
                 stale.unlink()

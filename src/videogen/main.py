@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import glob
 import logging
 import os
+import re
 import secrets
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -148,16 +150,18 @@ def _bind_host() -> str:
 
 
 #: 只能用 URL 传 token 的产物地址 —— `<img>` / `<video>` / `<a download>` 带不了请求头。
-#: 这些路径都是**只读**的产物下载，不接受任何写操作。
-_URL_TOKEN_SUFFIXES = (
-    "/final",
-    "/subtitles",
-    "/subtitles.vtt",
-    "/music/audio",
-    "/rejected-image",
+#: 都是**只读**的产物下载，按路由精确匹配
+#: （以前按子串匹配，`.../characters/references/plan` 也放行了）
+_URL_TOKEN_ROUTE = re.compile(
+    r"^/api/projects/[^/]+/(?:"
+    r"final|subtitles|subtitles\.vtt|music/audio"
+    r"|video/rejections/[^/]+/rejected-image"
+    r"|history/[^/]+/files/.+"
+    r"|clips/[^/]+"
+    r"|characters/[^/]+/reference"
+    r"|assets/[^/]+/[^/]+/reference"
+    r")$"
 )
-#: `/history/` 下只有 GET（看旧片段 / 旧成片），以后加写接口不能放在这个前缀下
-_URL_TOKEN_FRAGMENTS = ("/clips/", "/reference", "/history/")
 
 
 def url_token_allowed(path: str, method: str = "GET") -> bool:
@@ -167,12 +171,10 @@ def url_token_allowed(path: str, method: str = "GET") -> bool:
     只有「浏览器自己发起的产物读取」例外：HTML 里没法给 `<video src>` 加请求头，
     所以这几个只读路径同时接受 `?token=`。写接口一律只认请求头。
     """
-    if method.upper() not in ("GET", "HEAD") or not path.startswith("/api/"):
-        # 同一个前缀下也有写接口（`.../reference` 的上传 / 删除 / 付费生成）：只放行读
+    if method.upper() not in ("GET", "HEAD"):
+        # 同一个路由上也有写接口（`.../reference` 的上传 / 删除 / 付费生成）：只放行读
         return False
-    if path.endswith(_URL_TOKEN_SUFFIXES):
-        return True
-    return any(fragment in path for fragment in _URL_TOKEN_FRAGMENTS)
+    return _URL_TOKEN_ROUTE.match(path) is not None
 
 
 def cross_site_write(request: Request) -> bool:
@@ -202,10 +204,44 @@ def cross_site_write(request: Request) -> bool:
     return urlsplit(origin).netloc not in own and origin.rstrip("/") not in allowed
 
 
+_LOCAL_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+
+
+def host_allowed(request: Request) -> bool:
+    """没设 API_TOKEN 时，只接受发给本机名（或显式放行的主机）的请求。
+
+    DNS rebinding：攻击者的域名先解析到自己的服务器、页面加载后再解析到 127.0.0.1，
+    浏览器把之后的请求当成同源，`Origin` 和 `Host` 都是攻击者的域名 —— `cross_site_write`
+    看到两者一致就放行了，页面因此能读写所有项目、触发付费生成。浏览器改不了 `Host` 头，
+    所以按 `Host` 白名单拦。设了 token 时不用这一层：rebinding 的页面拿不到 token。
+    """
+    if settings.api_token.strip():
+        return True
+    extra = {h.strip().lower() for h in settings.api_allowed_hosts.split(",") if h.strip()}
+    if "*" in extra:
+        return True
+    allowed = set(_LOCAL_HOSTS) | extra
+    allowed |= {
+        (urlsplit(o.strip()).hostname or "").lower()
+        for o in settings.api_allowed_origins.split(",")
+        if o.strip()
+    }
+    bind = _bind_host().lower()
+    if bind not in ("0.0.0.0", "::", ""):
+        allowed.add(bind)
+    host = (urlsplit(f"//{request.headers.get('host', '')}").hostname or "").lower()
+    return host in allowed
+
+
 @app.middleware("http")
 async def api_token_middleware(request: Request, call_next):
     token = settings.api_token.strip()
     path = request.url.path
+    if not host_allowed(request):
+        return JSONResponse(
+            {"detail": "Host 不在白名单（没设 API_TOKEN 时只接受本机名，见 API_ALLOWED_HOSTS）"},
+            status_code=400,
+        )
     if path.startswith("/api") and cross_site_write(request):
         return JSONResponse({"detail": "拒绝跨站写请求"}, status_code=403)
     if token and path.startswith("/api") and path != "/api/health":
@@ -214,7 +250,16 @@ async def api_token_middleware(request: Request, call_next):
             supplied = request.query_params.get("token") or ""
         if not secrets.compare_digest(supplied, token):
             return JSONResponse({"detail": "缺少或错误的 API Token"}, status_code=401)
-    return await call_next(request)
+    response = await call_next(request)
+    # 上传的参考图会原样回给浏览器：别让浏览器按内容猜类型（图片里藏 HTML 就成了同源页面）
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    return response
+
+
+def _has_valid_token(request: Request) -> bool:
+    token = settings.api_token.strip()
+    supplied = request.headers.get("x-api-token") or ""
+    return not token or secrets.compare_digest(supplied, token)
 
 
 # ── 统一错误映射 ───────────────────────────────────────────
@@ -570,7 +615,7 @@ async def project_voices(project_id: str):
 
 
 @app.get("/api/health")
-async def health():
+async def health(request: Request):
     caps = await ffmpeg_capabilities()
     burn_exe, burn_caps = await resolve_ffmpeg_for({"subtitles"})
     can_burn = "subtitles" in burn_caps
@@ -606,6 +651,12 @@ async def health():
         "ffmpeg_can_embed_subtitles": "mov_text" in caps,
         "ffmpeg_auto_upgrade": settings.ffmpeg_auto_upgrade,
         "stages_implemented": ["bible", "script", "storyboard", "video", "audio", "compose"],
+        **(
+            {}
+            if _has_valid_token(request)
+            # 设了 token 时，没鉴权的请求（health 不要求 token）看不到本机绝对路径
+            else {"bgm_dir": "", "ffmpeg_path": "", "ffmpeg_burn_path": ""}
+        ),
         "stages_pending": [],
         "active_jobs": pipeline.jobs.active_count,
         "active_batches": batches.active_count,
@@ -1454,13 +1505,20 @@ def _load_character(project_id: str, char_id: str) -> tuple[StoryBible, Characte
     return bible, character
 
 
-@app.post("/api/projects/{project_id}/characters/{char_id}/reference")
-async def upload_reference(project_id: str, char_id: str, req: ReferenceImageRequest):
-    """上传角色参考图（base64）。真实视频 provider 会用它保持角色外观一致。"""
+#: 文件头 → 允许的扩展名
+_IMAGE_SIGNATURES = (
+    (b"\x89PNG\r\n\x1a\n", {".png"}),
+    (b"\xff\xd8\xff", {".jpg", ".jpeg"}),
+)
+
+
+def _decode_image_upload(req: ReferenceImageRequest) -> tuple[bytes, str]:
+    """解码上传的参考图，返回（内容, 扩展名）。按文件头认类型，和扩展名对不上就拒。
+
+    以前只看扩展名：任何内容改个 `.png` 的名字都能存进 refs/，再原样回给浏览器、交给 ffmpeg 解码。
+    """
     import base64
     import binascii
-
-    _load_character(project_id, char_id)  # 项目/角色不存在就直接 404
 
     suffix = Path(req.filename).suffix.lower()
     if suffix not in {".png", ".jpg", ".jpeg", ".webp"}:
@@ -1469,15 +1527,28 @@ async def upload_reference(project_id: str, char_id: str, req: ReferenceImageReq
         raw = base64.b64decode(req.content_base64, validate=True)
     except (binascii.Error, ValueError) as exc:
         raise HTTPException(400, f"base64 解码失败：{exc}") from exc
-
     limit = int(settings.reference_image_max_mb * 1024 * 1024)
     if len(raw) > limit:
         raise HTTPException(400, f"参考图太大（{len(raw)} 字节 > {limit} 字节）")
     if not raw:
         raise HTTPException(400, "参考图内容为空")
+    is_webp = raw[:4] == b"RIFF" and raw[8:12] == b"WEBP"
+    allowed = {".webp"} if is_webp else next(
+        (suffixes for magic, suffixes in _IMAGE_SIGNATURES if raw.startswith(magic)), set()
+    )
+    if suffix not in allowed:
+        raise HTTPException(400, f"文件内容不是 {suffix.lstrip('.')} 图片（按文件头判断）")
+    return raw, suffix
+
+
+@app.post("/api/projects/{project_id}/characters/{char_id}/reference")
+async def upload_reference(project_id: str, char_id: str, req: ReferenceImageRequest):
+    """上传角色参考图（base64）。真实视频 provider 会用它保持角色外观一致。"""
+    _load_character(project_id, char_id)  # 项目/角色不存在就直接 404
+    raw, suffix = _decode_image_upload(req)
 
     target = store.refs_dir(project_id) / f"{char_id}{suffix}"
-    for stale in store.refs_dir(project_id).glob(f"{char_id}.*"):
+    for stale in store.refs_dir(project_id).glob(f"{glob.escape(char_id)}.*"):
         if stale != target:
             stale.unlink(missing_ok=True)
     target.write_bytes(raw)
@@ -1518,7 +1589,7 @@ async def delete_reference(project_id: str, char_id: str):
             bible.characters[index] = item.model_copy(update={"reference_image": ""})
             break
     store.save_bible(project_id, bible)
-    for stale in store.refs_dir(project_id).glob(f"{char_id}.*"):
+    for stale in store.refs_dir(project_id).glob(f"{glob.escape(char_id)}.*"):
         stale.unlink(missing_ok=True)
     return {"status": "ok", "removed": bool(character.reference_image)}
 
@@ -1596,22 +1667,8 @@ async def upload_asset_reference(
     project_id: str, kind: str, asset_id: str, req: ReferenceImageRequest
 ):
     """上传资产参考图（base64）：场景图 / 道具图 / 角色图。"""
-    import base64
-    import binascii
-
     _load_asset(project_id, kind, asset_id)
-    suffix = Path(req.filename).suffix.lower()
-    if suffix not in {".png", ".jpg", ".jpeg", ".webp"}:
-        raise HTTPException(400, "只支持 png / jpg / jpeg / webp")
-    try:
-        raw = base64.b64decode(req.content_base64, validate=True)
-    except (binascii.Error, ValueError) as exc:
-        raise HTTPException(400, f"base64 解码失败：{exc}") from exc
-    limit = int(settings.reference_image_max_mb * 1024 * 1024)
-    if len(raw) > limit:
-        raise HTTPException(400, f"参考图太大（{len(raw)} 字节 > {limit} 字节）")
-    if not raw:
-        raise HTTPException(400, "参考图内容为空")
+    raw, suffix = _decode_image_upload(req)
 
     target = store.refs_dir(project_id) / f"{asset_id}{suffix}"
     asset_service.clear_reference_files(store, project_id, asset_id, keep=target)

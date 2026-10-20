@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import glob
 import logging
 import re
 from pathlib import Path
@@ -222,7 +223,7 @@ def clear_reference_files(
     store: FileStore, project_id: str, asset_id: str, keep: Path | None = None
 ) -> None:
     """删掉 refs/ 里这个资产的旧图（换图/删图时用；`keep` 是刚生成的那张）。"""
-    for stale in store.refs_dir(project_id).glob(f"{asset_id}.*"):
+    for stale in store.refs_dir(project_id).glob(f"{glob.escape(asset_id)}.*"):
         if stale != keep and stale.suffix.lower() in _ALLOWED_SUFFIXES:
             stale.unlink(missing_ok=True)
 

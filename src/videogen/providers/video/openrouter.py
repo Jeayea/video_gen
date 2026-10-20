@@ -6,6 +6,7 @@ import logging
 import re
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -114,6 +115,20 @@ class OpenRouterVideoProvider(VideoProvider):
     def _headers(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
 
+    def _own_host(self, url: str) -> bool:
+        """这个地址是不是 OpenRouter 自己的（同协议，同主机或它的子域名）。
+
+        `polling_url` / `unsigned_urls` 都来自接口响应：指向别的域名时不能带 key 过去
+        （key 会被第三方拿到）。实测 `unsigned_urls` 就是 OpenRouter 自己的 content 端点。
+        """
+        mine, theirs = urlsplit(self.base_url), urlsplit(url)
+        host, base = (theirs.hostname or "").lower(), (mine.hostname or "").lower()
+        same_host = host == base or host.endswith(f".{base}")
+        return bool(base) and theirs.scheme == mine.scheme and same_host
+
+    def _headers_for(self, url: str) -> dict[str, str]:
+        return self._headers() if self._own_host(url) else {}
+
     async def _http(self) -> httpx.AsyncClient:
         if self._client is None:
             self._client = httpx.AsyncClient(timeout=httpx.Timeout(60.0, read=300.0))
@@ -134,7 +149,9 @@ class OpenRouterVideoProvider(VideoProvider):
         last_error = ""
         for attempt in range(1, self.max_http_retries + 1):
             try:
-                response = await client.get(url, headers=self._headers(), timeout=timeout_sec)
+                response = await client.get(
+                    url, headers=self._headers_for(url), timeout=timeout_sec
+                )
             except httpx.HTTPError as exc:
                 last_error = f"{type(exc).__name__}: {exc}"
                 if attempt < self.max_http_retries:
@@ -282,7 +299,7 @@ class OpenRouterVideoProvider(VideoProvider):
             )
 
             status = await self._poll(
-                polling_url, job_id=job_id, shot_id=request.shot_id, payload=payload
+                polling_url, job_id=job_id, shot_id=request.shot_id, payload=payload, fresh=True
             )
         urls = [str(u) for u in (status.get("unsigned_urls") or [])]
 
@@ -424,6 +441,13 @@ class OpenRouterVideoProvider(VideoProvider):
                     )
                 ) from exc
 
+            if response.status_code == 504:
+                # 网关等上游超时：上游可能已经建好任务（和读超时一样），重发 = 可能买两次
+                raise VideoJobPending(
+                    "提交视频任务返回 504（网关超时），任务可能已在服务端创建并计费；"
+                    "请先到 OpenRouter 后台核对再重试"
+                )
+
             if response.status_code in _RETRY_STATUS and attempt < self.max_http_retries:
                 logger.warning(
                     "提交视频任务返回 %d，第 %d/%d 次重试",
@@ -468,8 +492,9 @@ class OpenRouterVideoProvider(VideoProvider):
         job_id: str,
         shot_id: str,
         payload: dict[str, Any] | None = None,
+        fresh: bool = False,
     ) -> dict[str, Any]:
-        """轮询到 completed / failed / 超时。
+        """轮询到 completed / failed / 超时（`fresh` = 这个任务是这一轮刚提交的）。
 
         有的模型不是提交时 400，而是任务跑起来才报图片被拒（MiniMax H3：
         `input new_sensitive, input image sensitive (1026)`）—— 同样按「带的图被拒」中断，交给用户。
@@ -482,8 +507,10 @@ class OpenRouterVideoProvider(VideoProvider):
             try:
                 status = await self._get_json(polling_url)
             except VideoProviderError as exc:
-                if getattr(exc, "status_code", 0) in (404, 410):
-                    # 服务端说没有这个任务：没什么可等的，按「生成失败」处理（可重新提交）
+                if getattr(exc, "status_code", 0) in (404, 410) and not fresh:
+                    # 续查的老任务服务端说没有：过期了，按「生成失败」处理（可重新提交）。
+                    # 刚提交的任务查不到更可能是还没同步过去 —— 走下面的 pending，
+                    # 下次接着查；当场重交就可能买两份
                     raise VideoProviderError(
                         f"视频任务不存在（job={job_id}）：{scrub_secrets(str(exc))[:200]}"
                     ) from exc
@@ -527,7 +554,8 @@ class OpenRouterVideoProvider(VideoProvider):
         candidates: list[tuple[str, bool]] = [
             (f"{self.base_url}/videos/{job_id}/content?index=0", True)
         ]
-        candidates += [(url, True) for url in urls]
+        # 别的主机上的地址只匿名下载：key 不出 OpenRouter
+        candidates += [(url, True) for url in urls if self._own_host(url)]
         candidates += [(url, False) for url in urls]
 
         failures: list[str] = []
@@ -555,12 +583,13 @@ class OpenRouterVideoProvider(VideoProvider):
     async def _try_download(self, url: str, output: Path, *, authorized: bool) -> tuple[bool, str]:
         """下载一次，返回 (是否成功, 失败原因)。"""
         client = await self._http()
-        headers = self._headers() if authorized else {}
+        headers = self._headers_for(url) if authorized else {}
         try:
             async with client.stream(
                 "GET", url, headers=headers, timeout=httpx.Timeout(60.0, read=300.0)
             ) as resp:
-                if resp.status_code >= 400:
+                # 只认 2xx：httpx 默认不跟随跳转，3xx 的响应体会被当成「片段」写盘
+                if not 200 <= resp.status_code < 300:
                     return False, f"HTTP {resp.status_code}"
                 with output.open("wb") as handle:
                     async for chunk in resp.aiter_bytes(_CHUNK):

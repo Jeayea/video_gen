@@ -18,6 +18,14 @@ from pathlib import Path
 REAL_KEY = re.compile(r"sk-or-v1-[0-9a-fA-F]{32,}")
 #: 其它常见密钥前缀（同样按“前缀 + 长随机串”判定）
 OTHER_KEYS = re.compile(r"(?i)\b(sk-[a-z0-9]{32,}|ghp_[A-Za-z0-9]{30,})\b")
+#: 更多常见形态：Anthropic / AWS AK / Google API key / Slack token / 私钥块（大小写敏感）
+MORE_KEYS = re.compile(
+    r"sk-ant-[A-Za-z0-9_-]{20,}"
+    r"|\bAKIA[0-9A-Z]{16}\b"
+    r"|\bAIza[0-9A-Za-z_-]{35}\b"
+    r"|\bxox[abposr]-[0-9A-Za-z-]{10,}"
+    r"|-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----"
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -40,7 +48,7 @@ def test_no_real_looking_keys_in_tracked_files():
             text = path.read_text(encoding="utf-8", errors="ignore")
         except OSError:  # pragma: no cover
             continue
-        for pattern in (REAL_KEY, OTHER_KEYS):
+        for pattern in (REAL_KEY, OTHER_KEYS, MORE_KEYS):
             for match in pattern.finditer(text):
                 offenders.append(f"{path.relative_to(ROOT)}: {match.group(0)[:12]}…")
     assert not offenders, "工作树里出现了像真 key 的字符串：\n" + "\n".join(offenders)

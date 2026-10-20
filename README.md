@@ -37,6 +37,7 @@ git clone https://github.com/Jeayea/video_gen.git && cd video_gen
 - 启动也可以用 `.venv/bin/videogen serve [--host ... --port ... --reload]`
 - 可选：`python -m videogen.tools.demo_bgm` 生成 4 首演示 BGM 到 `./assets/bgm`
 - 服务默认只监听 `127.0.0.1`。改监听地址用 `HOST=0.0.0.0 PORT=8001 ./run.sh`，**暴露到局域网前先设置 `API_TOKEN`**
+  （没设 `API_TOKEN` 时只接受发给本机名的请求；不设 token 又要用局域网 IP 访问，把主机名写进 `API_ALLOWED_HOSTS`）
 
 ## 使用
 

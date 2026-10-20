@@ -274,6 +274,11 @@ def test_url_token_allowlist():
     assert url_token_allowed("/api/projects/abc/clips/scene_1_shot_1")
     assert url_token_allowed("/api/projects/abc/characters/c1/reference")
     assert url_token_allowed("/api/projects/abc/history/20261014-x/files/output/final.mp4")
+    assert url_token_allowed("/api/projects/abc/assets/settings/loc_1/reference")
+    assert url_token_allowed("/api/projects/abc/video/rejections/seg_1/rejected-image")
+    # 精确到路由：以前按子串 `/reference` 匹配，这个只读接口也被放行了
+    assert not url_token_allowed("/api/projects/abc/characters/references/plan")
+    assert not url_token_allowed("/api/projects/abc/clips/x/../../bible")
     # 写接口与 JSON 接口：只认请求头
     assert not url_token_allowed("/api/projects")
     assert not url_token_allowed("/api/projects/abc")
@@ -646,6 +651,34 @@ def test_reference_image_validation(client, monkeypatch):
     resp = client.post(url, json={"filename": "a.png", "content_base64": PNG_BASE64})
     assert resp.status_code == 400
     assert "太大" in resp.json()["detail"]
+
+
+def test_reference_upload_checks_file_signature(client):
+    """按文件头认类型：改个 .png 的名字不算图片；扩展名和内容对不上也拒。"""
+    pid = prepare_confirmed_storyboard(client)
+    url = f"/api/projects/{pid}/characters/char_1/reference"
+    html = base64.b64encode(b"<html><script>alert(1)</script></html>").decode()
+    resp = client.post(url, json={"filename": "a.png", "content_base64": html})
+    assert resp.status_code == 400 and "文件头" in resp.json()["detail"]
+    jpeg_named_png = base64.b64encode(b"\xff\xd8\xff\xe0" + b"x" * 10).decode()
+    assert client.post(
+        url, json={"filename": "a.png", "content_base64": jpeg_named_png}
+    ).status_code == 400
+    assert client.post(
+        url, json={"filename": "a.jpg", "content_base64": jpeg_named_png}
+    ).status_code == 200
+    webp = base64.b64encode(b"RIFF\x00\x00\x00\x00WEBPVP8 ").decode()
+    assert client.post(url, json={"filename": "a.webp", "content_base64": webp}).status_code == 200
+    image = client.get(url)
+    assert image.headers["x-content-type-options"] == "nosniff"
+
+
+def test_health_hides_local_paths_without_token(client, monkeypatch):
+    monkeypatch.setattr(main.settings, "api_token", "secret-token")
+    anonymous = client.get("/api/health").json()
+    assert anonymous["ffmpeg_path"] == "" and anonymous["bgm_dir"] == ""
+    authed = client.get("/api/health", headers={"X-API-Token": "secret-token"}).json()
+    assert authed["bgm_dir"]
 
 
 def test_ai_reference_plan_and_generation_flow(client):
@@ -1332,3 +1365,58 @@ def test_cross_site_check_works_behind_reverse_proxy(client, monkeypatch):
     assert client.post("/api/projects", json=body, headers=other).status_code == 403
     monkeypatch.setattr(main.settings, "api_allowed_origins", "https://ui.example.com/")
     assert client.post("/api/projects", json=body, headers=other).status_code == 200
+
+
+def test_dns_rebinding_host_is_rejected_without_token(client, monkeypatch):
+    """攻击者域名解析到 127.0.0.1：Origin 和 Host 一致，跨站检查拦不住，要靠 Host 白名单。"""
+    monkeypatch.setattr(main.settings, "api_allowed_hosts", "")
+    rebound = {"Host": "evil.example:8000", "Origin": "http://evil.example:8000"}
+    assert client.get("/api/projects", headers=rebound).status_code == 400
+    body = {"input_text": "x"}
+    assert client.post("/api/projects", json=body, headers=rebound).status_code == 400
+    for host in ("127.0.0.1:8000", "localhost:8000", "[::1]:8000"):
+        assert client.get("/api/projects", headers={"Host": host}).status_code == 200
+    # 显式放行的主机（局域网访问）/ `*` 关掉检查
+    monkeypatch.setattr(main.settings, "api_allowed_hosts", "studio.lan")
+    assert client.get("/api/projects", headers={"Host": "studio.lan:8000"}).status_code == 200
+    monkeypatch.setattr(main.settings, "api_allowed_hosts", "*")
+    assert client.get("/api/projects", headers=rebound).status_code == 200
+
+
+def test_host_check_is_skipped_when_token_is_set(client, monkeypatch):
+    """设了 token：rebinding 的页面拿不到 token，Host 不再限制（反向代理 / 局域网照常用）。"""
+    monkeypatch.setattr(main.settings, "api_allowed_hosts", "")
+    monkeypatch.setattr(main.settings, "api_token", "secret-token")
+    other = {"Host": "studio.example.com"}
+    assert client.get("/api/projects", headers=other).status_code == 401
+    ok = {**other, "X-API-Token": "secret-token"}
+    assert client.get("/api/projects", headers=ok).status_code == 200
+
+
+def test_put_rejects_ids_that_would_become_unsafe_paths(client):
+    """手写的 id 会被拼进 clips/<id>.mp4、refs/<id>.png：带 ../ 或通配符的一律 400。"""
+    pid = client.post("/api/projects", json={"input_text": "路径测试"}).json()["id"]
+    assert client.post(f"/api/projects/{pid}/bible/generate", json={}).status_code == 200
+    bible = client.get(f"/api/projects/{pid}/bible").json()
+    bible["characters"][0]["id"] = "*"
+    response = client.put(f"/api/projects/{pid}/bible", json=bible)
+    assert response.status_code == 400 and "id" in response.json()["detail"]
+
+    assert client.post(f"/api/projects/{pid}/script/generate", json={}).status_code == 200
+    script = client.get(f"/api/projects/{pid}/script").json()
+    script["scenes"][0]["id"] = "../../escape"
+    assert client.put(f"/api/projects/{pid}/script", json=script).status_code == 400
+
+
+def test_reference_cleanup_treats_ids_literally(tmp_path):
+    """清旧图用 glob：id 里的 `*` / `[` 不能当通配符（以前 id 为 * 时会删掉 refs/ 下所有图）。"""
+    from videogen.services import asset_service
+
+    store = FileStore(tmp_path / "projects")
+    refs = store.refs_dir("p1")
+    refs.mkdir(parents=True, exist_ok=True)
+    for name in ("char_1.png", "char_2.jpg", "loc_1.png"):
+        (refs / name).write_bytes(b"x")
+    asset_service.clear_reference_files(store, "p1", "*")
+    asset_service.clear_reference_files(store, "p1", "char_[12]")
+    assert sorted(p.name for p in refs.iterdir()) == ["char_1.png", "char_2.jpg", "loc_1.png"]

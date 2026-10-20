@@ -242,3 +242,22 @@ def test_provider_requires_api_key(monkeypatch):
     monkeypatch.setattr(get_settings(), "openrouter_api_key", "")
     with pytest.raises(ImageProviderError, match="OPENROUTER_API_KEY"):
         OpenRouterImageProvider()
+
+
+@pytest.mark.asyncio
+async def test_read_timeout_after_sending_is_not_resent(tmp_path):
+    """请求发出去后读超时：图可能已经画完、扣了费 —— 不重发，也不让上层重试（以前会再买一张）。"""
+    posts: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        posts.append(request)
+        raise httpx.ReadTimeout("timed out", request=request)
+
+    provider = make_provider(handler, max_http_retries=3)
+    with pytest.raises(ImageProviderError) as exc:
+        await provider.generate(
+            ImageRequest(subject_id="c", prompt="p", output_path=tmp_path / "c.png")
+        )
+    await provider.aclose()
+    assert len(posts) == 1
+    assert exc.value.retryable is False

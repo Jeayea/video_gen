@@ -64,6 +64,9 @@ def fast_video_settings(monkeypatch):
     # 本机 .env 可能为某个模型手调过这两项
     monkeypatch.setattr(settings, "video_frame_mode", "auto")
     monkeypatch.setattr(settings, "video_prompt_limits", "kwaivgi/=2500")
+    # TestClient 发的 Host 是 testserver；没设 token 时 Host 白名单只认本机名
+    monkeypatch.setattr(settings, "api_token", "")
+    monkeypatch.setattr(settings, "api_allowed_hosts", "testserver")
     # 有些用例直接 `settings.xxx = ...` 改全局配置（没走 monkeypatch）：
     # 用例结束整份还原，否则会串到后面的用例里（真实症状：单跑通过、和别的文件一起跑失败）
     snapshot = dict(settings.__dict__)
