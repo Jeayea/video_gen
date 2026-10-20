@@ -114,6 +114,9 @@ class FakeLLM(LLMProvider):
         self.explainer_line_refs = ["fact_1"]
         self.explainer_review_issues: list[dict] = []
         self.explainer_reviews = 0
+        #: 短剧剧本医生：返回哪些问题 / 被调了几次
+        self.script_review_issues: list[dict] = []
+        self.script_reviews = 0
         self.explainer_annotate_valid = True
         #: 科普分镜：故意漏掉最后一个镜头的画面 / 收到过的画面分镜请求（user prompt）
         self.explainer_visuals_skip_last = False
@@ -246,7 +249,14 @@ class FakeLLM(LLMProvider):
         if "配音导演" in system:
             self._maybe_fail("audio_script")
             return self._voice_script(messages)
-        return {}
+        if "剧本医生" in system:
+            self.script_reviews += 1
+            return {"issues": list(self.script_review_issues)}
+        if "影视配乐指导" in system:
+            return {}  # 不给配乐建议（MusicBrief 全是默认值）
+        # 认不出阶段就报错：以前静默返回 {}，被当成「审稿没问题」之类的合法回答，
+        # 改了提示词、锚点没跟上时测试照样通过（短剧剧本医生就一直没被测到）
+        raise AssertionError(f"FakeLLM 认不出这是哪个阶段，system prompt 开头：{system[:60]!r}")
 
     def _bible_item(self, user: str) -> dict:
         """单条重写：照抄当前版本，描述 / 外貌加个标记，方便测试断言。"""

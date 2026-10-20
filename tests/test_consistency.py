@@ -534,3 +534,26 @@ def test_offscreen_speaker_is_not_forced_into_frame():
     assert not lipsync_service.shot_eligible(storyboard.shots[0])
     assert ShotDraft(voice_offscreen=None).voice_offscreen is False
     assert ShotDraft(voice_offscreen="true").voice_offscreen is True
+
+
+@pytest.mark.asyncio
+async def test_script_doctor_error_blocks_confirmation_end_to_end(store):
+    """短剧剧本医生走完整链路：报 ERROR 就拦住「确认剧本」，force 才放行。
+
+    以前 FakeLLM 认不出剧本医生的提示词、静默返回 {}，这条路径在流水线测试里从没被测到过。
+    """
+    llm = FakeLLM(scenes=2)
+    llm.script_review_issues = [
+        {"severity": "error", "scene_id": "scene_2", "message": "高潮没有落地"}
+    ]
+    pipeline = Pipeline(store, llm_factory=lambda: llm)
+    project = Project(input_text="剧本医生链路", target_duration_sec=30)
+    store.save_project(project)
+    await pipeline.generate_bible(project.id)
+    await pipeline.generate_script(project.id)
+
+    assert llm.script_reviews == 1
+    with pytest.raises(PipelineError, match="高潮没有落地"):
+        await pipeline.confirm_script(project.id)
+    confirmed = await pipeline.confirm_script(project.id, force=True)
+    assert confirmed.status == ProjectStatus.SCRIPT_CONFIRMED

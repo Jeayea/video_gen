@@ -15,10 +15,19 @@ import re
 from dataclasses import dataclass
 
 _NUM = r"[0-9０-９零〇一二两三四五六七八九十百千万]+"
+_SP = r"[ \t　]*"
+#: 英文章号：数字 / 罗马数字 / 英文数词（CHAPTER ONE、Chapter Twenty-One）
+_EN_NUM = (
+    r"(?:\d+|[IVXLC]+|(?i:(?:twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety)"
+    r"(?:[- ](?:one|two|three|four|five|six|seven|eight|nine))?"
+    r"|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen"
+    r"|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen))"
+)
+#: 「第 1 章」（数字两边带空格）、「卷一 第一章」（前面带卷号）也认；单独一行「卷一」不算章
 _HEADING_TOKEN = rf"""(
-        第{_NUM}[章回节卷集部篇]
+        (?:卷{_NUM}{_SP})?第{_SP}{_NUM}{_SP}[章回节卷集部篇]
       | 序章 | 序言 | 序幕 | 楔子 | 引子 | 尾声 | 终章 | 后记 | 番外
-      | (?:chapter|CHAPTER|Chapter)[ \t]+(?:\d+|[IVXLC]+)
+      | (?:chapter|CHAPTER|Chapter)[ \t]+{_EN_NUM}
       | Prologue | Epilogue
     )"""
 #: 标题词后面要么直接换行，要么先有分隔符（空格 / 冒号 / 顿号 / 点 / 破折号）再跟标题。
@@ -84,6 +93,11 @@ def _pack(paragraphs: list[str], limit: int) -> list[str]:
     if current:
         chunks.append("\n".join(current))
     return chunks
+
+
+def pack_paragraphs(text: str, limit: int) -> list[str]:
+    """整段文字按段落装箱（每块不超过 `limit` 字），一个字都不丢。"""
+    return _pack(_paragraphs(_normalize(text)), limit)
 
 
 def _by_headings(text: str) -> list[RawChapter]:

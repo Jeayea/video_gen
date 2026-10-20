@@ -8,6 +8,7 @@ from videogen.models.bible import Character, Prop, Setting, StoryBible
 from videogen.models.project import InputMode, Project
 from videogen.providers.llm.base import LLMMessage, LLMProvider
 from videogen.utils import region
+from videogen.utils.ids import allocate_id
 
 logger = logging.getLogger(__name__)
 
@@ -193,19 +194,17 @@ def finalize_bible(bible: StoryBible, project: Project) -> StoryBible:
     declared = region.normalize_region(project.cast_region)
     if declared:
         bible.cast_region = declared
-    # 兜底：模型偶尔漏 id，补成稳定编号
-    for i, character in enumerate(bible.characters, start=1):
-        if not character.id:
-            character.id = f"char_{i}"
-    for i, setting in enumerate(bible.settings, start=1):
-        if not setting.id:
-            setting.id = f"loc_{i}"
-    for i, prop in enumerate(bible.props, start=1):
-        if not prop.id:
-            prop.id = f"prop_{i}"
-    for i, fact in enumerate(bible.facts, start=1):
-        if not fact.id:
-            fact.id = f"fact_{i}"
+    # 兜底：模型偶尔漏 id，补上不和已有 id 撞号的编号
+    # （以前按下标补：模型给了 char_2 又漏了第 2 个的 id，补出来还是 char_2）
+    for prefix, items in (
+        ("char", bible.characters),
+        ("loc", bible.settings),
+        ("prop", bible.props),
+        ("fact", bible.facts),
+    ):
+        for item in items:
+            if not item.id:
+                item.id = allocate_id(prefix, (other.id for other in items if other.id))
     return bible
 
 

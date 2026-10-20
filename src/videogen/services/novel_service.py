@@ -46,6 +46,7 @@ from videogen.models.script import (
 from videogen.providers.llm.base import LLMMessage, LLMProvider
 from videogen.services import bible_service
 from videogen.utils.coerce import coerce_int, coerce_optional_int, ensure_str_list
+from videogen.utils.ids import allocate_id
 from videogen.utils.novel import source_fingerprint, split_chapters
 from videogen.utils.text import quote_source
 
@@ -361,11 +362,7 @@ def _add_aliases(item, names: list[str]) -> None:
 
 
 def _next_id(prefix: str, items: list) -> str:
-    used = {item.id for item in items}
-    n = 1
-    while f"{prefix}_{n}" in used:
-        n += 1
-    return f"{prefix}_{n}"
+    return allocate_id(prefix, (item.id for item in items))
 
 
 def _fmt_existing(bible: StoryBible) -> str:

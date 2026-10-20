@@ -13,6 +13,7 @@ from tests.conftest import wait_for_job
 from tests.factories import small_project
 from tests.fakes import FakeBgmLibrary, FakeLLM, FakeTTSProvider, FakeVideoProvider
 from videogen import main
+from videogen.config import get_settings
 from videogen.models.audio import AudioClip, AudioManifest
 from videogen.models.bible import Character, Fact, Setting, StoryBible
 from videogen.models.compose import ComposeSegment, SubtitleMode
@@ -298,6 +299,9 @@ def test_regenerated_knowledge_keeps_ids_and_status_of_unchanged_facts():
         old,
         max_facts=60,
     )
+    # 和 generate_knowledge_base 同一顺序：先收尾出处，再比出处有没有变
+    explainer_service.verify_sources(bible.facts, "", min_chars=8)
+    explainer_service.keep_status_if_source_unchanged(bible.facts, old)
     by_content = {f.content: f for f in bible.facts}
     assert (by_content["甲"].id, by_content["甲"].status) == ("fact_1", "confirmed")
     # 出处变了：id 不变，但要重新核对
@@ -306,6 +310,20 @@ def test_regenerated_knowledge_keeps_ids_and_status_of_unchanged_facts():
     assert by_content["丁"].id == "fact_4"
     assert "丙" not in by_content
     assert [c.name for c in bible.characters] == ["讲解员"]
+
+
+def test_regenerating_without_material_keeps_confirmed_facts():
+    """没有资料：旧出处已被收尾成「模型自述」，模型这次给的引文是空的 —— 不能因此打回已确认。"""
+    old = StoryBible(
+        facts=[Fact(id="fact_1", content="甲", source=explainer_service.SOURCE_SELF,
+                    status="confirmed")]
+    )
+    bible = explainer_service.merge_knowledge([_response(("甲", ""))], old, max_facts=60)
+    explainer_service.verify_sources(bible.facts, "", min_chars=8)
+    explainer_service.keep_status_if_source_unchanged(bible.facts, old)
+    assert (bible.facts[0].source, bible.facts[0].status) == (
+        explainer_service.SOURCE_SELF, "confirmed"
+    )
 
 
 def test_manual_edit_resets_fact_status():
@@ -687,6 +705,37 @@ async def test_storyboard_is_one_shot_per_sentence(store, make_pipeline, setting
     )
 
 
+async def test_storyboard_edits_cannot_touch_the_narration(store, make_pipeline):
+    """手工改分镜只能改画面：改旁白、把旁白挪进台词、改时长、增删镜头都拒（一句一镜不能被绕过）。"""
+    project, pipeline, _, storyboard = await _with_storyboard(store, make_pipeline)
+
+    visual = storyboard.model_copy(deep=True)
+    visual.shots[0].video_prompt = "a wide shot of a clear blue sky"
+    saved = await pipeline.update_storyboard(project.id, visual.model_dump(mode="json"))
+    assert saved.shots[0].video_prompt == "a wide shot of a clear blue sky"
+
+    def edited(change) -> dict:
+        board = saved.model_copy(deep=True)
+        change(board)
+        return board.model_dump(mode="json")
+
+    def to_dialogue(board):
+        board.shots[0].dialogue_text, board.shots[0].narration = board.shots[0].narration, None
+
+    def retime(board):
+        board.shots[0].duration_sec += 2
+
+    for change in (
+        lambda b: setattr(b.shots[0], "narration", "改过的旁白"),
+        to_dialogue,
+        lambda b: setattr(b.shots[0], "fact_refs", []),
+        retime,
+        lambda b: b.shots.pop(),
+    ):
+        with pytest.raises(PipelineError, match="科普分镜"):
+            await pipeline.update_storyboard(project.id, edited(change))
+
+
 async def test_storyboard_visual_prompt_carries_the_rules(store, make_pipeline):
     _, _, llm, _ = await _with_storyboard(store, make_pipeline)
     system = next(
@@ -983,7 +1032,9 @@ async def test_explainer_compose_trims_to_voice_and_labels(store, monkeypatch):
     for segment in report.segments:
         voice = audio.for_shot(segment.shot_id)
         # 说完 + 0.2 秒停顿：不超过文件长度 + 0.2（mock 配音尾巴可能带静音）
-        assert 0.2 < segment.duration_sec <= voice.duration_sec + 0.2 + 0.001
+        # 时长对齐到整帧（向上取整），最多多一帧
+        frame = 1 / max(1, get_settings().video_fps)
+        assert 0.2 < segment.duration_sec <= voice.duration_sec + 0.2 + frame + 0.001
     assert store.load_storyboard(project.id).shots[0].duration_sec == 3  # 分镜没被改
 
     assert report.ai_label == "本视频由 AI 生成"
@@ -1472,6 +1523,59 @@ async def test_outline_with_too_few_scenes_is_asked_again(store, make_pipeline):
     project, _, _ = await _with_bible(store, make_pipeline, stubborn)
     with pytest.raises(ValueError, match="2 次都只给了 4 场"):
         await explainer_service.generate_outline(stubborn, project, store.load_bible(project.id))
+
+
+async def test_outline_mode_follows_the_users_point_count(store, make_pipeline):
+    """用户写好的知识点：2 个就 2 场（不再要求至少 3 个），9 个也不截掉（以前超过 5 个就截）。"""
+    for points in (2, 9):
+        llm = FakeLLM()
+        llm.explainer_points = points
+        project, _, _ = await _with_bible(store, make_pipeline, llm, input_mode="outline")
+        outline = await explainer_service.generate_outline(
+            llm, project, store.load_bible(project.id)
+        )
+        assert len(outline.scenes) == points + 2
+        assert sum(1 for c in llm.calls if "科普讲解的结构编辑" in str(c[0].content)) == 1
+
+
+def test_split_sentences_keeps_attributions_quotes_and_leading_ellipsis():
+    def split(text):
+        return [s for _, s in explainer_service.split_sentences(text)]
+
+    # 引号里的感叹号不断句：「“…！”他说。」是一句（以前切成两个镜头）
+    assert split("“天是蓝的！”他说。为什么？") == ["“天是蓝的！”他说。", "为什么？"]
+    # 两段连着的引语各成一句
+    assert split("他问：“为什么？”“因为散射。”") == ["他问：“为什么？”", "“因为散射。”"]
+    # 开头的省略号不丢字（以前直接被丢掉，违背「不改用户的字」）
+    assert split("……天为什么是蓝的？") == ["……天为什么是蓝的？"]
+    # 英文按句点切，小数点不切（以前英文整段一个镜头）
+    assert split("Why is the sky blue? It is 3.14 times. Done.") == [
+        "Why is the sky blue?", "It is 3.14 times.", "Done."
+    ]
+    # 括号尾巴并进前一句（老行为）
+    assert split("天为什么是蓝的？（先想一想）") == ["天为什么是蓝的？（先想一想）"]
+
+
+def test_source_material_chunks_keep_every_word_and_use_material_guard():
+    """参考资料切块不丢字（以前复用小说切章，标题前的短引言会被丢掉），提示语也不再叫它「小说原文」。"""
+    from videogen.utils.text import MATERIAL_GUARD, quote_source
+
+    material = "导语：本文整理自医生访谈。\n\n第一章 喝水\n" + "每天要喝够水。" * 20
+    chunks = explainer_service.split_source(material, 6000)
+    assert "导语：本文整理自医生访谈。" in "".join(chunks)
+    quoted = quote_source("资料", guard=MATERIAL_GUARD)
+    assert "参考资料" in quoted and "小说原文" not in quoted
+
+
+def test_quote_matching_normalizes_full_width_and_case():
+    material = "资料：男性每天约１５００毫升，女性更少。İstanbul has many people living there."
+    state, real = explainer_service.match_quote("男性每天约1500毫升", material, min_chars=8)
+    assert (state, real) == ("ok", "男性每天约１５００毫升")
+    # 展开成两个字的大写字母不能让切回原文的位置错位（以前多带一截尾巴）
+    state, real = explainer_service.match_quote(
+        "istanbul has many people", material, min_chars=8
+    )
+    assert (state, real) == ("ok", "İstanbul has many people")
 
 
 def test_prompts_pin_down_container_openings_and_contact_points():

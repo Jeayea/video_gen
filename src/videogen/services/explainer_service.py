@@ -7,11 +7,13 @@
 from __future__ import annotations
 
 import difflib
+import functools
 import hashlib
 import json
 import logging
 import math
 import re
+import unicodedata
 from collections import Counter
 from collections.abc import Callable
 
@@ -43,8 +45,8 @@ from videogen.models.storyboard import Shot, Storyboard
 from videogen.providers.llm.base import LLMMessage, LLMProvider
 from videogen.services import bible_service, script_service, storyboard_service
 from videogen.utils.duration import SPEECH_CHARS_PER_SEC, apply_duration_budget, speech_seconds
-from videogen.utils.novel import source_fingerprint, split_chapters
-from videogen.utils.text import quote_source
+from videogen.utils.novel import pack_paragraphs, source_fingerprint
+from videogen.utils.text import MATERIAL_GUARD, quote_source
 
 logger = logging.getLogger(__name__)
 
@@ -320,7 +322,7 @@ def _knowledge_prompt(
     ]
     if chunk is not None:
         part = f"（第 {index}/{total} 块，只从这一块里取事实）" if total > 1 else ""
-        lines += ["", f"## 参考资料{part}", quote_source(chunk)]
+        lines += ["", f"## 参考资料{part}", quote_source(chunk, guard=MATERIAL_GUARD)]
     lines += ["", _source_rule(project, chunk is not None, min_chars)]
     constraint = bible_service.constraint_block(project)
     if constraint:
@@ -336,9 +338,12 @@ def source_fingerprint_for(project: Project) -> str:
 
 
 def split_source(text: str, max_chars: int) -> list[str]:
-    """参考资料按段落切块（复用小说切章：有章节标题按标题切，超长再按段落拆）。"""
-    size = max(500, int(max_chars))
-    return [c.text for c in split_chapters(text, chunk_chars=size, max_chars=size)]
+    """参考资料按段落装箱切块（不认章节标题）。
+
+    以前复用小说切章：标题前不到 200 字的引言、正文不到 20 字的「章」会被丢掉 ——
+    对小说合理（那是目录 / 题记），对参考资料就是丢了内容。
+    """
+    return pack_paragraphs(text, max(500, int(max_chars)))
 
 
 async def generate_knowledge_base(
@@ -388,6 +393,7 @@ async def generate_knowledge_base(
 
     bible = merge_knowledge(results, previous, max_facts=settings.explainer_max_facts)
     verify_sources(bible.facts, material, min_chars=min_chars)
+    keep_status_if_source_unchanged(bible.facts, previous)
     if not bible.facts:
         raise ValueError("知识底稿没有生成任何事实")
     logger.info(
@@ -446,11 +452,12 @@ def merge_knowledge(
             source = _compact(item.source)
             kept = old_facts.get(content)
             if kept is not None:
-                # 内容一字不差：沿用 id；出处也没变才沿用核对状态
-                status = kept.status if _compact(kept.source) == source else "unverified"
+                # 内容一字不差：沿用 id 和核对状态。出处有没有变要等 `verify_sources`
+                # 把引文收尾（换成资料原句 / 标「模型自述」）之后再比
+                # （`keep_status_if_source_unchanged`）
                 facts.append(
                     Fact(id=kept.id, content=content, type=item.type or kept.type,
-                         source=source, status=status)
+                         source=source, status=kept.status)
                 )
                 continue
             while f"fact_{number}" in used:
@@ -526,15 +533,22 @@ def reset_changed_facts(old: StoryBible | None, new: StoryBible) -> list[str]:
 # ── 出处校验（确定性，$0）────────────────────────────
 
 
-def _normalize_with_map(text: str) -> tuple[str, list[int]]:
-    """去掉空白和标点（只留字母、数字、汉字），并记下每个字在原文里的位置。"""
+@functools.lru_cache(maxsize=8)
+def _normalize_with_map(text: str) -> tuple[str, tuple[int, ...]]:
+    """去掉空白和标点（只留字母、数字、汉字），并记下每个字在原文里的位置。
+
+    逐字做 NFKC + casefold：全角数字 / 字母（「１５００」）和模型引文里的半角写法对得上；
+    一个字展开成几个字时（`İ` → `i̇`）每个都记原来那个位置，切回原文时不会错位。
+    缓存：同一份资料要和每条事实比一次，以前每条都重新归一化整份资料。
+    """
     chars: list[str] = []
     index: list[int] = []
     for i, ch in enumerate(text):
-        if ch.isalnum():
-            chars.append(ch.lower())
-            index.append(i)
-    return "".join(chars), index
+        for norm in unicodedata.normalize("NFKC", ch).casefold():
+            if norm.isalnum():
+                chars.append(norm)
+                index.append(i)
+    return "".join(chars), tuple(index)
 
 
 def match_quote(quote: str, material: str, *, min_chars: int) -> tuple[str, str]:
@@ -604,6 +618,19 @@ def verify_sources(facts: list[Fact], material: str, *, min_chars: int) -> None:
             fact.source = SOURCE_NOT_FOUND
         else:
             fact.source = source
+
+
+def keep_status_if_source_unchanged(facts: list[Fact], previous: StoryBible | None) -> None:
+    """重新生成底稿后：沿用了 id 的事实，出处（收尾之后）变了才退回 unverified。
+
+    以前在收尾之前比：旧出处已经是「模型自述」/ 资料原句，新出处是模型这次的原始引文
+    （空串 / 改过字的引文），两边永远不等 —— 没有资料的项目重新生成一次，所有「已确认」都被打回。
+    """
+    old = {f.id: f for f in (previous.facts if previous else [])}
+    for fact in facts:
+        prior = old.get(fact.id)
+        if prior is not None and _compact(prior.source) != _compact(fact.source):
+            fact.status = "unverified"
 
 
 def source_state(fact: Fact, material: str, *, min_chars: int) -> str:
@@ -690,7 +717,16 @@ async def generate_outline(
         LLMMessage(role="system", content=OUTLINE_SYSTEM),
         LLMMessage(role="user", content="\n".join(lines)),
     ]
-    need = MIN_POINTS + 2
+    # 用户自己写了知识点：一个知识点一场、不增不删，只要求「提问 + 至少一个知识点 + 小结」。
+    # 以前一律要求至少 MIN_POINTS 个知识点：用户只写了 2 个时，要么报错、
+    # 要么逼模型违背用户的大纲去拆；超过 MAX_POINTS 个时多出来的被悄悄截掉
+    user_points = project.input_mode == InputMode.OUTLINE
+    need = 3 if user_points else MIN_POINTS + 2
+    split_hint = (
+        "请按用户写好的知识点逐个成场，补上开场提问和小结。"
+        if user_points
+        else "请把知识点拆开，重写完整大纲。"
+    )
     raw: list[dict] = []
     # 场数不够时把要求告诉模型再要一次：同一份输入 gemini-3.8-flash 有时给 5 场、有时给 4 场
     for attempt in range(OUTLINE_ATTEMPTS):
@@ -705,16 +741,15 @@ async def generate_outline(
             LLMMessage(
                 role="user",
                 content=f"只有 {len(raw)} 场，不够：至少要 {need} 场"
-                f"（1 场开场提问 + 至少 {MIN_POINTS} 场知识点 + 1 场小结）。"
-                "请把知识点拆开，重写完整大纲。",
+                f"（1 场开场提问 + 至少 {need - 2} 场知识点 + 1 场小结）。" + split_hint,
             ),
         ]
     else:
         raise ValueError(
-            f"科普大纲至少要 {need} 场（提问 + {MIN_POINTS} 个知识点 + 小结），"
+            f"科普大纲至少要 {need} 场（提问 + {need - 2} 个知识点 + 小结），"
             f"模型 {OUTLINE_ATTEMPTS} 次都只给了 {len(raw)} 场"
         )
-    if len(raw) > MAX_POINTS + 2:
+    if not user_points and len(raw) > MAX_POINTS + 2:
         raw = [raw[0], *raw[1 : MAX_POINTS + 1], raw[-1]]
     budget = apply_duration_budget(project.target_duration_sec, len(raw), MIN_SCENE_DURATION_SEC)
     return ScriptOutline(
@@ -806,7 +841,7 @@ async def generate_scene(
     ]
     if material:
         excerpt = material[: settings.explainer_source_max_chars]
-        parts.append(f"\n## 参考资料\n{quote_source(excerpt)}")
+        parts.append(f"\n## 参考资料\n{quote_source(excerpt, guard=MATERIAL_GUARD)}")
     if revision is not None:
         said = "\n".join(f"  {d.line}" for d in revision.dialogue) or "  （无）"
         note = " ".join(str(feedback or "").split()) or "整体重写一版，讲得更清楚"
@@ -900,9 +935,62 @@ ANNOTATE_SYSTEM = """你是科普文稿标注员。用户已经写好了一支�
 }
 只输出 JSON。"""
 
-_SENTENCE_RE = re.compile(r"[^。！？!?…]+[。！？!?…”」』]*")
+_TERMINATORS = frozenset("。！？!?…")
+_CLOSERS = frozenset("”」』’\"')）)]")
+_QUOTE_PAIRS = {"“": "”", "「": "」", "『": "』"}
 #: 句末标点后面整段都在括号里的片段（「天为什么是蓝的？（先想一想）」）：属于前一句，不单独成句
 _BRACKET_TAIL_RE = re.compile(r"^\s*[（(][^）)]*[）)]\s*$")
+
+
+def _ends_sentence(text: str, i: int) -> bool:
+    """`text[i]` 是不是句末标点（英文句点要后面是空白 / 结尾、前面不是数字：3.14 不切）。"""
+    ch = text[i]
+    if ch in _TERMINATORS:
+        return True
+    if ch == ".":
+        before = text[i - 1] if i else ""
+        after = text[i + 1] if i + 1 < len(text) else ""
+        return not before.isdigit() and (not after or after.isspace())
+    return False
+
+
+def _split_paragraph(paragraph: str) -> list[str]:
+    """按句末标点切，引号里的句末标点不切（「“天是蓝的！”他说。」是一句）。
+
+    句子原样拼回去就是原段落（只差句间空白）：开头的「……」这类标点并进后一句，不丢字。
+    """
+    sentences: list[str] = []
+    quotes: list[str] = []
+    start = i = 0
+    while i < len(paragraph):
+        ch = paragraph[i]
+        if ch in _QUOTE_PAIRS:
+            quotes.append(_QUOTE_PAIRS[ch])
+        elif quotes and ch == quotes[-1]:
+            quotes.pop()
+            # 引号里是一整句、引号外紧跟的不是正文（下一句引语 / 空白 / 段尾）：句子在这里结束
+            after = paragraph[i + 1] if i + 1 < len(paragraph) else ""
+            prev = paragraph[i - 1] if i else ""
+            whole_quote = not after or after.isspace() or after in _QUOTE_PAIRS
+            if not quotes and prev in _TERMINATORS and whole_quote:
+                sentences.append(paragraph[start : i + 1])
+                start = i + 1
+        elif not quotes and _ends_sentence(paragraph, i):
+            end = i + 1
+            while end < len(paragraph) and (
+                paragraph[end] in _TERMINATORS or paragraph[end] in _CLOSERS
+            ):
+                end += 1
+            piece = paragraph[start:end]
+            if any(c not in _TERMINATORS and c not in _CLOSERS and not c.isspace() for c in piece):
+                sentences.append(piece)
+                start = end
+            i = end
+            continue
+        i += 1
+    if paragraph[start:].strip():
+        sentences.append(paragraph[start:])
+    return sentences
 
 
 def split_sentences(text: str) -> list[tuple[int, str]]:
@@ -911,7 +999,7 @@ def split_sentences(text: str) -> list[tuple[int, str]]:
     paragraphs = [p for p in re.split(r"\n\s*\n|\n", text or "") if p.strip()]
     for index, paragraph in enumerate(paragraphs):
         sentences: list[str] = []
-        for piece in _SENTENCE_RE.findall(paragraph):
+        for piece in _split_paragraph(paragraph):
             if sentences and _BRACKET_TAIL_RE.match(piece):
                 sentences[-1] += piece
             elif piece.strip():
