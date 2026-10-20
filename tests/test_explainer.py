@@ -1554,6 +1554,11 @@ def test_split_sentences_keeps_attributions_quotes_and_leading_ellipsis():
     ]
     # 括号尾巴并进前一句（老行为）
     assert split("天为什么是蓝的？（先想一想）") == ["天为什么是蓝的？（先想一想）"]
+    # 漏了闭引号：不当引号，照常断句（否则从开引号到段尾并成一个超长镜头）
+    assert split("他说“天是蓝的。其实不是。阳光被散射了。") == [
+        "他说“天是蓝的。", "其实不是。", "阳光被散射了。"
+    ]
+    assert split("“天是蓝的。“其实不是。") == ["“天是蓝的。", "“其实不是。"]
 
 
 def test_source_material_chunks_keep_every_word_and_use_material_guard():

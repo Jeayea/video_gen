@@ -965,7 +965,10 @@ def _split_paragraph(paragraph: str) -> list[str]:
     while i < len(paragraph):
         ch = paragraph[i]
         if ch in _QUOTE_PAIRS:
-            quotes.append(_QUOTE_PAIRS[ch])
+            # 后面没有配对的闭引号（漏打 / 打成了另一个开引号）就不当引号：
+            # 否则从这里到段尾都切不开，整段并成一句 = 一个超长镜头
+            if _QUOTE_PAIRS[ch] in paragraph[i + 1 :]:
+                quotes.append(_QUOTE_PAIRS[ch])
         elif quotes and ch == quotes[-1]:
             quotes.pop()
             # 引号里是一整句、引号外紧跟的不是正文（下一句引语 / 空白 / 段尾）：句子在这里结束

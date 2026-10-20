@@ -289,6 +289,34 @@ def test_unreported_units_are_estimated_not_booked_at_zero(store):
     assert store.load_cost_report(project.id).total_usd == pytest.approx(1.8)
 
 
+@pytest.mark.parametrize("with_other_unit", [False, True])
+def test_resplit_segment_is_not_billed_again(store, with_other_unit):
+    """整段买到、切分失败（扣费挂在 FAILED 的第一个镜头上、当场记了账），下一轮重切成功：
+    段里其余镜头是第一次就绪，但这段的钱已经记过了，不能再按单价估一遍。"""
+    from videogen.models.video import ClipStatus, VideoClip, VideoManifest
+
+    pipeline = build(store)
+    project = Project(title="重切不重记")
+    store.save_project(project)
+    clips = [
+        VideoClip(shot_id="a1", segment_id="seg_a", status=ClipStatus.READY,
+                  duration_sec=5, cost_usd=1.3, cost_recorded=True),
+        VideoClip(shot_id="a2", segment_id="seg_a", status=ClipStatus.READY, duration_sec=5),
+    ]
+    if with_other_unit:
+        clips.append(VideoClip(shot_id="b1", status=ClipStatus.READY, duration_sec=5,
+                               cost_usd=0.65))
+    manifest = VideoManifest(provider="openrouter", model="m", clips=clips)
+    recorded = pipeline._record_video_cost(
+        project.id, manifest, price_per_second=0.13, settings=get_settings()
+    )
+    expected = 0.65 if with_other_unit else 0.0
+    assert recorded == pytest.approx(expected)
+    report = store.load_cost_report(project.id)
+    assert (report.total_usd if report else 0.0) == pytest.approx(expected)
+    assert all(c.cost_recorded for c in manifest.clips)
+
+
 @pytest.mark.asyncio
 async def test_bible_item_rewrite_keeps_references_registered_meanwhile(store, monkeypatch):
     """重写一个圣经条目要等 LLM 几秒：这期间别的角色刚登记的定妆照不能被整份写回抹掉。"""

@@ -2371,19 +2371,17 @@ class Pipeline:
             return 0.0
         actual = round(sum(c.cost_usd for c in unrecorded), 6)
         seconds = sum(c.duration_sec for c in unrecorded)
-        if actual > 0:
-            # 段落的扣费只记在段内第一个镜头上，所以按「单元」（段 / 单镜）看有没有实报：
-            # 有实报的单元按实报；没实报的单元按单价 × 秒数估。以前只要有一条实报，
-            # 整批都按实报合计入账，没实报的那几段记成 $0
-            units: dict[str, list] = {}
-            for clip in unrecorded:
-                units.setdefault(clip.segment_id or clip.shot_id, []).append(clip)
-            unreported = sum(
-                c.duration_sec
-                for group in units.values()
-                if not any(c.cost_usd > 0 for c in group)
-                for c in group
-            )
+        # 段落的扣费只记在段内第一个镜头上，所以按「单元」（段 / 单镜）看有没有实报，
+        # 而且要看整份清单：整段切分失败时第一个镜头当场记过账，重切成功后其余镜头才就绪，
+        # 它们的钱已经在那一笔里了。有实报的单元按实报，没实报的单元按单价 × 秒数估
+        # （以前只要有一条实报，整批按实报合计，没实报的那几段记成 $0）
+        def unit_of(clip) -> str:
+            return clip.segment_id or clip.shot_id
+
+        paid_units = {unit_of(c) for c in manifest.clips if c.cost_usd > 0}
+        explicit = any(unit_of(c) in paid_units for c in unrecorded)
+        if explicit:
+            unreported = sum(c.duration_sec for c in unrecorded if unit_of(c) not in paid_units)
             if unreported:
                 unit_price = (
                     price_per_second
@@ -2401,18 +2399,19 @@ class Pipeline:
                     expected,
                     manifest.model,
                 )
-        cost_service.record(
-            self.store,
-            project_id,
-            cost_service.video_entry(
-                manifest.provider,
-                manifest.model or settings.video_provider,
-                seconds,
-                len(unrecorded),
-                price_per_second=price_per_second,
-                actual_usd=actual if actual > 0 else None,
-            ),
-        )
+        if not (explicit and actual <= 0):  # 全是已记过账的段里的镜头：只打标记
+            cost_service.record(
+                self.store,
+                project_id,
+                cost_service.video_entry(
+                    manifest.provider,
+                    manifest.model or settings.video_provider,
+                    seconds,
+                    len(unrecorded),
+                    price_per_second=price_per_second,
+                    actual_usd=actual if explicit else None,
+                ),
+            )
         for clip in unrecorded:
             clip.cost_recorded = True
         return actual

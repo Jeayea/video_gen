@@ -1757,6 +1757,13 @@ reads / written / sign / displays / characters 这类词后面**的引号中文�
 | 分段复用标记不含配音文件身份 | 标记里加配音文件的大小 + 修改时间 | `test_segment_marker_changes_when_the_voice_file_is_redone` |
 | 密钥扫描只认 3 种前缀，没有提交前检查 | `test_secrets.py` 加 Anthropic / AWS / Google / Slack / 私钥块；新增 `tools/hooks/pre-commit`（ruff + gitleaks，没装 gitleaks 时跑自带扫描）。全部提交历史按这些形态扫过一遍：0 命中 | — |
 
+**提交前自查又找到的两处**
+
+| 问题 | 修法 | 用例 |
+|---|---|---|
+| 整段切分失败时，扣费挂在第一个镜头上、当场记了账；下一轮重切成功后，段里其余镜头第一次就绪、没有扣费，记账时又按单价 × 秒数估了一笔（纯重切时 `main` 上就有；上面「没实报的单元按单价估」让它和别的段混在一起时也会发生） | 「这个单元有没有实报」看整份清单，不只看这一批没记账的；全是已记账单元里的镜头时只打标记、不记账 | `test_resplit_segment_is_not_billed_again` |
+| 新的逐字切句：开引号没有配对的闭引号（漏打、打成另一个开引号）时，从开引号到段尾都不断句，整段并成一个超长镜头（旧正则不会） | 后面没有配对闭引号的开引号不当引号 | `test_split_sentences_keeps_*` |
+
 **行为变化**：科普资料切块的边界变了，已经抽到一半的底稿续跑时会按新切法重抽（几分钱 LLM）；
 preflight 不再把「就绪的占位片段」算待生成（和真正生成一致：mock 缺 ffmpeg 时本来就不会重生成）。
 
