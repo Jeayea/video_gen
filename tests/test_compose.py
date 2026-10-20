@@ -19,7 +19,7 @@ from videogen.orchestrator import pipeline as pipeline_module
 from videogen.orchestrator.pipeline import Pipeline, PipelineError
 from videogen.providers.tts.mock import MockTTSProvider
 from videogen.providers.video.mock import MockVideoProvider
-from videogen.services import compose_service, subtitle_service
+from videogen.services import compose_service, music_service, subtitle_service
 from videogen.utils.av_sync import check_av_sync
 from videogen.utils.ffmpeg import (
     ffmpeg_available,
@@ -510,6 +510,28 @@ async def test_compose_failure_settles_back_to_audio_ready(store, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_compose_failure_keeps_render_caches(store, monkeypatch):
+    """合成失败只删半截成片：分段 / 口型 / 配乐缓存留着，重试不用全部重渲。"""
+    pipeline = real_pipeline(store)
+    project = await fake_media_project(store)
+    output = store.output_dir(project.id)
+    (output / "final.mp4").write_bytes(b"half")
+    (output / "subtitles.srt").write_text("1", encoding="utf-8")
+    for cache in ("segments", "lipsynced", "music"):
+        (output / cache).mkdir(exist_ok=True)
+        (output / cache / "x.bin").write_bytes(b"cached")
+    monkeypatch.setattr(pipeline_module.compose_service, "compose", SlowCompose(delay=0, fail=True))
+
+    job = await pipeline.start_compose(project.id)
+    assert (await wait_for_job(pipeline, job.id)).status.value == "failed"
+
+    assert not (output / "final.mp4").exists()
+    assert not (output / "subtitles.srt").exists()
+    for cache in ("segments", "lipsynced", "music"):
+        assert (output / cache / "x.bin").is_file()
+
+
+@pytest.mark.asyncio
 async def test_compose_status_shape(store, monkeypatch):
     pipeline = real_pipeline(store)
     project = await fake_media_project(store)
@@ -685,6 +707,35 @@ async def test_speed_change_actually_burns_subtitles(store):
         pytest.skip("本机没有带 libass 的 ffmpeg")
     assert report.subtitle_mode_effective == SubtitleMode.BURN
     assert report.subtitle_style == "soft"
+
+
+@requires_ffmpeg
+@pytest.mark.asyncio
+async def test_ai_label_keeps_its_length_after_speed_change(store, monkeypatch):
+    """标识在变速前烧进画面：2 倍速时要按 6 秒烧，观众看到的才是 3 秒（以前只剩 1.5 秒）。"""
+    from videogen.services import explainer_service
+
+    pipeline = real_pipeline(store)
+    project = await prepare_media(store, pipeline, small_project(store, shots=2))
+    monkeypatch.setattr(
+        compose_service.explainer_service, "ai_label_text", lambda *_a, **_k: "本视频由 AI 生成"
+    )
+    seen: dict = {}
+    original = compose_service.subtitle_service.build_ass
+
+    def spy(*args, **kwargs):
+        seen["label_sec"] = kwargs.get("label_sec")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(compose_service.subtitle_service, "build_ass", spy)
+    job = await pipeline.start_compose(
+        project.id, overrides={"compose_subtitle_mode": "burn", "compose_speed": 2.0}
+    )
+    finished = await wait_for_job(pipeline, job.id, timeout=180)
+    if "label_sec" not in seen:
+        pytest.skip("本机没有带 libass 的 ffmpeg")
+    assert finished.status.value == "succeeded", finished.error
+    assert seen["label_sec"] == pytest.approx(explainer_service.AI_LABEL_SEC * 2)
 
 
 # ── 响度（EBU R128）────────────────────────────────────
@@ -1533,3 +1584,69 @@ def test_apply_speed_pins_exact_duration():
     # 帧率必须显式给：否则 setpts 改完时间戳会被 CFR 转换吃掉
     assert args[args.index("-r") + 1] == "24"
     assert "setpts=PTS/2" in " ".join(args)
+
+
+@pytest.mark.asyncio
+async def test_music_is_planned_on_the_compose_timeline(store, monkeypatch):
+    """配乐拿到的是成片里每个镜头的最终时长（对齐到整帧），不是分镜整数秒。"""
+    pipeline = real_pipeline(store)
+    project = await fake_media_project(store)
+    seen: dict = {}
+
+    async def fake_resolve(**kwargs):
+        seen["durations"] = kwargs.get("durations")
+        return music_service.MusicOutcome(ok=True, engine="none")
+
+    monkeypatch.setattr(pipeline_module.music_service, "resolve_music", fake_resolve)
+    monkeypatch.setattr(pipeline_module.compose_service, "compose", SlowCompose(delay=0))
+    job = await pipeline.start_compose(project.id)
+    assert (await wait_for_job(pipeline, job.id)).status.value == "succeeded"
+
+    durations = seen["durations"]
+    shots = store.load_storyboard(project.id).shots
+    assert set(durations) == {shot.id for shot in shots}
+    fps = get_settings().video_fps
+    for value in durations.values():
+        assert abs(value * fps - round(value * fps)) < 1e-6  # 整帧
+
+
+@pytest.mark.asyncio
+async def test_plan_timeline_snaps_durations_up_to_whole_frames(tmp_path, monkeypatch):
+    """段落切出来的镜头按实长走（不是整帧）：每段向上取整到整帧，拼接后不累积漂移。"""
+    settings = get_settings()
+    monkeypatch.setattr(settings, "video_fps", 24)
+    monkeypatch.setattr(settings, "compose_follow_clip_length", True)
+    clips_dir = tmp_path / "clips"
+    clips_dir.mkdir()
+    shots, clips = [], []
+    for index in range(1, 4):
+        (clips_dir / f"s{index}.mp4").write_bytes(b"x")
+        shots.append(Shot(id=f"s{index}", scene_id="sc", shot_no=index, duration_sec=3))
+        clips.append(
+            VideoClip(
+                shot_id=f"s{index}", status=ClipStatus.READY, media_kind=MediaKind.VIDEO,
+                path=f"clips/s{index}.mp4",
+            )
+        )
+
+    async def real_lengths(segments, *_args, **_kwargs):
+        for segment, length in zip(segments, (1.03, 2.5, 4.0), strict=True):
+            segment.duration_sec = length
+
+    monkeypatch.setattr(compose_service, "_follow_clip_lengths", real_lengths)
+    segments = await compose_service.plan_timeline(
+        Project(title="t"), Storyboard(shots=shots), VideoManifest(clips=clips), None,
+        project_dir=tmp_path, settings=settings,
+    )
+    assert [s.duration_sec for s in segments] == [round(25 / 24, 6), 2.5, 4.0]
+
+
+def test_segment_marker_changes_when_the_voice_file_is_redone(tmp_path):
+    """分段复用标记里带上配音文件的身份：同名配音重配过（参数没变）也要重渲那一段。"""
+    voice = tmp_path / "scene_1_shot_1.mp3"
+    voice.write_bytes(b"first take")
+    before = compose_service._file_stamp(voice)
+    voice.write_bytes(b"second, longer take")
+    assert compose_service._file_stamp(voice) != before
+    assert compose_service._file_stamp(None) == "none"
+    assert compose_service._file_stamp(tmp_path / "gone.mp3") == "missing"

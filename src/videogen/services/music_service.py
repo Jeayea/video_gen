@@ -208,9 +208,12 @@ async def resolve_music(
     library: BgmLibrary | None = None,
     request: MusicRequest | None = None,
     llm: LLMProvider | None = None,
+    durations: dict[str, float] | None = None,
 ) -> MusicOutcome:
     """按引擎决定这次用什么音乐（选曲 / 现写 / 外部模型）。
 
+    `durations` 是成片里每个镜头的最终时长（`compose_service.plan_timeline`）：给了就按它写谱，
+    不在里面的镜头（没有可用片段）不进配乐；不给就按分镜秒数（老行为）。
     永远不抛异常：失败就是 `ok=False` + `note`，让调用方决定是告警还是报错。
     """
     settings = settings or get_settings()
@@ -257,6 +260,9 @@ async def resolve_music(
             outcome.elapsed_sec = round(time.time() - started, 2)
             return outcome
 
+    if durations is not None:
+        storyboard = _timed_storyboard(storyboard, durations)
+
     if mode == "cli":
         outcome = await _generate_cli(
             project=project,
@@ -284,6 +290,16 @@ async def resolve_music(
     )
     outcome.elapsed_sec = round(time.time() - started, 2)
     return outcome
+
+
+def _timed_storyboard(storyboard: Storyboard, durations: dict[str, float]) -> Storyboard:
+    """换成成片里的真实时长（镜头时长在分镜里是整数秒，合成会改）。只用来写谱，不落盘。"""
+    shots = [
+        shot.model_copy(update={"duration_sec": durations[shot.id]})
+        for shot in storyboard.shots
+        if shot.id in durations
+    ]
+    return storyboard.model_copy(update={"shots": shots})
 
 
 def _resolve_engine(project: Project, settings: Settings, request: MusicRequest) -> str:
@@ -339,7 +355,11 @@ async def _generate_local(
 
     speech = _speech_windows(shots, audio_manifest)
     motions = await _collect_motions(
-        shots, video_manifest, frames_dir, fps=settings.audio_motion_rate
+        shots,
+        video_manifest,
+        frames_dir,
+        project_dir=output_dir.parent,
+        fps=settings.audio_motion_rate,
     )
 
     brief: list[dict[str, Any]] | None = None
@@ -522,17 +542,24 @@ async def _collect_motions(
     video_manifest: VideoManifest | None,
     frames_dir: Path | None,
     *,
+    project_dir: Path,
     fps: float = 6.0,
 ) -> dict[str, Any]:
-    """每个镜头的画面运动实测（与配音文案共用同一份缓存，算过就不再算）。"""
+    """每个镜头的画面运动实测（与配音文案共用同一份缓存，算过就不再算）。
+
+    清单里的片段路径是相对项目目录的（`clips/x.mp4`），必须拼上项目目录再判断存在：
+    以前直接 `Path(clip.path).is_file()`，按进程工作目录解析永远找不到，
+    配乐从来没拿到过运动数据（「动作爆发给重音」一直没生效）。
+    """
     result: dict[str, Any] = {}
     if not ffmpeg_available():
         return result
     clips: dict[str, Path] = {}
     for clip in getattr(video_manifest, "ready_clips", []) or []:
         shot_id = str(getattr(clip, "shot_id", ""))
-        path = Path(str(getattr(clip, "path", "") or ""))
-        if shot_id and path.is_file():
+        raw = str(getattr(clip, "path", "") or "")
+        path = project_dir / raw if raw else None
+        if shot_id and path is not None and path.is_file():
             clips[shot_id] = path
     if not clips:
         return result
@@ -702,7 +729,11 @@ async def _generate_cli(
         shots=shots,
         speech_windows=_speech_windows(shots, audio_manifest),
         motions=await _collect_motions(
-            shots, video_manifest, frames_dir, fps=settings.audio_motion_rate
+            shots,
+            video_manifest,
+            frames_dir,
+            project_dir=output_dir.parent,
+            fps=settings.audio_motion_rate,
         ),
         duration_sec=duration,
         seed=seed,

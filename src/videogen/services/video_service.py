@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import glob
+import hashlib
 import logging
 import os
 import re
@@ -50,6 +52,21 @@ def _with_pending_hint(message: str) -> str:
 
 #: 老版本的错误文案：轮询超时 / 已生成但下载失败（都带 `job=<id>`）
 _LEGACY_PENDING_RE = re.compile(r"(?:生成超时|已生成但下载失败)（job=([\w.-]+)")
+
+
+def _unsplit_for_lack_of_ffmpeg(clip: VideoClip | None) -> bool:
+    """老版本：真买到的整段因为本机没有 ffmpeg 被标成「就绪 + 占位」。
+
+    装好 ffmpeg 后当成待处理：续跑时复用整段文件直接重切，不重买。
+    """
+    return (
+        clip is not None
+        and clip.status == ClipStatus.READY
+        and clip.media_kind == MediaKind.PLACEHOLDER
+        and bool(clip.segment_path)
+        and (clip.error or "").startswith("没有 ffmpeg")
+        and ffmpeg_available()
+    )
 
 
 def legacy_pending_job(clip: VideoClip) -> str:
@@ -155,16 +172,7 @@ async def generate_clips(
     # 段落分镜：同一段的镜头一次生成；没编段的镜头各自成段（= 原来的单镜生成）
     todo: list[Segment] = []
     for segment in segments_of(storyboard):
-        stale = False
-        for shot in segment.shots:
-            clip = manifest.get(shot.id)
-            if not (
-                clip is not None
-                and clip.status == ClipStatus.READY
-                and _clip_file_exists(project_dir, clip)
-            ):
-                stale = True
-        if not stale:
+        if not unit_needs_generation(segment, manifest, project_dir):
             continue  # 续跑：已经生成好的不重复烧额度
         for shot in segment.shots:
             clip = manifest.get(shot.id) or VideoClip(shot_id=shot.id, scene_id=shot.scene_id)
@@ -293,12 +301,14 @@ async def _generate_one(
 
     output = clips_dir / f"{shot.id}.mp4"
     unit = segment or Segment(id=shot.id, scene_id=shot.scene_id, shots=[shot])
+    unit_key = unit_fingerprint(shot.id, [shot])
     references, shot_seed = resolve_references(shot, bible, project_dir, provider, seed)
+    resume = _resume_job_id(manifest, [clip], unit_key, shot.id)
     first_frame = None
     if unit.id in manifest.reference_waived:
         logger.warning("镜头 %s：用户已同意不带参考图 / 首帧生成", shot.id)
         references = []
-    elif keyframer is not None:
+    elif keyframer is not None and not resume:  # 续查已提交的任务不用首帧（同段落）
         try:
             first_frame = await keyframer.first_frame(unit, provider, previous=previous)
         except KeyframeUnavailable as exc:
@@ -310,7 +320,8 @@ async def _generate_one(
     request = VideoRequest(
         shot_id=shot.id,
         scene_id=shot.scene_id,
-        prompt=with_opening_frame_note(build_prompt(shot, project, bible), first_frame),
+        prompt=(clip.prompt if resume and clip.prompt else None)
+        or with_opening_frame_note(build_prompt(shot, project, bible), first_frame),
         still_prompt=(
             still_prompt(shot, project, bible) if getattr(provider, "draws_stills", False) else ""
         ),
@@ -320,11 +331,12 @@ async def _generate_one(
         reference_images=references,
         first_frame=first_frame,
         seed=shot_seed,
-        resume_job_id=clip.pending_job_id,
+        resume_job_id=resume,
     )
 
     def submitted(job_id: str) -> None:
         clip.pending_job_id = job_id
+        clip.job_unit = unit_key
         manifest.upsert(clip)
         _emit(on_progress, manifest)
 
@@ -447,14 +459,23 @@ async def _generate_segment(
         return
     output = clips_dir / "segments" / f"{segment.id}.mp4"
     output.parent.mkdir(parents=True, exist_ok=True)
+    unit_key = unit_fingerprint(segment.id, segment.shots)
     references, segment_seed = resolve_segment_references(
         segment.shots, bible, project_dir, provider, seed, settings=settings
+    )
+    resume = _resume_job_id(manifest, clips, unit_key, segment.id)
+    # 上一轮整段已经买到、只是没切成功：直接重切，不重新提交
+    reuse = (
+        _resumable(manifest, clips, unit_key, "segment_path")
+        and (Path(project_dir) / clips[0].segment_path).is_file()
     )
     first_frame = None
     if segment.id in manifest.reference_waived:
         logger.warning("段落 %s：用户已同意不带参考图 / 首帧生成", segment.id)
         references = []
-    elif keyframer is not None:
+    elif keyframer is not None and not (resume or reuse):
+        # 续查已提交的任务 / 复用已买到的整段不用首帧：不画
+        # （白花 $0.04，预算刚好用完时还会挡住免费的续查）
         try:
             first_frame = await keyframer.first_frame(segment, provider, previous=previous)
         except KeyframeUnavailable as exc:
@@ -467,7 +488,9 @@ async def _generate_segment(
     request = VideoRequest(
         shot_id=segment.id,
         scene_id=segment.scene_id,
-        prompt=with_opening_frame_note(
+        # 续查时 prompt 不会再发一遍：沿用提交时记下的那份（原声旁白按它判断）
+        prompt=(clips[0].prompt if resume and clips[0].prompt else None)
+        or with_opening_frame_note(
             build_segment_prompt(segment.shots, project, bible, settings=settings),
             first_frame,
             settings=settings,
@@ -478,7 +501,7 @@ async def _generate_segment(
         reference_images=references,
         first_frame=first_frame,
         seed=segment_seed,
-        resume_job_id=clips[0].pending_job_id,
+        resume_job_id=resume,
     )
 
     def update(**fields: object) -> None:
@@ -488,13 +511,11 @@ async def _generate_segment(
             manifest.upsert(clip)
 
     def submitted(job_id: str) -> None:
-        update(pending_job_id=job_id)
+        update(pending_job_id=job_id, job_unit=unit_key)
         _emit(on_progress, manifest)
 
     request.on_submitted = submitted
 
-    # 上一轮整段已经买到、只是没切成功：直接重切，不重新提交
-    reuse = clips[0].segment_path and (Path(project_dir) / clips[0].segment_path).is_file()
     generated = None
     if not reuse:
         update(
@@ -557,15 +578,21 @@ async def _generate_segment(
             generated_at=datetime.now(UTC).isoformat(),
         )
         _clear_waiver(manifest, segment.id)
+        # 立刻落盘：切分期间被取消 / 进程挂掉时，磁盘上也有「这段已经买到」和这笔扣费
+        _emit(on_progress, manifest)
 
     source = Path(project_dir) / clips[0].segment_path
-    if clips[0].media_kind == MediaKind.PLACEHOLDER or not ffmpeg_available():
+    if clips[0].media_kind == MediaKind.PLACEHOLDER:
         # 占位文件切不了（mock 缺 ffmpeg）：每个镜头都指向整段占位文件，合成会照常拒绝
+        update(status=ClipStatus.READY, path=clips[0].segment_path, error="")
+        return
+    if not ffmpeg_available():
+        # 真买到的整段、只是本机没有 ffmpeg：按「切分失败」处理（保留整段、下次直接重切）。
+        # 以前标成 READY + 占位：装好 ffmpeg 之后「已就绪」不再生成、合成又拒收占位，只能重买
         update(
-            status=ClipStatus.READY,
-            path=clips[0].segment_path,
-            media_kind=MediaKind.PLACEHOLDER,
-            error="" if clips[0].media_kind == MediaKind.PLACEHOLDER else "没有 ffmpeg，无法切分",
+            status=ClipStatus.FAILED,
+            error=f"整段已生成（{clips[0].segment_path}），本机没有 ffmpeg 无法切分；"
+            "装好 ffmpeg 后重试会直接重切，不重新计费",
         )
         return
     try:
@@ -818,6 +845,38 @@ def _without_no_cut(directive: str) -> str:
     """去掉表演要求里禁止剪切的条目（逗号分隔），其余原样保留。"""
     items = [item for item in str(directive or "").split(",") if not _NO_CUT.search(item)]
     return ",".join(items)
+
+
+def unit_needs_generation(
+    segment: Segment, manifest: VideoManifest | None, project_dir: Path | None
+) -> bool:
+    """这个单元（一段 / 一个单镜）这次要不要生成 —— 续跑、预算门、preflight 用同一个判断。
+
+    段里任何一个镜头没有就绪片段（或片段文件丢了、或是买到了整段但没切开），整段都要生成。
+    `project_dir` 为空时不查文件在不在（只看清单）。
+    """
+    for shot in segment.shots:
+        clip = manifest.get(shot.id) if manifest else None
+        if clip is None or clip.status != ClipStatus.READY:
+            return True
+        if project_dir is not None and not _clip_file_exists(Path(project_dir), clip):
+            return True
+        if _unsplit_for_lack_of_ffmpeg(clip):
+            return True
+    return False
+
+
+def pending_units(
+    storyboard: Storyboard,
+    manifest: VideoManifest | None,
+    provider: VideoProvider,
+    project_dir: Path | None = None,
+) -> list[Segment]:
+    """这次「生成视频片段」真正会去生成的单元。换了 provider / 模型就是全部。"""
+    segments = segments_of(storyboard)
+    if manifest is not None and provider_switched(manifest, provider):
+        return segments
+    return [s for s in segments if unit_needs_generation(s, manifest, project_dir)]
 
 
 def provider_switched(manifest: VideoManifest, provider: VideoProvider) -> bool:
@@ -1344,6 +1403,46 @@ def shot_signature(shot: Shot) -> tuple:
     )
 
 
+def unit_fingerprint(unit_id: str, shots: list[Shot]) -> str:
+    """生成单元（单镜或一段）的指纹：单元 id + 段内镜头顺序 + 每个镜头影响画面的字段。"""
+    raw = repr((unit_id, [(shot.id, shot_signature(shot)) for shot in shots]))
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _resumable(
+    manifest: VideoManifest, clips: list[VideoClip], key: str, field: str
+) -> bool:
+    """`field`（job id / 整段文件）能不能给这个单元接着用。
+
+    要同时满足：挂着它的镜头正好是这个单元的镜头（一个不多、一个不少），
+    并且提交时记下的单元指纹和现在一样。老清单没有指纹，只看前一条。
+    """
+    value = getattr(clips[0], field)
+    if not value:
+        return False
+    holders = {c.shot_id for c in manifest.clips if getattr(c, field) == value}
+    if holders != {c.shot_id for c in clips}:
+        return False
+    return all(c.job_unit == key for c in clips) or all(not c.job_unit for c in clips)
+
+
+def _resume_job_id(manifest: VideoManifest, clips: list[VideoClip], key: str, unit_id: str) -> str:
+    """这个单元能接着查的 job id；对不上的清掉（服务端可能已扣费，这笔账只能人工核对）。"""
+    job_id = clips[0].pending_job_id
+    if not job_id or _resumable(manifest, clips, key, "pending_job_id"):
+        return job_id
+    logger.warning(
+        "%s：任务 %s 是按另一种分镜 / 编段提交的，不再接着查、重新提交（旧任务可能已扣费）",
+        unit_id,
+        job_id,
+    )
+    for clip in clips:
+        if clip.pending_job_id == job_id:
+            clip.pending_job_id = ""
+            manifest.upsert(clip)
+    return ""
+
+
 def storyboard_impact(
     old: Storyboard | None, new: Storyboard, manifest: VideoManifest | None
 ) -> dict:
@@ -1357,8 +1456,11 @@ def storyboard_impact(
     new_ids = {shot.id for shot in new.shots}
 
     def generated(shot_id: str) -> bool:
+        """已生成，或者已经提交 / 已经买到整段（失败的片段也可能挂着这两样）。"""
         clip = manifest.get(shot_id) if manifest else None
-        return clip is not None and clip.status == ClipStatus.READY
+        if clip is None:
+            return False
+        return clip.status == ClipStatus.READY or bool(clip.pending_job_id or clip.segment_path)
 
     stale: list[dict] = []
     kept = 0
@@ -1415,7 +1517,7 @@ def invalidate_clips(
     for clip in list(manifest.clips):
         if clip.shot_id not in targets:
             continue
-        for cached in (project_dir / "frames").glob(f"{clip.shot_id}.*"):
+        for cached in (project_dir / "frames").glob(f"{glob.escape(clip.shot_id)}.*"):
             cached.unlink(missing_ok=True)
         if drop:
             manifest.clips.remove(clip)
@@ -1430,6 +1532,7 @@ def invalidate_clips(
         clip.error = ""
         clip.task_id = None
         clip.pending_job_id = ""
+        clip.job_unit = ""
         clip.path = ""
         clip.segment_path = ""
         clip.prompt = ""
@@ -1548,7 +1651,7 @@ def restore_clips(
             }
         )
         manifest.upsert(clip)
-        for cached in (project_dir / "frames").glob(f"{shot.id}.*"):
+        for cached in (project_dir / "frames").glob(f"{glob.escape(shot.id)}.*"):
             cached.unlink(missing_ok=True)
     restored_from = str(meta.get("model") or "")
     warnings = []

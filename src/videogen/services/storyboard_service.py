@@ -762,6 +762,42 @@ def chain_predecessors(
     return found
 
 
+def keep_unchanged_scene_segments(new: Storyboard, old: Storyboard | None) -> list[str]:
+    """完全没改过的场沿用旧的编段，返回沿用了哪几场。
+
+    配音阶段的音画对齐会把镜头拉长、写回分镜，但不重新编段；之后随便改一场、按新时长
+    整片重编，没动过的场也会编出不同的段 —— 已经买到的段整段作废重买（实测一场 4 镜 $2.1）。
+    「完全没改」= 同样的镜头、同样的顺序、除 `segment_id` 外每个字段都一样。
+    """
+    if old is None:
+        return []
+
+    def by_scene(board: Storyboard) -> dict[str, list[Shot]]:
+        groups: dict[str, list[Shot]] = {}
+        for shot in board.shots:
+            groups.setdefault(shot.scene_id, []).append(shot)
+        return groups
+
+    before = by_scene(old)
+    kept: list[str] = []
+    for scene_id, shots in by_scene(new).items():
+        previous = before.get(scene_id)
+        if not previous or len(previous) != len(shots):
+            continue
+        if not all(shot.segment_id for shot in previous):
+            continue
+        same = all(
+            a.model_dump(exclude={"segment_id"}) == b.model_dump(exclude={"segment_id"})
+            for a, b in zip(previous, shots, strict=True)
+        )
+        if not same:
+            continue
+        for shot, prior in zip(shots, previous, strict=True):
+            shot.segment_id = prior.segment_id
+        kept.append(scene_id)
+    return kept
+
+
 def segments_of(storyboard: Storyboard) -> list[Segment]:
     """按镜头上已有的 `segment_id` 还原段落（没编段的镜头各自成段 = 单镜生成）。"""
     segments: list[Segment] = []

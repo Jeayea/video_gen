@@ -16,13 +16,15 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
+from pathlib import Path
 
 from videogen.config import Settings, get_settings
 from videogen.models.audio import AudioManifest
 from videogen.models.cost import CostReport
 from videogen.models.project import Project
 from videogen.models.storyboard import Storyboard
-from videogen.models.video import ClipStatus, MediaKind, VideoManifest
+from videogen.models.video import VideoManifest
 from videogen.providers.video.base import VideoProvider, VideoProviderError
 from videogen.services import (
     audio_script_service,
@@ -38,10 +40,12 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "ACTIONS",
     "UnavailableVideoProvider",
+    "VideoQuote",
     "audio_plan",
     "budget_projection",
     "compose_plan",
     "preflight",
+    "quote_units",
     "video_plan",
 ]
 
@@ -86,6 +90,57 @@ def budget_projection(report, upcoming_usd: float) -> dict:
     }
 
 
+@dataclass
+class VideoQuote:
+    """一批生成单元的报价：预算门、preflight 用同一份（口径和真正下单一致）。"""
+
+    price: float  #: 每秒单价（插图 provider 是每张）
+    price_source: str  #: provider / config
+    options: list[float] = field(default_factory=list)  #: 时长档位
+    billed_seconds: float = 0.0  #: 按档位取整后的计费秒数
+    usd: float = 0.0
+    #: 付费模型、单价读不到、配置也没填：预估是 $0，预算拦不住
+    price_unknown: bool = False
+
+
+async def quote_units(
+    units: list[Segment],
+    provider: VideoProvider,
+    settings: Settings | None = None,
+    *,
+    price_per_second: float | None = None,
+) -> VideoQuote:
+    """这些单元（段 / 单镜）按模型档位要买多少秒、花多少钱。
+
+    每一步问不到都有退路：单价问不到用配置单价，档位问不到按分镜秒数 ——
+    但付费模型最后单价还是 0 时标 `price_unknown`，由调用方决定拦不拦（设了预算就拦）。
+    """
+    prices = cost_service.PriceTable.from_settings(settings or get_settings())
+    unit_price = price_per_second
+    if unit_price is None:
+        try:
+            unit_price = await provider.price_per_second()
+        except Exception:  # 问不到单价就退回配置，不能因此拒绝出预算
+            logger.warning("视频单价查询失败，退回配置单价", exc_info=True)
+    price = prices.video_per_second if unit_price is None else max(0.0, unit_price)
+    options: list[float] = []
+    try:
+        options = list(await provider.duration_options())
+    except Exception:
+        logger.warning("视频时长档位查询失败，按无档位处理", exc_info=True)
+    billed = 0.0
+    for unit in units:
+        billed += await _planned(provider, unit.duration_sec)
+    return VideoQuote(
+        price=price,
+        price_source="provider" if unit_price is not None else "config",
+        options=options,
+        billed_seconds=billed,
+        usd=round(billed * price, 6),
+        price_unknown=price <= 0 and billed > 0 and provider.paid,
+    )
+
+
 async def video_plan(
     storyboard: Storyboard | None,
     video: VideoManifest | None,
@@ -94,70 +149,45 @@ async def video_plan(
     *,
     price_per_second: float | None = None,
     keyframe_estimator: KeyframeEstimator | None = None,
+    project_dir: Path | None = None,
 ) -> dict:
     """算清楚这次「生成视频片段」会买多少秒、花多少钱，以及合并镜头能省多少。
 
+    要买哪些单元用 `video_service.pending_units`（和真正生成同一个判断），
+    价钱用 `quote_units`（和预算门同一个口径）。给了 `project_dir` 时片段文件丢了也算待生成。
     `keyframe_estimator`：只认首帧的模型要先画开场关键帧（按张计费），这笔钱算进
     `estimated_usd`，明细在 `keyframes`。
     """
     settings = settings or get_settings()
-    prices = cost_service.PriceTable.from_settings(settings)
     shots = storyboard.shots if storyboard else []
     ready = video.ready_clips if video else []
     failed = video.failed_clips if video else []
     placeholders = video.placeholder_clips if video else []
 
     provider_model = getattr(provider, "model", "") or provider.name
-    unit_price = price_per_second
-    if unit_price is None:
-        try:
-            unit_price = await provider.price_per_second()
-        except Exception:  # 问不到单价就退回配置，不能因此拒绝出预算
-            logger.warning("视频单价查询失败，退回配置单价", exc_info=True)
-    price = prices.video_per_second if unit_price is None else max(0.0, unit_price)
-    price_source = "provider" if unit_price is not None else "config"
-
-    options: list[float] = []
-    try:
-        options = list(await provider.duration_options())
-    except Exception:
-        logger.warning("视频时长档位查询失败，按无档位处理", exc_info=True)
-    min_sec = options[0] if options else 1.0
-    max_sec = options[-1] if options else 0.0
-
-    # 已经就绪的片段要不要重跑：provider / 模型对不上就必须全部重生成。
-    # 用 video_service 里那一份判断，保证「预估」与「真正跑」永远是同一个口径。
-    switched = bool(video) and video_service.provider_switched(video, provider)
-    pending = [] if switched else [
-        shot for shot in shots if _needs_clip(shot, video)
-    ]
-
-    storyboard_seconds = sum(int(s.duration_sec) for s in shots)
-    # 计费单位是「段」：段落分镜下一段只买一次档位；没编段的镜头各自成段（= 单镜计费）
     segments = storyboard_service.segments_of(storyboard) if storyboard else []
-    pending_ids = {shot.id for shot in pending}
-    billed_all = 0.0
-    billed_pending = 0.0
-    pending_segments: list[Segment] = []
-    for segment in segments:
-        seconds = await _planned(provider, segment.duration_sec)
-        billed_all += seconds
-        if any(sid in pending_ids for sid in segment.shot_ids):
-            billed_pending += seconds
-            pending_segments.append(segment)
-    if switched:
-        billed_pending = billed_all
-        pending_segments = list(segments)
+    # 已经就绪的片段要不要重跑：provider / 模型对不上就必须全部重生成。
+    switched = bool(video) and video_service.provider_switched(video, provider)
+    pending_segments = (
+        video_service.pending_units(storyboard, video, provider, project_dir) if storyboard else []
+    )
+    # 段里缺一个镜头，整段都要重生成：待生成镜头按「整段」展开
+    pending = [shot for seg in pending_segments for shot in seg.shots]
     segments_pending = len(pending_segments)
     segment_mode = any(len(seg.shots) > 1 for seg in segments)
-    if not switched:
-        # 段里缺一个镜头，整段都要重生成：待生成镜头按「整段」展开
-        pending = [
-            shot
-            for seg in segments
-            if any(sid in pending_ids for sid in seg.shot_ids)
-            for shot in seg.shots
-        ]
+
+    quote = await quote_units(
+        pending_segments, provider, settings, price_per_second=price_per_second
+    )
+    price, options = quote.price, quote.options
+    price_source = quote.price_source
+    min_sec = options[0] if options else 1.0
+    max_sec = options[-1] if options else 0.0
+    billed_pending = quote.billed_seconds
+    billed_all = 0.0
+    for segment in segments:
+        billed_all += await _planned(provider, segment.duration_sec)
+    storyboard_seconds = sum(int(s.duration_sec) for s in shots)
 
     to_generate = len(shots) if switched else len(pending)
 
@@ -202,7 +232,7 @@ async def video_plan(
                 f"{plan['billed_seconds']:g} 秒，多付 {extra:g} 秒 ≈ "
                 f"${extra * price:.4f}"
             )
-    if price <= 0 and to_generate and provider.paid:
+    if quote.price_unknown:
         plan["price_unknown"] = True
         plan["warnings"].append(
             f"读不到 {provider_model} 的单价，预估按 $0 算、预算拦不住："
@@ -251,15 +281,6 @@ def _switch_reason(video: VideoManifest | None, provider_name: str, model: str) 
     if video.model and model and video.model != model:
         parts.append(f"{video.model} → {model}")
     return "，".join(parts) or "配置变化"
-
-
-def _needs_clip(shot, video: VideoManifest | None) -> bool:
-    if video is None:
-        return True
-    clip = video.get(shot.id)
-    if clip is None:
-        return True
-    return clip.status != ClipStatus.READY or clip.media_kind == MediaKind.PLACEHOLDER
 
 
 def _pending_seconds(pending: list) -> float:
@@ -418,6 +439,7 @@ async def preflight(
     action: str = "all",
     script_mode: str = "",
     keyframe_estimator: KeyframeEstimator | None = None,
+    project_dir: Path | None = None,
 ) -> dict:
     """把各阶段的预估拼成一份「动手前的账单」。"""
     settings = settings or get_settings()
@@ -430,7 +452,12 @@ async def preflight(
     compose_part = None
     if action in {"all", "video"}:
         video_part = await video_plan(
-            storyboard, video, provider, settings, keyframe_estimator=keyframe_estimator
+            storyboard,
+            video,
+            provider,
+            settings,
+            keyframe_estimator=keyframe_estimator,
+            project_dir=project_dir,
         )
     if action in {"all", "audio"}:
         audio_part = audio_plan(

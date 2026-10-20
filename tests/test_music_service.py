@@ -20,6 +20,7 @@ from videogen.models.storyboard import Shot, Storyboard
 from videogen.models.video import ClipStatus, MediaKind, VideoClip, VideoManifest
 from videogen.services import music_service
 from videogen.utils import music as music_utils
+from videogen.utils.ffmpeg import ffmpeg_available, run_ffmpeg
 from videogen.utils.file_store import FileStore
 
 
@@ -692,3 +693,40 @@ def test_default_bgm_track_is_backwards_compatible():
     assert track.engine == "library"
     assert track.loop is True
     assert track.duck is None
+
+
+@pytest.mark.skipif(not ffmpeg_available(), reason="需要 ffmpeg")
+@pytest.mark.asyncio
+async def test_motions_resolve_clip_paths_against_the_project_dir(tmp_path, monkeypatch):
+    """清单里的片段路径是相对项目目录的：进程工作目录不在项目里也要找得到。
+
+    以前按工作目录解析，真实项目 28 个镜头命中 0 个，配乐从来没拿到过运动数据。
+    """
+    project_dir = tmp_path / "proj"
+    (project_dir / "clips").mkdir(parents=True)
+    await run_ffmpeg(
+        [
+            "-hide_banner", "-loglevel", "error",
+            "-f", "lavfi", "-i", "testsrc2=s=160x160:d=1:r=12",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-y",
+            str(project_dir / "clips" / "s1.mp4"),
+        ],
+        timeout_sec=60,
+    )
+    manifest = VideoManifest(
+        clips=[
+            VideoClip(
+                shot_id="s1",
+                status=ClipStatus.READY,
+                media_kind=MediaKind.VIDEO,
+                path="clips/s1.mp4",
+            )
+        ]
+    )
+    shot = Shot(id="s1", scene_id="sc1", shot_no=1, duration_sec=1)
+    monkeypatch.chdir(tmp_path)  # 工作目录不是项目目录
+
+    motions = await music_service._collect_motions(
+        [shot], manifest, project_dir / "frames", project_dir=project_dir, fps=6.0
+    )
+    assert "s1" in motions and motions["s1"] is not None

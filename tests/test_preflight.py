@@ -383,13 +383,26 @@ async def test_budget_basis_is_pending_only_when_provider_unchanged(store):
 
     storyboard = store.load_storyboard(project.id)
     video = store.load_video_manifest(project.id)
-    assert await pipeline._budget_shots(storyboard, video) == []
+    project = store.load_project(project.id)
+    assert await pipeline._budget_units(storyboard, video, project) == []
 
     # 删掉一个片段 -> 只补那一个
     video.clips[0].status = ClipStatus.FAILED
     store.save_video_manifest(project.id, video)
-    targets = await pipeline._budget_shots(storyboard, store.load_video_manifest(project.id))
-    assert [shot.id for shot in targets] == [storyboard.shots[0].id]
+    targets = await pipeline._budget_units(
+        storyboard, store.load_video_manifest(project.id), project
+    )
+    assert [shot.id for unit in targets for shot in unit.shots] == [storyboard.shots[0].id]
+
+    # 片段文件丢了也要补（和真正生成同一个判断；以前预算门只看清单状态，按 $0 估）
+    video = store.load_video_manifest(project.id)
+    video.clips[0].status = ClipStatus.READY
+    store.save_video_manifest(project.id, video)
+    (store.project_dir(project.id) / video.clips[1].path).unlink()
+    targets = await pipeline._budget_units(
+        storyboard, store.load_video_manifest(project.id), project
+    )
+    assert [shot.id for unit in targets for shot in unit.shots] == [storyboard.shots[1].id]
 
 
 def test_audio_plan_charges_llm_script_separately():
@@ -774,9 +787,11 @@ async def test_generate_video_uses_same_billing_basis_as_preflight(store):
     original = settings.budget_usd
     try:
         settings.budget_usd = 0.0
-        upcoming = await pipeline._estimate_video_usd(
-            pipeline.store.load_storyboard(project.id).shots
+        project = store.load_project(project.id)
+        units = await pipeline._budget_units(
+            store.load_storyboard(project.id), store.load_video_manifest(project.id), project
         )
+        upcoming = await pipeline._estimate_video_usd(units, project)
     finally:
         settings.budget_usd = original
     assert upcoming == pytest.approx(expected)

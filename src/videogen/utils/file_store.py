@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 import os
-import re
 import shutil
 import tempfile
 from pathlib import Path
@@ -30,6 +29,7 @@ from videogen.models.storyboard import Storyboard
 from videogen.models.video import VideoManifest
 from videogen.models.world_state import WorldState
 from videogen.utils import media_history
+from videogen.utils.ids import SAFE_ID_RE
 from videogen.utils.naming import derive_title, project_slug
 
 logger = logging.getLogger(__name__)
@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 T = TypeVar("T", bound=BaseModel)
 
 #: 项目 id = 目录名：只允许字母 / 数字（含中文）/ `_` / `-`，没有 `.` 和 `/`，避免路径穿越
-_ID_RE = re.compile(r"\w[\w-]{0,63}")
+_ID_RE = SAFE_ID_RE
 
 
 class FileStore:
@@ -95,6 +95,9 @@ class FileStore:
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
                 handle.write(payload)
+                # 先落到盘上再改名：断电时不会留下一个空的 meta.json（随后又被当成坏文件隔离）
+                handle.flush()
+                os.fsync(handle.fileno())
             os.replace(tmp_name, path)
         except BaseException:
             Path(tmp_name).unlink(missing_ok=True)
@@ -114,9 +117,16 @@ class FileStore:
         if not path.exists():
             return None
         try:
-            return model_cls.model_validate_json(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError) as exc:
-            # pydantic 的 ValidationError 是 ValueError 的子类，一起兜住
+            raw = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            # 读不到（文件句柄用完、权限、网络盘抖动）不等于文件坏了：不隔离，这次当不存在。
+            # 以前一起隔离成 .bad，一次 EMFILE 就能让项目从列表里消失
+            logger.warning("读取产物失败（不隔离）：%s（%s）", path, exc)
+            return None
+        try:
+            return model_cls.model_validate_json(raw)
+        except ValueError as exc:
+            # 内容坏了 / 版本不兼容（pydantic 的 ValidationError 是 ValueError 的子类）
             self._quarantine(path, exc)
             return None
 
@@ -196,7 +206,30 @@ class FileStore:
         return True
 
     # --- Bible ---
-    def save_bible(self, project_id: str, bible: StoryBible) -> None:
+    def save_bible(
+        self, project_id: str, bible: StoryBible, *, keep_references: bool = False
+    ) -> None:
+        """写圣经。`keep_references=True`：参考图以磁盘上的为准。
+
+        给「读圣经 → 等 LLM 几秒 → 整份写回」的路径用：等的这几秒里，定妆照 / 场景图可能刚在别处
+        登记进圣经（`character_image_service` / `asset_service`），用开工时那份写回会把它抹掉，
+        之后的视频就不带参考图了。读和写之间没有 await，在事件循环里是原子的。
+        """
+        if keep_references:
+            current = self.load_bible(project_id)
+            if current is not None:
+                for kind in ("characters", "settings", "props"):
+                    refs = {item.id: item.reference_image for item in getattr(current, kind)}
+                    setattr(
+                        bible,
+                        kind,
+                        [
+                            item.model_copy(update={"reference_image": refs[item.id]})
+                            if item.id in refs and refs[item.id] != item.reference_image
+                            else item
+                            for item in getattr(bible, kind)
+                        ],
+                    )
         self._save(project_id, "story_bible", bible)
 
     def load_bible(self, project_id: str) -> StoryBible | None:
@@ -321,6 +354,22 @@ class FileStore:
         if compose:
             self.remove_artifact(project_id, "compose_report")
             shutil.rmtree(directory / "output", ignore_errors=True)
+
+    def discard_compose_output(self, project_id: str) -> None:
+        """合成失败 / 取消：删掉半截成片和它的报告，**留下缓存子目录**。
+
+        `output/` 下的子目录（`segments/` 分段、`lipsynced/` 口型、`music/` 配乐）是按输入做了
+        新鲜度校验的缓存，留着下次直接复用；以前这里整个删 `output/`，一次失败就要全部重渲。
+        """
+        if not self.is_valid_id(project_id):
+            return
+        self.remove_artifact(project_id, "compose_report")
+        output = self.project_dir(project_id) / "output"
+        if not output.is_dir():
+            return
+        for item in output.iterdir():
+            if item.is_file() or item.is_symlink():
+                item.unlink(missing_ok=True)
 
     def archive_media(
         self,

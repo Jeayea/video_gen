@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import shutil
 from collections.abc import Callable
 from pathlib import Path
@@ -538,6 +539,51 @@ def _burn_filter(subtitle_name: str) -> str:
     return f"subtitles={subtitle_name}"
 
 
+async def plan_timeline(
+    project: Project,
+    storyboard: Storyboard,
+    video_manifest: VideoManifest,
+    voice_audio: AudioManifest | None,
+    *,
+    project_dir: Path,
+    settings: Settings,
+    bible=None,
+    warnings: list[str] | None = None,
+) -> list[ComposeSegment]:
+    """定下成片里每个镜头的**最终时长**：分段渲染、字幕、配乐都按这一份走。
+
+    镜头时长会被改两次（科普按配音实长裁；段落切出来的镜头按片段实长走），再对齐到整帧 ——
+    不对齐的话每段的帧数取整误差在拼接后累加（实测 10 段差 18ms，100 段约 0.2 秒），
+    字幕和闪避跟着漂。配乐以前按分镜整数秒写（科普 60 秒对成片 54.2 秒，越往后越偏）。
+    只读输入、确定性计算：合成前给配乐算一次、合成里再算一次，结果一样。
+    """
+    warnings = warnings if warnings is not None else []
+    segments = subtitle_service.build_segments(
+        storyboard, voice_audio, speaker_names=subtitle_service.speaker_name_map(bible)
+    )
+    segments = [s for s in segments if _bind_video(s, video_manifest, project_dir, warnings)]
+    if explainer_service.is_explainer(project):
+        # 科普：镜头按配音实长 + 句间停顿裁（必须在字幕之前：字幕时间轴按段时长累加）
+        await _fit_to_voice(
+            segments, voice_audio, project_dir, settings.explainer_line_gap_sec, warnings
+        )
+    elif settings.compose_follow_clip_length:
+        await _follow_clip_lengths(segments, video_manifest, voice_audio, project_dir)
+    fps = max(1, settings.video_fps)
+    for segment in segments:
+        # 向上取整：只会多出不到一帧（冻结），不会切掉配音的尾巴
+        frames = max(1, math.ceil(segment.duration_sec * fps - 1e-6))
+        segment.duration_sec = round(frames / fps, 6)
+    return segments
+
+
+def voice_audio_for(
+    project: Project, audio_manifest: AudioManifest | None, settings: Settings
+) -> AudioManifest | None:
+    """合成用哪份配音：原声模式不读配音清单（切换模式前留下的 TTS 条目也不用）。"""
+    return audio_manifest if video_service.dub_mode_for(project, settings) == "tts" else None
+
+
 async def compose(
     project: Project,
     storyboard: Storyboard,
@@ -570,7 +616,7 @@ async def compose(
         )
     # 原声模式：人声全用视频原片，不读配音清单（切换模式前留下的 TTS 条目也不用）
     dub_mode = video_service.dub_mode_for(project, settings)
-    voice_audio = audio_manifest if dub_mode == "tts" else None
+    voice_audio = voice_audio_for(project, audio_manifest, settings)
     if voice_audio is not None and not voice_audio.is_usable:
         raise ComposeError(
             f"配音不完整（就绪 {len(voice_audio.ready_clips)}/"
@@ -583,18 +629,17 @@ async def compose(
     if (voice_audio is None or not voice_audio.clips) and not native:
         warnings.append("没有配音，成片为纯画面（无声）")
 
-    segments = subtitle_service.build_segments(
-        storyboard, voice_audio, speaker_names=subtitle_service.speaker_name_map(bible)
+    segments = await plan_timeline(
+        project,
+        storyboard,
+        video_manifest,
+        voice_audio,
+        project_dir=project_dir,
+        settings=settings,
+        bible=bible,
+        warnings=warnings,
     )
-    segments = [s for s in segments if _bind_video(s, video_manifest, project_dir, warnings)]
     explainer = explainer_service.is_explainer(project)
-    if explainer:
-        # 科普：镜头按配音实长 + 句间停顿裁（必须在字幕之前：字幕时间轴按段时长累加）
-        await _fit_to_voice(
-            segments, voice_audio, project_dir, settings.explainer_line_gap_sec, warnings
-        )
-    elif settings.compose_follow_clip_length:
-        await _follow_clip_lengths(segments, video_manifest, voice_audio, project_dir)
     for segment in segments:
         segment.native_voice = segment.shot_id in native and not segment.audio_path
     native_count = sum(1 for s in segments if s.native_voice)
@@ -822,7 +867,8 @@ async def compose(
                 font_scale=settings.compose_subtitle_font_scale,
                 margin_scale=settings.compose_subtitle_margin_scale,
                 label=label,
-                label_sec=explainer_service.AI_LABEL_SEC,
+                # 标识在变速之前烧进画面：按倍速拉长，变速后观众看到的仍是 AI_LABEL_SEC 秒
+                label_sec=explainer_service.AI_LABEL_SEC * speed,
                 cues=not label_only,
             ),
             encoding="utf-8",
@@ -1156,7 +1202,8 @@ async def _render_all(
             # 「另一套参数」重渲过（真实事故：关掉响度归一的对比跑复用到了归一后的分段）。
             marker = segments_dir / f"{segment.shot_id}.params"
             params = (
-                f"ambient={'on' if use_ambient else 'off'}"
+                f"voice={_file_stamp(audio_path)} "
+                f"ambient={f'{segment_ambient_db:+.1f}' if use_ambient else 'off'}"
                 f" mouth={delay_ms if delay_ms > 0 else 'off'}"
                 f" lipsync={'on' if lipsynced is not None else 'off'}"
                 f" gain={gain_db:+.1f}"
@@ -1171,6 +1218,8 @@ async def _render_all(
             ):
                 logger.debug("复用已渲染分段：%s", output.name)
             else:
+                # 先删标记再渲：渲到一半被杀时，半截文件不会因为旧标记还在而被当成可复用
+                marker.unlink(missing_ok=True)
                 await render_segment(
                     segment,
                     video_path=video_path,
@@ -1199,7 +1248,15 @@ async def _render_all(
                     f"分段渲染 {done}/{len(segments)}",
                 )
 
-    await asyncio.gather(*(run_one(segment) for segment in segments))
+    tasks = [asyncio.create_task(run_one(segment)) for segment in segments]
+    try:
+        await asyncio.gather(*tasks)
+    except BaseException:
+        # 一段失败就停掉其余的（它们的 ffmpeg 会被杀掉），不留后台任务继续往目录里写
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
     return delays, gains
 
 
@@ -1454,6 +1511,7 @@ async def _render_passthrough(
         whole = ComposeSegment(
             shot_id=segment_id, index=group[0].index, duration_sec=duration, native_voice=True
         )
+        marker.unlink(missing_ok=True)  # 同上：半截文件不能复用
         await render_segment(
             whole,
             video_path=source,
@@ -1468,6 +1526,17 @@ async def _render_passthrough(
             ambient_gain_db=0.0,
         )
         marker.write_text(params, encoding="utf-8")
+
+
+def _file_stamp(path: Path | None) -> str:
+    """配音文件的身份（大小 + 修改时间）：同名文件被重配过也要重渲这一段。"""
+    if path is None:
+        return "none"
+    try:
+        stat = path.stat()
+    except OSError:
+        return "missing"
+    return f"{stat.st_size}:{stat.st_mtime_ns}"
 
 
 def _params_match(marker: Path, params: str) -> bool:

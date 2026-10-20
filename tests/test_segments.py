@@ -550,3 +550,217 @@ def test_narration_goes_to_video_model_only_when_enabled(settings, monkeypatch):
     assert "不该被念" not in prompt  # 有台词的镜头只念台词
     single = video_service.build_prompt(shot, Project(title="t"), StoryBible())
     assert "两手持帘入水一荡" in single
+
+
+class _TimesOutOnce(MockVideoProvider):
+    """第一次提交后轮询超时（job 留在服务端），之后正常出片、每次报 $1.30。"""
+
+    def __init__(self):
+        super().__init__(fps=12, crf=35)
+        self.calls: list[tuple[str, str]] = []
+        self.first = True
+
+    async def generate(self, request: VideoRequest) -> GeneratedClip:
+        from videogen.providers.video.base import VideoJobPending
+
+        self.calls.append((request.shot_id, request.resume_job_id))
+        if self.first:
+            self.first = False
+            if request.on_submitted:
+                request.on_submitted("J1")
+            raise VideoJobPending("轮询超时", job_id="J1")
+        clip = await super().generate(request)
+        return clip.model_copy(update={"actual_cost_usd": 1.30})
+
+
+@requires_ffmpeg
+@pytest.mark.asyncio
+async def test_regrouped_segments_do_not_resume_the_old_job(tmp_path):
+    """段 [s1,s2,s3] 的任务没取回，改分镜后重新编段成 [s1,s2] + [s3]：
+
+    两个新单元都不能接着查旧 job（以前都去查 J1，同一笔 $1.30 记两次，s3 还拿到旧画面）。
+    """
+
+    def board(third: int) -> Storyboard:
+        shots = [
+            Shot(id=f"s{i}", scene_id="scene_1", shot_no=i, duration_sec=d, video_prompt=f"p{i}")
+            for i, d in ((1, 3), (2, 3), (3, third))
+        ]
+        board = Storyboard(shots=shots)
+        storyboard_service.assign_segments(board, target_sec=12, max_sec=15)
+        return board
+
+    provider = _TimesOutOnce()
+    project = Project(title="重新编段")
+    old = board(3)
+    manifest = await video_service.generate_clips(
+        project, old, provider, tmp_path / "clips", tmp_path, retry_backoff_sec=0
+    )
+    assert {c.pending_job_id for c in manifest.clips} == {"J1"}
+
+    new = board(10)
+    assert [s.shot_ids for s in storyboard_service.segments_of(new)] == [["s1", "s2"], ["s3"]]
+    impact = video_service.storyboard_impact(old, new, manifest)
+    assert sorted(impact["stale_shots"]) == ["s1", "s2", "s3"]  # 没就绪、但挂着 job 的也算
+
+    # 就算调用方漏了作废（直接拿旧清单生成），也不能去续查按旧编段提交的 job
+    manifest = await video_service.generate_clips(
+        project, new, provider, tmp_path / "clips", tmp_path, existing=manifest,
+        retry_backoff_sec=0,
+    )
+    assert [resume for _, resume in provider.calls[1:]] == ["", ""]
+    assert all(c.status == ClipStatus.READY for c in manifest.clips)
+
+
+@pytest.mark.asyncio
+async def test_editing_one_scene_keeps_segments_of_untouched_scenes(store, monkeypatch, settings):
+    """配音对齐把 a4 拉长（写回分镜、不重编段）后，只改 scene_2：scene_1 的段不能被重编、重买。"""
+    monkeypatch.setattr(settings, "video_segment_target_sec", 12)
+    monkeypatch.setattr(settings, "video_segment_max_sec", 15)
+    monkeypatch.setattr(settings, "video_segment_max_shots", 4)
+    project = Project(title="只改一场")
+    store.save_project(project)
+    board = Storyboard(
+        shots=[_shot(f"a{i}", "scene_1", d) for i, d in ((1, 4), (2, 4), (3, 4), (4, 3))]
+        + [_shot("b1", "scene_2", 6)]
+    )
+    storyboard_service.assign_segments(board, target_sec=12, max_sec=15, min_sec=5, max_shots=4)
+    first = storyboard_service.segments_of(board)[0]
+    assert first.shot_ids == ["a1", "a2", "a3", "a4"]
+    board.shots[3].duration_sec = 4  # 音画对齐写回的时长
+    store.save_storyboard(project.id, board)
+    store.save_video_manifest(
+        project.id,
+        VideoManifest(
+            clips=[
+                VideoClip(shot_id=s.id, scene_id=s.scene_id, status=ClipStatus.READY, path="x")
+                for s in board.shots
+            ]
+        ),
+    )
+
+    edited = board.model_copy(deep=True)
+    edited.shots[4].video_prompt = "改过的画面"
+    tiers = [float(x) for x in range(5, 16)]  # 像 H3：最短 5 秒
+    pipeline = Pipeline(
+        store,
+        llm_factory=lambda: FakeLLM(),
+        video_factory=lambda: FakeVideoProvider(duration_options=tiers),
+    )
+    impact = await pipeline.storyboard_impact(project.id, edited.model_dump(mode="json"))
+
+    assert impact["stale_shots"] == ["b1"]
+
+
+class _CountingMock(MockVideoProvider):
+    def __init__(self):
+        super().__init__(fps=12, crf=35)
+        self.calls = 0
+
+    async def generate(self, request: VideoRequest) -> GeneratedClip:
+        self.calls += 1
+        return await super().generate(request)
+
+
+@requires_ffmpeg
+@pytest.mark.asyncio
+async def test_bought_segment_without_ffmpeg_is_resplit_later_not_rebought(tmp_path, monkeypatch):
+    """买到整段时本机没 ffmpeg：保留整段、标失败；装好后重试直接重切，不再买一次。
+
+    以前标成「就绪 + 占位」：生成跳过它、合成又拒收占位，只能重买。
+    """
+    board = Storyboard(
+        shots=[_shot("s1", "scene_1", 3, video_prompt="p1"), _shot("s2", "scene_1", 3)]
+    )
+    storyboard_service.assign_segments(board, target_sec=12, max_sec=15)
+    provider = _CountingMock()
+    project = Project(title="缺 ffmpeg")
+
+    # 片段是 mock 先用 ffmpeg 画好的；只让「切分」这一步看到没有 ffmpeg
+    real = video_service.ffmpeg_available
+    monkeypatch.setattr(video_service, "ffmpeg_available", lambda: False)
+    original_generate = provider.generate
+
+    async def generate_with_ffmpeg(request):
+        monkeypatch.setattr(video_service, "ffmpeg_available", real)
+        try:
+            return await original_generate(request)
+        finally:
+            monkeypatch.setattr(video_service, "ffmpeg_available", lambda: False)
+
+    provider.generate = generate_with_ffmpeg
+    manifest = await video_service.generate_clips(
+        project, board, provider, tmp_path / "clips", tmp_path, retry_backoff_sec=0
+    )
+    assert provider.calls == 1
+    assert all(c.status == ClipStatus.FAILED and c.segment_path for c in manifest.clips)
+    assert "没有 ffmpeg" in manifest.clips[0].error
+
+    monkeypatch.setattr(video_service, "ffmpeg_available", real)
+    manifest = await video_service.generate_clips(
+        project, board, provider, tmp_path / "clips", tmp_path, existing=manifest,
+        retry_backoff_sec=0,
+    )
+    assert provider.calls == 1  # 没有重买
+    assert all(c.status == ClipStatus.READY for c in manifest.clips)
+
+
+class _CountingKeyframer:
+    def __init__(self):
+        self.calls = 0
+
+    async def first_frame(self, unit, provider, previous=None):
+        self.calls += 1
+        return None
+
+
+@requires_ffmpeg
+@pytest.mark.asyncio
+async def test_resuming_a_submitted_job_does_not_draw_a_new_keyframe(tmp_path):
+    """续查已提交的任务：首帧早就随任务发出去了，不再画（以前每次续查都可能多花 $0.04）。"""
+    board = Storyboard(shots=[_shot("s1", "scene_1", 3), _shot("s2", "scene_1", 3)])
+    storyboard_service.assign_segments(board, target_sec=12, max_sec=15)
+    provider = _TimesOutOnce()
+    keyframer = _CountingKeyframer()
+    project = Project(title="续查不画首帧")
+
+    manifest = await video_service.generate_clips(
+        project, board, provider, tmp_path / "clips", tmp_path, retry_backoff_sec=0,
+        keyframer=keyframer,
+    )
+    assert keyframer.calls == 1 and manifest.clips[0].pending_job_id == "J1"
+    submitted_prompt = manifest.clips[0].prompt
+
+    manifest = await video_service.generate_clips(
+        project, board, provider, tmp_path / "clips", tmp_path, existing=manifest,
+        retry_backoff_sec=0, keyframer=keyframer,
+    )
+    assert provider.calls[-1][1] == "J1"  # 接着查的是原任务
+    assert keyframer.calls == 1
+    assert all(c.status == ClipStatus.READY for c in manifest.clips)
+    assert manifest.clips[0].prompt == submitted_prompt
+
+
+@pytest.mark.asyncio
+async def test_storyboard_impact_prices_rebuys_by_billing_tier(store):
+    """改分镜的确认框里「重做费用」按模型档位算：3 秒的段在 H3 上要买 5 秒。"""
+    project = Project(title="重做费用")
+    store.save_project(project)
+    board = Storyboard(shots=[_shot("a1", "scene_1", 3)])
+    storyboard_service.assign_segments(board, target_sec=12, max_sec=15)
+    store.save_storyboard(project.id, board)
+    store.save_video_manifest(
+        project.id,
+        VideoManifest(clips=[VideoClip(shot_id="a1", status=ClipStatus.READY, path="x")]),
+    )
+    edited = board.model_copy(deep=True)
+    edited.shots[0].video_prompt = "新画面"
+    provider = FakeVideoProvider(
+        duration_options=[float(x) for x in range(5, 16)], price_usd_per_sec=0.13
+    )
+    pipeline = Pipeline(store, llm_factory=lambda: FakeLLM(), video_factory=lambda: provider)
+
+    impact = await pipeline.storyboard_impact(project.id, edited.model_dump(mode="json"))
+    assert impact["stale_seconds"] == 3
+    assert impact["billed_seconds"] == 5
+    assert impact["estimated_usd"] == pytest.approx(0.65)

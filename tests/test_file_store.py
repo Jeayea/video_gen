@@ -81,3 +81,23 @@ def test_save_is_atomic_and_readable(tmp_path):
     # 目录里不该留下临时文件
     leftovers = [p.name for p in (tmp_path / project.id).iterdir() if p.name.startswith(".meta.")]
     assert leftovers == []
+
+
+def test_transient_read_error_does_not_quarantine(tmp_path, monkeypatch):
+    """读文件时的 OSError（句柄用完 / 权限）不等于文件坏了：不能隔离成 .bad、让项目从列表里消失。"""
+    from pathlib import Path
+
+    store = FileStore(tmp_path / "projects")
+    project = Project(title="瞬时错误")
+    store.save_project(project)
+    real = Path.read_text
+
+    def flaky(self, *args, **kwargs):
+        if self.name == "meta.json":
+            raise OSError(24, "Too many open files")
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", flaky)
+    assert store.load_project(project.id) is None
+    monkeypatch.setattr(Path, "read_text", real)
+    assert store.load_project(project.id) is not None  # 文件还在、没被改名
