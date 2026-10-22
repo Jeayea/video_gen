@@ -143,6 +143,8 @@ class VisualDraft(BaseModel):
     video_prompt: str = ""
     location: str = ""
     props_in_frame: StrList = Field(default_factory=list)
+    #: 手账拼贴画风才要：画面上的手写批注
+    annotation: str = ""
 
     @field_validator("index", mode="before")
     @classmethod

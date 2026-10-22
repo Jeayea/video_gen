@@ -231,6 +231,21 @@ SUBTITLE_LOOKS: dict[str, SubtitleLook] = {
         blur=5 / 1440,
         spacing=6 / 1440,
     ),
+    # 手写笔记：手写体、深色墨水 + 白描边（白纸背景上看得清），配科普「手账拼贴」画风。
+    # 字体是站酷快乐体（ZCOOL KuaiLe），没装时 libass 会退回别的字体
+    "note": SubtitleLook(
+        font="ZCOOL KuaiLe",
+        bold=False,
+        primary="&H00262626",
+        outline_colour="&H10FFFFFF",
+        back_colour="&H00000000",
+        border_style=1,
+        font_scale=60 / 1440,
+        outline=5 / 1440,
+        shadow=0.0,
+        blur=1 / 1440,
+        spacing=2 / 1440,
+    ),
     # 老样式：纯白粗体 + 硬描边（v0.21 之前的观感）
     "classic": SubtitleLook(
         font="",

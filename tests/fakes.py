@@ -183,6 +183,12 @@ class FakeLLM(LLMProvider):
             return self._knowledge(user)
         if "科普讲解的结构编辑" in system:
             self._maybe_fail("explainer_outline")
+            sections = re.search(r"这就是全片结构，共 (\d+) 段", user)
+            if sections:  # 用户写了分段：一段一场，不另加开场和小结
+                return {"scenes": [
+                    {"title": f"第 {i} 段", "brief": f"第 {i} 段"}
+                    for i in range(1, int(sections.group(1)) + 1)
+                ]}
             return {
                 "scenes": [{"title": "开场提问", "brief": "天为什么是蓝的？"}]
                 + [
@@ -467,6 +473,8 @@ class FakeLLM(LLMProvider):
                     "video_prompt": f"macro shot of sunlight through a glass prism {i}{revised}, "
                     "no text, no labels",
                     "location": "loc_1",
+                    # 手账拼贴画风才采用；别的画风必须忽略
+                    "annotation": f"批注{i}：这也行？",
                     "narration": "模型改写过的旁白（不该被采用）",
                     "duration_sec": 99,
                 }

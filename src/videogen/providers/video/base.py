@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 from pydantic import BaseModel, Field
@@ -102,6 +102,13 @@ class VideoRequest(BaseModel):
     #: 插图 provider（`draws_stills`）用的图片 prompt：视频 prompt 里的表演 / 运镜 / 「一镜到底」
     #: 对一张图没有意义，还可能把图画成多格拼贴。其余 provider 不读
     still_prompt: str = ""
+    #: 插图 provider：配图按这个比例画（空 = 用 `aspect_ratio`）
+    still_aspect: str = ""
+    #: 插图 provider：画完配图后把它加工成最终画面（手账拼贴：资料卡 + 配图 + 批注），
+    #: 参数是配图路径，返回画面路径。为空就直接用配图
+    compose_still: Callable[[Path], Awaitable[Path]] | None = Field(default=None, exclude=True)
+    #: 插图 provider 的推拉幅度（拼贴画面上有字，推拉大了会把字推出画面）
+    still_zoom: float | None = None
     #: 任务一提交成功就回调（参数是 job id）：上层要立刻把 job id 落盘，
     #: 之后不管是取消、超时还是进程重启，都能接着轮询而不是再买一次
     on_submitted: Callable[[str], None] | None = Field(default=None, exclude=True)

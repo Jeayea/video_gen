@@ -45,20 +45,22 @@ class _NotRetryable(VideoProviderError):
     retryable = False
 
 
-def ken_burns_filter(width: int, height: int, frames: int, fps: int, motion: str) -> str:
+def ken_burns_filter(
+    width: int, height: int, frames: int, fps: int, motion: str, *, amount: float = _ZOOM
+) -> str:
     """一张图 → `frames` 帧的推拉 / 平移。先放大到两倍再 zoompan，减轻取整造成的抖动。"""
     last = max(1, frames - 1)
     progress = f"(on/{last})"
     center_x = "iw/2-(iw/zoom/2)"
     center_y = "ih/2-(ih/zoom/2)"
     if motion == "zoom_out":
-        zoom, x, y = f"{1 + _ZOOM}-{_ZOOM}*{progress}", center_x, center_y
+        zoom, x, y = f"{1 + amount}-{amount}*{progress}", center_x, center_y
     elif motion == "pan_right":
-        zoom, x, y = f"{1 + _ZOOM}", f"(iw-iw/zoom)*{progress}", center_y
+        zoom, x, y = f"{1 + amount}", f"(iw-iw/zoom)*{progress}", center_y
     elif motion == "pan_left":
-        zoom, x, y = f"{1 + _ZOOM}", f"(iw-iw/zoom)*(1-{progress})", center_y
+        zoom, x, y = f"{1 + amount}", f"(iw-iw/zoom)*(1-{progress})", center_y
     else:  # zoom_in
-        zoom, x, y = f"1+{_ZOOM}*{progress}", center_x, center_y
+        zoom, x, y = f"1+{amount}*{progress}", center_x, center_y
     big_w, big_h = width * 2, height * 2
     return (
         f"scale={big_w}:{big_h}:force_original_aspect_ratio=increase,crop={big_w}:{big_h},"
@@ -111,17 +113,27 @@ class StillVideoProvider(VideoProvider):
         output.parent.mkdir(parents=True, exist_ok=True)
         prompt = request.still_prompt or request.prompt
         image_path, cost = await self._draw(request, output, prompt)
+        if request.compose_still is not None:
+            # 手账拼贴：配图 + 资料卡 + 批注拼成一帧（本机计算，不花钱；失败按渲染失败重试）
+            try:
+                image_path = await request.compose_still(image_path)
+            except Exception as exc:
+                raise VideoProviderError(f"拼贴画面合成失败：{exc}") from exc
 
         width, height = _RESOLUTIONS.get(request.aspect_ratio, _RESOLUTIONS["9:16"])
         seconds = max(1.0, float(request.duration_sec)) + self.slack_sec
         frames = max(2, round(seconds * self.fps))
         motion = motion_for(request.shot_id)
+        zoom = _ZOOM
+        if request.still_zoom is not None:
+            # 画面上有字：只做轻微推近（平移会把一侧的字推出画面）
+            motion, zoom = "zoom_in", request.still_zoom
         try:
             await run_ffmpeg(
                 [
                     "-y", "-hide_banner", "-loglevel", "error",
                     "-i", str(image_path),
-                    "-vf", ken_burns_filter(width, height, frames, self.fps, motion),
+                    "-vf", ken_burns_filter(width, height, frames, self.fps, motion, amount=zoom),
                     "-frames:v", str(frames),
                     "-c:v", "libx264", "-preset", "veryfast", "-crf", str(self.crf),
                     "-pix_fmt", "yuv420p", "-r", str(self.fps),
@@ -156,7 +168,7 @@ class StillVideoProvider(VideoProvider):
                     subject_id=request.shot_id,
                     prompt=prompt,
                     output_path=output.with_suffix(".png"),
-                    aspect_ratio=request.aspect_ratio,
+                    aspect_ratio=request.still_aspect or request.aspect_ratio,
                     reference_images=list(request.reference_images),
                 )
             )

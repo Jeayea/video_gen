@@ -17,7 +17,10 @@ videogen = "videogen.cli:main"
 
 [project.optional-dependencies]
 # 便携 ffmpeg（pip 装一个自带二进制，不用 brew）；视频阶段需要
-media = ["imageio-ffmpeg>=0.5"]
+media = [
+    "imageio-ffmpeg>=0.5",
+    "pillow>=11.0",  # 科普「手账拼贴」画风：排资料卡、画红框、叠图层（只处理自己生成的图）
+]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.24",

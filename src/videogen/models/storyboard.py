@@ -111,6 +111,8 @@ class Shot(BaseModel):
     voice_direction: VoiceDirection | None = None
     #: 科普：这一镜的旁白依据哪几条事实（从剧本旁白句继承）。短剧不用
     fact_refs: StrList = Field(default_factory=list)
+    #: 科普「手账拼贴」画风：画面上手写的一句批注（口语短评，代码用手写字体写上去，不交给图片模型）
+    annotation: str = ""
 
     @field_validator("duration_sec", mode="before")
     @classmethod

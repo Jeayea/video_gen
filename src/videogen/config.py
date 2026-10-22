@@ -155,6 +155,10 @@ class Settings(BaseSettings):
         "clean modern editorial illustration, soft natural colors, simple shapes, "
         "gentle lighting, uncluttered background"
     )
+    #: 「手账拼贴」画风（illustration_style=notebook）的字体文件路径（空 = 按常见位置自动找）。
+    #: 手写字体用于批注，推荐站酷快乐体（ZCOOL KuaiLe，SIL OFL）；衬线体用于排资料原文
+    collage_hand_font: str = ""
+    collage_serif_font: str = ""
     tts_timeout_sec: float = 60.0
     #: 每句对白后面留的呼吸时间（秒），用于音画对齐
     audio_gap_sec: float = 0.25

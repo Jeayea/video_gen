@@ -66,6 +66,14 @@ VISUAL_STILL = "still"
 VISUAL_VIDEO = "video"
 
 
+NOTEBOOK = "notebook"
+
+
+def uses_collage(project: Project | None) -> bool:
+    """插图模式 + 手账拼贴画风：每一帧由代码把资料卡、配图、手写批注拼起来。"""
+    return uses_stills(project) and getattr(project, "illustration_style", "") == NOTEBOOK
+
+
 def uses_stills(project: Project | None) -> bool:
     """这个项目的画面是不是每句一张 AI 示意图（`visual_mode=still`，只对科普生效）。"""
     return is_explainer(project) and getattr(project, "visual_mode", "") == VISUAL_STILL
@@ -94,6 +102,20 @@ TONES: dict[str, tuple[str, str, str, str]] = {
         "画面要有喜剧感：夸张的表情和动作、反差、会做表情的拟人化物件（水瓶、器官、细胞），"
         "像表情包；讲事实的镜头仍要让人一眼看懂这件事",
         "念法俏皮、有节奏感，梗要念出笑点；讲到事实和建议时稳下来",
+    ),
+    # 带人读论文 / 报告：第一人称、有自己的判断，但用词克制，像讲课而不是聊天
+    "commentary": (
+        "个人解读",
+        "第一人称讲解，像研究者带人读这份资料：可以用「我」给出判断（「我认为这个设定的关键在于……」"
+        "「这一点值得存疑」），但要说清楚是看法；资料作者的观点和论文自己承认的局限说成"
+        "「作者认为」「论文也承认」，不要说成「我认为」。用平实、完整的句子，像讲课或纪录片旁白："
+        "不用「咱们」「你看」「呢」「啊」这类口头语气词，不用网络流行语、感叹句和夸张的说法"
+        "（「杀疯了」「逆袭」「硬核」「躺赢」）。讲资料内容的句子照底稿说，数字和结论不夸张；"
+        "术语第一次出现时用半句话解释。段与段之间用一句话交代逻辑关系"
+        "（「这就引出了方法上的设计」），让观众跟着一条线走",
+        "画面像在资料旁边画的示意：简单、直白",
+        "像本人在讲一份自己读过的资料：语速平稳、吐字清楚，有自然的停顿和轻重；"
+        "不要播音腔，也不要聊天式的大起伏",
     ),
 }
 
@@ -138,6 +160,15 @@ ILLUSTRATION_STYLES: dict[str, tuple[str, str]] = {
         "中国水墨",
         "traditional Chinese ink wash painting, expressive brush strokes, muted colors with "
         "light color accents, generous empty space, no calligraphy, no seals",
+    ),
+    # 手账拼贴：配图只是马克笔线稿，原文资料卡和手写批注由代码排进画面（collage_service）
+    NOTEBOOK: (
+        "手账拼贴",
+        "black marker doodle on plain white paper, thick rounded hand-drawn lines with a slight "
+        "wobble, simple shapes, one or two flat accent colors, lots of empty white space, "
+        # 写「像笔记本上的速写」会被画出螺旋装订线和纸边（RSI 试拍 10 张里 6 张）
+        "no shading, no background scenery, no notebook, no spiral binding, no page edges, "
+        "no frame",
     ),
 }
 #: 画风 key 的写法；自填画风不能和它撞
@@ -231,7 +262,10 @@ def apply_creation_defaults(project: Project, settings: Settings | None = None) 
     if not project.visual_mode:
         project.visual_mode = VISUAL_STILL
     if not project.subtitle_style:
-        project.subtitle_style = SUBTITLE_STYLE
+        # 手账拼贴配手写体字幕；其余画风用半透明底条
+        project.subtitle_style = (
+            "note" if project.illustration_style == NOTEBOOK else SUBTITLE_STYLE
+        )
     if not project.music_mood:
         project.music_mood = MUSIC_MOOD
     if project.music_gain_db is None:
@@ -266,6 +300,8 @@ KNOWLEDGE_SYSTEM = """你是科普知识底稿编辑。为一支 30-120 秒的�
 - facts：讲清这个题目必需的事实，8-20 条。type 填 concept（核心概念）/ misconception
   （常见误解，content 写成「常见误解：……；实际上……」）/ number（数字、日期、量级）/ general
 - 每条事实只说一件事，能被人逐条核对；拿不准的不要写，不要编数字
+- content 只转述 source 那句原文：主语和范围照原句（「表现最好的那个」不能写成「平均」「普遍」，
+  一个例子不能写成一类规律），不加原句里没有的限定、原因和推论
 - source 按用户消息里的「出处要求」写
 - settings 是演示环境（实验室、天空、细胞内部……）2-5 个；props 是需要反复出现、外观要一致的
   演示物 0-3 个，没有就给空数组
@@ -276,13 +312,15 @@ KNOWLEDGE_SYSTEM = """你是科普知识底稿编辑。为一支 30-120 秒的�
   mouth at the top, no other openings"）。不写的话每张图的出水方式都不一样（拧盖、泵头、龙头），
   人喝水时嘴也对不上瓶口
 - style.explainer_tone 按题目选一个：serious（严肃的医疗、安全、灾难、历史悲剧）/ light（一般科普）/
-  meme（网络热词、流行现象、段子式的问题，即使和健康有关也可以选）
+  meme（网络热词、流行现象、段子式的问题，即使和健康有关也可以选）/
+  commentary（带人读一篇论文、报告或政策文件）
 - style.illustration_style 按题目选一个最合适的插图画风：{styles}
 - 不要输出任何 id（由系统分配）
 - 只输出 JSON""".replace(
     "{styles}",
     " / ".join(f"{key}（{label}）" for key, (label, _) in ILLUSTRATION_STYLES.items())
-    + "。讲古希腊罗马、古代中国这类历史题目时选对应时代的画风",
+    + "。讲古希腊罗马、古代中国这类历史题目时选对应时代的画风；"
+    "带人读论文、报告这类有参考资料的题目选 notebook",
 )
 
 
@@ -551,6 +589,30 @@ def _normalize_with_map(text: str) -> tuple[str, tuple[int, ...]]:
     return "".join(chars), tuple(index)
 
 
+def locate_quote(quote: str, material: str) -> tuple[int, int] | None:
+    """原文在资料里的位置 `(起, 止)`（忽略空白和标点的差异；找不到返回 None）。
+
+    通过出处校验的事实，`source` 就是资料里的原句，这里只做精确定位（不做近似匹配）。
+    """
+    norm_quote, _ = _normalize_with_map(quote)
+    if not norm_quote:
+        return None
+    norm_material, index = _normalize_with_map(material)
+    pos = norm_material.find(norm_quote)
+    if pos < 0:
+        return None
+    start, end = index[pos], index[pos + len(norm_quote) - 1] + 1
+    # 归一化只留字母数字：引文首尾的括号 / 引号 / 句号要补回来（「(weakest)」不能框成「(weakest」）
+    stripped = quote.strip()
+    tail = stripped[len(stripped.rstrip("）)]」』”\"'.。!！?？")):]
+    if tail and material[end : end + len(tail)] == tail:
+        end += len(tail)
+    head = stripped[: len(stripped) - len(stripped.lstrip("（(「『“\"'"))]
+    if head and material[start - len(head) : start] == head:
+        start -= len(head)
+    return start, end
+
+
 def match_quote(quote: str, material: str, *, min_chars: int) -> tuple[str, str]:
     """引文能不能在资料里找到。返回 `(状态, 资料里的真实原句)`。
 
@@ -701,13 +763,34 @@ def _audience(project: Project) -> str:
     return " ".join(project.audience.split()) or "没有专业背景的成年人"
 
 
+_POINT_SPLIT = re.compile(r"\s*(?:->|→|=>|⇒)\s*")
+_POINT_BULLET = re.compile(r"^\s*(?:[-*•·]|\d+[.、)）]|[（(]\d+[)）])\s*")
+
+
+def user_points(text: str) -> list[str]:
+    """用户写的分段：一行一段（行首的编号 / 圆点去掉）；一行里用「->」「→」连起来的也拆开。"""
+    points: list[str] = []
+    for line in str(text or "").splitlines():
+        for part in _POINT_SPLIT.split(line):
+            part = _POINT_BULLET.sub("", part).strip()
+            if part:
+                points.append(part)
+    return points
+
+
 async def generate_outline(
     llm: LLMProvider, project: Project, bible: StoryBible
 ) -> ScriptOutline:
+    # 用户自己写了分段：分段就是全片结构，一段一场、不增不删，也不另加开场提问和小结
+    # （以前固定再补这两场：「概念 → 方法 → 实验 → 局限」这种结构会被套成 6 场的「问答」）
+    points = user_points(project.input_text) if project.input_mode == InputMode.OUTLINE else []
+    numbered = "\n".join(f"{i}. {p}" for i, p in enumerate(points, start=1))
     lines = [
         f"## 题目\n{project.input_text}" if project.input_mode == InputMode.THEME else
-        "## 用户写好的知识点（每个知识点一场，不增不删、不改顺序；你只补开场提问和小结）\n"
-        f"{project.input_text}",
+        f"## 用户写好的分段（这就是全片结构，共 {len(points)} 段：每段一场，不增不删、不改顺序；"
+        "不要另加开场提问和小结 —— 第一段兼作开场，用一个问题或现象把人带进来，"
+        "最后一段兼作收尾，结尾要回到第一段的问题、给出一句回答）\n"
+        f"{numbered}",
         f"\n目标观众：{_audience(project)}",
         tone_block(project),
         f"目标时长：{project.target_duration_sec} 秒",
@@ -717,39 +800,37 @@ async def generate_outline(
         LLMMessage(role="system", content=OUTLINE_SYSTEM),
         LLMMessage(role="user", content="\n".join(lines)),
     ]
-    # 用户自己写了知识点：一个知识点一场、不增不删，只要求「提问 + 至少一个知识点 + 小结」。
-    # 以前一律要求至少 MIN_POINTS 个知识点：用户只写了 2 个时，要么报错、
-    # 要么逼模型违背用户的大纲去拆；超过 MAX_POINTS 个时多出来的被悄悄截掉
-    user_points = project.input_mode == InputMode.OUTLINE
-    need = 3 if user_points else MIN_POINTS + 2
-    split_hint = (
-        "请按用户写好的知识点逐个成场，补上开场提问和小结。"
-        if user_points
-        else "请把知识点拆开，重写完整大纲。"
-    )
+    need = MIN_POINTS + 2
     raw: list[dict] = []
-    # 场数不够时把要求告诉模型再要一次：同一份输入 gemini-3.8-flash 有时给 5 场、有时给 4 场
+    # 场数不对时把要求告诉模型再要一次：同一份输入 gemini-3.8-flash 有时给 5 场、有时给 4 场
     for attempt in range(OUTLINE_ATTEMPTS):
         response = await llm.chat_json(messages, schema=OutlineResponse, temperature=0.5)
         raw = [s for s in response.scenes if isinstance(s, dict)]
-        if len(raw) >= need:
+        if (len(raw) == len(points)) if points else (len(raw) >= need):
             break
-        logger.warning("科普大纲只有 %d 场（第 %d 次），要求重写", len(raw), attempt + 1)
+        logger.warning("科普大纲给了 %d 场（第 %d 次），要求重写", len(raw), attempt + 1)
+        correction = (
+            f"给了 {len(raw)} 场，不对：用户写了 {len(points)} 段，就是 {len(points)} 场，"
+            "一段一场，不要另加开场提问和小结。"
+            if points
+            else f"只有 {len(raw)} 场，不够：至少要 {need} 场"
+            f"（1 场开场提问 + 至少 {need - 2} 场知识点 + 1 场小结）。"
+            "请把知识点拆开，重写完整大纲。"
+        )
         messages = [
             *messages,
             LLMMessage(role="assistant", content=json.dumps({"scenes": raw}, ensure_ascii=False)),
-            LLMMessage(
-                role="user",
-                content=f"只有 {len(raw)} 场，不够：至少要 {need} 场"
-                f"（1 场开场提问 + 至少 {need - 2} 场知识点 + 1 场小结）。" + split_hint,
-            ),
+            LLMMessage(role="user", content=correction),
         ]
     else:
         raise ValueError(
-            f"科普大纲至少要 {need} 场（提问 + {need - 2} 个知识点 + 小结），"
+            f"用户写了 {len(points)} 段，模型 {OUTLINE_ATTEMPTS} 次给的场数都对不上"
+            f"（{len(raw)} 场）"
+            if points
+            else f"科普大纲至少要 {need} 场（提问 + {need - 2} 个知识点 + 小结），"
             f"模型 {OUTLINE_ATTEMPTS} 次都只给了 {len(raw)} 场"
         )
-    if not user_points and len(raw) > MAX_POINTS + 2:
+    if not points and len(raw) > MAX_POINTS + 2:
         raw = [raw[0], *raw[1 : MAX_POINTS + 1], raw[-1]]
     budget = apply_duration_budget(project.target_duration_sec, len(raw), MIN_SCENE_DURATION_SEC)
     return ScriptOutline(
@@ -772,7 +853,8 @@ SCENE_SYSTEM = """你是科普旁白撰稿。你在逐场写一支科普讲解�
 全片只有一个旁白声音，没有角色对白。
 
 规则：
-1. 每句旁白只讲一个意思，15-30 字，口语、念得顺。一句话就是一个镜头，每句都要能配一个画面
+1. 每句旁白只讲一个意思，15-30 字，念得顺；宁可多写一句，也不要把两件事压进一句。
+   一句话就是一个镜头，每句都要能配一个画面
 2. 每句标 fact_refs：这句话依据知识底稿里的哪几条事实（写 id）；纯过渡句（「我们来看看」）给空数组。
    不标事实的句子只能是提问、过渡或比喻：不能自己下结论、给数字，开场钩子也不能为了抓人把事实说重
    （底稿说「可能」，就不能写成「容易」「一定」「会」）
@@ -1248,6 +1330,7 @@ VISUAL_FIELDS = (
     "video_prompt",
     "location",
     "props_in_frame",
+    "annotation",
 )
 
 VISUALS_SYSTEM = """你是科普画面分镜师。一支科普讲解短片的旁白已经定稿，一句旁白就是一个镜头，
@@ -1281,6 +1364,34 @@ VISUALS_SYSTEM = """你是科普画面分镜师。一支科普讲解短片的旁
 - 一个镜头只写一个连续的画面，不要在一句 video_prompt 里塞多个画面切换
 - 相邻镜头的画面要连得上（同一个演示过程的前后两步、同一个地点换景别）
 - 只输出 JSON: {"shots": [...]}"""
+
+
+#: 手账拼贴画风追加给画面分镜师的要求（批注由代码用手写字体写进画面，不进图片 prompt）
+ANNOTATION_MAX_CHARS = 16
+NOTEBOOK_RULES = (
+    "\n## 手账拼贴画风\n"
+    "画面是一张白纸：左边贴着这句旁白引用的资料原文（代码排版、红笔框出原句），右边是一幅马克笔线稿。"
+    "video_prompt 只写这幅线稿：一个简单、一眼能懂的比喻或示意（物件、箭头、简笔小人），"
+    "白底、不要背景场景、不要字。\n"
+    "每个镜头再给一个 \"annotation\"：画面上手写的批注，中文，不超过 12 个字，{voice}；"
+    "不写数字、不写新的事实、不把「可能」说成「一定」。"
+)
+#: 批注的口吻跟着语气走：轻松 / 玩梗可以吐槽，严谨 / 个人解读只点要点
+_NOTE_VOICES = {
+    "light": "像作者在资料旁边写的笔记或吐槽（反问、感叹、一句点评都行）",
+    "meme": "像作者在资料旁边写的吐槽（反问、感叹、一句点评都行）",
+}
+_NOTE_VOICE_PLAIN = (
+    "像读者在资料页边写的批注：点出这句的要点、前提或疑问（「关键：没有起始代码」「只是单项」），"
+    "平实，不用感叹号和网络用语"
+)
+
+
+def notebook_rules(project: Project | None) -> str:
+    """手账拼贴追加给画面分镜师的要求；不是手账拼贴时为空。"""
+    if not uses_collage(project):
+        return ""
+    return NOTEBOOK_RULES.format(voice=_NOTE_VOICES.get(tone_of(project), _NOTE_VOICE_PLAIN))
 
 
 def shots_from_scene(
@@ -1351,6 +1462,7 @@ async def generate_visuals(
         tone_block(project, 2),
         (f"插图画风：{illustration_label(project)}（画面描述要能用这种画风画出来）"
          if uses_stills(project) else ""),
+        notebook_rules(project),
         "\n## 本场",
         f"场次: {scene.id}",
         f"标题: {scene.heading}",
@@ -1402,6 +1514,8 @@ async def generate_visuals(
         shot.video_prompt = storyboard_service.sanitize_video_prompt(draft.video_prompt, bible)
         shot.location = location if location in known_locs else ""
         shot.props_in_frame = [p for p in draft.props_in_frame if p in known_props]
+        if uses_collage(project):
+            shot.annotation = " ".join(draft.annotation.split())[:ANNOTATION_MAX_CHARS]
     if missing:
         logger.warning("科普分镜 %s：模型漏了 %d 个镜头的画面：%s", scene.id, len(missing),
                        "、".join(missing))

@@ -1525,17 +1525,27 @@ async def test_outline_with_too_few_scenes_is_asked_again(store, make_pipeline):
         await explainer_service.generate_outline(stubborn, project, store.load_bible(project.id))
 
 
-async def test_outline_mode_follows_the_users_point_count(store, make_pipeline):
-    """用户写好的知识点：2 个就 2 场（不再要求至少 3 个），9 个也不截掉（以前超过 5 个就截）。"""
-    for points in (2, 9):
+async def test_outline_mode_follows_the_users_sections_exactly(store, make_pipeline):
+    """用户写的分段就是全片结构：2 段就 2 场、9 段就 9 场，不另加开场提问和小结、不截掉。"""
+    for count in (2, 9):
         llm = FakeLLM()
-        llm.explainer_points = points
-        project, _, _ = await _with_bible(store, make_pipeline, llm, input_mode="outline")
+        text = "\n".join(f"{i}. 第 {i} 段" for i in range(1, count + 1))
+        project, _, _ = await _with_bible(
+            store, make_pipeline, llm, input_mode="outline", input_text=text
+        )
         outline = await explainer_service.generate_outline(
             llm, project, store.load_bible(project.id)
         )
-        assert len(outline.scenes) == points + 2
+        assert len(outline.scenes) == count
         assert sum(1 for c in llm.calls if "科普讲解的结构编辑" in str(c[0].content)) == 1
+
+
+def test_user_points_accept_lines_and_arrows():
+    points = explainer_service.user_points("概念 -> 论文的 idea → 方法")
+    assert points == ["概念", "论文的 idea", "方法"]
+    assert explainer_service.user_points("1. 概念\n2、方法\n- 局限\n\n（4）未来") == [
+        "概念", "方法", "局限", "未来"
+    ]
 
 
 def test_split_sentences_keeps_attributions_quotes_and_leading_ellipsis():

@@ -333,6 +333,15 @@ async def _generate_one(
         seed=shot_seed,
         resume_job_id=resume,
     )
+    if getattr(provider, "draws_stills", False) and explainer_service.uses_collage(project):
+        from videogen.services import collage_service
+
+        if reason := collage_service.unavailable_reason():
+            clip.status = ClipStatus.FAILED
+            clip.error = reason
+            manifest.upsert(clip)
+            return
+        _attach_collage(request, shot, project, bible, clips_dir)
 
     def submitted(job_id: str) -> None:
         clip.pending_job_id = job_id
@@ -1226,7 +1235,8 @@ def still_prompt(
     parts = [
         f"An illustration for a science explainer video, aspect ratio {project.aspect_ratio.value}",
         base,
-        location_anchor(shot, bible, base),
+        # 手账拼贴的配图是白纸上的线稿：不要场景背景
+        "" if explainer_service.uses_collage(project) else location_anchor(shot, bible, base),
         prop_anchor(shot, bible, base),
         f"style: {style}" if (style := explainer_service.illustration_prompt(project, settings))
         else "",
@@ -1235,6 +1245,31 @@ def still_prompt(
     joined = ". ".join(part.strip().rstrip(".").strip() for part in parts if part.strip())
     body = english_only(joined, keep_signage=True)
     return f"{body}. {text_rule(body, default=_STILL_NO_TEXT)}."
+
+
+#: 拼贴画面上有字：推近幅度压小（默认 0.12 会把卡片边上的字推出画面）
+COLLAGE_ZOOM = 0.035
+
+
+def _attach_collage(
+    request: VideoRequest,
+    shot: Shot,
+    project: Project,
+    bible: StoryBible | None,
+    clips_dir: Path,
+) -> None:
+    """手账拼贴：配图画完后和资料卡、批注拼成一帧（`collage_service`）。"""
+    from videogen.services import collage_service
+
+    spec = collage_service.build_spec(shot, project, bible)
+    output = clips_dir / f"{shot.id}.collage.png"
+
+    async def compose(doodle: Path) -> Path:
+        return await asyncio.to_thread(collage_service.render, spec, doodle, output)
+
+    request.compose_still = compose
+    request.still_aspect = collage_service.doodle_aspect(spec)
+    request.still_zoom = COLLAGE_ZOOM
 
 
 def location_anchor(shot: Shot, bible: StoryBible | None, base: str = "") -> str:
@@ -1396,11 +1431,18 @@ _VIDEO_FIELDS = (
 
 
 def shot_signature(shot: Shot) -> tuple:
-    """镜头里影响画面的那部分（念法、LLM 文案标记这类不影响画面的字段不算）。"""
-    return tuple(
+    """镜头里影响画面的那部分（念法、LLM 文案标记这类不影响画面的字段不算）。
+
+    手账拼贴的镜头（有手写批注）还要算上批注和 `fact_refs`（资料卡印的是引用事实的原句）。
+    只在有批注时才算：别的镜头签名和以前一样（已提交任务的指纹不会失效）。
+    """
+    signature = tuple(
         tuple(value) if isinstance(value := getattr(shot, name), list) else value
         for name in _VIDEO_FIELDS
     )
+    if not shot.annotation:
+        return signature
+    return (*signature, ("annotation", shot.annotation), ("fact_refs", tuple(shot.fact_refs)))
 
 
 def unit_fingerprint(unit_id: str, shots: list[Shot]) -> str:
