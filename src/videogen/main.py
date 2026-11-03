@@ -35,7 +35,9 @@ from videogen.services import (
     explainer_service,
     lipsync_service,
     music_service,
+    screenplay_service,
     subtitle_service,
+    video_service,
     voice_catalog,
 )
 from videogen.services.character_image_service import CharacterImageError
@@ -892,6 +894,27 @@ async def get_script(project_id: str):
     return script.model_dump()
 
 
+@app.get("/api/projects/{project_id}/screenplay")
+async def get_screenplay(project_id: str, mode: str = "script"):
+    """文学剧本（纯排版，$0）：`mode=script` 按剧本排，`mode=shots` 场内按镜头展开。
+
+    返回结构化 blocks（界面渲染）+ markdown（导出）；内部 id 都换成名字。
+    """
+    if mode not in screenplay_service.MODES:
+        raise HTTPException(400, f"mode 只能是 {' / '.join(screenplay_service.MODES)}")
+    project = store.load_project(project_id)
+    script = pipeline.get_script(project_id) if project else None
+    if not script:
+        raise HTTPException(404, "剧本不存在")
+    return screenplay_service.build(
+        script,
+        pipeline.get_bible(project_id),
+        pipeline.get_storyboard(project_id),
+        mode=mode,
+        title=project.title,
+    )
+
+
 @app.put("/api/projects/{project_id}/script")
 async def update_script(project_id: str, data: dict):
     """全量更新剧本（仅允许在确认之前）。"""
@@ -930,6 +953,25 @@ async def reopen_script(project_id: str):
 async def generate_storyboard(project_id: str, req: GenerateRequest | None = None):
     storyboard = await pipeline.generate_storyboard(project_id, model=_model_of(project_id, req))
     return storyboard.model_dump()
+
+
+@app.get("/api/projects/{project_id}/storyboard/shots/{shot_id}/prompt")
+async def preview_shot_prompt(project_id: str, shot_id: str):
+    """预览这一镜所在单元（段落或单镜）最终发给视频模型的 prompt（$0，不调 API）。"""
+    project = store.load_project(project_id)
+    storyboard = store.load_storyboard(project_id) if project else None
+    if not storyboard:
+        raise HTTPException(404, "分镜不存在")
+    try:
+        return video_service.preview_prompt(
+            storyboard,
+            shot_id,
+            project,
+            store.load_bible(project_id),
+            store.load_video_manifest(project_id),
+        )
+    except KeyError:
+        raise HTTPException(404, f"镜头不存在: {shot_id}") from None
 
 
 @app.get("/api/projects/{project_id}/storyboard")

@@ -275,6 +275,10 @@ class Settings(BaseSettings):
     #: 整段直通：一段里的镜头都用原声、不需要按镜头处理声音时，直接拿视频模型的整段原片渲一次
     #: （不经过「切成单镜 → 再逐镜渲染」的两道重编码）
     compose_segment_passthrough: bool = True
+    #: 镜头转场（分镜里 `transition` = dissolve / fade）的默认时长（秒）；镜头自己填了
+    #: `transition_sec` 以它为准。转场不改时间轴：叠化压在后一镜开头、经黑场是前一镜末尾淡出
+    #: + 后一镜开头淡入，各占一半
+    compose_transition_sec: float = 0.6
     #: 口型对齐的最大延后量（秒）；超过就不对齐（避免把尾音挤出片段）
     compose_mouth_align_max_sec: float = 1.5
     compose_ambient_mode: str = "off"

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field, field_validator
 
+from videogen.models.transition import normalize_transition
 from videogen.utils.coerce import StrList, coerce_int, coerce_seconds, ensure_str_list
 
 DEFAULT_SCENE_DURATION_SEC = 10
@@ -22,8 +23,12 @@ class DialogueLine(BaseModel):
     line: str = ""
     #: 科普：这句话依据知识底稿里的哪几条事实（fact_1…）；纯过渡句为空。短剧不用
     fact_refs: StrList = Field(default_factory=list)
+    #: 说这句之前的动作 / 反应（剧本的动作行，镜头能拍到的东西）。不念、不进字幕
+    action: str = ""
+    #: 语气 / 方式括注（「低声」「电话里」「画外」），不念、不进字幕
+    parenthetical: str = ""
 
-    @field_validator("speaker", "line", mode="before")
+    @field_validator("speaker", "line", "action", "parenthetical", mode="before")
     @classmethod
     def _stringify(cls, value: object) -> str:
         return "" if value is None else str(value)
@@ -36,6 +41,25 @@ class Scene(BaseModel):
     dialogue: list[DialogueLine] = Field(default_factory=list)
     duration_sec: int = DEFAULT_SCENE_DURATION_SEC
     emotion: str = ""
+    #: 故事时间标注：「现在」「回忆 · 2009 年冬」（倒叙 / 插叙时让人读得出这是哪条线）
+    time_label: str = ""
+    #: 从上一场怎么进来（同分镜的 `transition`：空 = 硬切 / dissolve / fade）。
+    #: 生成分镜时落到这一场第一个镜头上
+    transition_in: str = ""
+    #: 开场画面：环境 + 人物在做什么（只写镜头能拍到、能听到的东西）
+    action: str = ""
+    #: 场末画面：最后一个动作或停留的画面（跨时空切走时，下一场常从这里接）
+    closing: str = ""
+
+    @field_validator("time_label", "action", "closing", mode="before")
+    @classmethod
+    def _text(cls, value: object) -> str:
+        return "" if value is None else str(value).strip()
+
+    @field_validator("transition_in", mode="before")
+    @classmethod
+    def _coerce_transition(cls, value: object) -> str:
+        return normalize_transition(value)
 
     @field_validator("dialogue", mode="before")
     @classmethod

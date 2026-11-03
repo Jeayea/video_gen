@@ -76,8 +76,15 @@ def _segment_filter(
     ambient_gain_db: float = -20.0,
     voice_delay_ms: int = 0,
     voice_gain_db: float = 0.0,
+    fade_in_sec: float = 0.0,
+    fade_out_sec: float = 0.0,
+    dissolve_sec: float = 0.0,
+    still_input: int = -1,
 ) -> str:
     """拼一条分段滤镜：视频统一规格，音频把「配音」和「模型自带环境音」混起来。
+
+    转场只动画面、不动时长：`fade_in_sec` / `fade_out_sec` 是从黑淡入 / 淡出到黑；
+    `dissolve_sec` 是开头从输入 `still_input`（上一镜的最后一帧）叠化过来。
 
     三种组合：
     - 只有配音：`[1:a] -> [a]`
@@ -85,15 +92,36 @@ def _segment_filter(
     - 两者都有：环境音压到 `ambient_gain_db`，再和人声 `amix`（`normalize=0`
       保证人声音量不被拉低）
     """
-    video = (
-        f"[0:v]scale={width}:{height}:force_original_aspect_ratio=decrease,"
+    normalize = (
+        f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
         f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,"
-        f"setsar=1,fps={fps},format=yuv420p,"
+        f"setsar=1,fps={fps},format=yuv420p"
+    )
+    fades = []
+    if fade_in_sec > 0:
+        fades.append(f"fade=t=in:st=0:d={fade_in_sec:.3f}")
+    if fade_out_sec > 0:
+        fades.append(f"fade=t=out:st={max(0.0, duration - fade_out_sec):.3f}:d={fade_out_sec:.3f}")
+    tail = ("," + ",".join(fades)) if fades else ""
+    dissolve = dissolve_sec > 0 and still_input >= 0
+    video = (
+        f"[0:v]{normalize},"
         # 片段比镜头短就冻结最后一帧补齐（不重新烧视频额度）
         f"tpad=stop_mode=clone:stop_duration={duration:.3f},"
-        f"trim=duration={duration:.3f},setpts=PTS-STARTPTS[v]"
+        f"trim=duration={duration:.3f},setpts=PTS-STARTPTS"
+        + ("[base]" if dissolve else f"{tail}[v]")
     )
     chains = [video]
+    if dissolve:
+        # 上一镜的最后一帧定格 dissolve_sec 秒，offset=0 叠进这一镜：输出长度 = 这一镜的长度
+        chains.append(
+            f"[{still_input}:v]{normalize},trim=end_frame=1,setpts=PTS-STARTPTS,"
+            f"tpad=stop_mode=clone:stop_duration={dissolve_sec:.3f},"
+            f"trim=duration={dissolve_sec:.3f},setpts=PTS-STARTPTS[still]"
+        )
+        chains.append(
+            f"[still][base]xfade=transition=fade:duration={dissolve_sec:.3f}:offset=0{tail}[v]"
+        )
     if voice and ambient:
         chains.append(
             _resample(
@@ -131,20 +159,33 @@ async def render_segment(
     ambient_gain_db: float = -20.0,
     voice_delay_ms: int = 0,
     voice_gain_db: float = 0.0,
+    dissolve_from: Path | None = None,
 ) -> None:
     """把一个镜头渲染成「视频 + 该镜头配音」的标准片段。
 
     统一分辨率/帧率/采样率/声道，这样后续 concat 可以纯 stream copy。
     `voice_gain_db` 是这条配音的响度修正（逐条对齐，见 utils/loudness.py）。
+    转场（`segment.fade_in_sec` / `fade_out_sec` / `dissolve_sec`）在这里烧进画面；
+    叠化要上一镜的视频 `dissolve_from`（取 `segment.dissolve_from_sec` 那一帧）。
     """
     duration = max(0.2, float(segment.duration_sec))
     args = ["-y", "-hide_banner", "-loglevel", "error", "-i", str(video_path)]
+    inputs = 1
     voice = audio_path is not None and Path(audio_path).is_file()
     if voice:
         args += ["-i", str(audio_path)]
+        inputs += 1
     elif not ambient:
         # 既没配音也不用环境音时，也要有音轨，否则 concat 时各段流不一致
         args += ["-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100"]
+        inputs += 1
+    still_input = -1
+    dissolve_sec = min(float(segment.dissolve_sec), duration)
+    if dissolve_sec > 0 and dissolve_from is not None and Path(dissolve_from).is_file():
+        args += ["-ss", f"{max(0.0, segment.dissolve_from_sec):.3f}", "-i", str(dissolve_from)]
+        still_input = inputs
+    else:
+        dissolve_sec = 0.0
 
     args += [
         "-filter_complex",
@@ -158,6 +199,10 @@ async def render_segment(
             ambient_gain_db=ambient_gain_db,
             voice_delay_ms=voice_delay_ms,
             voice_gain_db=voice_gain_db,
+            fade_in_sec=min(float(segment.fade_in_sec), duration),
+            fade_out_sec=min(float(segment.fade_out_sec), duration),
+            dissolve_sec=dissolve_sec,
+            still_input=still_input,
         ),
         "-map",
         "[v]",
@@ -577,11 +622,81 @@ async def plan_timeline(
     return segments
 
 
+async def apply_transitions(
+    segments: list[ComposeSegment],
+    storyboard: Storyboard,
+    project_dir: Path,
+    settings: Settings,
+) -> int:
+    """按分镜的 `transition` 给分段标上淡入 / 淡出 / 叠化，返回用了几处转场。
+
+    时间轴一点不变（字幕、配乐、闪避都按镜头时长累加，不用重算）：
+    - `fade`（经黑场）：上一镜末尾淡出、这一镜开头淡入，各占一半；
+      一边是黑场时另一边独占整段转场时长（淡出到黑 / 从黑淡入）
+    - `dissolve`（叠化）：这一镜开头从上一镜的最后一帧化过来，压在这一镜里；
+      上一镜是黑场时就是从黑淡入，这一镜是黑场时就是上一镜淡出到黑
+    - 第一个镜头标了转场 = 从黑淡入
+    转场最多占镜头的一半，镜头太短时按比例缩。
+    """
+    shots = {shot.id: shot for shot in storyboard.shots}
+    fps = max(1, settings.video_fps)
+    default_sec = max(0.0, float(settings.compose_transition_sec))
+    used = 0
+    for segment in segments:
+        shot = shots.get(segment.shot_id)
+        segment.black_screen = bool(shot and shot.black_screen)
+    for index, segment in enumerate(segments):
+        shot = shots.get(segment.shot_id)
+        kind = shot.transition if shot else ""
+        if not kind:
+            continue
+        seconds = shot.transition_sec if shot.transition_sec else default_sec
+        if seconds <= 0:
+            continue
+        used += 1
+        half_cur = segment.duration_sec / 2
+        if index == 0:
+            segment.fade_in_sec = round(min(seconds, half_cur), 3)
+            continue
+        previous = segments[index - 1]
+        half_prev = previous.duration_sec / 2
+        if segment.black_screen:  # 转进黑场 = 上一镜淡出到黑
+            previous.fade_out_sec = round(min(seconds, half_prev), 3)
+            continue
+        if previous.black_screen:  # 从黑场出来 = 这一镜从黑淡入
+            segment.fade_in_sec = round(min(seconds, half_cur), 3)
+            continue
+        if kind == "fade":
+            each = min(seconds / 2, half_prev, half_cur)
+            previous.fade_out_sec = round(each, 3)
+            segment.fade_in_sec = round(each, 3)
+            continue
+        # 叠化：上一镜在成片里显示到的最后一帧（片段比镜头短时是片段末帧，渲染会冻结它）
+        length = await probe_duration(project_dir / previous.video_path) or previous.duration_sec
+        segment.dissolve_sec = round(min(seconds, half_cur), 3)
+        segment.dissolve_from = previous.video_path
+        segment.dissolve_from_sec = round(
+            max(0.0, min(previous.duration_sec, length) - 1.5 / fps), 3
+        )
+    return used
+
+
 def voice_audio_for(
-    project: Project, audio_manifest: AudioManifest | None, settings: Settings
+    project: Project,
+    audio_manifest: AudioManifest | None,
+    settings: Settings,
+    storyboard: Storyboard | None = None,
 ) -> AudioManifest | None:
-    """合成用哪份配音：原声模式不读配音清单（切换模式前留下的 TTS 条目也不用）。"""
-    return audio_manifest if video_service.dub_mode_for(project, settings) == "tts" else None
+    """合成用哪份配音：原声模式只读黑场镜头的配音（切换模式前留下的 TTS 条目也不用）。"""
+    if video_service.dub_mode_for(project, settings) == "tts":
+        return audio_manifest
+    black = video_service.black_voice_shots(storyboard) if storyboard is not None else set()
+    if audio_manifest is None or not black:
+        return None
+    clips = [c for c in audio_manifest.clips if c.shot_id in black]
+    if not clips:
+        return None
+    return audio_manifest.model_copy(update={"clips": clips})
 
 
 async def compose(
@@ -616,7 +731,7 @@ async def compose(
         )
     # 原声模式：人声全用视频原片，不读配音清单（切换模式前留下的 TTS 条目也不用）
     dub_mode = video_service.dub_mode_for(project, settings)
-    voice_audio = voice_audio_for(project, audio_manifest, settings)
+    voice_audio = voice_audio_for(project, audio_manifest, settings, storyboard)
     if voice_audio is not None and not voice_audio.is_usable:
         raise ComposeError(
             f"配音不完整（就绪 {len(voice_audio.ready_clips)}/"
@@ -643,6 +758,12 @@ async def compose(
     for segment in segments:
         segment.native_voice = segment.shot_id in native and not segment.audio_path
     native_count = sum(1 for s in segments if s.native_voice)
+    transitions = await apply_transitions(segments, storyboard, project_dir, settings)
+    if transitions:
+        warnings.append(f"转场：{transitions} 处（叠化 / 经黑场淡出淡入，不改时长）")
+    black_count = sum(1 for s in segments if s.black_screen)
+    if black_count:
+        warnings.append(f"黑场：{black_count} 个镜头是本机生成的黑画面")
     if dub_mode == "native":
         silent: list[str] = []
         for segment in segments:
@@ -1201,6 +1322,9 @@ async def _render_all(
             # 文件名方案会被上一轮的旧标记骗过 —— 旧标记还在、分段文件却已经被
             # 「另一套参数」重渲过（真实事故：关掉响度归一的对比跑复用到了归一后的分段）。
             marker = segments_dir / f"{segment.shot_id}.params"
+            dissolve_from = (
+                project_dir / segment.dissolve_from if segment.dissolve_sec > 0 else None
+            )
             params = (
                 f"voice={_file_stamp(audio_path)} "
                 f"ambient={f'{segment_ambient_db:+.1f}' if use_ambient else 'off'}"
@@ -1210,11 +1334,14 @@ async def _render_all(
                 f" native={'on' if native else 'off'}"
                 f" dur={segment.duration_sec:.3f}"
                 f" out={width}x{height}@{fps} crf={crf} preset={preset}"
+                f" fade={segment.fade_in_sec:.3f}/{segment.fade_out_sec:.3f}"
+                f" dissolve={segment.dissolve_sec:.3f}@{segment.dissolve_from}"
+                f":{segment.dissolve_from_sec:.3f}"
             )
             if (
                 reuse
                 and _params_match(marker, params)
-                and _segment_is_fresh(output, [video_path, audio_path])
+                and _segment_is_fresh(output, [video_path, audio_path, dissolve_from])
             ):
                 logger.debug("复用已渲染分段：%s", output.name)
             else:
@@ -1234,6 +1361,7 @@ async def _render_all(
                     ambient_gain_db=segment_ambient_db,
                     voice_delay_ms=delay_ms,
                     voice_gain_db=gain_db,
+                    dissolve_from=dissolve_from,
                 )
                 marker.write_text(params, encoding="utf-8")
             async with lock:
@@ -1474,6 +1602,8 @@ def _passthrough_groups(
             and indexes == list(range(indexes[0], indexes[0] + len(group)))
             and all(s.native_voice and not s.audio_path for s in group)
             and not any(s.shot_id in synced for s in group)
+            # 有转场的镜头要逐镜渲（淡入淡出 / 叠化烧在分段里）
+            and not any(s.fade_in_sec or s.fade_out_sec or s.dissolve_sec for s in group)
             and (project_dir / expected[0].segment_path).is_file()
             and manifest.get(group[0].shot_id).segment_offset_sec == 0
         ):

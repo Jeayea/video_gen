@@ -33,7 +33,14 @@ from videogen.providers.video.base import (
 from videogen.services import explainer_service, voice_catalog
 from videogen.services.storyboard_service import Segment, chain_predecessors, segments_of
 from videogen.utils import language, media_history, region
-from videogen.utils.ffmpeg import cut_clip, detect_cuts, ffmpeg_available, probe_duration
+from videogen.utils.ffmpeg import (
+    FFmpegError,
+    cut_clip,
+    detect_cuts,
+    ffmpeg_available,
+    probe_duration,
+    run_ffmpeg,
+)
 from videogen.utils.redact import scrub_secrets
 
 if TYPE_CHECKING:  # 关键帧服务反过来依赖本模块，这里只用于类型标注
@@ -94,6 +101,8 @@ ProgressCallback = Callable[[VideoManifest], None] | None
 
 #: 首次失败后等待多久再试（秒），测试里传 0
 DEFAULT_RETRY_BACKOFF_SEC = 1.5
+#: 黑场片段的 provider 标记：本机 ffmpeg 生成，$0
+BLACK_PROVIDER = "local-black"
 
 
 async def generate_clips(
@@ -171,9 +180,13 @@ async def generate_clips(
 
     # 段落分镜：同一段的镜头一次生成；没编段的镜头各自成段（= 原来的单镜生成）
     todo: list[Segment] = []
+    black: list[Shot] = []
     for segment in segments_of(storyboard):
         if not unit_needs_generation(segment, manifest, project_dir):
             continue  # 续跑：已经生成好的不重复烧额度
+        if segment.black:
+            black.extend(segment.shots)  # 黑场本机生成，不进视频模型的队列
+            continue
         for shot in segment.shots:
             clip = manifest.get(shot.id) or VideoClip(shot_id=shot.id, scene_id=shot.scene_id)
             clip.status = ClipStatus.PENDING
@@ -186,6 +199,8 @@ async def generate_clips(
             manifest.upsert(clip)
         todo.append(segment)
 
+    for shot in black:
+        await _make_black_clip(shot, project, clips_dir, project_dir, manifest)
     _emit(on_progress, manifest)
     if not todo:
         logger.info("视频片段已全部就绪，无需生成（project=%s）", project.id)
@@ -868,6 +883,8 @@ def unit_needs_generation(
         clip = manifest.get(shot.id) if manifest else None
         if clip is None or clip.status != ClipStatus.READY:
             return True
+        if shot.black_screen != (clip.provider == BLACK_PROVIDER):
+            return True  # 改成黑场 / 不再是黑场：手上的片段不是这一镜要的画面
         if project_dir is not None and not _clip_file_exists(Path(project_dir), clip):
             return True
         if _unsplit_for_lack_of_ffmpeg(clip):
@@ -881,8 +898,11 @@ def pending_units(
     provider: VideoProvider,
     project_dir: Path | None = None,
 ) -> list[Segment]:
-    """这次「生成视频片段」真正会去生成的单元。换了 provider / 模型就是全部。"""
-    segments = segments_of(storyboard)
+    """这次「生成视频片段」要向视频模型买的单元。换了 provider / 模型就是全部。
+
+    黑场不算：本机生成、不花钱（预算门、preflight 都用这个口径）。
+    """
+    segments = [s for s in segments_of(storyboard) if not s.black]
     if manifest is not None and provider_switched(manifest, provider):
         return segments
     return [s for s in segments if unit_needs_generation(s, manifest, project_dir)]
@@ -1084,6 +1104,46 @@ def mood_directive(mood: str) -> str:
         if english and english not in found:
             found.append(english)
     return ", ".join(found)
+
+
+def preview_prompt(
+    storyboard: Storyboard,
+    shot_id: str,
+    project: Project,
+    bible: StoryBible | None,
+    manifest: VideoManifest | None = None,
+    *,
+    settings: Settings | None = None,
+) -> dict:
+    """这个镜头所在的生成单元，按**现在的**分镜会发给视频模型的完整 prompt（不调 API）。
+
+    和真正生成走同一套拼装（段落 → `build_segment_prompt`，单镜 → `build_prompt`），
+    角色外貌 / 场景 / 道具锚点、表演与背景要求都在里面。没算进去的两样：
+    开场关键帧的说明（生成时画了首帧才追加）和 provider 按模型上限做的截断。
+    已经生成过的，`sent_prompt` 是当时实际发出去的那份。
+    """
+    unit = next((u for u in segments_of(storyboard) if any(s.id == shot_id for s in u.shots)), None)
+    if unit is None:
+        raise KeyError(shot_id)
+    shot_ids = [s.id for s in unit.shots]
+    if unit.black:
+        prompt, kind = "", "black"
+    elif len(unit.shots) > 1:
+        prompt = build_segment_prompt(unit.shots, project, bible, settings=settings)
+        kind = "segment"
+    else:
+        prompt, kind = build_prompt(unit.shots[0], project, bible, settings=settings), "shot"
+    clip = manifest.get(shot_ids[0]) if manifest else None
+    sent = clip.prompt if clip and clip.prompt else ""
+    return {
+        "unit_id": unit.id,
+        "kind": kind,
+        "shot_ids": shot_ids,
+        "prompt": prompt,
+        "chars": len(prompt),
+        "sent_prompt": sent,
+        "sent_differs": bool(sent) and sent.strip() != prompt.strip(),
+    }
 
 
 def build_prompt(
@@ -1440,6 +1500,9 @@ def shot_signature(shot: Shot) -> tuple:
         tuple(value) if isinstance(value := getattr(shot, name), list) else value
         for name in _VIDEO_FIELDS
     )
+    if shot.black_screen:
+        # 同上：只在是黑场时才算进来，别的镜头签名不变
+        signature = (*signature, ("black_screen", True))
     if not shot.annotation:
         return signature
     return (*signature, ("annotation", shot.annotation), ("fact_refs", tuple(shot.fact_refs)))
@@ -1790,9 +1853,20 @@ def native_voice_shots(
     return {
         shot.id
         for shot in storyboard.shots
-        if (clip := manifest.get(shot.id)) is not None
+        if not shot.black_screen  # 黑画面里没人出声：它的台词走 TTS（见 `black_voice_shots`）
+        and (clip := manifest.get(shot.id)) is not None
         and clip.status == ClipStatus.READY
         and clip.media_kind == MediaKind.VIDEO
+    }
+
+
+def black_voice_shots(storyboard: Storyboard) -> set[str]:
+    """有台词 / 旁白的黑场镜头：原声模式下也要 TTS 配音（片段是本机生成的无声黑画面）。"""
+    return {
+        shot.id
+        for shot in storyboard.shots
+        if shot.black_screen
+        and (str(shot.dialogue_text or "").strip() or str(shot.narration or "").strip())
     }
 
 
@@ -1951,6 +2025,63 @@ def _chain_source(
         logger.info("上一段 %s 没有就绪的片段，下一段不接戏、照常画开场关键帧", previous.id)
         return None
     return Path(project_dir) / clip.path
+
+
+async def _make_black_clip(
+    shot: Shot,
+    project: Project,
+    clips_dir: Path,
+    project_dir: Path,
+    manifest: VideoManifest,
+) -> None:
+    """黑场镜头：本机 ffmpeg 生成一段黑画面 + 静音（$0）。
+
+    长度按分镜时长；之后配音拉长镜头时，合成阶段会冻结末帧补足（黑的还是黑的），不用重做。
+    """
+    clip = manifest.get(shot.id) or VideoClip(shot_id=shot.id, scene_id=shot.scene_id)
+    clip.provider = BLACK_PROVIDER
+    clip.media_kind = MediaKind.VIDEO
+    clip.segment_id = ""
+    clip.segment_path = ""
+    clip.segment_offset_sec = 0.0
+    clip.pending_job_id = ""
+    clip.task_id = None
+    clip.cost_usd = 0.0
+    clip.cost_recorded = True  # 没花钱，不进账本
+    clip.duration_sec = shot.duration_sec
+    clip.aspect_ratio = project.aspect_ratio.value
+    clip.prompt = ""
+    clip.attempts += 1
+    output = Path(clips_dir) / f"{shot.id}.mp4"
+    output.parent.mkdir(parents=True, exist_ok=True)
+    width, height = project.output_resolution
+    fps = max(1, get_settings().video_fps)
+    seconds = max(1, int(shot.duration_sec))
+    try:
+        await run_ffmpeg(
+            [
+                "-y", "-hide_banner", "-loglevel", "error",
+                "-f", "lavfi", "-i", f"color=c=black:s={width}x{height}:r={fps}:d={seconds}",
+                "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
+                "-t", str(seconds),
+                "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest",
+                str(output),
+            ],
+            timeout_sec=60.0,
+        )
+    except FFmpegError as exc:
+        _cleanup_partial(output)
+        clip.status = ClipStatus.FAILED
+        clip.error = f"黑场片段生成失败（需要本机 ffmpeg）：{scrub_secrets(str(exc))[:200]}"
+        manifest.upsert(clip)
+        logger.warning("黑场镜头 %s 生成失败：%s", shot.id, exc)
+        return
+    clip.path = _relative(output, project_dir)
+    clip.status = ClipStatus.READY
+    clip.error = ""
+    clip.generated_at = datetime.now(UTC).isoformat()
+    manifest.upsert(clip)
+    logger.info("黑场镜头 %s：本机生成 %d 秒黑画面（$0）", shot.id, seconds)
 
 
 def _clip_file_exists(project_dir: Path, clip: VideoClip) -> bool:

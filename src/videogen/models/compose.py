@@ -35,6 +35,16 @@ class ComposeSegment(BaseModel):
     #: 这一镜的旁白视频模型已经在原声里念过了（`VIDEO_PROMPT_NARRATION`）：
     #: 没有配音文件，原声按原音量进成片，而不是当环境音压低
     native_voice: bool = False
+    #: 黑场镜头（本机生成的黑画面）
+    black_screen: bool = False
+    #: 转场（`compose_service.apply_transitions` 按分镜算好）：开头从黑淡入 / 末尾淡出到黑的秒数
+    fade_in_sec: float = 0.0
+    fade_out_sec: float = 0.0
+    #: 叠化：开头这么多秒从上一镜的最后一帧化过来（不改时长）
+    dissolve_sec: float = 0.0
+    #: 叠化的起始画面：上一镜的视频（相对项目目录）和取第几秒那一帧
+    dissolve_from: str = ""
+    dissolve_from_sec: float = 0.0
 
 
 class ComposeReport(BaseModel):

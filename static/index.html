@@ -174,6 +174,33 @@ body {
 .scene-block .dialogue { font-size: 12px; }
 .scene-block .dialogue .speaker { color: var(--accent2); font-weight: 500; }
 .scene-block .duration { font-size: 11px; color: var(--text2); margin-top: 6px; }
+.scene-block .action-line { font-size: 12px; color: var(--text2); font-style: italic; margin: 3px 0; }
+.scene-block .paren { color: var(--text2); }
+
+/* 文学剧本（纯排版视图） */
+.modal.screenplay-modal { width: min(860px, 100%); }
+.screenplay-tools { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; margin-bottom: 10px; }
+.screenplay {
+  font-family: "Songti SC", "Noto Serif CJK SC", "Source Han Serif SC", serif;
+  font-size: 15px; line-height: 1.9; color: var(--text);
+  border: 1px solid var(--border); border-radius: 10px; padding: 24px clamp(16px, 5vw, 56px);
+  max-height: 68vh; overflow: auto;
+}
+.screenplay .sp-title { text-align: center; font-size: 22px; font-weight: 700; margin-bottom: 4px; }
+.screenplay .sp-logline { text-align: center; color: var(--text2); font-size: 13px; margin-bottom: 14px; }
+.screenplay .sp-cast { font-size: 13px; margin: 8px 0 18px; padding-bottom: 14px; border-bottom: 1px solid var(--border); }
+.screenplay .sp-cast b { display: block; margin-bottom: 4px; }
+.screenplay .sp-scene { font-weight: 700; margin-top: 26px; }
+.screenplay .sp-meta { font-size: 12px; color: var(--text2); margin-bottom: 8px; }
+.screenplay .sp-action { margin: 6px 0; }
+.screenplay .sp-line { margin: 6px 0 6px 2em; }
+.screenplay .sp-line .who { font-weight: 700; }
+.screenplay .sp-line .paren { color: var(--text2); }
+.screenplay .sp-transition { font-weight: 700; margin: 10px 0; }
+.screenplay .sp-transition.right { text-align: right; }
+.screenplay .sp-shot { margin: 10px 0 4px; font-size: 14px; }
+.screenplay .sp-shot code { font-size: 11px; color: var(--accent2); border: 1px solid var(--border); border-radius: 4px; padding: 0 5px; margin-right: 6px; font-family: inherit; }
+.screenplay .sp-end { text-align: center; color: var(--text2); margin-top: 28px; }
 
 .shot-block {
   border: 1px solid var(--border); border-radius: 8px;
@@ -187,6 +214,22 @@ body {
   margin-top: 6px; font-family: monospace; font-size: 11px;
   color: #a5b4fc; word-break: break-all;
 }
+.shot-block .shot-line { margin-top: 4px; }
+.shot-block .shot-line .who { color: var(--accent2); font-weight: 500; }
+.shot-block .shot-line .paren { color: var(--text2); }
+.shot-block details.prompt-fold { margin-top: 6px; }
+.shot-block details.prompt-fold summary { cursor: pointer; font-size: 11px; color: var(--text2); }
+.shot-block .prompt-preview { margin-top: 6px; font-size: 11px; color: var(--text2); }
+.shot-block .prompt-preview .prompt { white-space: pre-wrap; }
+.scene-head {
+  margin: 14px 0 6px; padding: 6px 10px; border-left: 3px solid var(--accent2);
+  background: var(--bg); border-radius: 4px; font-size: 12px;
+}
+.scene-head:first-child { margin-top: 0; }
+.scene-head .sh-title { font-weight: 600; color: var(--text); }
+.scene-head .sh-sub { color: var(--text2); margin-left: 6px; }
+.storyboard-tools { display: flex; gap: 10px; align-items: center; margin-bottom: 8px; font-size: 12px; color: var(--text2); }
+.storyboard-tools label { display: inline-flex; gap: 4px; align-items: center; cursor: pointer; }
 
 .issue-list { margin-top: 8px; }
 .issue-item {
@@ -622,6 +665,22 @@ body {
 <section class="view" id="project-view" hidden>
   <div class="main" id="main"></div>
 </section>
+
+<div class="modal-backdrop" id="screenplay-modal" hidden onclick="if (event.target === this) closeScreenplay()">
+  <div class="modal screenplay-modal">
+    <h2>文学剧本</h2>
+    <div class="sub">从剧本和分镜直接排版（不调模型、不花钱），改了剧本 / 分镜再打开就是最新的。转场以分镜为准。</div>
+    <div class="screenplay-tools">
+      <button class="btn btn-sm btn-outline" id="sp-mode-script" onclick="openScreenplay('script')">按剧本</button>
+      <button class="btn btn-sm btn-outline" id="sp-mode-shots" onclick="openScreenplay('shots')">按镜头展开</button>
+      <button class="btn btn-sm" onclick="exportScreenplay()">导出 Markdown</button>
+      <button class="btn btn-sm btn-outline" onclick="closeScreenplay()">关闭</button>
+      <span class="hint" id="sp-stats"></span>
+    </div>
+    <div id="sp-warnings"></div>
+    <div class="screenplay" id="sp-body"></div>
+  </div>
+</div>
 
 <div class="modal-backdrop" id="create-modal" hidden onclick="if (event.target === this) closeCreate()">
   <div class="modal">
@@ -1224,6 +1283,7 @@ async function renderProject(id) {
           ? '<span class="hint">小说模式：先生成故事圣经（会切章并抽取前几章），再在章节列表里勾选要拍的章</span>' : ''}
         ${inStatus(p, ['draft','failed','script_review']) && !currentStoryOutline && !isExplainer(p)
           ? `<button class="btn btn-sm btn-outline" onclick="doGenerateStoryOutline()" id="btn-story">生成长篇大纲（${modelInfo && modelInfo.story_chapters ? modelInfo.story_chapters : 20} 章）</button>` : ''}
+        ${currentScript ? `<button class="btn btn-sm btn-outline" onclick="openScreenplay('script')" title="排成人读的剧本格式（不花钱），可导出 Markdown">文学剧本</button>` : ''}
         <button class="btn btn-sm btn-outline" onclick="startEdit('script')" id="btn-script-edit" style="display:none">编辑 JSON</button>
         ${inStatus(p, ['script_review'])
           ? '<button class="btn btn-sm btn-green" onclick="doConfirmScript()">确认剧本 → 进入分镜</button>' : ''}
@@ -1253,6 +1313,7 @@ async function renderProject(id) {
       <div class="panel-actions">
         ${inStatus(p, ['script_confirmed','storyboard_review'])
           ? '<button class="btn btn-sm" onclick="doGenerateStoryboard()" id="btn-storyboard">生成分镜</button>' : ''}
+        ${currentScript ? `<button class="btn btn-sm btn-outline" onclick="openScreenplay('shots')" title="按场通读分镜：景别、画面、谁说了什么，id 都换成名字（不花钱）">按场通读</button>` : ''}
         <button class="btn btn-sm btn-outline" onclick="startEdit('storyboard')" id="btn-storyboard-edit" style="display:none">编辑 JSON</button>
         ${inStatus(p, ['storyboard_review'])
           ? '<button class="btn btn-sm btn-green" onclick="doConfirmStoryboard()">确认分镜</button>' : ''}
@@ -2011,11 +2072,16 @@ function renderScript() {
       <div class="script-content">
         ${script.scenes.map((s, si) => `
           <div class="scene-block" id="scene-${si}">
-            <div class="heading">${esc(s.heading || s.id)} <span class="tag-mini">${esc(s.id)}</span></div>
-            <div class="summary">${esc(s.summary)}</div>
-            <div class="dialogue">
-              ${s.dialogue.map(d => `<div><span class="speaker" title="${esc(d.speaker)}">${esc(speakerName(d.speaker))}：</span>${esc(d.line)}${(d.fact_refs || []).map(factTag).join('')}</div>`).join('')}
+            <div class="heading">${esc(s.heading || s.id)} <span class="tag-mini">${esc(s.id)}</span>
+              ${s.time_label ? `<span class="tag-mini" title="故事时间">${esc(s.time_label)}</span>` : ''}
+              ${s.transition_in ? `<span class="tag-mini" title="从上一场怎么进来（生成分镜时落到第一个镜头上）">↪ ${esc(TRANSITION_LABELS[s.transition_in] || s.transition_in)}</span>` : ''}
             </div>
+            <div class="summary">${esc(s.summary)}</div>
+            ${s.action ? `<div class="action-line">${esc(s.action)}</div>` : ''}
+            <div class="dialogue">
+              ${s.dialogue.map(d => `${d.action ? `<div class="action-line">${esc(d.action)}</div>` : ''}<div><span class="speaker" title="${esc(d.speaker)}">${esc(speakerName(d.speaker))}</span>${d.parenthetical ? `<span class="paren">（${esc(d.parenthetical)}）</span>` : ''}<span class="speaker">：</span>${esc(d.line)}${(d.fact_refs || []).map(factTag).join('')}</div>`).join('')}
+            </div>
+            ${s.closing ? `<div class="action-line">${esc(s.closing)}</div>` : ''}
             <div class="duration">${s.duration_sec}s · ${esc(s.emotion)}</div>
             <div class="scene-actions">
               <button class="btn btn-sm btn-outline" onclick="toggleSceneEdit(${si})">编辑</button>
@@ -2033,9 +2099,23 @@ function renderScript() {
                   <label>时长 (秒)</label>
                   <input id="se-${si}-duration" type="number" value="${s.duration_sec}">
                 </div>
+                <div>
+                  <label>故事时间（倒叙 / 插叙用）</label>
+                  <input id="se-${si}-time" value="${esc(s.time_label || '')}" placeholder="现在 / 回忆 · 2009 年冬">
+                </div>
+                <div>
+                  <label>从上一场进来</label>
+                  <select id="se-${si}-transition">
+                    ${Object.entries(TRANSITION_LABELS).map(([key, name]) => `<option value="${key}" ${(s.transition_in || '') === key ? 'selected' : ''}>${esc(name)}</option>`).join('')}
+                  </select>
+                </div>
               </div>
-              <label>对白 (每行: 说话人: 台词)</label>
-              <textarea id="se-${si}-dialogue" style="min-height:80px">${esc(s.dialogue.map(d => d.speaker + ': ' + d.line).join('\n'))}</textarea>
+              <label>开场画面（镜头能拍到的东西）</label>
+              <textarea id="se-${si}-action">${esc(s.action || '')}</textarea>
+              <label>对白（每行「说话人: 台词」，语气写成「说话人（低声）: 台词」；以 △ 开头的行是下一句之前的动作）</label>
+              <textarea id="se-${si}-dialogue" style="min-height:100px">${esc(dialogueToText(s.dialogue))}</textarea>
+              <label>场末画面</label>
+              <textarea id="se-${si}-closing">${esc(s.closing || '')}</textarea>
               <div class="form-actions">
                 <button class="btn btn-sm btn-green" onclick="saveScene(${si})">保存此场</button>
                 <button class="btn btn-sm btn-outline" onclick="toggleSceneEdit(${si})">取消</button>
@@ -2083,6 +2163,82 @@ async function revalidate() {
     api(`/api/projects/${currentProjectId}/consistency/revalidate`, { method: 'POST' }));
 }
 
+// 对白编辑框的文本格式：「△ 动作」行 + 「说话人（括注）: 台词」行（科普的 fact_refs 按位置保留）
+function dialogueToText(dialogue) {
+  return (dialogue || []).map(d =>
+    (d.action ? `△ ${d.action}\n` : '') + d.speaker + (d.parenthetical ? `（${d.parenthetical}）` : '') + ': ' + d.line
+  ).join('\n');
+}
+
+function textToDialogue(text, previous) {
+  const out = [];
+  let pending = '';
+  for (const raw of (text || '').split('\n')) {
+    const row = raw.trim();
+    if (!row) continue;
+    if (row.startsWith('△')) { pending += row.slice(1).trim(); continue; }
+    const idx = row.search(/[:：]/);
+    let speaker = idx === -1 ? 'unknown' : row.substring(0, idx).trim();
+    const line = idx === -1 ? row : row.substring(idx + 1).trim();
+    let parenthetical = '';
+    const m = speaker.match(/^(.*?)[（(](.*)[）)]$/);
+    if (m) { speaker = m[1].trim(); parenthetical = m[2].trim(); }
+    const old = (previous || [])[out.length];
+    const fact_refs = old && old.line === line ? (old.fact_refs || []) : [];
+    out.push({ speaker, line, parenthetical, action: pending, fact_refs });
+    pending = '';
+  }
+  return { dialogue: out, trailing: pending };
+}
+
+let screenplayData = null;
+
+async function openScreenplay(mode) {
+  $('screenplay-modal').hidden = false;
+  $('sp-body').innerHTML = '<span class="hint">排版中…</span>';
+  try {
+    screenplayData = await api(`/api/projects/${currentProjectId}/screenplay?mode=${encodeURIComponent(mode)}`);
+  } catch (e) {
+    $('sp-body').innerHTML = `<span class="error-msg">${esc(e.message)}</span>`;
+    return;
+  }
+  const data = screenplayData;
+  $('sp-mode-script').classList.toggle('btn-outline', data.mode !== 'script');
+  $('sp-mode-shots').classList.toggle('btn-outline', data.mode !== 'shots');
+  const st = data.stats;
+  $('sp-stats').textContent = `${st.scenes} 场 · 约 ${st.duration_sec} 秒 · ${st.lines} 句台词${st.shots ? ` · ${st.shots} 个镜头` : ''} · ${st.transitions} 处转场`;
+  $('sp-warnings').innerHTML = (data.warnings || []).map(w => `<div class="issue-item issue-warning" style="margin-bottom:8px">${esc(w)}</div>`).join('');
+  $('sp-body').innerHTML = data.blocks.map(renderScreenplayBlock).join('');
+}
+
+function renderScreenplayBlock(b) {
+  switch (b.type) {
+    case 'title': return `<div class="sp-title">${esc(b.text)}</div>`;
+    case 'logline': return `<div class="sp-logline">${esc(b.text)}</div>`;
+    case 'cast': return `<div class="sp-cast"><b>人物</b>${b.items.map(i => `<div>${esc(i.name)}${i.note ? `：<span style="color:var(--text2)">${esc(i.note)}</span>` : ''}</div>`).join('')}</div>`;
+    case 'scene': return `<div class="sp-scene">${b.no}. ${esc(b.heading)}</div><div class="sp-meta">${[b.time_label, b.meta].filter(Boolean).map(esc).join(' · ')}</div>`;
+    case 'transition': return `<div class="sp-transition ${b.align === 'right' ? 'right' : ''}">${esc(b.text)}</div>`;
+    case 'action': return `<div class="sp-action">${esc(b.text)}</div>`;
+    case 'shot': return `<div class="sp-shot"><code>${esc(b.label)}</code>${esc(b.text)}</div>`;
+    case 'line': return `<div class="sp-line"><span class="who">${esc(b.speaker)}</span>${b.parenthetical ? `<span class="paren">（${esc(b.parenthetical)}）</span>` : ''}：${esc(b.text)}</div>`;
+    case 'end': return `<div class="sp-end">${esc(b.text)}</div>`;
+    default: return '';
+  }
+}
+
+function exportScreenplay() {
+  if (!screenplayData) return;
+  const blob = new Blob([screenplayData.markdown], { type: 'text/markdown;charset=utf-8' });
+  const link = document.createElement('a');
+  link.href = URL.createObjectURL(blob);
+  const suffix = screenplayData.mode === 'shots' ? '分镜通读本' : '文学剧本';
+  link.download = `${(screenplayData.title || 'screenplay').replace(/[\\/:*?"<>|]/g, '_')}-${suffix}.md`;
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+}
+
+function closeScreenplay() { $('screenplay-modal').hidden = true; }
+
 function toggleSceneEdit(si) {
   const elem = $(`scene-edit-${si}`);
   if (elem) elem.classList.toggle('active');
@@ -2095,13 +2251,12 @@ async function saveScene(si) {
   scene.summary = $(`se-${si}-summary`).value;
   scene.emotion = $(`se-${si}-emotion`).value;
   scene.duration_sec = parseInt($(`se-${si}-duration`).value) || scene.duration_sec;
-
-  const dlgText = $(`se-${si}-dialogue`).value.trim();
-  scene.dialogue = dlgText ? dlgText.split('\n').filter(l => l.trim()).map(line => {
-    const idx = line.indexOf(':');
-    if (idx === -1) return { speaker: 'unknown', line: line.trim() };
-    return { speaker: line.substring(0, idx).trim(), line: line.substring(idx + 1).trim() };
-  }) : [];
+  scene.time_label = $(`se-${si}-time`).value.trim();
+  scene.transition_in = $(`se-${si}-transition`).value;
+  scene.action = $(`se-${si}-action`).value.trim();
+  const parsed = textToDialogue($(`se-${si}-dialogue`).value, scene.dialogue);
+  scene.dialogue = parsed.dialogue;
+  scene.closing = [$(`se-${si}-closing`).value.trim(), parsed.trailing].filter(Boolean).join('');
 
   try {
     await api(`/api/projects/${currentProjectId}/script`, { method: 'PUT', body: JSON.stringify(currentScript) });
@@ -2142,22 +2297,82 @@ function renderStoryboard() {
     const sb = currentStoryboard;
     if (!sb || !$('storyboard-view')) return;
     $('btn-storyboard-edit').style.display = '';
-    $('storyboard-view').innerHTML = storyboardTierHint(sb) + segmentSummary(sb) + groupBySegment(sb.shots).map(group => {
+    let lastScene = null;
+    $('storyboard-view').innerHTML = storyboardTools() + storyboardTierHint(sb) + segmentSummary(sb) + groupBySegment(sb.shots).map(group => {
+      const sceneId = group.items[0].shot.scene_id;
+      const head = sceneId !== lastScene ? sceneHeadHtml(sceneId, group.items[0].shot) : '';
+      lastScene = sceneId;
       const blocks = group.items.map(({ shot, index }) => shotBlockHtml(shot, index)).join('');
-      if (!group.id || group.items.length < 2) return blocks;
+      if (!group.id || group.items.length < 2) return head + blocks;
       const total = group.items.reduce((a, x) => a + x.shot.duration_sec, 0);
       const bars = group.items.map(x => `<span style="flex:${x.shot.duration_sec}" title="${esc(x.shot.id)} · ${x.shot.duration_sec}s"></span>`).join('');
-      return `<div class="segment-block">
+      return `${head}<div class="segment-block">
         <div class="segment-head">
           <span class="seg-name">段落 ${esc(group.label)}</span>
           <span>${total}s · ${group.items.length} 镜 · 一次生成、段内硬切</span>
           <span class="segment-timeline">${bars}</span>
-          <span class="tag-mini">${esc(group.items[0].shot.scene_id)}</span>
         </div>
         ${blocks}
       </div>`;
     }).join('');
   } catch (e) { /* 面板渲染失败不应影响其它面板 */ }
+}
+
+// 每场前的场次标题：从剧本取场景 / 故事时间，转场以这一场第一镜为准（片子实际怎么剪）
+function sceneHeadHtml(sceneId, firstShot) {
+  const scenes = (currentScript && currentScript.scenes) || [];
+  const index = scenes.findIndex(x => x.id === sceneId);
+  const scene = scenes[index] || {};
+  const sub = [
+    scene.time_label,
+    firstShot && firstShot.transition ? `↪ ${TRANSITION_LABELS[firstShot.transition] || firstShot.transition}进` : '',
+    scene.emotion,
+  ].filter(Boolean).map(esc).join(' · ');
+  const title = `${index >= 0 ? `第 ${index + 1} 场 · ` : ''}${esc(cnHeading(scene.heading) || sceneId)}`;
+  return `<div class="scene-head" title="${esc(sceneId)}${scene.summary ? ' — ' + esc(scene.summary) : ''}"><span class="sh-title">${title}</span>${sub ? `<span class="sh-sub">${sub}</span>` : ''}</div>`;
+}
+
+// `INT. 教室 - 日` → `内景　教室 - 日`（和文学剧本视图一致）
+function cnHeading(text) {
+  const m = (text || '').match(/^\s*(INT\.?\s*\/\s*EXT\.?|EXT\.?\s*\/\s*INT\.?|INT\b\.?|EXT\b\.?)\s*/i);
+  if (!m) return text || '';
+  const both = /\//.test(m[1]);
+  const prefix = both ? '内/外景' : (/^INT/i.test(m[1]) ? '内景' : '外景');
+  return `${prefix}　${text.slice(m[0].length).trim()}`.trim();
+}
+
+function showPrompts() {
+  try { return localStorage.getItem('videogen.showPrompts') === '1'; } catch (e) { return false; }
+}
+
+function toggleShowPrompts(on) {
+  try { localStorage.setItem('videogen.showPrompts', on ? '1' : '0'); } catch (e) { /* 存不了就只管这一次 */ }
+  document.querySelectorAll('#storyboard-view details.prompt-fold').forEach(d => { d.open = on; });
+}
+
+function storyboardTools() {
+  return `<div class="storyboard-tools">
+    <label title="英文 prompt 是发给视频模型的原文；排查画面问题、审核被拒时才需要看"><input type="checkbox" ${showPrompts() ? 'checked' : ''} onchange="toggleShowPrompts(this.checked)"> 展开全部英文 prompt</label>
+  </div>`;
+}
+
+async function previewPrompt(shotId, si) {
+  const box = $(`prompt-preview-${si}`);
+  if (!box) return;
+  if (box.dataset.loaded === '1') { box.hidden = !box.hidden; return; }
+  box.hidden = false;
+  box.innerHTML = '生成预览中…';
+  try {
+    const r = await api(`/api/projects/${currentProjectId}/storyboard/shots/${encodeURIComponent(shotId)}/prompt`);
+    if (r.kind === 'black') { box.innerHTML = '黑场：本机生成黑画面，不发给视频模型'; box.dataset.loaded = '1'; return; }
+    const unit = r.kind === 'segment' ? `段落（${r.shot_ids.length} 镜一次生成）` : '单镜';
+    box.innerHTML = `<div>最终 prompt · ${unit} · ${r.chars} 字符（已拼上角色 / 场景 / 道具锚点和表演要求；不含开场关键帧说明，超出模型上限时发送前会再压缩）</div>
+      <div class="prompt">${esc(r.prompt)}</div>
+      ${r.sent_prompt ? `<div style="margin-top:6px">${r.sent_differs ? '⚠ 上次实际发出的和现在不一样（之后改过分镜，或带了开场关键帧说明）：' : '上次实际发出的就是这一份。'}</div>${r.sent_differs ? `<div class="prompt">${esc(r.sent_prompt)}</div>` : ''}` : ''}`;
+    box.dataset.loaded = '1';
+  } catch (e) {
+    box.innerHTML = `<span class="error-msg">${esc(e.message)}</span>`;
+  }
 }
 
 // 段落分镜：相邻、同 segment_id 的镜头归成一组（没编段的镜头各自一组）
@@ -2184,26 +2399,36 @@ function segmentSummary(sb) {
     ${groupBySegment(sb.shots).length} 次视频生成（${merged} 个镜头合进 ${groups.length} 段，段内硬切、生成后自动切回单镜）</div>`;
 }
 
+const TRANSITION_LABELS = { '': '硬切', dissolve: '叠化', fade: '经黑场淡出淡入' };
+
 function shotBlockHtml(s, si) {
   return `
       <div class="shot-block" id="shot-${si}">
         <div class="shot-header">
-          <span class="shot-no">${s.shot_no}</span>
+          <span class="shot-no" title="${esc(s.id)}">${s.shot_no}</span>
           <span class="camera">${esc(s.camera)}</span>
           <span style="color:var(--text2)">${s.duration_sec}s</span>
-          <span class="tag-mini">${esc(s.scene_id)}</span>
           ${(s.character_in_frame || []).length ? `<span class="tag-mini" title="出镜角色">👤 ${esc(namesOf('characters', s.character_in_frame))}</span>` : ''}
           ${s.location ? `<span class="tag-mini" title="场景">📍 ${esc(assetName('settings', s.location))}</span>` : ''}
           ${(s.props_in_frame || []).length ? `<span class="tag-mini" title="关键道具">🔑 ${esc(namesOf('props', s.props_in_frame))}</span>` : ''}
-          ${s.dialogue_text ? `<span style="color:var(--accent2)" title="${esc(s.dialogue_speaker)}">💬 ${esc(speakerName(s.dialogue_speaker))}${s.voice_offscreen ? '（画外音）' : ''}</span>` : ''}
+          ${isExplainer(currentProject) && s.dialogue_text ? `<span style="color:var(--accent2)" title="${esc(s.dialogue_speaker)}">💬 ${esc(speakerName(s.dialogue_speaker))}${s.voice_offscreen ? '（画外音）' : ''}</span>` : ''}
+          ${s.black_screen ? `<span class="tag-mini" title="画面全黑，本机生成，不调视频模型">⬛ 黑场</span>` : ''}
+          ${s.transition ? `<span class="tag-mini" title="从上一镜怎么进来（合成时生效，不改时长）">↪ ${esc(TRANSITION_LABELS[s.transition] || s.transition)}${s.transition_sec ? ` ${s.transition_sec}s` : ''}</span>` : ''}
         </div>
         ${isExplainer(currentProject) && (s.narration || s.dialogue_text) ? `<div style="color:var(--accent2)">🎙 ${esc(s.narration || s.dialogue_text)}${(s.fact_refs || []).map(factTag).join('')}</div>` : ''}
-        <div>${esc(s.visual_description)}</div>
-        ${s.video_prompt ? `<div class="prompt">${esc(s.video_prompt)}</div>` : ''}
+        <div>${s.black_screen && !s.visual_description ? '黑屏。' : esc(s.visual_description)}</div>
+        ${!isExplainer(currentProject) && s.dialogue_text ? `<div class="shot-line"><span class="who">${esc(speakerName(s.dialogue_speaker))}</span>${s.voice_offscreen ? '<span class="paren">（画外）</span>' : ''}：${esc(s.dialogue_text)}</div>` : ''}
+        ${!isExplainer(currentProject) && s.narration ? `<div class="shot-line"><span class="who">旁白</span>：${esc(s.narration)}</div>` : ''}
+        ${s.video_prompt ? `<details class="prompt-fold" ${showPrompts() ? 'open' : ''}>
+          <summary>英文 prompt（发给视频模型 · ${s.video_prompt.length} 字符）</summary>
+          <div class="prompt">${esc(s.video_prompt)}</div>
+        </details>` : ''}
+        <div class="prompt-preview" id="prompt-preview-${si}" hidden></div>
         <div class="shot-actions">
           <button class="btn btn-sm btn-outline" onclick="toggleShotEdit(${si})">编辑</button>
           <button class="btn btn-sm btn-outline" onclick="reviseStoryboard({shot_id: ${jsArg(s.id)}})" title="写一句修改意见，只重写这个镜头（时长不变）">按意见重写此镜</button>
           <button class="btn btn-sm btn-outline" onclick="reviseStoryboard({scene_id: ${jsArg(s.scene_id)}})" title="写一句修改意见，重写 ${esc(s.scene_id)} 的全部镜头">重写本场分镜</button>
+          ${!isExplainer(currentProject) ? `<button class="btn btn-sm btn-outline" onclick="previewPrompt(${jsArg(s.id)}, ${si})" title="看这一镜（或它所在的段落）真正要发给视频模型的完整 prompt，不花钱">预览最终 prompt</button>` : ''}
         </div>
         <div class="edit-form" id="shot-edit-${si}">
           <div class="row">
@@ -2236,6 +2461,19 @@ function shotBlockHtml(s, si) {
           </div>
           <label>旁白 (narration)</label>
           <input id="sh-${si}-narration" value="${esc(s.narration || '')}">
+          <div class="row">
+            <div>
+              <label>转场（从上一镜进来）</label>
+              <select id="sh-${si}-transition">
+                ${Object.entries(TRANSITION_LABELS).map(([key, name]) => `<option value="${key}" ${(s.transition || '') === key ? 'selected' : ''}>${esc(name)}</option>`).join('')}
+              </select>
+            </div>
+            <div>
+              <label>转场时长 (秒，空 = 默认)</label>
+              <input id="sh-${si}-transition-sec" type="number" step="0.1" min="0" value="${s.transition_sec ?? ''}">
+            </div>
+          </div>
+          <label><input id="sh-${si}-black" type="checkbox" ${s.black_screen ? 'checked' : ''}> 黑场（画面全黑，本机生成 $0；台词按画外音配音）</label>
           <div class="form-actions">
             <button class="btn btn-sm btn-green" onclick="saveShot(${si})">保存此镜</button>
             <button class="btn btn-sm btn-outline" onclick="toggleShotEdit(${si})">取消</button>
@@ -2290,6 +2528,9 @@ async function saveShot(si) {
   shot.dialogue_text = $(`sh-${si}-dialogue`).value || null;
   shot.dialogue_speaker = $(`sh-${si}-speaker`).value || null;
   shot.narration = $(`sh-${si}-narration`).value || null;
+  shot.transition = $(`sh-${si}-transition`).value;
+  shot.transition_sec = parseFloat($(`sh-${si}-transition-sec`).value) || null;
+  shot.black_screen = $(`sh-${si}-black`).checked;
 
   try {
     if (await putStoryboard(currentStoryboard)) await refresh();

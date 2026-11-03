@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from videogen.models.bible import StoryBible
 from videogen.models.llm_io import ShotsResponse
 from videogen.models.project import Project
-from videogen.models.script import Scene, Script
+from videogen.models.script import DialogueLine, Scene, Script
 from videogen.models.storyboard import DurationTier, Shot, Storyboard
 from videogen.providers.llm.base import LLMMessage, LLMProvider
 from videogen.utils.duration import fit_durations, plan_shot_count, scale_durations
@@ -52,7 +52,9 @@ STORYBOARD_SYSTEM = """你是一位专业分镜师。根据剧本场景生成分
   "narration": null 或 "旁白文字",
   "dialogue_text": null 或 "台词文字",
   "dialogue_speaker": null 或 "char_id",
-  "voice_offscreen": false
+  "voice_offscreen": false,
+  "black_screen": false,
+  "transition": "" 或 "dissolve" 或 "fade"
 }
 
 要求：
@@ -75,6 +77,15 @@ STORYBOARD_SYSTEM = """你是一位专业分镜师。根据剧本场景生成分
 - 情绪强烈的镜头优先用中景/近景：大特写会让模型把表情演成夸张的舞台剧
 - video_prompt 里描述表演要用克制的词（subtle / restrained / natural），不要写夸张副词
   （hysterically / dramatically / exaggeratedly）
+- transition 是这一镜**从上一镜怎么进来**：默认 ""（硬切）。dissolve = 叠化，fade = 经黑场
+  淡出淡入。转场是剪辑手段，别滥用：同一时空里的镜头一律硬切；时间线切换（回忆 ↔ 现实）、
+  时间跳跃、章节收尾才用。想让两条线「接上」时优先用**匹配剪辑**（硬切 + 上下两镜构图 / 动作 /
+  物件对得上，在 visual_description 里写清楚对上的是什么），比叠化更有力。
+  第一个镜头的 transition 照剧本的「从上一场进来」写，其余镜头没有理由就留空
+- 剧本的动作描写（开场画面 / △ 动作行 / 场末画面）就是镜头要拍的东西：照着拆镜头，
+  不要丢掉其中的物件和动作；括注（低声 / 画外 / 电话里）影响表演和 voice_offscreen
+- black_screen=true 是**黑场**：整个画面全黑，不拍任何东西（剧本写了「黑屏」「黑场」才用）。
+  黑场里的台词一律是画外音（电话里、门外），character_in_frame 留空，video_prompt 可以为空
 - 只输出 JSON: {"shots": [...]}"""
 
 _ASPECT_HINTS = {
@@ -192,7 +203,7 @@ async def generate_shots_for_scene(
     `story_context` 是这一场在整篇里的位置（章标题/情节点），避免分镜脱离全篇。
     """
     hint = aspect_hint(project)
-    dialogue_text = "\n".join(f"  {d.speaker}: {d.line}" for d in scene.dialogue) or "（无对白）"
+    dialogue_text = "\n".join(_format_script_line(d) for d in scene.dialogue) or "（无对白）"
     constraints = duration_constraints(scene.duration_sec, tier)
     shot_count_rule = (
         "按上面的镜头数与时长硬约束拆分"
@@ -209,6 +220,7 @@ async def generate_shots_for_scene(
     tier_block = f"\n## 时长硬约束（视频模型计费档位）\n{constraints}\n" if constraints else ""
     if segment_mode and not constraints:
         tier_block = f"\n## 段落节奏（视频按段生成）\n{SEGMENT_SHOT_RULES}\n"
+    revision_block = _revision_block(revision, feedback, target_shot)
     user_prompt = f"""## 角色与场景参考
 {format_brief_bible(bible)}
 
@@ -218,9 +230,9 @@ async def generate_shots_for_scene(
 摘要: {scene.summary}
 情绪: {scene.emotion}
 时长: {scene.duration_sec} 秒
-对白:
+{_scene_frame_block(scene)}对白:
 {dialogue_text}
-{context_block}{env_block}{tier_block}{_revision_block(revision, feedback, target_shot)}
+{_scene_closing_block(scene)}{context_block}{env_block}{tier_block}{revision_block}
 ## 要求
 - 画面比例: {project.aspect_ratio.value} → {hint}
 - {shot_count_rule}
@@ -267,9 +279,36 @@ async def generate_shots_for_scene(
                 dialogue_text=draft.dialogue_text,
                 dialogue_speaker=draft.dialogue_speaker,
                 voice_offscreen=bool(draft.voice_offscreen and draft.dialogue_text),
+                black_screen=draft.black_screen,
+                transition=draft.transition,
             )
         )
+    if shots and scene.transition_in and not target_shot and not shots[0].transition:
+        # 场与场之间怎么接是剧本定的：模型漏了就照剧本补上（只补第一镜，不改它写了的）
+        shots[0].transition = scene.transition_in
     return shots
+
+
+def _format_script_line(line: DialogueLine) -> str:
+    action = f"  △ {line.action}\n" if line.action else ""
+    paren = f"（{line.parenthetical}）" if line.parenthetical else ""
+    return f"{action}  {line.speaker}{paren}: {line.line}"
+
+
+def _scene_frame_block(scene: Scene) -> str:
+    rows = []
+    if scene.time_label:
+        rows.append(f"故事时间: {scene.time_label}")
+    if scene.transition_in:
+        label = {"dissolve": "叠化", "fade": "经黑场淡出淡入"}.get(scene.transition_in, "")
+        rows.append(f"从上一场进来: {label}（第一个镜头的 transition = {scene.transition_in}）")
+    if scene.action:
+        rows.append(f"开场画面: {scene.action}")
+    return "".join(f"{row}\n" for row in rows)
+
+
+def _scene_closing_block(scene: Scene) -> str:
+    return f"场末画面: {scene.closing}\n" if scene.closing else ""
 
 
 def _shot_brief(shot: Shot) -> str:
@@ -281,6 +320,8 @@ def _shot_brief(shot: Shot) -> str:
         f"地点: {shot.location}" if shot.location else "",
         f"台词（{shot.dialogue_speaker}）: {shot.dialogue_text}" if shot.dialogue_text else "",
         f"旁白: {shot.narration}" if shot.narration else "",
+        "黑场" if shot.black_screen else "",
+        f"转场: {shot.transition}" if shot.transition else "",
         f"video_prompt: {shot.video_prompt}" if shot.video_prompt else "",
     ]
     return "  - " + "；".join(p for p in parts if p)
@@ -670,6 +711,11 @@ class Segment:
     def shot_ids(self) -> list[str]:
         return [s.id for s in self.shots]
 
+    @property
+    def black(self) -> bool:
+        """黑场单元：本机生成黑画面，不调视频模型、不计费（黑场镜头永远自成一个单元）。"""
+        return bool(self.shots) and all(s.black_screen for s in self.shots)
+
 
 def assign_segments(
     storyboard: Storyboard,
@@ -686,6 +732,7 @@ def assign_segments(
     - 装到 `target_sec` 就收段；再装会超过 `max_sec` 或超过 `max_shots` 个镜头也收段
     - 场末尾的段短于模型最短档位 `min_sec` 时，能并进前一段（不超上限）就并进去，省一次最短计费
     - 单个镜头本身超过上限也自成一段（不拆镜头，交给模型档位去裁）
+    - 黑场镜头不进段落（本机生成），它两边的镜头也在这里断开
     """
     max_sec = max(1.0, float(max_sec))
     target_sec = min(max(1.0, float(target_sec)), max_sec)
@@ -693,6 +740,7 @@ def assign_segments(
     segments: list[Segment] = []
     scene_order: list[str] = []
     by_scene: dict[str, list[Shot]] = {}
+    position = {shot.id: index for index, shot in enumerate(storyboard.shots)}
     for shot in storyboard.shots:
         if shot.scene_id not in by_scene:
             scene_order.append(shot.scene_id)
@@ -703,6 +751,12 @@ def assign_segments(
         groups: list[list[Shot]] = []
         current: list[Shot] = []
         for shot in by_scene[scene_id]:
+            if shot.black_screen:
+                shot.segment_id = ""
+                if current:
+                    groups.append(current)
+                    current = []
+                continue
             if current:
                 total = sum(max(1, int(s.duration_sec)) for s in current)
                 loc_changed = bool(
@@ -727,9 +781,12 @@ def assign_segments(
             same_place = not (
                 last[0].location and prev[-1].location and last[0].location != prev[-1].location
             )
+            # 中间隔着黑场的两段不能并：并了就是隔着黑场一次生成
+            adjacent = position[last[0].id] == position[prev[-1].id] + 1
             if (
                 last_sec < min_sec
                 and same_place
+                and adjacent
                 and prev_sec + last_sec <= max_sec
                 and len(prev) + len(last) <= max_shots
             ):
@@ -753,6 +810,8 @@ def chain_predecessors(
     found: dict[str, Segment] = {}
     for previous, current in itertools.pairwise(segments):
         if current.id in waived or not previous.shots or not current.shots:
+            continue
+        if previous.black or current.black:  # 黑场的最后一帧是黑的，接不了戏
             continue
         if previous.scene_id != current.scene_id:
             continue
@@ -803,7 +862,7 @@ def segments_of(storyboard: Storyboard) -> list[Segment]:
     segments: list[Segment] = []
     index: dict[str, Segment] = {}
     for shot in storyboard.shots:
-        key = shot.segment_id
+        key = "" if shot.black_screen else shot.segment_id
         if not key:
             segments.append(Segment(id=shot.id, scene_id=shot.scene_id, shots=[shot]))
             continue

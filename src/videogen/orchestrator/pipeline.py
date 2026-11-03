@@ -262,7 +262,7 @@ class Pipeline:
             )
         except Exception:  # 判断不了就按「最坏情况全部重跑」保守估
             logger.warning("待生成单元判断失败，按全部单元预估预算", exc_info=True)
-            return storyboard_service.segments_of(storyboard)
+            return [u for u in storyboard_service.segments_of(storyboard) if not u.black]
         finally:
             await provider.aclose()
 
@@ -1708,7 +1708,9 @@ class Pipeline:
             )
         # 重买的钱按模型档位算（和预算门同一个 quote_units），不是分镜秒数 × 单价
         stale = {seg["segment_id"] for seg in impact["stale_segments"]}
-        units = [u for u in storyboard_service.segments_of(storyboard) if u.id in stale]
+        units = [
+            u for u in storyboard_service.segments_of(storyboard) if u.id in stale and not u.black
+        ]
         provider = self._video(project)
         try:
             quote = await preflight_service.quote_units(units, provider)
@@ -2760,16 +2762,46 @@ class Pipeline:
         """配音任务的生成部分（锁外跑）：原声模式直接出清单，TTS 模式先写文案、再逐条合成。"""
         try:
             if dub_mode == "native":
-                # 原声模式：对白 / 旁白都用视频模型原片里的声音，不调 TTS、不写念法、不花钱
-                ctx.note("原声模式：跳过 TTS 配音")
-                return AudioManifest(
-                    provider="native",
-                    voice_map=existing_audio.voice_map,
-                    warnings=[
-                        "原声模式（AUDIO_DUB_MODE=native）：不做 TTS 配音，所有镜头用视频原声；"
-                        "要按镜头配音改成 tts"
-                    ],
+                # 原声模式：对白 / 旁白都用视频模型原片里的声音，不调 TTS、不写念法、不花钱。
+                # 例外是黑场：黑画面是本机生成的、没有声音，它的台词 / 旁白只能 TTS
+                black = video_service.black_voice_shots(storyboard)
+                note = (
+                    "原声模式（AUDIO_DUB_MODE=native）：不做 TTS 配音，所有镜头用视频原声；"
+                    "要按镜头配音改成 tts"
                 )
+                if not black:
+                    ctx.note("原声模式：跳过 TTS 配音")
+                    return AudioManifest(
+                        provider="native", voice_map=existing_audio.voice_map, warnings=[note]
+                    )
+                ctx.note(f"原声模式：{len(black)} 个黑场镜头的台词 / 旁白走 TTS，其余用视频原声")
+                only_black = storyboard.model_copy(
+                    update={"shots": [s for s in storyboard.shots if s.id in black]}
+                )
+                manifest = await audio_service.synthesize_all(
+                    project,
+                    only_black,
+                    bible,
+                    provider,
+                    audio_dir,
+                    project_dir,
+                    settings=settings,
+                    concurrency=settings.tts_concurrency,
+                    max_retries=settings.tts_max_retries,
+                    retry_backoff_sec=settings.tts_retry_backoff_sec,
+                    existing=existing_audio,
+                    voice_overrides=voice_overrides,
+                    on_progress=on_progress,
+                )
+                manifest.warnings = [
+                    w for w in manifest.warnings if not w.startswith("原声模式")
+                ]
+                manifest.warnings.insert(
+                    0,
+                    f"原声模式：{len(black)} 个黑场镜头用 TTS 配音（黑画面没有原声），"
+                    "其余用视频原声",
+                )
+                return manifest
             # ── 可选：让 LLM 看着真实画面写/改配音文案 ──
             await self._apply_voice_script(
                 ctx,
@@ -3093,7 +3125,7 @@ class Pipeline:
                     project,
                     storyboard,
                     video,
-                    compose_service.voice_audio_for(project, audio, settings),
+                    compose_service.voice_audio_for(project, audio, settings, storyboard),
                     project_dir=self.store.ensure_project_dir(project_id),
                     settings=settings,
                     bible=self.store.load_bible(project_id),

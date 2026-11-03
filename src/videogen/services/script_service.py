@@ -59,13 +59,34 @@ SCENE_SYSTEM = """你是一位资深短剧编剧。你正在逐场编写短剧�
 3. 称呼只能使用角色的 name 或已有 aliases
 4. 对白要短促有力，符合短剧风格
 5. 每场必须有明确的情绪走向
-6. dialogue.line 只能是角色说出口的台词，禁止写入「（转身离开）」这类舞台提示/动作描述
+6. dialogue.line 只能是角色说出口的台词，禁止写入「（转身离开）」这类舞台提示/动作描述；
+   动作写进 action，语气写进 parenthetical
+7. 动作描写（action / dialogue[].action / closing）只写镜头能拍到、能听到的东西：
+   环境、人物在做什么、手里的物件、声音。不写心理活动和评价
+   （✗「她感到绝望」 ✓「她把工牌摘下来，攥在手心里」）。每处 1-3 句，具体到物件。
+   每句动作都写出主语（谁在做），不写画幅、景别、特写这类镜头术语（那是分镜的事）
+8. 人物的情绪靠动作和潜台词表现，台词不要把情绪和道理直接说出来
+9. 场次之间怎么接（transition_in，说的是「从上一场怎么进来」）：
+   - 同一时空接着演，或只是换个地方：留空（硬切）
+   - 现在 ↔ 回忆的切换、明显的时间跳跃：dissolve（叠化）
+   - 一章的开头 / 收尾、大段时间流逝：fade（经黑场淡出淡入）
+   跨时空切换时，本场的开场画面尽量接住上一场的结尾画面（同一个物件、同一个动作或同一个声音），
+   在 action 里写明接的是什么
+10. 剧本要求黑屏 / 黑场时，在 action 或 closing 里明确写「黑屏。」，黑屏里的声音写成对白
+    （parenthetical 写「画外」或「电话里」）
+11. 倒叙 / 插叙时，time_label 写清这一场在故事里的时间（「现在」「回忆 · 2009 年冬」），
+    让人一眼读出这是哪条线；单线顺叙的故事可以留空
 
 输出 JSON 格式：
 {
   "heading": "INT./EXT. 地点 - 日/夜",
   "summary": "本场内容一句话概括",
-  "dialogue": [{"speaker": "char_id", "line": "台词"}],
+  "time_label": "现在 / 回忆 · 某年某季（单线顺叙可留空）",
+  "transition_in": "" 或 "dissolve" 或 "fade",
+  "action": "开场画面：环境 + 人物在做什么",
+  "dialogue": [{"speaker": "char_id", "action": "说这句之前的动作或反应（可空）",
+                "parenthetical": "低声 / 画外 / 电话里（可空）", "line": "台词"}],
+  "closing": "场末画面：最后一个动作或停留的画面（可空）",
   "duration_sec": 数字（秒）,
   "emotion": "本场主情绪",
   "world_state_delta": {
@@ -155,10 +176,14 @@ def _format_prev_scenes(scenes: list[Scene]) -> str:
         return "（这是第一场）"
     prev = scenes[-1]
     lines = [f"上一场 [{prev.id}] {prev.heading}", f"摘要: {prev.summary}", f"情绪: {prev.emotion}"]
+    if prev.time_label:
+        lines.append(f"故事时间: {prev.time_label}")
     if prev.dialogue:
         lines.append("对白要点:")
         for d in prev.dialogue[-3:]:
             lines.append(f"  {d.speaker}: {d.line}")
+    if prev.closing:
+        lines.append(f"结尾画面: {prev.closing}")
     return "\n".join(lines)
 
 
@@ -845,10 +870,24 @@ async def generate_scene(
     response = await llm.chat_json(messages, schema=SceneResponse, temperature=0.6, max_tokens=4096)
 
     dialogue: list[DialogueLine] = []
+    pending_action = ""
     for line in response.dialogue:
-        cleaned = clean_dialogue_line(line.line)
-        if cleaned:
-            dialogue.append(DialogueLine(speaker=line.speaker.strip(), line=cleaned))
+        paren, cleaned = split_parenthetical(line.line)
+        action = _join_action(pending_action, line.action)
+        if not cleaned:
+            # 只有动作没有台词的一行：动作并进下一句之前（没有下一句就进场末画面）
+            pending_action = action
+            continue
+        pending_action = ""
+        speaker = line.speaker.strip()
+        dialogue.append(
+            DialogueLine(
+                speaker=speaker,
+                line=cleaned,
+                action=with_subject(action, speaker, bible),
+                parenthetical=_clean_parenthetical(line.parenthetical) or paren,
+            )
+        )
 
     scene = Scene(
         id=outline_scene.id,
@@ -857,28 +896,95 @@ async def generate_scene(
         dialogue=dialogue,
         duration_sec=response.duration_sec,
         emotion=response.emotion,
+        time_label=response.time_label,
+        transition_in=response.transition_in,
+        action=response.action,
+        closing=_join_action(pending_action, response.closing),
     )
     return scene, response
+
+
+def split_parenthetical(line: str) -> tuple[str, str]:
+    """台词开头的括号（「（咬牙）这个项目是我做的」）→ (括注, 干净台词)。
+
+    以前括号只是被删掉，现在留下来当括注：剧本里读得到语气，配音照样不念。
+    """
+    text = (line or "").strip().replace("**", "").strip()
+    match = _LEADING_BRACKETS.match(text)
+    paren = ""
+    if match:
+        paren = "，".join(
+            seg.strip("（）() ") for seg in re.findall(_BRACKET_SEG, match.group(0))
+        )
+    return _clean_parenthetical(paren), clean_dialogue_line(text)
+
+
+_PRONOUN_START = ("她", "他", "它", "两人", "众人", "大家", "所有人", "对方", "我", "你")
+#: 写的是环境 / 物件 / 声音，不是人在动：不补主语（补了就成「程静窗外雷声炸响」）
+_SCENERY_START = (
+    "窗", "门", "屋", "天", "雨", "风", "雷", "灯", "光", "阳光", "月", "夜", "远处", "四周",
+    "空气", "屏幕", "电话", "手机", "铃", "车", "街", "楼", "画面", "镜头", "声音", "一阵",
+    "一声", "突然", "忽然", "此时", "这时", "片刻", "良久", "沉默", "黑屏", "黑场",
+)
+
+
+def with_subject(action: str, speaker: str, bible: StoryBible) -> str:
+    """台词前的动作行没写主语（「指节扣了扣隔板」）时补上说话人的名字。
+
+    模型常把动作当成说话人自己的，省掉主语；排进剧本后就分不清是谁在动。
+    动作里已经提到任何角色（名字 / 别名 / id）、以代词开头、或写的是环境 / 物件 / 声音时不动。
+    """
+    action = (action or "").strip()
+    character = next((c for c in bible.characters if c.id == speaker), None)
+    if not action or character is None or action.startswith(_PRONOUN_START + _SCENERY_START):
+        return action
+    for other in bible.characters:
+        if any(n and n in action for n in (other.id, other.name, *other.aliases)):
+            return action
+    return f"{character.name}{action}"
+
+
+def _clean_parenthetical(value: str) -> str:
+    return (value or "").strip().strip("（）()").strip()
+
+
+def _join_action(*parts: str) -> str:
+    """几段动作描写拼成一段：中文直接接上，两边都是英文字母 / 数字时才隔一个空格。"""
+    out = ""
+    for part in (p.strip() for p in parts if p and p.strip()):
+        gap = " " if out and out[-1].isascii() and out[-1].isalnum() and part[0].isascii() else ""
+        out += gap + part
+    return out
 
 
 def _revision_block(revision: Scene | None, feedback: str) -> str:
     """重写一场时：当前版本 + 用户的修改意见（意见没提到的地方尽量保持）。"""
     if revision is None:
         return ""
-    lines = "\n".join(f"  {d.speaker}: {d.line}" for d in revision.dialogue) or "  （无对白）"
+    lines = "\n".join(_format_line(d) for d in revision.dialogue) or "  （无对白）"
     note = " ".join(str(feedback or "").split()) or "整体重写一版，保持剧情走向不变，写得更好"
     return f"""
 ## 重写本场（按修改意见）
 当前版本：
 标题: {revision.heading}
+故事时间: {revision.time_label or "（未标）"}
+转场: {revision.transition_in or "硬切"}
 摘要: {revision.summary}
 情绪: {revision.emotion}
+开场画面: {revision.action or "（无）"}
 对白:
 {lines}
+场末画面: {revision.closing or "（无）"}
 
 修改意见（优先级最高）：{note}
 只按修改意见改；意见没提到的部分（人物、因果、和前后场的衔接、时长）尽量保持。
 """
+
+
+def _format_line(d: DialogueLine) -> str:
+    action = f"  △ {d.action}\n" if d.action else ""
+    paren = f"（{d.parenthetical}）" if d.parenthetical else ""
+    return f"{action}  {d.speaker}{paren}: {d.line}"
 
 
 def _source_block(outline_scene: OutlineScene) -> str:
@@ -892,7 +998,7 @@ def _source_block(outline_scene: OutlineScene) -> str:
 
 改编要求：台词从原著对白里**挑**最关键的几句（可删减、口语化，不得改变意思），
 总量服从上面的「台词总量」，不要把原文对白整段搬进来；叙述与心理描写改写成
-动作或少量对白；不要加入原著没有的情节；说话人必须映射到故事圣经里的角色 id。
+action 里的动作描写或少量对白；不要加入原著没有的情节；说话人必须映射到故事圣经里的角色 id。
 """
 
 
@@ -925,7 +1031,9 @@ async def generate_logline(llm: LLMProvider, script: Script) -> str:
         LLMMessage(role="user", content=f"场景列表:\n{scene_summaries}"),
     ]
     try:
-        text = await llm.chat(messages, temperature=0.5, max_tokens=100)
+        # 推理型模型（gemini-3.8-flash）先花几百 token 思考：
+        # 100 时 logline 被截成「原生家庭的」，600 也不够（思考用了 573）
+        text = await llm.chat(messages, temperature=0.5, max_tokens=2048)
         return text.strip().strip('"').strip()
     except Exception as exc:  # noqa: BLE001 - logline 是锦上添花，不该拖垮整条流水线
         logger.warning("logline 生成失败，降级使用首场摘要: %s", exc)

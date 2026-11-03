@@ -309,7 +309,9 @@ def validate_storyboard(
 
         issues.extend(_check_shot_voice(shot, script))
 
-        if not shot.video_prompt.strip():
+        if shot.black_screen:
+            pass  # 黑场本机生成，不需要 video_prompt
+        elif not shot.video_prompt.strip():
             issues.append(
                 ConsistencyIssue(
                     severity=IssueSeverity.ERROR,

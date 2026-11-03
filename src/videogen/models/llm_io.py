@@ -81,7 +81,11 @@ class SceneResponse(BaseModel):
 
     heading: str = ""
     summary: str = ""
+    time_label: str = ""
+    transition_in: str = ""
+    action: str = ""
     dialogue: list[DialogueLine] = Field(default_factory=list)
+    closing: str = ""
     duration_sec: int = 10
     emotion: str = ""
     world_state_delta: WorldStateDelta = Field(default_factory=WorldStateDelta)
@@ -99,6 +103,11 @@ class SceneResponse(BaseModel):
     @classmethod
     def _coerce_duration(cls, value: object) -> int:
         return max(1, coerce_seconds(value, 10))
+
+    @field_validator("time_label", "transition_in", "action", "closing", mode="before")
+    @classmethod
+    def _none_to_text(cls, value: object) -> str:
+        return "" if value is None else str(value)
 
 
 class ShotsResponse(BaseModel):

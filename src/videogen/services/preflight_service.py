@@ -165,7 +165,10 @@ async def video_plan(
     placeholders = video.placeholder_clips if video else []
 
     provider_model = getattr(provider, "model", "") or provider.name
-    segments = storyboard_service.segments_of(storyboard) if storyboard else []
+    # 黑场本机生成、不花钱，不算进要买的单元
+    segments = (
+        [s for s in storyboard_service.segments_of(storyboard) if not s.black] if storyboard else []
+    )
     # 已经就绪的片段要不要重跑：provider / 模型对不上就必须全部重生成。
     switched = bool(video) and video_service.provider_switched(video, provider)
     pending_segments = (
@@ -188,8 +191,9 @@ async def video_plan(
     for segment in segments:
         billed_all += await _planned(provider, segment.duration_sec)
     storyboard_seconds = sum(int(s.duration_sec) for s in shots)
+    paid_shots = [s for s in shots if not s.black_screen]
 
-    to_generate = len(shots) if switched else len(pending)
+    to_generate = len(paid_shots) if switched else len(pending)
 
     plan: dict = {
         "action": "video",
@@ -203,6 +207,8 @@ async def video_plan(
         "max_sec": round(max_sec, 3),
         "duration_options": [round(value, 3) for value in options],
         "shots_total": len(shots),
+        #: 黑场镜头：本机生成，不在 to_generate / 计费里
+        "black_shots": len(shots) - len(paid_shots),
         "to_generate": to_generate,
         "segment_mode": segment_mode,
         "segments_total": len(segments),
@@ -224,7 +230,11 @@ async def video_plan(
     }
 
     if options and to_generate:
-        storyboard_secs = _pending_seconds(pending) if not switched else float(storyboard_seconds)
+        storyboard_secs = (
+            _pending_seconds(pending)
+            if not switched
+            else float(sum(int(s.duration_sec) for s in paid_shots))
+        )
         extra = round(plan["billed_seconds"] - storyboard_secs, 3)
         if extra > 0.05:
             plan["warnings"].append(
@@ -343,12 +353,15 @@ def audio_plan(
     """配音花多少：TTS 按字符（edge-tts 免费）+ 可选的 LLM 文案 token。
 
     `native_narration` 里的镜头旁白由视频原声直出，不走 TTS，不计字符。
-    `dub_mode="native"`：整片用视频原声，配音阶段不调 TTS、不写文案，$0。
+    `dub_mode="native"`：整片用视频原声，配音阶段不调 TTS、不写文案；只有黑场镜头
+    （本机生成的黑画面，没有原声）的台词 / 旁白按 TTS 计费。
     """
     settings = settings or get_settings()
     prices = cost_service.PriceTable.from_settings(settings)
     native_mode = dub_mode == "native"
-    shots = [] if native_mode else (storyboard.shots if storyboard else [])
+    shots = storyboard.shots if storyboard else []
+    if native_mode:
+        shots = [s for s in shots if s.black_screen]
     mode = (
         "off"
         if native_mode
@@ -406,7 +419,12 @@ def audio_plan(
             f"{len(native_narration)} 个镜头的旁白由视频原声直出，不另配音、不计 TTS 费用"
         )
     plan["dub_mode"] = "native" if native_mode else "tts"
-    if native_mode:
+    if native_mode and chars:
+        plan["warnings"].append(
+            f"原声模式：{len(shots)} 个黑场镜头的台词 / 旁白用 TTS 配音（{chars} 字），"
+            "其余用视频原声"
+        )
+    elif native_mode:
         plan["warnings"].append("原声模式：对白 / 旁白都用视频原声，不做 TTS 配音，$0")
     elif chars == 0 and not shots:
         plan["warnings"].append("还没有分镜，无法预估配音")
