@@ -337,6 +337,48 @@ async def test_price_from_cents_follows_resolution():
     assert await runway.price_per_second() == pytest.approx(0.28)
 
 
+HEYGEN = {
+    "id": "heygen/heygen-video-1",
+    "supported_resolutions": ["480p", "768p", "2K"],
+    "supported_durations": list(range(5, 16)),
+    "supported_frame_images": ["first_frame"],
+    "pricing_skus": {
+        "duration_seconds_2k": "0.1",
+        "duration_seconds_480p": "0.02",
+        "duration_seconds_768p": "0.036",
+        "reference_input_images": "0.04",
+        "reference_duration_seconds_2k": "0.18",
+        "reference_duration_seconds_480p": "0.07",
+        "reference_duration_seconds_768p": "0.1",
+    },
+}
+
+
+@pytest.mark.asyncio
+async def test_price_uses_reference_tier_when_sending_references(monkeypatch):
+    """HeyGen 带参考图按另一档收：以前按不带图的 $0.10 估，少算将近一半。"""
+    recorder = Recorder(models=[HEYGEN, HAILUO3])
+    heygen = "heygen/heygen-video-1"
+    assert await make_provider(recorder, model=heygen, resolution="2K").price_per_second() == (
+        pytest.approx(0.18)
+    )
+    assert await make_provider(recorder, model=heygen, resolution="768p").price_per_second() == (
+        pytest.approx(0.10)
+    )
+    # 不送参考图时按普通档
+    plain = make_provider(recorder, model=heygen, resolution="2K", use_reference_images=False)
+    assert await plain.price_per_second() == pytest.approx(0.10)
+    monkeypatch.setattr(get_settings(), "video_frame_mode", "first_frame")
+    assert await make_provider(recorder, model=heygen, resolution="2K").price_per_second() == (
+        pytest.approx(0.10)
+    )
+    monkeypatch.setattr(get_settings(), "video_frame_mode", "auto")
+    # H3 的 reference_images 是按镜头的附加费，不改每秒单价
+    assert await make_provider(recorder, model="minimax/hailuo-3").price_per_second() == (
+        pytest.approx(0.13)
+    )
+
+
 @pytest.mark.asyncio
 async def test_unknown_price_blocks_video_under_budget(store, monkeypatch):
     model = {**HAILUO3, "pricing_skus": {"some_new_unit": "1"}}

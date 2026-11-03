@@ -219,7 +219,12 @@ class OpenRouterVideoProvider(VideoProvider):
         # 带音频 / 不带音频两档价（Kling、Veo、Seedance 1.5）：按是否真的生成音轨取对应那档，
         # 否则开了音轨却按低价预估（Kling 少算 1/3）
         with_audio = bool(self.generate_audio and caps.get("generate_audio"))
-        price = _per_second_price(skus, wanted, with_audio)
+        price = None
+        if await self.frame_mode() == "references":
+            # 带参考图另有一档每秒价（HeyGen：2K $0.10 → $0.18）；没带图时按它估只会偏保守
+            price = _per_second_price(_reference_skus(skus), wanted, with_audio)
+        if price is None:
+            price = _per_second_price(skus, wanted, with_audio)
         if price is None:
             price = _token_price(skus, wanted, with_audio)
         return price
@@ -612,6 +617,19 @@ _RESOLUTION_TAGS = ("480p", "720p", "768p", "1080p", "2k", "4k")
 _NOT_OUTPUT_SECOND = (
     "reference", "continuation", "minimum", "image_input", "megapixel", "video_input",
 )
+
+
+def _reference_skus(skus: dict[str, Any]) -> dict[str, Any]:
+    """带参考图时的每秒价目（`reference_duration_seconds_2k` → `duration_seconds_2k`）。
+
+    H3 的 `reference_images` 是按镜头的附加费、不按秒，不在这里。
+    """
+    prefix = "reference_"
+    return {
+        str(key)[len(prefix):]: value
+        for key, value in skus.items()
+        if str(key).lower().startswith(prefix) and "second" in str(key).lower()
+    }
 
 
 def _per_second_price(skus: dict[str, Any], wanted: str, with_audio: bool) -> float | None:
