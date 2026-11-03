@@ -17,6 +17,9 @@ class Settings(BaseSettings):
     llm_provider: str = "openrouter"
     openrouter_api_key: str = Field(default="", repr=False)
     openrouter_model: str = "google/gemini-2.5-flash"
+    #: 剧本阶段（逐场剧本 / 分场 / 按意见重写一场）单独指定模型；留空 = 用 OPENROUTER_MODEL。
+    #: 请求里显式选的模型、项目上存的模型都比它优先
+    script_llm_model: str = ""
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
     llm_timeout_sec: float = 120.0
     llm_max_retries: int = 2
@@ -321,6 +324,7 @@ class Settings(BaseSettings):
     #: 0 = 不限制；单位 USD
     budget_usd: float = 0.0
     budget_warn_ratio: float = 0.8
+    #: LLM 单价只在 provider 没报实际扣费时兜底（OpenRouter 默认在 usage.cost 里报）
     llm_input_price_per_mtok: float = 0.30
     llm_output_price_per_mtok: float = 2.50
     #: 真实视频 API 按秒计费（mock = 0），例如可灵约 0.05/秒
@@ -329,7 +333,8 @@ class Settings(BaseSettings):
     tts_price_per_mchar: float = 0.0
     #: 可切换的模型候选（逗号分隔），用于前端下拉
     llm_model_candidates: str = (
-        "google/gemini-2.5-flash,google/gemini-2.5-pro,anthropic/claude-3.5-haiku"
+        "google/gemini-2.5-flash,google/gemini-3.8-flash,deepseek/deepseek-v4.1-flash,"
+        "google/gemini-2.5-pro,anthropic/claude-3.5-haiku"
     )
 
     # 角色一致性

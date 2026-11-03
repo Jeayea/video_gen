@@ -282,3 +282,14 @@ def test_preview_prompt_uses_the_same_builder_as_generation():
     )
     with pytest.raises(KeyError):
         video_service.preview_prompt(board, "nope", project, bible())
+
+
+def test_screenplay_marks_chapter_changes():
+    md = screenplay_service.build(
+        script(), bible(),
+        chapters={
+            "scene_1": "第一章：脚本", "scene_2": "第一章：脚本", "scene_3": "第十六章：黑屏"
+        },
+    )["markdown"]
+    assert md.count("**—— 第一章：脚本 ——**") == 1
+    assert md.index("第一章") < md.index("## 1.") < md.index("第十六章") < md.index("## 3.")

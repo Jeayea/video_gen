@@ -912,7 +912,17 @@ async def get_screenplay(project_id: str, mode: str = "script"):
         pipeline.get_storyboard(project_id),
         mode=mode,
         title=project.title,
+        chapters=_scene_chapter_titles(project_id),
     )
+
+
+def _scene_chapter_titles(project_id: str) -> dict[str, str]:
+    """场次 id → 章标题（没有长篇大纲的项目返回空）。"""
+    outline, story = store.load_outline(project_id), store.load_story_outline(project_id)
+    if not outline or not story:
+        return {}
+    titles = {c.id: c.title or c.id for c in story.chapters}
+    return {s.id: titles[s.chapter_id] for s in outline.scenes if s.chapter_id in titles}
 
 
 @app.put("/api/projects/{project_id}/script")

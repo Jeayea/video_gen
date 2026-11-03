@@ -190,6 +190,7 @@ body {
 .screenplay .sp-logline { text-align: center; color: var(--text2); font-size: 13px; margin-bottom: 14px; }
 .screenplay .sp-cast { font-size: 13px; margin: 8px 0 18px; padding-bottom: 14px; border-bottom: 1px solid var(--border); }
 .screenplay .sp-cast b { display: block; margin-bottom: 4px; }
+.screenplay .sp-chapter { text-align: center; font-weight: 700; color: var(--accent2); margin: 34px 0 4px; letter-spacing: .1em; }
 .screenplay .sp-scene { font-weight: 700; margin-top: 26px; }
 .screenplay .sp-meta { font-size: 12px; color: var(--text2); margin-bottom: 8px; }
 .screenplay .sp-action { margin: 6px 0; }
@@ -2216,6 +2217,7 @@ function renderScreenplayBlock(b) {
     case 'title': return `<div class="sp-title">${esc(b.text)}</div>`;
     case 'logline': return `<div class="sp-logline">${esc(b.text)}</div>`;
     case 'cast': return `<div class="sp-cast"><b>人物</b>${b.items.map(i => `<div>${esc(i.name)}${i.note ? `：<span style="color:var(--text2)">${esc(i.note)}</span>` : ''}</div>`).join('')}</div>`;
+    case 'chapter': return `<div class="sp-chapter">${esc(b.text)}</div>`;
     case 'scene': return `<div class="sp-scene">${b.no}. ${esc(b.heading)}</div><div class="sp-meta">${[b.time_label, b.meta].filter(Boolean).map(esc).join(' · ')}</div>`;
     case 'transition': return `<div class="sp-transition ${b.align === 'right' ? 'right' : ''}">${esc(b.text)}</div>`;
     case 'action': return `<div class="sp-action">${esc(b.text)}</div>`;

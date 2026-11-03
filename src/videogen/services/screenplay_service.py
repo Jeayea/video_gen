@@ -38,8 +38,12 @@ def build(
     *,
     mode: str = "script",
     title: str = "",
+    chapters: dict[str, str] | None = None,
 ) -> dict[str, Any]:
-    """返回 `{"title", "mode", "blocks", "markdown", "stats", "warnings"}`。"""
+    """返回 `{"title", "mode", "blocks", "markdown", "stats", "warnings"}`。
+
+    `chapters`：场次 id → 所属章的标题（长篇项目）；换章时插一行章标题。
+    """
     mode = mode if mode in MODES else "script"
     names = _name_map(bible)
     shots_by_scene: dict[str, list[Shot]] = {}
@@ -67,8 +71,13 @@ def build(
         mode = "script"
 
     transitions = [_scene_transition(s, shots_by_scene.get(s.id)) for s in script.scenes]
+    current_chapter = None
     for index, scene in enumerate(script.scenes):
         shots = shots_by_scene.get(scene.id, [])
+        chapter = (chapters or {}).get(scene.id)
+        if chapter and chapter != current_chapter:
+            blocks.append({"type": "chapter", "text": chapter})
+        current_chapter = chapter
         blocks.append(
             {
                 "type": "scene",
@@ -299,6 +308,8 @@ def to_markdown(blocks: list[dict[str, Any]]) -> str:
                 for item in block["items"]
             ))
             out.append("---")
+        elif kind == "chapter":
+            out.append(f"**—— {block['text']} ——**")
         elif kind == "scene":
             title = f"## {block['no']}. {block['heading']}"
             sub = " · ".join(p for p in (block.get("time_label"), block.get("meta")) if p)

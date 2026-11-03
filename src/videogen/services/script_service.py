@@ -67,11 +67,14 @@ SCENE_SYSTEM = """你是一位资深短剧编剧。你正在逐场编写短剧�
    每句动作都写出主语（谁在做），不写画幅、景别、特写这类镜头术语（那是分镜的事）
 8. 人物的情绪靠动作和潜台词表现，台词不要把情绪和道理直接说出来
 9. 场次之间怎么接（transition_in，说的是「从上一场怎么进来」）：
-   - 同一时空接着演，或只是换个地方：留空（硬切）
-   - 现在 ↔ 回忆的切换、明显的时间跳跃：dissolve（叠化）
+   - 同一时空接着演、只是换个地方、同一时刻另一个地方的平行剪辑：留空（硬切）
+   - 现在 ↔ 回忆的切换、明显的时间跳跃：dissolve（叠化）；也可以硬切，大纲写了「硬切」就硬切
    - 一章的开头 / 收尾、大段时间流逝：fade（经黑场淡出淡入）
-   跨时空切换时，本场的开场画面尽量接住上一场的结尾画面（同一个物件、同一个动作或同一个声音），
-   在 action 里写明接的是什么
+   进回忆要有此刻的触发：一样东西、一句话或一个声音。声音先进时，把那句声音写进上一场的 closing
+   （它在上一场的画面上就响起来）。大纲没写的回忆不要自己加。
+   匹配剪辑（上下两场对同一个动作 / 构图）是重手法：只在大纲明确写了「匹配剪辑」时用，
+   不要每次切换都去对一个手部动作。action / closing 只写画面和声音，
+   不写「接上一场……」「叠化至」这类剪辑说明（转场写在 transition_in 里）
 10. 剧本要求黑屏 / 黑场时，在 action 或 closing 里明确写「黑屏。」，黑屏里的声音写成对白
     （parenthetical 写「画外」或「电话里」）
 11. 倒叙 / 插叙时，time_label 写清这一场在故事里的时间（「现在」「回忆 · 2009 年冬」），
@@ -307,6 +310,10 @@ CHAPTER_SCENE_SYSTEM = """你是分场编剧。把指定的**章**展开成可�
 4. 环境细节要服务情绪（例如冷白顶灯下的空会议室）
 
 禁止：把一章写成多场同质重复；禁止没有冲突的过场；禁止一句概述带过整章
+（例外：情节点写了「冷开场」的，单独成一场 3-5 秒，只写那个画面）
+
+情节点里写明的结构照做：冷开场、硬切、叠化、声音先进、两地同时（平行剪辑）、匹配剪辑
+都写进对应那场的 brief；情节点没写的闪回 / 回忆不要自己加
 
 只输出 JSON：
 {"scenes": [{"title": "场标题",
@@ -793,7 +800,8 @@ async def ask_review(
     ]
     try:
         result = await llm.chat_json(
-            messages, schema=StructureReview, temperature=0.2, max_tokens=2048
+            # 推理型模型（deepseek-v4.1-flash）先思考再出 JSON：2048 时 content 为空
+            messages, schema=StructureReview, temperature=0.2, max_tokens=8192
         )
     except Exception:
         logger.warning("剧本结构评审失败（不影响生成）", exc_info=True)
@@ -867,7 +875,7 @@ async def generate_scene(
         LLMMessage(role="system", content=SCENE_SYSTEM),
         LLMMessage(role="user", content=user_prompt),
     ]
-    response = await llm.chat_json(messages, schema=SceneResponse, temperature=0.6, max_tokens=4096)
+    response = await llm.chat_json(messages, schema=SceneResponse, temperature=0.6, max_tokens=8192)
 
     dialogue: list[DialogueLine] = []
     pending_action = ""

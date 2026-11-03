@@ -557,3 +557,23 @@ async def test_script_doctor_error_blocks_confirmation_end_to_end(store):
         await pipeline.confirm_script(project.id)
     confirmed = await pipeline.confirm_script(project.id, force=True)
     assert confirmed.status == ProjectStatus.SCRIPT_CONFIRMED
+
+
+@pytest.mark.asyncio
+async def test_script_stage_uses_script_llm_model(store, fake_llm, monkeypatch):
+    """SCRIPT_LLM_MODEL 只管剧本阶段：圣经照旧用默认模型，显式选的模型比它优先。"""
+    from videogen.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "script_llm_model", "deepseek/deepseek-v4.1-flash")
+    pipeline = Pipeline(store, llm_factory=lambda: fake_llm)
+    project = Project(input_text="剧本换模型", target_duration_sec=30)
+    store.save_project(project)
+
+    await pipeline.generate_bible(project.id)
+    assert fake_llm.models_used == []
+    await pipeline.generate_script(project.id)
+    # 写剧本用 DeepSeek；剧本医生换回默认模型（第二个 provider 实例，不切模型）
+    assert fake_llm.models_used == ["deepseek/deepseek-v4.1-flash"]
+    sid = store.load_script(project.id).scenes[0].id
+    await pipeline.regenerate_scene(project.id, sid, model="google/gemini-3.8-flash")
+    assert fake_llm.models_used[-1] == "google/gemini-3.8-flash"

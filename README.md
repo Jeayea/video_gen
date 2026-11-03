@@ -112,6 +112,7 @@ curl -s localhost:8001/api/projects/$PID/cost        # 实际花费账本
 | 想做什么 | 配置 |
 |----------|------|
 | 换 LLM | `OPENROUTER_MODEL` |
+| 剧本阶段单独用一个模型（例如 `deepseek/deepseek-v4.1-flash`） | `SCRIPT_LLM_MODEL` |
 | 按角色 TTS 配音（默认用视频原声） | `AUDIO_DUB_MODE=tts`，`TTS_PROVIDER=edge\|openrouter` |
 | 配乐来源 | `BGM_ENGINE=generate\|library\|cli\|none` |
 | 字幕 | `COMPOSE_SUBTITLE_MODE=soft\|burn\|none`，样式 `COMPOSE_SUBTITLE_STYLE=soft\|box\|doc\|classic` |

@@ -38,6 +38,8 @@ def fast_video_settings(monkeypatch):
     # 角色图同理：默认工厂绝不能真的去打图片模型
     monkeypatch.setattr(settings, "image_provider", "mock")
     monkeypatch.setattr(settings, "budget_usd", 0.0)
+    # 本机 .env 里可能给剧本阶段单独配了模型：测试一律用默认模型，要测的用例自己打开
+    monkeypatch.setattr(settings, "script_llm_model", "")
     # 合成基线：本地 .env 可能已经设成 burn（会真的改走 libass 分支），
     # 需要烧字幕的用例自己显式传 overrides
     monkeypatch.setattr(settings, "compose_subtitle_mode", "soft")

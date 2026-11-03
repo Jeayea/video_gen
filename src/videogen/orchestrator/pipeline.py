@@ -238,6 +238,39 @@ class Pipeline:
             provider = language.with_language(provider, get_settings().language_for(project))
         return provider
 
+    async def _review_script(
+        self,
+        project: Project,
+        script: Script,
+        bible: StoryBible,
+        writer: LLMProvider,
+        model: str,
+        *,
+        adaptation: bool,
+    ) -> list:
+        """剧本医生。剧本用了 `SCRIPT_LLM_MODEL` 时换回默认模型来审：
+
+        写和审不是同一个模型（第二双眼睛）；另外 deepseek-v4.1-flash 在这个评审提示词上
+        会把 8192 个 token 全花在思考上、不出正文（2026-11-03 实测两次）。
+        """
+        partial = self._is_partial_arc(project.id)
+        if model or not get_settings().script_llm_model:
+            return await script_service.review_structure(
+                writer, script, bible, partial=partial, adaptation=adaptation
+            )
+        reviewer = self._llm("", project)
+        try:
+            return await script_service.review_structure(
+                reviewer, script, bible, partial=partial, adaptation=adaptation
+            )
+        finally:
+            self._record_llm_cost(project.id, CostStage.SCRIPT, reviewer)
+            await reviewer.aclose()
+
+    def _script_llm(self, model: str, project: Project) -> LLMProvider:
+        """剧本阶段的 LLM：没显式选模型时用 `SCRIPT_LLM_MODEL`（留空 = 默认模型）。"""
+        return self._llm(model or get_settings().script_llm_model, project)
+
     # ── 成本记账 / 预算 ───────────────────────────────────
 
     def cost_report(self, project_id: str) -> CostReport:
@@ -776,7 +809,8 @@ class Pipeline:
             novel_mode = project.input_mode == InputMode.NOVEL
             if novel_mode:
                 bible = await self._prepare_novel_chapters(project, chapters, model)
-            llm = self._llm(model, project)
+            # 科普的文稿要逐句标出处，不跟着剧本模型走
+            llm = self._llm(model, project) if explainer else self._script_llm(model, project)
             review_issues: list = []
             try:
                 if explainer:
@@ -800,12 +834,8 @@ class Pipeline:
                         llm, project, script, bible
                     )
                 elif get_settings().script_llm_review:
-                    review_issues = await script_service.review_structure(
-                        llm,
-                        script,
-                        bible,
-                        partial=self._is_partial_arc(project_id),
-                        adaptation=novel_mode,
+                    review_issues = await self._review_script(
+                        project, script, bible, llm, model, adaptation=novel_mode
                     )
             except Exception as exc:
                 self._fail(project, "剧本生成")
@@ -1272,8 +1302,8 @@ class Pipeline:
             ) or WorldState()
 
             self._guard_budget(project_id, action="重写场次")
-            llm = self._llm(model, project)
             explainer = explainer_service.is_explainer(project)
+            llm = self._llm(model, project) if explainer else self._script_llm(model, project)
             try:
                 if explainer:
                     scene, new_facts = await explainer_service.generate_scene(
