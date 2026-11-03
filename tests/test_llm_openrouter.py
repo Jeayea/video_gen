@@ -235,3 +235,39 @@ def test_network_error_is_wrapped():
             await provider.chat([LLMMessage(role="user", content="hi")])
 
     asyncio.run(run())
+
+
+def test_usage_cost_from_response_goes_into_the_ledger_numbers():
+    """OpenRouter 在 usage 里报实际扣费（含推理 token）：账本要用它，不按配置单价估。"""
+    def handler(request):
+        return httpx.Response(200, json={
+            "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+            "usage": {"prompt_tokens": 34, "completion_tokens": 39, "cost": 2.103e-05},
+        })
+
+    provider = make_provider(handler)
+    ask(provider)
+    usage = provider.take_usage()
+    assert usage.reported_usd == pytest.approx(2.103e-05)
+    assert usage.unreported_input_tokens == 0 and usage.unreported_output_tokens == 0
+
+
+def test_missing_cost_falls_back_to_unit_prices():
+    provider = make_provider(lambda request: ok())
+    ask(provider)
+    usage = provider.take_usage()
+    assert usage.reported_usd == 0 and usage.unreported_input_tokens == 7
+
+
+def test_empty_content_cut_by_max_tokens_says_so():
+    def handler(request):
+        return httpx.Response(200, json={
+            "choices": [{"message": {"role": "assistant", "content": None},
+                         "finish_reason": "length"}],
+            "usage": {"prompt_tokens": 7, "completion_tokens": 2048, "cost": 0.001},
+        })
+
+    provider = make_provider(handler)
+    with pytest.raises(LLMError, match="max_tokens"):
+        ask(provider)
+    assert provider.take_usage().reported_usd == pytest.approx(0.001)  # 白花的钱也要记账

@@ -231,3 +231,34 @@ async def test_cost_status_shape(store, fake_llm):
     assert status["budget_usd"] == get_settings().budget_usd
     assert set(status["estimate"]) == {"video_usd", "audio_usd"}
     assert "llm_input_per_mtok" in status["prices"]
+
+
+# ── LLM：优先记 provider 报的实际扣费 ─────────────────
+
+
+def test_llm_usd_prefers_reported_cost_and_prices_only_the_rest():
+    from videogen.providers.llm.base import TokenUsage
+    from videogen.services.cost_service import PriceTable
+
+    prices = PriceTable(llm_input_per_mtok=1.0, llm_output_per_mtok=10.0)
+    usage = TokenUsage()
+    # 一次报了价（deepseek：实收远低于配置单价），一次没报（按单价估）
+    usage.merge(TokenUsage(calls=1, input_tokens=1_000_000, output_tokens=1_000_000,
+                           reported_usd=0.5, reported_input_tokens=1_000_000,
+                           reported_output_tokens=1_000_000))
+    usage.merge(TokenUsage(calls=1, input_tokens=1_000_000, output_tokens=0))
+    assert prices.llm_usd(usage) == 1.5
+    # 老口径（没有报价字段）照旧全按单价
+    assert prices.llm_usd(TokenUsage(input_tokens=1_000_000, output_tokens=100_000)) == 2.0
+
+
+def test_record_usage_with_cost_marks_tokens_as_reported():
+    from tests.fakes import FakeLLM
+
+    llm = FakeLLM()
+    llm.take_usage()
+    llm.record_usage(input_tokens=100, output_tokens=50, cost_usd=0.0002)
+    llm.record_usage(input_tokens=10, output_tokens=5)
+    usage = llm.take_usage()
+    assert usage.reported_usd == 0.0002
+    assert (usage.unreported_input_tokens, usage.unreported_output_tokens) == (10, 5)

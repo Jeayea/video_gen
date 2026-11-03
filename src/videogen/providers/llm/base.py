@@ -7,20 +7,40 @@ from pydantic import BaseModel
 
 
 class TokenUsage(BaseModel):
-    """一次（或一段）调用的 token 统计，用于成本记账。"""
+    """一次（或一段）调用的 token 统计，用于成本记账。
+
+    `reported_usd` 是 provider 在响应里报的实际扣费（OpenRouter 的 `usage.cost`），
+    `reported_*_tokens` 是这部分扣费覆盖了哪些 token；剩下没报价的 token 才按配置单价估。
+    以前一律按配置单价（gemini-2.5-flash 的价）记，换了模型账就不对：
+    gemini-3.8-flash 少记约一半，deepseek-v4.1-flash 多记约 5 倍。
+    """
 
     calls: int = 0
     input_tokens: int = 0
     output_tokens: int = 0
+    reported_usd: float = 0.0
+    reported_input_tokens: int = 0
+    reported_output_tokens: int = 0
 
     @property
     def total_tokens(self) -> int:
         return self.input_tokens + self.output_tokens
 
+    @property
+    def unreported_input_tokens(self) -> int:
+        return max(0, self.input_tokens - self.reported_input_tokens)
+
+    @property
+    def unreported_output_tokens(self) -> int:
+        return max(0, self.output_tokens - self.reported_output_tokens)
+
     def merge(self, other: TokenUsage) -> None:
         self.calls += other.calls
         self.input_tokens += other.input_tokens
         self.output_tokens += other.output_tokens
+        self.reported_usd += other.reported_usd
+        self.reported_input_tokens += other.reported_input_tokens
+        self.reported_output_tokens += other.reported_output_tokens
 
 
 class LLMError(RuntimeError):
@@ -102,12 +122,22 @@ class LLMProvider(ABC):
         return current
 
     def record_usage(
-        self, *, input_tokens: int = 0, output_tokens: int = 0, calls: int = 1
+        self,
+        *,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        calls: int = 1,
+        cost_usd: float | None = None,
     ) -> None:
+        """累加一次调用的用量；`cost_usd` 是 provider 报的实际扣费（没报就留 None，按单价估）。"""
         usage = self._usage_ref()
         usage.calls += max(0, calls)
         usage.input_tokens += max(0, input_tokens)
         usage.output_tokens += max(0, output_tokens)
+        if cost_usd is not None and cost_usd >= 0:
+            usage.reported_usd += cost_usd
+            usage.reported_input_tokens += max(0, input_tokens)
+            usage.reported_output_tokens += max(0, output_tokens)
 
     def take_usage(self) -> TokenUsage:
         """取走并清零累计量：按阶段记账用。"""

@@ -243,7 +243,13 @@ class OpenRouterProvider(LLMProvider):
             return
         if completion == 0 and total > prompt:
             completion = total - prompt
-        self.record_usage(input_tokens=prompt, output_tokens=completion)
+        # OpenRouter 默认在 usage 里报实际扣费（含推理 token、按真实路由到的上游价）
+        cost: float | None
+        try:
+            cost = float(raw["cost"]) if raw.get("cost") is not None else None
+        except (TypeError, ValueError):
+            cost = None
+        self.record_usage(input_tokens=prompt, output_tokens=completion, cost_usd=cost)
 
     @staticmethod
     def _content_of(data: dict[str, Any]) -> str:
@@ -257,6 +263,10 @@ class OpenRouterProvider(LLMProvider):
                 part.get("text", "") for part in content if isinstance(part, dict)
             )
         if not isinstance(content, str):
+            finish = str((data.get("choices") or [{}])[0].get("finish_reason") or "")
+            if content is None and finish == "length":
+                # 推理型模型把 max_tokens 全花在思考上，正文一个字没出
+                raise LLMError("LLM 输出被 max_tokens 截断（推理型模型先花 token 思考），没有正文")
             raise LLMError("LLM 响应 content 字段不是字符串")
         usage = (data.get("usage") or {}).get("total_tokens")
         if usage:

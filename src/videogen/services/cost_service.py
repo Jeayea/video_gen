@@ -53,9 +53,11 @@ class PriceTable(BaseModel):
         )
 
     def llm_usd(self, usage: TokenUsage) -> float:
+        """provider 报了实际扣费的部分照实记，没报的 token 才按配置单价估。"""
         return round(
-            usage.input_tokens / 1_000_000 * self.llm_input_per_mtok
-            + usage.output_tokens / 1_000_000 * self.llm_output_per_mtok,
+            usage.reported_usd
+            + usage.unreported_input_tokens / 1_000_000 * self.llm_input_per_mtok
+            + usage.unreported_output_tokens / 1_000_000 * self.llm_output_per_mtok,
             6,
         )
 
