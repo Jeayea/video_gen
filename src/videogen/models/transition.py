@@ -33,3 +33,36 @@ def normalize_transition(value: object) -> str:
     """模型 / 人工写的转场 → `TRANSITIONS` 之一；认不出来的当硬切。"""
     key = str(value or "").strip().lower().replace(" ", "_").replace("-", "_")
     return _TRANSITION_ALIASES.get(key, key if key in TRANSITIONS else "")
+
+
+#: 黑场能用的音效（本机合成，见 `utils/sfx.py`）。循环类的铺满所在的时间，一次性的只响一下
+SFX_NAMES = ("phone_ring", "phone_vibrate", "call_connect", "busy_tone", "hang_up")
+_SFX_ALIASES = {
+    "ring": "phone_ring",
+    "ringtone": "phone_ring",
+    "铃声": "phone_ring",
+    "来电铃声": "phone_ring",
+    "vibrate": "phone_vibrate",
+    "vibration": "phone_vibrate",
+    "震动": "phone_vibrate",
+    "connect": "call_connect",
+    "接通": "call_connect",
+    "busy": "busy_tone",
+    "忙音": "busy_tone",
+    "hangup": "hang_up",
+    "挂断": "hang_up",
+}
+
+
+def normalize_sfx(value: object) -> list[str]:
+    """模型 / 人工写的音效列表 → `SFX_NAMES` 里的名字；认不出来的丢掉。"""
+    if value is None or value == "":
+        return []
+    items = value if isinstance(value, (list, tuple)) else str(value).replace("，", ",").split(",")
+    out = []
+    for item in items:
+        key = str(item or "").strip().lower().replace(" ", "_").replace("-", "_")
+        name = _SFX_ALIASES.get(key, key)
+        if name in SFX_NAMES:
+            out.append(name)
+    return out

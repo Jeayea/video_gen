@@ -306,7 +306,9 @@ def test_build_prompt_carries_the_spoken_line_for_lip_sync(
     prompt = video_service.build_prompt(shot, ready_project)
     assert "薇儿，为什么？" in prompt
     assert "lip-sync" in prompt
-    assert "no on-screen text" in prompt
+    assert "no subtitles or captions" in prompt
+    # 只禁字幕，不禁画面里的字（同一段里的便签 / 屏幕要照写）
+    assert "no on-screen text" not in prompt
 
     # 可以整体关掉（老行为：模型自己编话）
     monkeypatch.setattr(settings, "video_prompt_dialogue", False)

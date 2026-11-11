@@ -22,3 +22,5 @@ assets/lipsync/
 
 # 端到端冒烟的工作目录（tools/e2e/mock_pipeline_e2e.py）
 .e2e/
+
+.DS_Store

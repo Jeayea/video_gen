@@ -577,3 +577,22 @@ async def test_script_stage_uses_script_llm_model(store, fake_llm, monkeypatch):
     sid = store.load_script(project.id).scenes[0].id
     await pipeline.regenerate_scene(project.id, sid, model="google/gemini-3.8-flash")
     assert fake_llm.models_used[-1] == "google/gemini-3.8-flash"
+
+
+
+def test_quoted_on_screen_text_is_not_flagged_as_non_english():
+    from videogen.models.bible import StoryBible
+    from videogen.models.script import Scene, Script
+    from videogen.models.storyboard import Shot, Storyboard
+
+    script = Script(scenes=[Scene(id="scene_1")])
+
+    def board(prompt):
+        return Storyboard(shots=[Shot(id="s1", scene_id="scene_1", shot_no=1, video_prompt=prompt)])
+
+    def flagged(prompt):
+        issues = consistency_service.validate_storyboard(board(prompt), script, StoryBible())
+        return any("非英文" in i.message for i in issues)
+
+    assert not flagged('a phone screen reads "妈 未接来电", static camera')
+    assert flagged("一个女人站在路口")

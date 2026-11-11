@@ -3,7 +3,7 @@ from __future__ import annotations
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from videogen.models.script import MIN_SCENE_DURATION_SEC
-from videogen.models.transition import TRANSITIONS, normalize_transition
+from videogen.models.transition import SFX_NAMES, TRANSITIONS, normalize_sfx, normalize_transition
 from videogen.utils.coerce import StrList, coerce_seconds, ensure_optional_str
 
 DEFAULT_SHOT_DURATION_SEC = 4
@@ -72,6 +72,10 @@ class ShotDraft(BaseModel):
     black_screen: bool = False
     #: 从上一镜怎么进来（见 `TRANSITIONS`）
     transition: str = ""
+    #: 黑场上的画面文字（黑底白字，如「八个月前」）
+    screen_text: str = ""
+    #: 黑场里的音效（`SFX_NAMES` 之一，按顺序排进这一镜）
+    sfx: StrList = Field(default_factory=list)
 
     @field_validator("duration_sec", mode="before")
     @classmethod
@@ -92,6 +96,16 @@ class ShotDraft(BaseModel):
     @classmethod
     def _coerce_transition(cls, value: object) -> str:
         return normalize_transition(value)
+
+    @field_validator("screen_text", mode="before")
+    @classmethod
+    def _coerce_text(cls, value: object) -> str:
+        return "" if value is None else str(value).strip()
+
+    @field_validator("sfx", mode="before")
+    @classmethod
+    def _coerce_sfx(cls, value: object) -> list[str]:
+        return normalize_sfx(value)
 
 
 class Shot(BaseModel):
@@ -135,6 +149,10 @@ class Shot(BaseModel):
     transition: str = ""
     #: 转场时长（秒）；空 = `COMPOSE_TRANSITION_SEC`
     transition_sec: float | None = None
+    #: 黑场上的画面文字（黑底白字，本机渲染，如冷开场后的「八个月前」）。只对黑场生效
+    screen_text: str = ""
+    #: 黑场里的音效（本机合成，$0）：`SFX_NAMES` 里的名字，按顺序排进这一镜。只对黑场生效
+    sfx: StrList = Field(default_factory=list)
 
     @field_validator("duration_sec", mode="before")
     @classmethod
@@ -166,6 +184,16 @@ class Shot(BaseModel):
         except (TypeError, ValueError):
             return None
         return seconds if seconds > 0 else None
+
+    @field_validator("screen_text", mode="before")
+    @classmethod
+    def _coerce_text(cls, value: object) -> str:
+        return "" if value is None else str(value).strip()
+
+    @field_validator("sfx", mode="before")
+    @classmethod
+    def _coerce_sfx(cls, value: object) -> list[str]:
+        return normalize_sfx(value)
 
     @model_validator(mode="after")
     def _black_has_no_one_in_frame(self) -> Shot:
@@ -210,11 +238,13 @@ class Storyboard(BaseModel):
 __all__ = [
     "DEFAULT_SHOT_DURATION_SEC",
     "MIN_SCENE_DURATION_SEC",
+    "SFX_NAMES",
     "TRANSITIONS",
     "DurationTier",
     "Shot",
     "ShotDraft",
     "Storyboard",
     "VoiceDirection",
+    "normalize_sfx",
     "normalize_transition",
 ]

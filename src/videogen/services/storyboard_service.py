@@ -54,7 +54,9 @@ STORYBOARD_SYSTEM = """你是一位专业分镜师。根据剧本场景生成分
   "dialogue_speaker": null 或 "char_id",
   "voice_offscreen": false,
   "black_screen": false,
-  "transition": "" 或 "dissolve" 或 "fade"
+  "transition": "" 或 "dissolve" 或 "fade",
+  "screen_text": "",
+  "sfx": []
 }
 
 要求：
@@ -63,7 +65,8 @@ STORYBOARD_SYSTEM = """你是一位专业分镜师。根据剧本场景生成分
   （格式：the sign reads "<画面上的原文>"，原文照抄，不要换成它的英文意思）
 - video_prompt 里禁止出现 char_1 / loc_1 这类内部 id，必须写成具体的外貌/场景描述
 - **背景必须写实、写满**：environment 部分要说清「有什么陈设/道具、什么材质、光从哪来、
-  前景与景深里有什么」，至少写到一个**具体的可见物**。
+  前景与景深里有什么」，至少写到一个**具体的可见物**。特写 / 插入镜头只写画框里看得见的东西
+  （加一个虚化的背景暗示就够），不用把整个场景再写一遍。
   只写 "in an office" / "in a room" 这类泛称、或压根不提背景，模型就会把背景画成一面
   空墙 —— 这种 prompt 一律不合格，必须重写成有层次的场景
 - location 必须填故事圣经场景列表里真实存在的 id：视频生成时会用它的环境描述做**背景锚点**，
@@ -72,11 +75,22 @@ STORYBOARD_SYSTEM = """你是一位专业分镜师。根据剧本场景生成分
 - props_in_frame 只填画面里**看得见**、且在故事圣经道具列表里的关键道具 id；没有就给空数组
 - 构图提示随 aspect_ratio 变化
 - 台词尽量对准角色镜头，**且说话人必须出现在 character_in_frame 里**（说话却不在画面里是穿帮）
-- camera 必须同时写清景别与运镜（如「近景 · 缓推」）；一个镜头里只写**一个连续动作**，
-  不要在一句 video_prompt 里塞多个画面切换
+- camera 写清景别与运镜（如「近景 · 固定」）。**运镜默认是固定**：只有在有理由时才动——
+  跟着人走、揭开画框外的信息、情绪一点点压上来。一场里推 / 拉最多一次，不要每个镜头都「缓推」
+- **一个镜头只拍一个画面单元**（一个动作 / 一个反应 / 一个物件）。剧本一句动作里有好几个动作，
+  就拆成几个镜头，或者只留最要紧的那个；不要在 4 秒里塞「亮屏 + 点开 + 打字 + 回车 + 报错」
+- **节奏要有长短**：插入镜头（屏幕、手、物件）1-2 秒，情绪落点的镜头可以停 5-6 秒，
+  不要每个镜头都一样长
+- **镜头之间要有关系**：用「她看 → 她看到的东西（插入 / 主观镜头）→ 她的反应」来组织，
+  用景别对比（全景之后接特写）制造剪辑点；不要每个镜头都从远到近把整个环境重新描述一遍
+- 剧本写了「回到开场的画面」「和开场一样」时，这一镜的景别、机位和画面描述照抄开场那一镜
+  （首尾呼应要靠构图一模一样才成立）
 - 情绪强烈的镜头优先用中景/近景：大特写会让模型把表情演成夸张的舞台剧
 - video_prompt 里描述表演要用克制的词（subtle / restrained / natural），不要写夸张副词
   （hysterically / dramatically / exaggeratedly）
+- visual_description 和 video_prompt 只写看得见的东西：不写情绪形容（「神情麻木」「绝望」）、
+  不写比喻（「像一座孤岛」「目光冻结」），把它换成可见的表现（「她没有抬头，手指扣在纸箱边上」）；
+  也不写「叠化进入」「切到」这类剪辑说明（转场写在 transition 里）
 - transition 是这一镜**从上一镜怎么进来**：默认 ""（硬切）。dissolve = 叠化，fade = 经黑场
   淡出淡入。转场是剪辑手段，别滥用：同一时空里的镜头一律硬切；时间线切换（回忆 ↔ 现实）、
   时间跳跃、章节收尾才用。想让两条线「接上」时优先用**匹配剪辑**（硬切 + 上下两镜构图 / 动作 /
@@ -85,7 +99,11 @@ STORYBOARD_SYSTEM = """你是一位专业分镜师。根据剧本场景生成分
 - 剧本的动作描写（开场画面 / △ 动作行 / 场末画面）就是镜头要拍的东西：照着拆镜头，
   不要丢掉其中的物件和动作；括注（低声 / 画外 / 电话里）影响表演和 voice_offscreen
 - black_screen=true 是**黑场**：整个画面全黑，不拍任何东西（剧本写了「黑屏」「黑场」才用）。
-  黑场里的台词一律是画外音（电话里、门外），character_in_frame 留空，video_prompt 可以为空
+  黑场里的台词一律是画外音（电话里、门外），character_in_frame 留空，video_prompt 可以为空。
+  黑场可以带 screen_text（黑底白字，剧本写了「字幕：八个月前」这类画面文字时照抄原文）和
+  sfx（音效，只能从 phone_ring / phone_vibrate / call_connect / busy_tone / hang_up 里选，
+  按顺序排进这一镜：铃声响完再接通就写 ["phone_ring", "call_connect"]）。
+  剧本里黑屏期间的铃声 / 接通 / 挂断 / 忙音要单独成一个黑场镜头，不要和台词挤在同一镜
 - 只输出 JSON: {"shots": [...]}"""
 
 _ASPECT_HINTS = {
@@ -149,7 +167,8 @@ def sanitize_video_prompt(prompt: str, bible: StoryBible) -> str:
 
 #: 段落分镜下给分镜 LLM 的节奏要求（镜头可以短，计费按「段」算）
 SEGMENT_SHOT_RULES = """- 同一场相邻的镜头会被编成一段（8-15 秒）**一次生成、段内硬切**，
-  计费按段算：所以镜头可以短（2-6 秒），每个镜头只聚焦一个画面单元（一个动作 / 一个反应 / 一个特写）
+  计费按段算：所以镜头可以短（1-6 秒），每个镜头只聚焦一个画面单元
+  （一个动作 / 一个反应 / 一个特写），长短交错（插入镜头 1-2 秒，落点镜头 5-6 秒）
 - 段内靠换景别、换角度、换拍摄对象形成剪辑节奏；同一场里不要换地点
 - 有台词的镜头时长 ≥ 台词字数 ÷ 4.5 + 1 秒，演不完的台词拆到下一个镜头"""
 
@@ -281,6 +300,8 @@ async def generate_shots_for_scene(
                 voice_offscreen=bool(draft.voice_offscreen and draft.dialogue_text),
                 black_screen=draft.black_screen,
                 transition=draft.transition,
+                screen_text=draft.screen_text,
+                sfx=draft.sfx,
             )
         )
     if shots and scene.transition_in and not target_shot and not shots[0].transition:
@@ -321,6 +342,8 @@ def _shot_brief(shot: Shot) -> str:
         f"台词（{shot.dialogue_speaker}）: {shot.dialogue_text}" if shot.dialogue_text else "",
         f"旁白: {shot.narration}" if shot.narration else "",
         "黑场" if shot.black_screen else "",
+        f"画面文字: {shot.screen_text}" if shot.black_screen and shot.screen_text else "",
+        f"音效: {', '.join(shot.sfx)}" if shot.black_screen and shot.sfx else "",
         f"转场: {shot.transition}" if shot.transition else "",
         f"video_prompt: {shot.video_prompt}" if shot.video_prompt else "",
     ]

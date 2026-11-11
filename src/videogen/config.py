@@ -275,6 +275,11 @@ class Settings(BaseSettings):
     #: 切点吸附到真实硬切后，片段是 3.21 / 2.88 秒这样的长度；按分镜卡回 3 / 4 秒就会
     #: 砍掉镜头尾巴（连同原声旁白）或冻结补帧。整段加起来不变，所以总时长不变
     compose_follow_clip_length: bool = True
+    #: 黑场里有配音时，镜头按「说完的那一刻 + 这么多秒」收短（黑场本机生成、没有计费档位，
+    #: 分镜按「字数 ÷ 4.5 + 1 秒」留的余量在黑场里就是拖沓）。只缩不拉；0 = 不缩
+    compose_black_voice_tail_sec: float = 0.4
+    #: 黑场带电话音效（铃声 / 接通 / 挂断…）的场次里，画外台词按电话听筒音色出（300–3400 Hz 带通）
+    compose_black_phone_voice: bool = True
     #: 整段直通：一段里的镜头都用原声、不需要按镜头处理声音时，直接拿视频模型的整段原片渲一次
     #: （不经过「切成单镜 → 再逐镜渲染」的两道重编码）
     compose_segment_passthrough: bool = True

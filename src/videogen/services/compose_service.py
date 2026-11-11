@@ -16,6 +16,7 @@ from videogen.models.storyboard import Storyboard
 from videogen.models.video import VideoManifest
 from videogen.services import explainer_service, lipsync_service, subtitle_service, video_service
 from videogen.utils import loudness as loudness_utils
+from videogen.utils import sfx
 from videogen.utils.audio_align import mouth_align_delay, speech_span
 from videogen.utils.av_sync import check_av_sync, format_sync_warning
 from videogen.utils.ffmpeg import atempo_chain as ffmpeg_atempo_chain
@@ -48,6 +49,13 @@ def _resolution(project: Project) -> tuple[int, int]:
     return width - width % 2, height - height % 2
 
 
+#: 电话听筒音色：300–3400 Hz 带通（两级，更陡），再补回带通损失的约 3 dB
+#: （《沪漂》房东的两句云端 TTS 实测带通后掉 2.6 / 3.2 LU）
+PHONE_VOICE_FILTER = (
+    "highpass=f=300,highpass=f=300,lowpass=f=3400,lowpass=f=3400,volume=3dB"
+)
+
+
 def _resample(
     label_in: str,
     label_out: str,
@@ -55,9 +63,11 @@ def _resample(
     *,
     gain_db: float = 0.0,
     delay_ms: int = 0,
+    phone: bool = False,
 ) -> str:
-    """统一采样格式，并按需**延后人声**（口型对齐用）。"""
+    """统一采样格式，并按需**延后人声**（口型对齐用）；`phone` 时先过一道电话音色。"""
     gain = f"volume={gain_db:.1f}dB," if gain_db else ""
+    gain = (PHONE_VOICE_FILTER + "," if phone else "") + gain
     delay = f"adelay={delay_ms}|{delay_ms}," if delay_ms > 0 else ""
     return (
         f"[{label_in}]aresample=44100,aformat=channel_layouts=stereo,{gain}{delay}"
@@ -76,6 +86,7 @@ def _segment_filter(
     ambient_gain_db: float = -20.0,
     voice_delay_ms: int = 0,
     voice_gain_db: float = 0.0,
+    voice_phone: bool = False,
     fade_in_sec: float = 0.0,
     fade_out_sec: float = 0.0,
     dissolve_sec: float = 0.0,
@@ -125,7 +136,12 @@ def _segment_filter(
     if voice and ambient:
         chains.append(
             _resample(
-                "1:a", "voice", duration, gain_db=voice_gain_db, delay_ms=voice_delay_ms
+                "1:a",
+                "voice",
+                duration,
+                gain_db=voice_gain_db,
+                delay_ms=voice_delay_ms,
+                phone=voice_phone,
             )
         )
         chains.append(_resample("0:a", "ambient", duration, gain_db=ambient_gain_db))
@@ -135,7 +151,14 @@ def _segment_filter(
         )
     elif voice:
         chains.append(
-            _resample("1:a", "a", duration, gain_db=voice_gain_db, delay_ms=voice_delay_ms)
+            _resample(
+                "1:a",
+                "a",
+                duration,
+                gain_db=voice_gain_db,
+                delay_ms=voice_delay_ms,
+                phone=voice_phone,
+            )
         )
     elif ambient:
         chains.append(_resample("0:a", "a", duration, gain_db=ambient_gain_db))
@@ -199,6 +222,7 @@ async def render_segment(
             ambient_gain_db=ambient_gain_db,
             voice_delay_ms=voice_delay_ms,
             voice_gain_db=voice_gain_db,
+            voice_phone=segment.voice_phone,
             fade_in_sec=min(float(segment.fade_in_sec), duration),
             fade_out_sec=min(float(segment.fade_out_sec), duration),
             dissolve_sec=dissolve_sec,
@@ -614,6 +638,10 @@ async def plan_timeline(
         )
     elif settings.compose_follow_clip_length:
         await _follow_clip_lengths(segments, video_manifest, voice_audio, project_dir)
+    if not explainer_service.is_explainer(project) and settings.compose_black_voice_tail_sec > 0:
+        await _fit_black_to_voice(
+            segments, storyboard, voice_audio, project_dir, settings.compose_black_voice_tail_sec
+        )
     fps = max(1, settings.video_fps)
     for segment in segments:
         # 向上取整：只会多出不到一帧（冻结），不会切掉配音的尾巴
@@ -642,9 +670,19 @@ async def apply_transitions(
     fps = max(1, settings.video_fps)
     default_sec = max(0.0, float(settings.compose_transition_sec))
     used = 0
+    # 黑场里有电话音效的场次 = 一通电话：这场黑场里的画外台词按听筒音色出
+    phone_scenes = (
+        {s.scene_id for s in storyboard.shots if s.black_screen and s.sfx}
+        if settings.compose_black_phone_voice
+        else set()
+    )
     for segment in segments:
         shot = shots.get(segment.shot_id)
         segment.black_screen = bool(shot and shot.black_screen)
+        segment.black_sfx = bool(shot and shot.black_screen and shot.sfx)
+        segment.voice_phone = bool(
+            shot and shot.black_screen and shot.voice_offscreen and shot.scene_id in phone_scenes
+        )
     for index, segment in enumerate(segments):
         shot = shots.get(segment.shot_id)
         kind = shot.transition if shot else ""
@@ -1288,7 +1326,8 @@ async def _render_all(
             # 原声里就是这一镜的旁白：原音量进成片（不是环境音那样压到 -20dB）
             native = segment.native_voice and await has_ambient(video_path)
             segment_ambient_db = ambient_gain_db
-            if native:
+            if native or segment.black_sfx:
+                # 原声旁白 / 黑场音效：片段自己的声音按原音量进成片
                 use_ambient, segment_ambient_db = True, 0.0
             # 口型对齐：画面里的人几秒开口，配音就延后几秒（只用本地计算，不重新烧视频）。
             # 逐帧口型已经让嘴跟着配音走了，再叠加延后会把嘴和声音错开。
@@ -1332,6 +1371,7 @@ async def _render_all(
                 f" lipsync={'on' if lipsynced is not None else 'off'}"
                 f" gain={gain_db:+.1f}"
                 f" native={'on' if native else 'off'}"
+                f" phone={'on' if segment.voice_phone else 'off'}"
                 f" dur={segment.duration_sec:.3f}"
                 f" out={width}x{height}@{fps} crf={crf} preset={preset}"
                 f" fade={segment.fade_in_sec:.3f}/{segment.fade_out_sec:.3f}"
@@ -1540,6 +1580,38 @@ async def _follow_clip_lengths(
             # 已经按配音拉长过的镜头保留拉长后的时长（尾部冻结帧是有意的）
             need = max(need, segment.duration_sec)
         segment.duration_sec = round(max(length, need), 3)
+
+
+async def _fit_black_to_voice(
+    segments: list[ComposeSegment],
+    storyboard: Storyboard,
+    audio: AudioManifest | None,
+    project_dir: Path,
+    tail_sec: float,
+) -> None:
+    """黑场：有配音的镜头收短到「说完 + `tail_sec`」（只缩不拉）。
+
+    黑场是本机生成的，没有视频模型的计费档位要凑；分镜给台词留的「÷4.5 + 1 秒」余量在黑场里
+    就是一段拖沓的空黑。「说完」按配音文件里的人声算（云端 TTS 文件尾巴常带静音）。
+    带循环音效（铃声 / 忙音）的黑场不缩：那些音效本来就是要铺满这一镜的；
+    一次性音效（接通 / 挂断）保证放得完。
+    """
+    shots = {shot.id: shot for shot in storyboard.shots}
+    for segment in segments:
+        shot = shots.get(segment.shot_id)
+        if shot is None or not shot.black_screen or sfx.has_loop(shot.sfx):
+            continue
+        voice = audio.for_shot(segment.shot_id) if audio and segment.audio_path else None
+        if voice is None or voice.duration_sec <= 0:
+            continue
+        spoken = voice.duration_sec
+        audio_file = project_dir / segment.audio_path
+        span = await speech_span(audio_file, audio_file.parent)
+        if span is not None and 0 < span[1] < spoken:
+            spoken = span[1]
+        need = max(sfx.fixed_seconds(shot.sfx), max(0.0, voice.offset_sec) + spoken + tail_sec)
+        if need < segment.duration_sec:
+            segment.duration_sec = round(need, 3)
 
 
 async def _fit_to_voice(

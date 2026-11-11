@@ -322,7 +322,7 @@ def validate_storyboard(
                     suggestion="补写英文视频 prompt 后再进入视频生成",
                 )
             )
-        elif not shot.video_prompt.isascii():
+        elif not _without_quoted_text(shot.video_prompt).isascii():
             issues.append(
                 ConsistencyIssue(
                     severity=IssueSeverity.WARNING,
@@ -645,3 +645,11 @@ def _check_world_state_open_threads(ws: WorldState) -> list[ConsistencyIssue]:
             suggestion="确认这些悬念是否在后续场景中解决",
         )
     ]
+
+
+#: 画面里要出现的文字（招牌 / 屏幕 / 便签）按规定保留原文、用引号括起来，不算「非英文」
+_QUOTED_TEXT = re.compile(r'"[^"]*"|“[^”]*”|「[^」]*」|『[^』]*』')
+
+
+def _without_quoted_text(prompt: str) -> str:
+    return _QUOTED_TEXT.sub("", prompt or "")

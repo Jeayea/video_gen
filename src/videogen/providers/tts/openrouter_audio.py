@@ -88,6 +88,11 @@ _LANGUAGE_NAMES = {
 }
 
 
+#: 台词里写出来的停顿：省略号 / 破折号（连写的算一处）
+_PAUSE_MARKS = re.compile(r"(?:…|\.\.\.|——|--)+")
+PAUSE_SEC = 0.6
+
+
 class OpenRouterTTSProvider(TTSProvider):
     """OpenRouter 的语音合成（走 `POST /chat/completions` 的音频输出）。
 
@@ -200,6 +205,8 @@ class OpenRouterTTSProvider(TTSProvider):
         expected = estimate_speech_sec(text)
         if expected <= 0 or result.duration_sec <= 0:
             return result
+        # 「……」「——」是写进台词的停顿（「喂？……喂？」），字数估算里没有，按每处 0.6 秒放宽
+        expected += PAUSE_SEC * len(_PAUSE_MARKS.findall(text or ""))
         limit = max(expected * self.max_duration_ratio, expected + 1.0)
         if result.duration_sec <= limit:
             return result

@@ -2402,6 +2402,7 @@ function segmentSummary(sb) {
 }
 
 const TRANSITION_LABELS = { '': '硬切', dissolve: '叠化', fade: '经黑场淡出淡入' };
+const SFX_LABELS = { phone_ring: '手机铃声', phone_vibrate: '手机震动', call_connect: '接通', busy_tone: '忙音', hang_up: '挂断' };
 
 function shotBlockHtml(s, si) {
   return `
@@ -2415,10 +2416,12 @@ function shotBlockHtml(s, si) {
           ${(s.props_in_frame || []).length ? `<span class="tag-mini" title="关键道具">🔑 ${esc(namesOf('props', s.props_in_frame))}</span>` : ''}
           ${isExplainer(currentProject) && s.dialogue_text ? `<span style="color:var(--accent2)" title="${esc(s.dialogue_speaker)}">💬 ${esc(speakerName(s.dialogue_speaker))}${s.voice_offscreen ? '（画外音）' : ''}</span>` : ''}
           ${s.black_screen ? `<span class="tag-mini" title="画面全黑，本机生成，不调视频模型">⬛ 黑场</span>` : ''}
+          ${s.black_screen && (s.sfx || []).length ? `<span class="tag-mini" title="黑场音效（本机合成，$0）">🔊 ${esc(s.sfx.map(n => SFX_LABELS[n] || n).join(' → '))}</span>` : ''}
           ${s.transition ? `<span class="tag-mini" title="从上一镜怎么进来（合成时生效，不改时长）">↪ ${esc(TRANSITION_LABELS[s.transition] || s.transition)}${s.transition_sec ? ` ${s.transition_sec}s` : ''}</span>` : ''}
         </div>
         ${isExplainer(currentProject) && (s.narration || s.dialogue_text) ? `<div style="color:var(--accent2)">🎙 ${esc(s.narration || s.dialogue_text)}${(s.fact_refs || []).map(factTag).join('')}</div>` : ''}
         <div>${s.black_screen && !s.visual_description ? '黑屏。' : esc(s.visual_description)}</div>
+        ${s.black_screen && s.screen_text ? `<div class="shot-line"><span class="who">画面文字</span>：「${esc(s.screen_text)}」</div>` : ''}
         ${!isExplainer(currentProject) && s.dialogue_text ? `<div class="shot-line"><span class="who">${esc(speakerName(s.dialogue_speaker))}</span>${s.voice_offscreen ? '<span class="paren">（画外）</span>' : ''}：${esc(s.dialogue_text)}</div>` : ''}
         ${!isExplainer(currentProject) && s.narration ? `<div class="shot-line"><span class="who">旁白</span>：${esc(s.narration)}</div>` : ''}
         ${s.video_prompt ? `<details class="prompt-fold" ${showPrompts() ? 'open' : ''}>
@@ -2476,6 +2479,10 @@ function shotBlockHtml(s, si) {
             </div>
           </div>
           <label><input id="sh-${si}-black" type="checkbox" ${s.black_screen ? 'checked' : ''}> 黑场（画面全黑，本机生成 $0；台词按画外音配音）</label>
+          <label>黑场画面文字（黑底白字，例如「八个月前」；只对黑场生效）</label>
+          <input id="sh-${si}-screen-text" value="${esc(s.screen_text || '')}">
+          <label>黑场音效（按顺序，逗号分隔：${Object.entries(SFX_LABELS).map(([k, v]) => `${k}=${v}`).join(' / ')}）</label>
+          <input id="sh-${si}-sfx" value="${esc((s.sfx || []).join(', '))}">
           <div class="form-actions">
             <button class="btn btn-sm btn-green" onclick="saveShot(${si})">保存此镜</button>
             <button class="btn btn-sm btn-outline" onclick="toggleShotEdit(${si})">取消</button>
@@ -2533,6 +2540,8 @@ async function saveShot(si) {
   shot.transition = $(`sh-${si}-transition`).value;
   shot.transition_sec = parseFloat($(`sh-${si}-transition-sec`).value) || null;
   shot.black_screen = $(`sh-${si}-black`).checked;
+  shot.screen_text = $(`sh-${si}-screen-text`).value.trim();
+  shot.sfx = $(`sh-${si}-sfx`).value.split(/[,，]/).map(x => x.trim()).filter(Boolean);
 
   try {
     if (await putStoryboard(currentStoryboard)) await refresh();

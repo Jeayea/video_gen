@@ -37,6 +37,10 @@ class ComposeSegment(BaseModel):
     native_voice: bool = False
     #: 黑场镜头（本机生成的黑画面）
     black_screen: bool = False
+    #: 黑场片段自带音效（本机合成）：合成时按原音量混进这一镜（不当环境音压低）
+    black_sfx: bool = False
+    #: 黑场里的电话对白（这场黑场带电话音效、台词是画外音）：配音过一道听筒音色
+    voice_phone: bool = False
     #: 转场（`compose_service.apply_transitions` 按分镜算好）：开头从黑淡入 / 末尾淡出到黑的秒数
     fade_in_sec: float = 0.0
     fade_out_sec: float = 0.0

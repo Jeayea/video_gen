@@ -220,6 +220,32 @@ async def test_transitions_never_exceed_half_a_shot(tmp_path, settings):
     assert segments[0].fade_out_sec == 0.5 and segments[1].fade_in_sec == 0.5
 
 
+@pytest.mark.asyncio
+async def test_phone_call_black_lines_get_the_handset_voice(tmp_path, settings):
+    """黑场带电话音效的那场 = 一通电话：画外台词（含没挂音效的那几镜）过听筒音色。"""
+    board = Storyboard(
+        shots=[
+            shot(1, black_screen=True, sfx=["phone_ring"]),
+            shot(2, black_screen=True, dialogue_text="房租这礼拜到账。", voice_offscreen=True),
+            shot(3, dialogue_text="好。"),  # 不是黑场：不动
+            shot(4, black_screen=True, dialogue_text="喂？", voice_offscreen=True, scene_id="s2"),
+        ]
+    )
+    segments = segs([2, 2, 2, 2])
+    await compose_service.apply_transitions(segments, board, tmp_path, settings)
+    assert [s.voice_phone for s in segments] == [False, True, False, False]
+    assert "lowpass=f=3400" in compose_service._segment_filter(
+        1080, 1920, 2.0, 24, voice=True, ambient=False, voice_phone=True
+    )
+    assert "lowpass" not in compose_service._segment_filter(
+        1080, 1920, 2.0, 24, voice=True, ambient=False
+    )
+
+    settings.compose_black_phone_voice = False
+    await compose_service.apply_transitions(segments, board, tmp_path, settings)
+    assert not any(s.voice_phone for s in segments)
+
+
 # ── 真实 ffmpeg ──────────────────────────────────────
 
 
@@ -294,3 +320,116 @@ async def test_black_screen_and_transitions_end_to_end(store, settings):
     assert await mean_luma(final, report.segments[0].duration_sec + 1.2) > 20
     assert any("黑场" in w for w in report.warnings)
     assert store.load_project(project.id).status == ProjectStatus.DONE
+
+
+# ── 黑场的画面文字与音效 ──────────────────────────────
+
+
+def test_sfx_names_normalize_and_change_the_black_signature():
+    black = shot(1, black_screen=True, sfx="铃声，接通, 不认识", screen_text=" 八个月前 ")
+    assert black.sfx == ["phone_ring", "call_connect"] and black.screen_text == "八个月前"
+    plain_black = shot(1, black_screen=True)
+    assert video_service.shot_signature(black) != video_service.shot_signature(plain_black)
+    # 非黑场镜头写了也不影响签名（只对黑场生效）
+    assert video_service.shot_signature(shot(1, screen_text="x")) == video_service.shot_signature(
+        shot(1)
+    )
+
+
+def test_sfx_track_layout_one_shots_and_loops(tmp_path):
+    import wave
+
+    from videogen.utils import sfx
+
+    path = sfx.render_track(["phone_ring", "call_connect"], 2.0, tmp_path / "a.wav")
+    with wave.open(str(path)) as wav:
+        assert wav.getnchannels() == 2 and abs(wav.getnframes() - 2 * sfx.SAMPLE_RATE) <= 1
+        frames = wav.readframes(wav.getnframes())
+    import array
+
+    pcm = array.array("h", frames)
+    loud = max(abs(v) for v in pcm[: sfx.SAMPLE_RATE])  # 第一秒在响铃
+    assert loud > 3000
+    busy = sfx.render_track(["busy_tone"], 1.4, tmp_path / "b.wav")
+    with wave.open(str(busy)) as wav:
+        pcm = array.array("h", wav.readframes(wav.getnframes()))
+    # 忙音：0.35 秒响、0.35 秒停
+    off = pcm[2 * int(0.45 * sfx.SAMPLE_RATE): 2 * int(0.65 * sfx.SAMPLE_RATE)]
+    assert max(abs(v) for v in off) == 0
+
+
+def test_title_card_has_text_in_the_middle(tmp_path):
+    from PIL import Image
+
+    from videogen.utils import title_card
+
+    path = title_card.render("八个月前", 360, 640, tmp_path / "card.png")
+    image = Image.open(path).convert("L")
+    assert image.getpixel((5, 5)) == 0
+    middle = image.crop((60, 280, 300, 360))
+    assert middle.getextrema()[1] > 150  # 中间一行字是亮的
+
+
+@requires_ffmpeg
+@pytest.mark.asyncio
+async def test_black_card_and_sfx_end_up_in_the_film(store, settings):
+    settings.audio_dub_mode = "native"
+    project = small_project(store, shots=2, shot_duration=2)
+    board = store.load_storyboard(project.id)
+    board.shots[1] = board.shots[1].model_copy(
+        update={"black_screen": True, "screen_text": "八个月前", "sfx": ["phone_ring"],
+                "dialogue_text": None, "voice_offscreen": False}
+    )
+    store.save_storyboard(project.id, board)
+    pipeline = media_pipeline(store)
+    for start in (pipeline.start_video_generation, pipeline.start_audio_generation):
+        job = await start(project.id)
+        assert (await wait_for_job(pipeline, job.id)).status.value == "succeeded"
+    project_dir = store.ensure_project_dir(project.id)
+    clip = store.load_video_manifest(project.id).get(board.shots[1].id)
+    assert clip.provider == video_service.BLACK_PROVIDER
+    raw = await run_ffmpeg_bytes(
+        ["-v", "error", "-ss", "1.0", "-i", str(project_dir / clip.path), "-frames:v", "1",
+         "-vf", "format=gray", "-f", "rawvideo", "-"]
+    )
+    assert max(raw) > 150 and raw[0] < 10  # 中间有亮字，角落是黑的
+
+    job = await pipeline.start_compose(project.id)
+    finished = await wait_for_job(pipeline, job.id, timeout=180)
+    assert finished.status.value == "succeeded", finished.error
+    report = store.load_compose_report(project.id)
+    start = report.segments[0].duration_sec
+    pcm = await run_ffmpeg_bytes(
+        ["-v", "error", "-ss", f"{start + 0.1:.2f}", "-t", "0.8", "-i",
+         str(project_dir / report.output_path), "-ac", "1", "-f", "s16le", "-"]
+    )
+    import array
+
+    samples = array.array("h", pcm)
+    assert samples and max(abs(v) for v in samples) > 1500  # 黑场里听得见铃声
+
+
+@pytest.mark.asyncio
+async def test_black_shots_shrink_to_the_voice_but_keep_loops_and_one_shots(tmp_path):
+    board = Storyboard(
+        shots=[
+            shot(1, black_screen=True, duration_sec=4,
+                 dialogue_text="喂？", dialogue_speaker="char_6"),
+            shot(2, black_screen=True, duration_sec=3, sfx=["phone_ring"],
+                 dialogue_text="喂？", dialogue_speaker="char_6"),
+            shot(3, black_screen=True, duration_sec=3, sfx=["call_connect", "hang_up"],
+                 dialogue_text="嗯", dialogue_speaker="char_6"),
+            shot(4, duration_sec=4, dialogue_text="你好", dialogue_speaker="char_1"),  # 不是黑场
+            shot(5, black_screen=True, duration_sec=2),  # 没有配音
+        ]
+    )
+    audio = AudioManifest(clips=[
+        AudioClip(id=f"a{i}", shot_id=f"scene_1_shot_{i}", status=ClipStatus.READY, duration_sec=d,
+                  path=f"audio/a{i}.wav")
+        for i, d in ((1, 1.2), (2, 1.2), (3, 0.1), (4, 1.0))
+    ])
+    segments = segs([4, 3, 3, 4, 2])
+    for seg in segments[:4]:
+        seg.audio_path = f"audio/a{seg.index + 1}.wav"  # 文件不在：按配音时长算「说完」
+    await compose_service._fit_black_to_voice(segments, board, audio, tmp_path, 0.4)
+    assert [s.duration_sec for s in segments] == [1.6, 3, 0.5, 4, 2]

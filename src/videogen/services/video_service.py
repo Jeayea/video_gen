@@ -32,7 +32,7 @@ from videogen.providers.video.base import (
 )
 from videogen.services import explainer_service, voice_catalog
 from videogen.services.storyboard_service import Segment, chain_predecessors, segments_of
-from videogen.utils import language, media_history, region
+from videogen.utils import language, media_history, region, sfx, title_card
 from videogen.utils.ffmpeg import (
     FFmpegError,
     cut_clip,
@@ -1414,6 +1414,9 @@ def dialogue_directive(shot: Shot, bible: StoryBible | None = None) -> str:
     不写台词时，模型会**自己编一段话**在说 —— 嘴按它编的话动，我们再叠 TTS，
     口型必然对不上。写上台词（并禁止字幕）后，原生表演与我们的配音才在同一句话上。
 
+    只禁「字幕」，不写「no on-screen text」：段落 prompt 是一整串，模型分不清这句只管哪一镜，
+    会连同一段里的便签、屏幕、招牌上该有的字一起压掉（《沪漂》第 2 场一段里两者同时出现）。
+
     **故意不写说话人的名字**：中文名（「林悦」）出现在 prompt 里有被画成画面文字的风险
     （图片 prompt 上真实发生过：中文名被当成海报标题）。对模型来说「画面里正在说话的那个人」
     已经足够 —— 这一镜通常就一个说话人，两人同框时模型按台词本身也能对上。
@@ -1429,13 +1432,13 @@ def dialogue_directive(shot: Shot, bible: StoryBible | None = None) -> str:
             f"an off-screen voice{f' ({voice})' if voice else ''} is heard saying this exact "
             f"{spoken} line: "
             f'"{text}" — the speaker is not visible, '
-            "nobody on screen lip-syncs this line, no on-screen text or captions"
+            "nobody on screen lip-syncs this line, no subtitles or captions"
         )
     who = f"the on-screen speaker ({voice})" if voice else "the on-screen speaker"
     return (
         f'{who} says this exact {spoken} line: "{text}" — natural lip-sync '
         f"matched to the {spoken} speech, mouth movement and breathing follow the line, "
-        "no on-screen text or captions"
+        "no subtitles or captions"
     )
 
 
@@ -1461,7 +1464,7 @@ def narration_directive(
     voice = " ".join(str(settings.video_narrator_voice or "").split()) or "a calm narrator"
     return (
         f"documentary voice-over: {voice} {_narration_marker(text)} — nobody on screen speaks "
-        "or moves their lips, no on-screen text or captions"
+        "or moves their lips, no subtitles or captions"
     )
 
 
@@ -1501,8 +1504,10 @@ def shot_signature(shot: Shot) -> tuple:
         for name in _VIDEO_FIELDS
     )
     if shot.black_screen:
-        # 同上：只在是黑场时才算进来，别的镜头签名不变
+        # 同上：只在是黑场时才算进来，别的镜头签名不变。画面文字 / 音效改了要重做这段黑场（$0）
         signature = (*signature, ("black_screen", True))
+        if shot.screen_text or shot.sfx:
+            signature = (*signature, ("screen_text", shot.screen_text), ("sfx", tuple(shot.sfx)))
     if not shot.annotation:
         return signature
     return (*signature, ("annotation", shot.annotation), ("fact_refs", tuple(shot.fact_refs)))
@@ -2057,22 +2062,42 @@ async def _make_black_clip(
     width, height = project.output_resolution
     fps = max(1, get_settings().video_fps)
     seconds = max(1, int(shot.duration_sec))
+    work = Path(clips_dir) / ".black"
     try:
+        if shot.screen_text:
+            # 黑底白字的字幕卡：文字淡入淡出（从黑来、回到黑），整段时长不变
+            card = title_card.render(shot.screen_text, width, height, work / f"{shot.id}.png")
+            fade = min(0.4, seconds / 4)
+            video_in = ["-loop", "1", "-framerate", str(fps), "-i", str(card)]
+            video_filter = [
+                "-vf",
+                f"fade=t=in:st=0:d={fade:.2f},fade=t=out:st={seconds - fade:.2f}:d={fade:.2f},"
+                "format=yuv420p",
+            ]
+        else:
+            color = f"color=c=black:s={width}x{height}:r={fps}:d={seconds}"
+            video_in = ["-f", "lavfi", "-i", color]
+            video_filter = []
+        if shot.sfx:
+            track = sfx.render_track(shot.sfx, seconds, work / f"{shot.id}.wav")
+            audio_in = ["-i", str(track)]
+        else:
+            audio_in = ["-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100"]
         await run_ffmpeg(
             [
                 "-y", "-hide_banner", "-loglevel", "error",
-                "-f", "lavfi", "-i", f"color=c=black:s={width}x{height}:r={fps}:d={seconds}",
-                "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
+                *video_in, *audio_in, *video_filter,
                 "-t", str(seconds),
-                "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest",
+                "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-ar", "44100",
                 str(output),
             ],
             timeout_sec=60.0,
         )
-    except FFmpegError as exc:
+    except (FFmpegError, OSError, ImportError) as exc:
         _cleanup_partial(output)
         clip.status = ClipStatus.FAILED
-        clip.error = f"黑场片段生成失败（需要本机 ffmpeg）：{scrub_secrets(str(exc))[:200]}"
+        reason = scrub_secrets(str(exc))[:200]
+        clip.error = f"黑场片段生成失败（需要本机 ffmpeg / Pillow）：{reason}"
         manifest.upsert(clip)
         logger.warning("黑场镜头 %s 生成失败：%s", shot.id, exc)
         return

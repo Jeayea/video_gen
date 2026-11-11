@@ -339,3 +339,31 @@ async def test_absurdly_long_line_fails_instead_of_shipping(tmp_path, monkeypatc
             )
         )
     assert "时长异常" in str(exc.value)
+
+
+@pytest.mark.asyncio
+async def test_written_pause_is_not_mistaken_for_improvisation(tmp_path, monkeypatch):
+    """「喂？……喂？」念 1.8 秒是对的（中间那一拍停顿是写进去的），不能当成加戏拦掉。"""
+    from videogen.providers.tts import openrouter_audio
+
+    async def fake_probe(path):
+        return 1.8
+
+    monkeypatch.setattr(openrouter_audio, "probe_duration", fake_probe)
+    provider = make_provider(lambda request: ok_response(transcript="喂？……喂？"))
+    result = await provider.synthesize(
+        TTSRequest(clip_id="c", text="喂？……喂？", voice="coral", output_path=tmp_path / "c.wav")
+    )
+    assert result.duration_sec == 1.8
+
+    monkeypatch.setattr(openrouter_audio, "probe_duration", lambda path: _const(6.0))
+    with pytest.raises(TTSProviderError):  # 真加戏照样拦
+        await provider.synthesize(
+            TTSRequest(
+                clip_id="d", text="喂？……喂？", voice="coral", output_path=tmp_path / "d.wav"
+            )
+        )
+
+
+async def _const(value):
+    return value

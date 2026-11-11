@@ -20,6 +20,13 @@ from videogen.models.script import NARRATOR, Scene, Script
 from videogen.models.storyboard import Shot, Storyboard
 
 MODES = ("script", "shots")
+SFX_LABELS = {
+    "phone_ring": "手机铃声",
+    "phone_vibrate": "手机震动",
+    "call_connect": "接通",
+    "busy_tone": "忙音",
+    "hang_up": "挂断",
+}
 
 #: 场末转场（写在上一场末尾）/ 场首转场（写在这一场开头）
 _OUT_LABELS = {"dissolve": "叠化至：", "fade": "淡出。"}
@@ -195,7 +202,14 @@ def _shot_blocks(shots: list[Shot], names: dict[str, str]) -> list[dict[str, Any
             label.append("叠化进")
         elif position > 1 and shot.transition == "fade":
             label.append("经黑场进")
-        picture = "黑屏。" if shot.black_screen else _sub_ids(shot.visual_description, names)
+        if shot.black_screen:
+            picture = "黑屏。"
+            if shot.screen_text:
+                picture += f"画面文字：「{shot.screen_text}」。"
+            if shot.sfx:
+                picture += "音效：" + "、".join(SFX_LABELS.get(n, n) for n in shot.sfx) + "。"
+        else:
+            picture = _sub_ids(shot.visual_description, names)
         blocks.append({"type": "shot", "label": " · ".join(label), "text": picture})
         if shot.dialogue_text:
             blocks.append(
