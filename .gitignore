@@ -29,3 +29,7 @@ assets/lipsync/
 /test_raven/
 /bianxingji.txt
 /kongyiji.txt
+
+# 案例素材（含真实人物的事实底稿与映射），只留本机
+/docs/case_diving/
+/tools/case_diving/
