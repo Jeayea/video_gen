@@ -424,6 +424,7 @@ class Pipeline:
 
     def _invalidate_media(self, project_id: str) -> None:
         """文本产物变了，下游媒体全部作废（避免用旧分镜去合成）。"""
+        self._settle_video_cost(project_id)  # 清单要删了：没入账的扣费先记下来
         self.store.purge_media(
             project_id, video=True, audio=True, compose=True, reason="剧本或分镜重新生成"
         )
@@ -1766,7 +1767,9 @@ class Pipeline:
         storyboard = await self._apply_segment_mode(storyboard, project=project)
         if any(shot.segment_id for shot in storyboard.shots):
             storyboard_service.keep_unchanged_scene_segments(
-                storyboard, self.store.load_storyboard(project.id)
+                storyboard,
+                self.store.load_storyboard(project.id),
+                signature=video_service.shot_signature,
             )
         return storyboard
 
@@ -1787,6 +1790,7 @@ class Pipeline:
             project_dir = self.store.ensure_project_dir(project_id)
             self.store.save_storyboard(project_id, storyboard)
             if video is not None:
+                self._settle_video_cost(project_id, video)  # 作废会清掉片段上的扣费
                 video_service.invalidate_clips(
                     video, impact["stale_shots"], project_dir, reason="分镜修改"
                 )
@@ -1849,6 +1853,7 @@ class Pipeline:
                 raise PipelineError("没有找到要重做的段 / 镜头")
             stale = [i for t in targets for i in t["shots"]]
             label = "重做 " + "、".join(t["segment_id"] for t in targets)
+            self._settle_video_cost(project_id, video)  # 作废会清掉片段上的扣费
             video_service.invalidate_clips(
                 video, stale, self.store.ensure_project_dir(project_id), reason=label
             )
@@ -2131,6 +2136,9 @@ class Pipeline:
             # 只为「还没生成的那部分」预留预算；真实模型按自己的档位算秒数。
             # 注意：换 provider/模型时旧片段会**全部重跑**，预算必须按全部算 ——
             # 否则「生成缺失片段」会把预算门控绕过去（真实场景：mock → H3 一次 $9.75）。
+            # 上一轮被硬杀时已买到的片段可能没入账：先补记，预算门才看得到这笔钱
+            # （换模型重跑也会在任务里把这些片段的扣费清零）
+            self._settle_video_cost(project_id)
             video = self.store.load_video_manifest(project_id)
             storyboard = await self._apply_segment_mode(
                 storyboard, video=video, only_if_missing=True, project=project
@@ -2392,12 +2400,12 @@ class Pipeline:
         2. 进程在「片段已落盘、账本还没写」时挂掉，下次续跑只补记账，不会重复计费
         3. 失败重试成功只记一次
         """
-        # 段落整段已买到但切分失败的片段是 FAILED 却带着扣费：也必须记账
+        # 带着扣费的片段不管什么状态都必须记账：整段已买到但切分失败的是 FAILED，
+        # 切分途中被取消 / 进程被杀的还停在 GENERATING
         unrecorded = [
             c
             for c in manifest.clips
-            if not c.cost_recorded
-            and (c.status == ClipStatus.READY or (c.status == ClipStatus.FAILED and c.cost_usd > 0))
+            if not c.cost_recorded and (c.status == ClipStatus.READY or c.cost_usd > 0)
         ]
         if not unrecorded:
             return 0.0
@@ -2447,6 +2455,28 @@ class Pipeline:
         for clip in unrecorded:
             clip.cost_recorded = True
         return actual
+
+    def _settle_video_cost(self, project_id: str, manifest: VideoManifest | None = None) -> float:
+        """把清单里「已花钱、还没进账本」的片段补记进去（没有任务在跑时才能调）。
+
+        视频费用平时在任务结束 / 取消 / 异常时入账；进程被硬杀就来不及。之后：
+        - 预算门只看账本，这笔钱不算数，可能超出预算；
+        - 重做 / 改分镜 / 换模型会把片段上的扣费清零，这笔钱就再也找不回来了。
+        所以在预算检查之前、作废片段之前、重启恢复时都先调一次。不传 `manifest` 时自己读盘并落盘。
+        """
+        own = manifest is None
+        if own:
+            manifest = self.store.load_video_manifest(project_id)
+        if manifest is None:
+            return 0.0
+        recorded = self._record_video_cost(
+            project_id, manifest, price_per_second=None, settings=get_settings()
+        )
+        if own and any(c.cost_recorded for c in manifest.clips):
+            self.store.save_video_manifest(project_id, manifest)
+        if recorded > 0:
+            logger.warning("补记未入账的视频花费 $%.4f project=%s", recorded, project_id)
+        return recorded
 
     async def reconcile_video_cost(self, project_id: str) -> dict:
         """把视频清单里「已实测但没记账」的花费补进账本。
@@ -3246,6 +3276,9 @@ class Pipeline:
             manifest = self.store.load_video_manifest(project.id)
             audio = self.store.load_audio_manifest(project.id)
             if project.status == ProjectStatus.VIDEO_GENERATING:
+                # 被杀之前已经买到的片段：任务没走到记账那一步，这里补上
+                if manifest is not None and self._settle_video_cost(project.id, manifest):
+                    self.store.save_video_manifest(project.id, manifest)
                 self._settle_video_status(project, manifest, audio)
             elif project.status == ProjectStatus.AUDIO_GENERATING:
                 self._settle_audio_status(project, audio, manifest)

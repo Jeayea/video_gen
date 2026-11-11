@@ -8,7 +8,7 @@ from videogen.models.bible import Character, Prop, Setting, StoryBible
 from videogen.models.project import InputMode, Project
 from videogen.providers.llm.base import LLMMessage, LLMProvider
 from videogen.utils import region
-from videogen.utils.ids import allocate_id
+from videogen.utils.ids import allocate_id, is_safe_id
 
 logger = logging.getLogger(__name__)
 
@@ -202,6 +202,12 @@ def finalize_bible(bible: StoryBible, project: Project) -> StoryBible:
         ("prop", bible.props),
         ("fact", bible.facts),
     ):
+        for item in items:
+            # 模型写的 id 会拼进文件名（`refs/<id>.png`，还会被 `glob("<id>.*")` 清理）：
+            # 带 `../`、`*` 的当成没给，重新编号（原文 / 参考资料能诱导模型写出这种 id）
+            if item.id and not is_safe_id(item.id):
+                logger.warning("圣经里的 id 不合规，重新编号：%r", item.id)
+                item.id = ""
         for item in items:
             if not item.id:
                 item.id = allocate_id(prefix, (other.id for other in items if other.id))

@@ -453,6 +453,14 @@ class OpenRouterVideoProvider(VideoProvider):
                     "请先到 OpenRouter 后台核对再重试"
                 )
 
+            if response.status_code >= 500 and not _is_api_error(response):
+                # 5xx 但响应不是 OpenRouter 自己的错误 JSON（网关 / CDN 的错误页）：说明响应不是
+                # 接口写的，上游有没有建任务不知道。和 504 一样不重发
+                raise VideoJobPending(
+                    f"提交视频任务返回 {response.status_code}（网关错误，不是接口的报错），"
+                    "任务可能已在服务端创建并计费；请先到 OpenRouter 后台核对再重试"
+                )
+
             if response.status_code in _RETRY_STATUS and attempt < self.max_http_retries:
                 logger.warning(
                     "提交视频任务返回 %d，第 %d/%d 次重试",
@@ -939,3 +947,12 @@ def _http_error_message(response: httpx.Response, url: str) -> str:
     return scrub_secrets(f"OpenRouter {label}：{detail}")[:400]
 
 
+
+
+def _is_api_error(response: httpx.Response) -> bool:
+    """响应是不是接口自己报的错（`{"error": {...}}`）。网关 / CDN 的错误页不是。"""
+    try:
+        data = response.json()
+    except ValueError:
+        return False
+    return isinstance(data, dict) and "error" in data

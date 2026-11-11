@@ -652,6 +652,47 @@ async def test_editing_one_scene_keeps_segments_of_untouched_scenes(store, monke
     assert impact["stale_shots"] == ["b1"]
 
 
+@pytest.mark.asyncio
+async def test_editing_only_voice_direction_keeps_paid_segment(store, monkeypatch, settings):
+    """配音对齐把镜头拉长后，只改这一场里一条念法：不影响画面，这一场的段不能被重编、重买。"""
+    from videogen.models.storyboard import VoiceDirection
+
+    monkeypatch.setattr(settings, "video_segment_target_sec", 12)
+    monkeypatch.setattr(settings, "video_segment_max_sec", 15)
+    monkeypatch.setattr(settings, "video_segment_max_shots", 4)
+    project = Project(title="只改念法")
+    store.save_project(project)
+    board = Storyboard(shots=[_shot(f"a{i}", "scene_1", 3) for i in range(1, 5)])
+    storyboard_service.assign_segments(board, target_sec=12, max_sec=15, min_sec=5, max_shots=4)
+    assert storyboard_service.segments_of(board)[0].shot_ids == ["a1", "a2", "a3", "a4"]
+    for shot, seconds in zip(board.shots, (6, 5, 3, 3), strict=True):
+        shot.duration_sec = seconds  # 音画对齐写回的时长
+    store.save_storyboard(project.id, board)
+    store.save_video_manifest(
+        project.id,
+        VideoManifest(
+            clips=[
+                VideoClip(shot_id=s.id, scene_id=s.scene_id, status=ClipStatus.READY, path="x")
+                for s in board.shots
+            ]
+        ),
+    )
+
+    edited = board.model_copy(deep=True)
+    edited.shots[3].voice_direction = VoiceDirection(instruction="轻一点")
+    edited.shots[1].transition = "dissolve"
+    tiers = [float(x) for x in range(5, 16)]
+    pipeline = Pipeline(
+        store,
+        llm_factory=lambda: FakeLLM(),
+        video_factory=lambda: FakeVideoProvider(duration_options=tiers),
+    )
+    impact = await pipeline.storyboard_impact(project.id, edited.model_dump(mode="json"))
+
+    assert impact["stale_shots"] == []
+    assert impact["kept_segments"] == 1
+
+
 class _CountingMock(MockVideoProvider):
     def __init__(self):
         super().__init__(fps=12, crf=35)

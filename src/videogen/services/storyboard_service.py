@@ -3,6 +3,7 @@ from __future__ import annotations
 import itertools
 import logging
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from videogen.models.bible import StoryBible
@@ -844,8 +845,16 @@ def chain_predecessors(
     return found
 
 
-def keep_unchanged_scene_segments(new: Storyboard, old: Storyboard | None) -> list[str]:
+def keep_unchanged_scene_segments(
+    new: Storyboard,
+    old: Storyboard | None,
+    *,
+    signature: Callable[[Shot], object] | None = None,
+) -> list[str]:
     """完全没改过的场沿用旧的编段，返回沿用了哪几场。
+
+    `signature` 给了就只比它（调用方传「影响画面的字段」）：只改念法 / 转场这类不影响画面的
+    字段时，这一场也沿用旧编段 —— 不然对齐拉长过的时长会让它编出不同的段，已买到的段被作废。
 
     配音阶段的音画对齐会把镜头拉长、写回分镜，但不重新编段；之后随便改一场、按新时长
     整片重编，没动过的场也会编出不同的段 —— 已经买到的段整段作废重买（实测一场 4 镜 $2.1）。
@@ -868,9 +877,9 @@ def keep_unchanged_scene_segments(new: Storyboard, old: Storyboard | None) -> li
             continue
         if not all(shot.segment_id for shot in previous):
             continue
+        key = signature or (lambda shot: shot.model_dump(exclude={"segment_id"}))
         same = all(
-            a.model_dump(exclude={"segment_id"}) == b.model_dump(exclude={"segment_id"})
-            for a, b in zip(previous, shots, strict=True)
+            a.id == b.id and key(a) == key(b) for a, b in zip(previous, shots, strict=True)
         )
         if not same:
             continue

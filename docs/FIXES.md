@@ -1770,3 +1770,21 @@ preflight 不再把「就绪的占位片段」算待生成（和真正生成一�
 **没做**：重做中间章时的世界状态（已知限制 49，要按场留世界状态快照，是设计层面的改动）、口型产物按文件时间复用、
 口型对齐按配音文件长度算延后上限、请求体大小上限（整本小说可能就有几 MB，上限多少要按用途定）、
 `_generate_one` / `_generate_segment` 合并、`video_service.py` 按职责拆文件。
+
+## 2026-11-11 · 换手审查：四处会花冤枉钱 / 写到项目目录外的问题
+
+接手时把计费路径和接口面重读了一遍（全量 1080 个用例通过的前提下）。下面四条都补了回归用例。
+
+| 问题 | 修法 | 用例 |
+|---|---|---|
+| 配音对齐把镜头拉长、写回分镜之后，只改这一场里一条念法 / 转场：这一场「有改动」，按拉长后的时长重新编段，已买到的段被判作废（4 × 3 秒的一段对齐成 6/5/3/3 后，改一条念法就整段重买，H3 约 $2.47）。和「只改念法不作废任何片段」的说法矛盾 | `keep_unchanged_scene_segments` 可以只比「影响画面的字段」（`video_service.shot_signature`）：画面没变的场沿用旧编段 | `test_editing_only_voice_direction_keeps_paid_segment` |
+| 视频费用只在任务结束 / 取消 / 异常时入账。进程被硬杀、或切段途中取消（片段停在 GENERATING）后，已买到的片段没入账：预算门只看账本，下一轮可能超出 `BUDGET_USD`；这时再「重做这段」/ 改分镜 / 换模型，片段上的扣费被清零，`cost/reconcile` 也找不回来 | 新增 `Pipeline._settle_video_cost`，在预算检查之前、作废片段之前（重做 / 改分镜 / 下游全部作废）、重启恢复时各补记一次；记账判据改成「带着扣费的片段不管什么状态都记」 | `test_restart_recovery_records_paid_clips`、`test_invalidating_unrecorded_clips_keeps_their_cost`、`test_budget_gate_counts_unrecorded_spend` |
+| 提交视频任务遇到 500 / 502 / 503 会在 `_submit` 里重发，上层再重试，一段最多 9 次 POST。响应是网关 / CDN 的错误页时，上游有没有建任务不知道（和 504 一样），重发可能买两次 | 5xx 且响应不是接口自己的错误 JSON（`{"error": ...}`）时按 504 处理：抛 `VideoJobPending`、不重发。接口自己报的 5xx 仍然重试（请求被处理并拒绝了） | `test_gateway_error_page_on_submit_is_not_resubmitted` |
+| 圣经里的 id 只在用户 PUT 时校验；模型写的 id 原样保留，而它会拼成 `refs/<id>.png`、还会被 `glob("<id>.*")` 清理。小说原文 / 参考资料诱导模型写出 `../project` 时，出图写到 `refs/` 外面，清理 glob 会删掉 `project.json` | `finalize_bible` 把不合规的 id 当成没给、重新编号（小说合并也走这里） | `test_unsafe_model_ids_are_renumbered` |
+
+**行为变化**：老项目里「漏记」的视频花费，下次点「生成视频片段」/「重做这段」/ 改分镜时会自动补进账本
+（以前要手动点「补齐」）；补记后超预算的会被预算门拦下。网关错误页不再自动重试，要人工核对后再点一次生成。
+
+**没做**（审查里看到、还在）：POST 还没返回就取消时任务 id 来不及落盘；已买到但切分失败的段报价时仍按全价算
+（预算快用完时免费的重切会被拒）；provider 返回的轮询 / 下载地址不校验主机和大小；`usage.cost` 缺失时按取整后的秒数估算会少记；
+批量没有总预算（按项目算）；账本追加和 `cost_recorded` 落盘是两次写（中间挂掉会重复记一笔）；黑场字幕卡不换行（竖屏约 22 字以上被裁）。

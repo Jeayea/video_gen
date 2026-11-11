@@ -567,6 +567,74 @@ async def test_reconcile_backfills_missing_video_cost(store):
     assert again["recorded_usd"] == 0
 
 
+async def _killed_mid_job(store, pipeline):
+    """跑完一轮后把状态改成「任务被硬杀」：片段已买到、账本没记、状态还是生成中。"""
+    project = await build_confirmed_project(store, pipeline)
+    job = await pipeline.start_video_generation(project.id)
+    await wait_for_job(pipeline, job.id)
+    store.save_cost_report(project.id, CostReport(budget_usd=0.0))
+    manifest = store.load_video_manifest(project.id)
+    for clip in manifest.clips:
+        clip.cost_recorded = False
+    store.save_video_manifest(project.id, manifest)
+    return project
+
+
+def _video_usd(store, project_id) -> float:
+    report = cost_service.load_report(store, project_id)
+    return sum(e.usd for e in report.entries if e.stage == CostStage.VIDEO)
+
+
+@pytest.mark.asyncio
+async def test_restart_recovery_records_paid_clips(store):
+    """进程被硬杀：已买到的片段没走到记账那一步，重启恢复时要补记（否则预算门看不到这笔钱）。"""
+    pipeline = media_pipeline(store, CostReportingProvider())
+    project = await _killed_mid_job(store, pipeline)
+    project = store.load_project(project.id)
+    project.status = ProjectStatus.VIDEO_GENERATING
+    store.save_project(project)
+
+    await pipeline.recover_interrupted_jobs()
+
+    assert _video_usd(store, project.id) == pytest.approx(6.5)
+    assert all(c.cost_recorded for c in store.load_video_manifest(project.id).clips)
+    await pipeline.recover_interrupted_jobs()
+    assert _video_usd(store, project.id) == pytest.approx(6.5), "不能重复记"
+
+
+@pytest.mark.asyncio
+async def test_invalidating_unrecorded_clips_keeps_their_cost(store):
+    """「重做这段」会把片段上的扣费清零：没入账的要先记下来，不然这笔钱就消失了。"""
+    pipeline = media_pipeline(store, CostReportingProvider())
+    project = await _killed_mid_job(store, pipeline)
+    shot_id = store.load_video_manifest(project.id).clips[0].shot_id
+
+    await pipeline.invalidate_video(project.id, shots=[shot_id])
+
+    assert _video_usd(store, project.id) == pytest.approx(6.5)
+
+
+@pytest.mark.asyncio
+async def test_budget_gate_counts_unrecorded_spend(store, monkeypatch):
+    """预算门只看账本：上一轮没入账的 $6.5 要先补记，再判断够不够。"""
+    pipeline = media_pipeline(store, CostReportingProvider())
+    project = await _killed_mid_job(store, pipeline)
+    shot_id = store.load_video_manifest(project.id).clips[0].shot_id
+    manifest = store.load_video_manifest(project.id)
+    # 一个片段还没生成（PENDING、没花钱），其余已买到但没入账
+    clip = manifest.get(shot_id)
+    clip.status, clip.cost_usd, clip.path = ClipStatus.PENDING, 0.0, ""
+    store.save_video_manifest(project.id, manifest)
+    monkeypatch.setattr(get_settings(), "budget_usd", 5.0)
+    project = store.load_project(project.id)
+    project.status = ProjectStatus.STORYBOARD_CONFIRMED
+    store.save_project(project)
+
+    with pytest.raises(cost_service.BudgetExceeded):
+        await pipeline.start_video_generation(project.id)
+    assert _video_usd(store, project.id) == pytest.approx(9 * 0.65)
+
+
 # ── 分镜阶段的计费档位（v0.11「一开始就少而长」）──────
 
 

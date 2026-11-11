@@ -83,6 +83,22 @@ def test_new_ids_never_reuse_a_deleted_number():
     assert sorted(c.id for c in bible.characters) == ["char_2", "char_3"]
 
 
+def test_unsafe_model_ids_are_renumbered():
+    """模型给的 id 会拼成 `refs/<id>.png`：`../project` 这种要重新编号，不能原样落盘。"""
+    from videogen.models.bible import Character, Prop, StoryBible
+    from videogen.models.project import Project
+    from videogen.services import bible_service
+    from videogen.utils.ids import is_safe_id
+
+    bible = StoryBible(
+        characters=[Character(id="../project", name="甲"), Character(id="char_1", name="乙")],
+        props=[Prop(id="*", name="信")],
+    )
+    bible_service.finalize_bible(bible, Project(title="t"))
+    assert sorted(c.id for c in bible.characters) == ["char_1", "char_2"]
+    assert all(is_safe_id(item.id) for item in [*bible.characters, *bible.props])
+
+
 def test_split_ignores_sentence_that_looks_like_heading():
     text = "第一章 开学\n" + "她走进教室。\n" * 10 + "第三节课下课了。\n" + "铃响了。\n" * 10
     chapters = split_chapters(text)

@@ -1275,6 +1275,29 @@ async def test_gateway_timeout_on_submit_is_not_resubmitted(tmp_path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("status", [500, 502, 503])
+async def test_gateway_error_page_on_submit_is_not_resubmitted(tmp_path, status):
+    """5xx 且响应不是接口的错误 JSON（网关错误页）：上游可能已经建了任务 —— 不重发。
+
+    接口自己报的 5xx（`{"error": ...}`）仍然重试，见 `test_generation_failure_is_still_retried`。
+    """
+    from videogen.providers.video.base import VideoJobPending
+
+    class GatewayPage(Recorder):
+        def handler(self, request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/videos") and request.method == "POST":
+                self.submits += 1
+                return httpx.Response(status, text="<html>Bad Gateway</html>")
+            return super().handler(request)
+
+    recorder = GatewayPage()
+    provider = make_provider(recorder)
+    with pytest.raises(VideoJobPending, match=str(status)):
+        await provider.generate(request_for(tmp_path))
+    assert recorder.submits == 1
+
+
+@pytest.mark.asyncio
 async def test_fresh_job_not_found_yet_is_pending_not_resubmitted(tmp_path):
     """刚提交的任务第一次查询就 404：更可能是还没同步，留着 job id 下次接着查，不当场重交。"""
     from videogen.providers.video.base import VideoJobPending
