@@ -24,3 +24,8 @@ assets/lipsync/
 .e2e/
 
 .DS_Store
+
+# 另一个项目 / 试拍用的小说原文（译本版权不明），不进仓库
+/test_raven/
+/bianxingji.txt
+/kongyiji.txt
